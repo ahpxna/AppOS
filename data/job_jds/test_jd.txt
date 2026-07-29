@@ -1,0 +1,35 @@
+Some Of What You’ll Work On
+
+Perform penetration testing as well as purple and red team exercises.
+Conduct threat modeling, code reviews, and design reviews for development teams.
+Research new attack techniques and develop strategies to counter them.
+Develop and enforce security best practices and standards, maintaining internal compliance.
+Provide solutions to complex security issues, manage multiple tasks, and prioritize effectively in a fast-paced environment.
+Present technical security information to both technical and non-technical audiences.
+Maintain technical documentation, reports, and security tooling with attention to detail.
+Participate in other security-related initiatives as assigned.
+
+Who You Are
+
+5+ years of experience in offensive information security roles.
+Proficiency in at least one programming or scripting language (e.g., Go, Python, C/C++) for automation, code reviews, and tooling.
+Hands-on penetration testing experience and familiarity with offensive security tools.
+Strong technical knowledge of Linux operating systems and containerized environments.
+Experience securing Kubernetes and understanding related security practices.
+Able to navigate ambiguity, identify root causes, and solve complex security problems.
+Excellent written and verbal communication skills with strong technical documentation abilities.
+Capable of working independently while managing multiple priorities in a fast-paced environment.
+Strong desire to continuously learn and adopt new technologies and security techniques.
+
+Preferred
+
+Experience with firmware reverse engineering, analyzing binaries, bootloaders, and embedded systems for vulnerabilities.
+Relevant certifications such as Sec+, Net+, OSCP, or equivalent.
+Experience with EDR tuning, detections-as-code, or threat hunting as part of a Blue Team.
+Deep understanding of business-wide security best practices and implementation strategies.
+
+Wondering if you’re a good fit? We believe in investing in our people, and value candidates who can bring their own diversified experiences to our teams – even if you aren't a 100% skill or experience match. Here are a few qualities we’ve found compatible with our team. If some of this describes you, we’d love to talk. 
+
+You love hunting vulnerabilities and proactively improving security.
+You’re curious about evolving attack vectors and defense strategies.
+You’re an expert in offensive security techniques and tooling, with a passion for safeguarding systems.

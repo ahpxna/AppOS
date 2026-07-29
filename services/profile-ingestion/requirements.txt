@@ -1,0 +1,4 @@
+psycopg[binary]
+pypdf
+python-docx
+requests>=2.31.0

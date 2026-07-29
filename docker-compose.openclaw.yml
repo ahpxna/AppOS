@@ -1,0 +1,69 @@
+# =========================================================
+# L3 -- BROWSER RUNTIME (OpenClaw gateway + Chrome sidecar)
+#
+# Kept in a separate overlay so the core pipeline (L4/L5/L6)
+# runs without pulling ~2GB of browser images.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.openclaw.yml up -d
+#
+# First run only:
+#   docker compose -f docker-compose.yml -f docker-compose.openclaw.yml \
+#     run --rm openclaw onboard
+#
+# Then open http://127.0.0.1:18789 and paste OPENCLAW_GATEWAY_TOKEN
+# into Settings -> token.
+# =========================================================
+
+services:
+  openclaw:
+    image: ${OPENCLAW_IMAGE:-khal3d/openclaw:latest}
+    container_name: jobos-openclaw
+    restart: unless-stopped
+    ports:
+      # Bound to loopback only. This agent can drive a logged-in browser;
+      # it must never be reachable from the LAN.
+      - "127.0.0.1:18789:18789"   # Gateway UI / API
+      - "127.0.0.1:18791:18791"   # Bridge
+    environment:
+      OPENCLAW_GATEWAY_TOKEN: ${OPENCLAW_GATEWAY_TOKEN:?set OPENCLAW_GATEWAY_TOKEN in .env}
+      # Points the browser tool at the Chrome sidecar. Without a reachable
+      # CDP endpoint the browser tool stays inactive.
+      OPENCLAW_BROWSER_CDP_URL: http://browser:9222
+      OPENCLAW_BROWSER_ALLOW_EVAL: "false"
+    volumes:
+      - ./data/openclaw-config:/root/.openclaw
+      - ./data/openclaw-workspace:/workspace
+    depends_on:
+      - browser
+    networks:
+      - jobos
+    deploy:
+      resources:
+        limits:
+          # A runaway agent should not be able to OOM the host.
+          memory: 4g
+
+  browser:
+    # kasmweb/chrome gives a full desktop over noVNC, so sites requiring
+    # login (LinkedIn, Workday, Greenhouse) can be authenticated by hand
+    # once, in a visible browser, rather than scripted with stored passwords.
+    image: kasmweb/chrome:1.16.0
+    container_name: jobos-browser
+    restart: unless-stopped
+    # Chrome crashes silently without enough shared memory.
+    shm_size: 1gb
+    ports:
+      - "127.0.0.1:6901:6901"     # noVNC desktop (manual login)
+      - "127.0.0.1:9222:9222"     # CDP (consumed by openclaw)
+    environment:
+      VNC_PW: ${BROWSER_VNC_PASSWORD:?set BROWSER_VNC_PASSWORD in .env}
+    networks:
+      - jobos
+    deploy:
+      resources:
+        limits:
+          memory: 4g
+
+networks:
+  jobos:
+    driver: bridge

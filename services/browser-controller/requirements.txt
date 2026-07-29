@@ -1,0 +1,20 @@
+# JobOS - profile ingestion pipeline
+#
+# Truoc patch file nay chi co psycopg. Ba dependency con lai duoc import
+# bang try/except roi gan = None, nen thieu chung khong crash -> parse ra
+# chuoi rong -> ghi vao DB rong -> exit code 0. Data corruption im lang.
+#
+# Sau patch H1, thieu bat ky cai nao se SystemExit ngay.
+
+psycopg[binary]>=3.2.3,<4      # driver Postgres, dung boi tat ca script
+python-docx>=1.1.0             # ingest_files.parse_docx  (BAT BUOC)
+pypdf>=4.0.0                   # ingest_files.parse_pdf   (BAT BUOC)
+requests>=2.31.0               # goi Ollama /api/chat, /api/embed (BAT BUOC)
+
+# Ghi chu:
+#   - khong pin cung ==  vi psycopg 3.2.3 da cu; >= de nang duoc.
+#   - pdftotext (poppler) la BINARY he thong, khong phai pip:
+#         brew install poppler
+#     ocr_profile_files.py goi require_binary("pdftotext") va se chet neu thieu.
+#   - tesseract (neu dung OCR anh):
+#         brew install tesseract tesseract-langs

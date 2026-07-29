@@ -1,0 +1,31 @@
+SOC Analyst I — Managed Security Services
+
+About the role:
+Join our 24/7 security operations center supporting mid-market clients across
+finance and healthcare. You will be the first line of triage on security alerts
+and will work alongside senior analysts who handle escalation and threat hunting.
+
+Responsibilities:
+- Monitor SIEM alert queues and triage according to documented runbooks
+- Investigate phishing reports submitted by client end users
+- Perform initial packet and log analysis to confirm or dismiss alerts
+- Escalate confirmed incidents to Tier 2 with a written summary
+- Maintain case notes and contribute to runbook improvements
+
+Requirements:
+- Linux and Windows operating system fundamentals
+- Network protocol analysis using tcpdump or Wireshark
+- Scripting ability in Python or Bash for routine automation
+- Familiarity with the MITRE ATT&CK framework
+- Clear written communication for incident documentation
+
+Nice to have:
+- Exposure to digital forensics tooling
+- Coursework or labs in vulnerability assessment
+- Security+ or equivalent certification
+
+New graduates are welcome to apply. We provide structured onboarding and
+mentorship for the first six months.
+
+Schedule: Rotating shifts including some nights and weekends.
+Location: Hybrid, three days onsite.

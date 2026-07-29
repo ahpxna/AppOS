@@ -1,0 +1,38 @@
+# === SECRETS — never commit ===
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials*.json
+
+# === Runtime data / volumes ===
+postgres_data/
+n8n_data/
+backups/
+logs/
+
+# === Personal profile data (PII: transcript, resume, coursework) ===
+data/profile_raw/
+data/profile_parsed/
+data/profile_parsed_v2/
+data/profile_sources_v2/
+!data/job_jds/
+
+# === Python ===
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# === Backup / scratch files ===
+*.bak
+*.bak.*
+*.dump
+*.DS_Store
+
+# === Editor ===
+.vscode/
+.idea/
+
