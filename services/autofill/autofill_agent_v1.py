@@ -75,26 +75,47 @@ TOGGLE_ROLES = {"checkbox", "radio"}
 INPUT_ROLES = TEXT_ROLES | CHOICE_ROLES | TOGGLE_ROLES
 
 # First match wins, so specific patterns precede general ones.
+# Broadened 2026-07-31 to cover fields recurring across Greenhouse, Lever,
+# Ashby, Workday, iCIMS, and SmartRecruiters application forms -- the
+# matcher itself is already platform-agnostic (it reads label TEXT, not
+# DOM structure), so widening this table is what "works on every ATS"
+# actually means in this design, not a per-platform integration.
 FIELD_PATTERNS: List[Tuple[str, str]] = [
     (r"(?i)^(your\s+)?(full\s+)?name$",                "full_name"),
     (r"(?i)\b(full|legal)\s*name\b",                   "full_name"),
     (r"(?i)\b(first|given)\s*name\b",                  "legal_first_name"),
     (r"(?i)\b(last|family|sur)\s*name\b",              "legal_last_name"),
     (r"(?i)\bmiddle\s*name\b",                         "middle_name"),
+    (r"(?i)\bmiddle\s*initial\b",                      "middle_name"),
     (r"(?i)\bpreferred\s*name\b",                      "preferred_name"),
+    (r"(?i)\bpronouns\b",                              "pronouns"),
     (r"(?i)\be-?mail\b",                               "email"),
     (r"(?i)\bcountry\s*code\b",                        "phone_country_code"),
-    (r"(?i)\b(phone|mobile|telephone)\b",              "phone"),
-    (r"(?i)address\s*line\s*2",                        "address_line2"),
+    (r"(?i)\b(phone|mobile|telephone|cell)\b",         "phone"),
+    (r"(?i)address\s*line\s*2|\bapt\.?\s*/?\s*suite\b","address_line2"),
     (r"(?i)\b(street|address\s*line\s*1|address1)\b",  "address_line1"),
     (r"(?i)postal\s*code\s*extension",                 "address_postal_ext"),
     (r"(?i)\b(zip|postal)\b",                          "address_postal"),
     (r"(?i)\bcity\b",                                  "address_city"),
+    (r"(?i)\bcounty\b",                                "address_county"),
     (r"(?i)\b(state|province|region)\b",               "address_state"),
     (r"(?i)\bcountry\b",                               "address_country"),
     (r"(?i)linked-?in",                                "linkedin_url"),
+    (r"(?i)\b(x|twitter)\s*(profile|handle|url)?\b",   "twitter_url"),
     (r"(?i)github",                                    "github_url"),
     (r"(?i)\b(portfolio|website|personal\s*site)\b",   "portfolio_url"),
+    (r"(?i)\bother\s*(url|link|profile)\b",            "other_url"),
+    # -- education --
+    (r"(?i)\b(university|college|school)\s*(name|attended)?\b", "university_name"),
+    (r"(?i)\bdegree\b",                                "degree"),
+    (r"(?i)\b(major|field\s*of\s*study|concentration)\b", "major"),
+    (r"(?i)\bgraduation\s*(date|year)?\b",             "graduation_date"),
+    # -- work history / target role --
+    (r"(?i)\bcurrent\s*(employer|company)\b",          "current_employer"),
+    (r"(?i)\bcurrent\s*(job\s*)?title\b",              "current_title"),
+    (r"(?i)\bdesired\s*(job\s*)?title\b",               "desired_title"),
+    (r"(?i)\byears?\s*of\s*experience\b",              "years_experience"),
+    (r"(?i)how\s*did\s*you\s*hear\s*about\s*(us|this\s*(role|position|job))", "referral_source"),
 ]
 
 # Controls that parse a resume and populate fields automatically. Reported,
@@ -104,9 +125,22 @@ RESUME_AUTOFILL_PATTERNS = [
     r"(?i)autofill\s*(with|from)?\s*(resume|cv)",
     r"(?i)auto-?fill\s*(with|from)?\s*(resume|cv)",
     r"(?i)parse\s*(my)?\s*resume",
-    r"(?i)apply\s*with\s*(linked-?in|indeed|profile)",
-    r"(?i)import\s*your\s*profile",
+    r"(?i)apply\s*with\s*(linked-?in|indeed|profile|github)",
+    r"(?i)import\s*(your|my)?\s*profile",
     r"(?i)upload\s*resume\s*to\s*autofill",
+    r"(?i)quick\s*apply",
+]
+
+# File-input controls (resume/cover-letter/transcript upload). These are
+# reported so the user knows a real file still has to be attached by hand;
+# uploading a file is a filesystem action this tool does not take, on the
+# same "draft-only, do not guess" principle as everything else here.
+FILE_UPLOAD_PATTERNS = [
+    r"(?i)\b(upload|attach|browse)\b.{0,20}\b(resume|cv|r[eé]sum[eé])\b",
+    r"(?i)\b(upload|attach|browse)\b.{0,20}\b(cover\s*letter)\b",
+    r"(?i)\b(upload|attach|browse)\b.{0,20}\b(transcript)\b",
+    r"(?i)^(choose|select)\s*file$",
+    r"(?i)^browse\.{0,3}$",
 ]
 
 
@@ -363,7 +397,8 @@ def build_plan(cur, nodes: List[Dict[str, Any]]) -> Dict[str, Any]:
     values = load_values(cur)
 
     plan = {"fills": [], "selects": [], "clicks": [],
-            "pauses": [], "missing": [], "unknown": [], "resume_controls": []}
+            "pauses": [], "missing": [], "unknown": [],
+            "resume_controls": [], "file_uploads": []}
     seen_groups = set()
 
     for idx, n in enumerate(nodes):
@@ -374,6 +409,11 @@ def build_plan(cur, nodes: List[Dict[str, Any]]) -> Dict[str, Any]:
         if any(re.search(p, label) for p in RESUME_AUTOFILL_PATTERNS):
             if n["ref"]:
                 plan["resume_controls"].append({"ref": n["ref"], "label": label})
+            continue
+
+        if any(re.search(p, label) for p in FILE_UPLOAD_PATTERNS):
+            if n["ref"]:
+                plan["file_uploads"].append({"ref": n["ref"], "label": label})
             continue
 
         # Button-group questions (Yes / No / N/A).
@@ -450,6 +490,13 @@ def print_plan(plan: Dict[str, Any], truncated: bool) -> None:
         print("  values are typed instead.")
         for r in plan["resume_controls"]:
             print(f"    - {r['label'][:66]}")
+
+    if plan["file_uploads"]:
+        print(f"\n  FILE UPLOADS ({len(plan['file_uploads'])}) -- not touched")
+        print("  Attaching a file is a filesystem action outside this tool's")
+        print("  scope. Attach these yourself:")
+        for u in plan["file_uploads"]:
+            print(f"    - {u['label'][:66]}")
 
     for key, title in (("fills", "WILL TYPE"), ("selects", "WILL SELECT"),
                        ("clicks", "WILL CLICK")):
@@ -638,6 +685,7 @@ def cmd_fill(conn, args) -> int:
                     for m in plan["missing"]],
         "unknown": [u["label"] for u in plan["unknown"]],
         "resume_controls_ignored": [r["label"] for r in plan["resume_controls"]],
+        "file_uploads_needing_manual_attach": [u["label"] for u in plan["file_uploads"]],
         "submitted": False,
     }
 

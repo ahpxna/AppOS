@@ -44,6 +44,8 @@ from typing import Any, Dict, List, Optional
 import psycopg
 from psycopg.types.json import Jsonb
 
+from services.common.observability import emit_trace, make_trace_id
+
 DB_HOST = os.getenv("JOBOS_DB_HOST", "127.0.0.1")
 DB_PORT = int(os.getenv("JOBOS_DB_PORT", "5433"))
 DB_NAME = os.getenv("JOBOS_DB_NAME", "job_apply_os")
@@ -60,6 +62,10 @@ OPENCLAW_AGENT = os.getenv("OPENCLAW_AGENT_RESEARCH", "main")
 
 RESEARCH_VERSION = "company_research_v1_webfetch_2026_07_28"
 DEFAULT_TTL_DAYS = int(os.getenv("JOBOS_RESEARCH_TTL_DAYS", "30"))
+
+
+def estimate_tokens(text: str) -> int:
+    return max(1, len(text) // 4)
 
 
 # ---------------------------------------------------------------- openclaw
@@ -322,10 +328,24 @@ def research_company(conn, company: str, domain: Optional[str], args) -> int:
         prompt = build_research_prompt(company, domain)
         print(f"  querying agent '{OPENCLAW_AGENT}' via web fetch/search...")
 
-        start = time.time()
-        session_id = f"jobos-research-{_uuid.uuid4().hex[:12]}"
-        raw = openclaw_agent(prompt, timeout=args.timeout, session_id=session_id)
-        elapsed = time.time() - start
+        start = time.perf_counter()
+        # openclaw_agent() already mints its own per-call session id (see
+        # its definition above); it does not accept a session_id kwarg.
+        # This call used to pass one anyway (and referenced an undefined
+        # `_uuid` name on top of that), which raised TypeError the moment
+        # this path actually ran against a live OpenClaw install. Fixed
+        # 2026-07-31.
+        raw = openclaw_agent(prompt, timeout=args.timeout)
+        elapsed = time.perf_counter() - start
+        emit_trace(
+            make_trace_id("company-research", company),
+            "company_research",
+            started_at=start,
+            tokens_in=estimate_tokens(prompt),
+            tokens_out=estimate_tokens(raw),
+            cost_usd=0.0,
+            company=company,
+        )
 
         parsed = extract_json_object(raw)
         data = validate(parsed)

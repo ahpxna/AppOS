@@ -39,6 +39,8 @@ from typing import Any, Dict, List, Optional
 import psycopg
 from psycopg.types.json import Jsonb
 
+from services.common.observability import emit_trace, make_trace_id
+
 DB_HOST = os.getenv("JOBOS_DB_HOST", "127.0.0.1")
 DB_PORT = int(os.getenv("JOBOS_DB_PORT", "5433"))
 DB_NAME = os.getenv("JOBOS_DB_NAME", "job_apply_os")
@@ -198,6 +200,8 @@ def verify_claims(
     timeout: int, temperature: float, num_ctx: int, verbose: bool,
 ) -> List[Dict[str, Any]]:
     results = []
+    tokens_in = tokens_out = 0
+    start = time.perf_counter()
     for i, c in enumerate(claims, 1):
         claim_text = c.get("claim", "")
         asset_id = c.get("source_asset_id")
@@ -235,6 +239,8 @@ def verify_claims(
             model=model, prompt=prompt, ollama_url=ollama_url,
             timeout=timeout, temperature=temperature, num_ctx=num_ctx,
         )
+        tokens_in += estimate_tokens(prompt)
+        tokens_out += estimate_tokens(raw)
         try:
             parsed = extract_json_object(raw)
             verdict = parsed.get("verdict", "unsupported")
@@ -258,6 +264,16 @@ def verify_claims(
             print(f"  [{i}/{len(claims)}] {mark}  {claim_text[:64]}")
             if verdict != "supported":
                 print(f"          -> {parsed.get('reason', '')}")
+    emit_trace(
+        make_trace_id("docverify", claims[0].get("source_asset_id", "batch") if claims else "batch"),
+        "document_truth_check",
+        started_at=start,
+        tokens_in=tokens_in,
+        tokens_out=tokens_out,
+        cost_usd=0.0,
+        claims=len(claims),
+        verdicts=len(results),
+    )
     return results
 
 

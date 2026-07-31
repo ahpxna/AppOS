@@ -1,8 +1,10 @@
 # =========================================================
 # L3 -- BROWSER RUNTIME (OpenClaw gateway + Chrome sidecar)
 #
-# Kept in a separate overlay so the core pipeline (L4/L5/L6)
-# runs without pulling ~2GB of browser images.
+# This overlay is the fallback containerized OpenClaw setup. The preferred
+# deployment is native OpenClaw under a dedicated OS user with its own
+# browser profile/tab; keep this file around for environments where that
+# is not practical.
 #
 #   docker compose -f docker-compose.yml -f docker-compose.openclaw.yml up -d
 #

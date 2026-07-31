@@ -32,6 +32,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import psycopg
 from psycopg.types.json import Jsonb
 
+from services.common.observability import emit_trace, make_trace_id
+
 DB_HOST = os.getenv("JOBOS_DB_HOST", "127.0.0.1")
 DB_PORT = int(os.getenv("JOBOS_DB_PORT", "5433"))
 DB_NAME = os.getenv("JOBOS_DB_NAME", "job_apply_os")
@@ -543,12 +545,22 @@ def main() -> int:
                 print(prompt)
                 print("===== END PROMPT =====\n")
 
-            start = time.time()
+            start = time.perf_counter()
             raw = ollama_generate(
                 model=args.model, prompt=prompt, ollama_url=args.ollama_url,
                 timeout=args.timeout, temperature=args.temperature, num_ctx=args.ctx,
             )
-            elapsed = time.time() - start
+            elapsed = time.perf_counter() - start
+            emit_trace(
+                make_trace_id("docgen", app["id"], args.doc_type),
+                "document_generation",
+                started_at=start,
+                tokens_in=estimate_tokens(prompt),
+                tokens_out=estimate_tokens(raw),
+                cost_usd=0.0,
+                application_id=app["id"],
+                doc_type=args.doc_type,
+            )
 
             parsed = extract_json_object(raw)
             content, used, evidence, dropped = validate_and_render(

@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import hmac
+import json
 import os
 import secrets
 import sys
@@ -55,6 +56,7 @@ APPROVAL_TYPES = (
     "send_message",         # L8: send a reply to a recruiter
     "spend_over_budget",    # L1: exceed the daily cost budget
     "browser_login",        # L3: open a session on a site requiring login
+    "fit_review",           # L5: borderline fit score (60-75), ask before spending on it
 )
 
 DEFAULT_TTL_MINUTES = 60
@@ -62,6 +64,108 @@ DEFAULT_TTL_MINUTES = 60
 
 def hash_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def hash_json(value) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+
+
+def fetch_submit_binding(cur, application_id: str) -> Dict[str, Any]:
+    cur.execute(
+        """
+        SELECT id::text, doc_type, version, content, qa_status, approved
+        FROM generated_documents
+        WHERE application_id = %s
+          AND qa_status = 'pass'
+        ORDER BY doc_type, version, created_at;
+        """,
+        (application_id,),
+    )
+    rows = cur.fetchall()
+    if not rows:
+        raise RuntimeError(
+            "ERROR: no document has passed the truth checker for this application."
+        )
+
+    documents = [
+        {
+            "id": row[0],
+            "doc_type": row[1],
+            "version": row[2],
+            "qa_status": row[4],
+            "approved": bool(row[5]),
+            "content_hash": hashlib.sha256((row[3] or "").encode("utf-8")).hexdigest(),
+        }
+        for row in rows
+    ]
+    return {
+        "documents": documents,
+        "content_hash": hash_json(documents),
+    }
+
+
+def fetch_reply_binding(cur, reply_id: str) -> Dict[str, Any]:
+    cur.execute(
+        """
+        SELECT id::text, thread_id::text, subject, body_text, evidence_map,
+               asset_ids_used, qa_status
+        FROM drafted_replies
+        WHERE id = %s;
+        """,
+        (reply_id,),
+    )
+    row = cur.fetchone()
+    if not row:
+        raise RuntimeError(f"Drafted reply not found: {reply_id}")
+    reply = {
+        "id": row[0],
+        "thread_id": row[1],
+        "subject": row[2] or "",
+        "body_text": row[3] or "",
+        "evidence_map": row[4] or {},
+        "asset_ids_used": row[5] or [],
+        "qa_status": row[6],
+    }
+    return {
+        "reply": reply,
+        "content_hash": hash_json({
+            "subject": reply["subject"],
+            "body_text": reply["body_text"],
+            "evidence_map": reply["evidence_map"],
+            "asset_ids_used": reply["asset_ids_used"],
+        }),
+    }
+
+
+def assert_binding_matches(cur, request_row: Dict[str, Any]) -> None:
+    atype = request_row["type"]
+    payload = request_row.get("payload_json") or {}
+    application_id = request_row.get("application_id")
+    if atype == "submit_application":
+        if not application_id:
+            raise RuntimeError("Approval request missing application_id.")
+        binding = fetch_submit_binding(cur, application_id)
+        if payload.get("content_hash") != binding["content_hash"]:
+            raise RuntimeError(
+                "Submission approval no longer matches the approved document set. "
+                "Recreate the approval request for the latest content."
+            )
+    elif atype == "send_message":
+        reply_id = (payload or {}).get("drafted_reply_id")
+        if not reply_id:
+            raise RuntimeError("send_message approval payload missing drafted_reply_id.")
+        binding = fetch_reply_binding(cur, reply_id)
+        if binding["reply"].get("qa_status") != "pass":
+            raise RuntimeError(
+                "Reply has not passed the truth checker yet. Verify it before approval."
+            )
+        if payload.get("content_hash") != binding["content_hash"]:
+            raise RuntimeError(
+                "Reply approval no longer matches the drafted reply content. "
+                "Recreate the approval request."
+            )
 
 
 def log_event(cur, request_id: Optional[str], event: str,
@@ -96,42 +200,70 @@ def cmd_create(conn, args) -> int:
             company = job_title = step = None
             summary = args.summary or args.type
 
+        payload = {"company": company, "job_title": job_title,
+                   "service_version": SERVICE_VERSION}
+        idempotency_key = None
+
         # Only issue an approval when there is something concrete to approve.
         if args.type == "submit_application" and args.application_id:
-            cur.execute(
-                """
-                SELECT count(*) FROM generated_documents
-                WHERE application_id = %s AND qa_status = 'pass';
-                """,
-                (args.application_id,),
-            )
-            if cur.fetchone()[0] == 0:
-                print(
-                    "ERROR: no document has passed the truth checker for this "
-                    "application. Approving a submission with nothing verified "
-                    "to submit would defeat the gate."
-                )
+            try:
+                binding = fetch_submit_binding(cur, args.application_id)
+            except RuntimeError as e:
+                print(f"ERROR: {e}")
                 return 1
+            payload["content_hash"] = binding["content_hash"]
+            payload["documents"] = binding["documents"]
+            idempotency_key = hash_json({
+                "type": args.type,
+                "application_id": args.application_id,
+                "content_hash": binding["content_hash"],
+            })
+        elif args.type == "fit_review" and args.application_id:
+            payload["content_hash"] = hash_json({
+                "application_id": args.application_id,
+                "summary": summary,
+            })
+            idempotency_key = hash_json({
+                "type": args.type,
+                "application_id": args.application_id,
+                "summary": summary,
+            })
 
         token = secrets.token_urlsafe(32)
         token_hash = hash_token(token)
+
+        if idempotency_key:
+            cur.execute(
+                """
+                SELECT id::text, status, summary_text
+                FROM approval_requests
+                WHERE idempotency_key = %s
+                ORDER BY created_at DESC
+                LIMIT 1;
+                """,
+                (idempotency_key,),
+            )
+            existing = cur.fetchone()
+            if existing:
+                print(f"\n  existing request: {existing[0]}")
+                print(f"  status:          {existing[1]}")
+                print(f"  summary:          {existing[2]}")
+                return 0
 
         cur.execute(
             """
             INSERT INTO approval_requests
               (type, application_id, payload_json, status, approval_channel,
                approval_token_hash, token_expires_at, requested_by, summary_text,
-               max_attempts, created_at)
+               max_attempts, idempotency_key, created_at)
             VALUES (%s, %s, %s, 'pending', %s, %s,
-                    now() + make_interval(mins => %s), %s, %s, %s, now())
+                    now() + make_interval(mins => %s), %s, %s, %s, %s, now())
             RETURNING id::text, token_expires_at;
             """,
             (
-                args.type, args.application_id,
-                Jsonb({"company": company, "job_title": job_title,
-                       "service_version": SERVICE_VERSION}),
+                args.type, args.application_id, Jsonb(payload),
                 args.channel, token_hash, args.ttl_minutes,
-                args.requested_by, summary, args.max_attempts,
+                args.requested_by, summary, args.max_attempts, idempotency_key,
             ),
         )
         request_id, expires = cur.fetchone()
@@ -207,6 +339,34 @@ def redeem(conn, token: str, *, decision: str, note: str, actor: str) -> int:
 
         (request_id, atype, application_id, _status,
          _hash, expires, attempts, max_attempts, summary) = matched
+
+        cur.execute(
+            """
+            SELECT type, application_id::text, payload_json, status, summary_text
+            FROM approval_requests
+            WHERE id = %s;
+            """,
+            (request_id,),
+        )
+        request_row = cur.fetchone()
+        if not request_row:
+            conn.rollback()
+            print("  Approval request disappeared.")
+            return 1
+        payload_request = {
+            "type": request_row[0],
+            "application_id": request_row[1],
+            "payload_json": request_row[2] or {},
+            "status": request_row[3],
+            "summary_text": request_row[4],
+        }
+        try:
+            assert_binding_matches(cur, payload_request)
+        except RuntimeError as e:
+            log_event(cur, request_id, "binding_mismatch", actor, {"error": str(e)})
+            conn.commit()
+            print(f"  {e}")
+            return 1
 
         if attempts >= max_attempts:
             log_event(cur, request_id, "locked_out", actor, {})

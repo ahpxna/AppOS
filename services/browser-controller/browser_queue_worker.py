@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import signal
 import socket
@@ -43,6 +44,8 @@ from typing import Any, Dict, Optional
 
 import psycopg
 from psycopg.types.json import Jsonb
+
+from services.common.observability import emit_trace, make_trace_id
 
 # ---------------------------------------------------------------- config
 
@@ -337,19 +340,45 @@ def require_approval(cur, application_id: Optional[str]) -> None:
         )
 
 
-def require_url(input_json: Dict[str, Any]) -> str:
+def load_allowed_domains(cur) -> list:
+    cur.execute("SELECT domain FROM allowed_domains WHERE enabled = true;")
+    return [r[0].lower() for r in cur.fetchall()]
+
+
+def check_domain(cur, url: str) -> None:
+    """The domain whitelist existed in the schema (allowed_domains,
+    migration 038) and was enforced inside autofill_agent_v1.py, but this
+    worker -- the actual single chokepoint where every browser task
+    (including ones NOT run through autofill_agent_v1.py) reaches
+    OpenClaw -- never called it. A JD or company page containing a link
+    could send the agent anywhere. Fixed 2026-07-31: enforced here too,
+    same logic as autofill_agent_v1.py's check_domain."""
+    m = re.search(r"https?://([^/]+)", url)
+    host = (m.group(1) if m else "").lower().split(":")[0]
+    for domain in load_allowed_domains(cur):
+        if host == domain or host.endswith("." + domain):
+            return
+    raise PermanentTaskError(
+        f"Domain '{host}' is not in allowed_domains. Add it deliberately:\n"
+        f"  INSERT INTO allowed_domains (domain, category) "
+        f"VALUES ('{host}', 'ats');"
+    )
+
+
+def require_url(cur, input_json: Dict[str, Any]) -> str:
     url = (input_json.get("url") or "").strip()
     if not url:
         raise PermanentTaskError("input_json.url is required.")
     if not url.startswith(("http://", "https://")):
         raise PermanentTaskError(f"Refusing non-http(s) URL: {url[:120]}")
+    check_domain(cur, url)
     return url
 
 
 # ---------------------------------------------------------------- handlers
 
 def handle_fetch_job_description(cur, task) -> Dict[str, Any]:
-    url = require_url(task["input_json"])
+    url = require_url(cur, task["input_json"])
     msg = (
         "Open this URL and return the full job description text.\n"
         f"URL: {url}\n\n"
@@ -368,7 +397,7 @@ def handle_fetch_job_description(cur, task) -> Dict[str, Any]:
 
 
 def handle_capture_page_snapshot(cur, task) -> Dict[str, Any]:
-    url = require_url(task["input_json"])
+    url = require_url(cur, task["input_json"])
     msg = (
         "Open this URL and list every form field: label, input type, whether it "
         "is required, and any select options.\n"
@@ -388,7 +417,7 @@ def handle_capture_page_snapshot(cur, task) -> Dict[str, Any]:
 
 def handle_fill_application_form(cur, task) -> Dict[str, Any]:
     inp = task["input_json"]
-    url = require_url(inp)
+    url = require_url(cur, inp)
     document_id = inp.get("generated_document_id")
     if not document_id:
         raise PermanentTaskError(
@@ -467,6 +496,8 @@ def process_one(conn) -> bool:
 
     print(f"\n[{task['task_type']}] {task['id']} "
           f"(retry {task['retry_count']}/{task['max_retries']})")
+    trace_id = make_trace_id("browser-task", task["id"])
+    start = time.perf_counter()
 
     try:
         with conn.cursor() as cur:
@@ -477,15 +508,26 @@ def process_one(conn) -> bool:
             if task["task_type"] in REQUIRES_APPROVAL:
                 require_approval(cur, task["application_id"])
 
-            start = time.time()
+            start = time.perf_counter()
             result = HANDLERS[task["task_type"]](cur, task)
-            elapsed = time.time() - start
+            elapsed = time.perf_counter() - start
 
             result["worker_version"] = WORKER_VERSION
             result["elapsed_seconds"] = round(elapsed, 1)
             complete_task(cur, task["id"], result)
         conn.commit()
         print(f"  completed in {elapsed:.1f}s")
+        emit_trace(
+            trace_id,
+            "browser_task",
+            started_at=start,
+            tokens_in=0,
+            tokens_out=0,
+            cost_usd=0.0,
+            task_id=task["id"],
+            task_type=task["task_type"],
+            status="completed",
+        )
 
     except PermanentTaskError as e:
         conn.rollback()
@@ -493,6 +535,17 @@ def process_one(conn) -> bool:
             fail_task(cur, task["id"], str(e))
         conn.commit()
         print(f"  refused (no retry): {e}")
+        emit_trace(
+            trace_id,
+            "browser_task",
+            started_at=start,
+            tokens_in=0,
+            tokens_out=0,
+            cost_usd=0.0,
+            task_id=task["id"],
+            task_type=task["task_type"],
+            status="failed",
+        )
 
     except TransientTaskError as e:
         conn.rollback()
@@ -500,6 +553,17 @@ def process_one(conn) -> bool:
             status = requeue_or_fail(cur, task, str(e))
         conn.commit()
         print(f"  transient error -> {status}: {e}")
+        emit_trace(
+            trace_id,
+            "browser_task",
+            started_at=start,
+            tokens_in=0,
+            tokens_out=0,
+            cost_usd=0.0,
+            task_id=task["id"],
+            task_type=task["task_type"],
+            status=status,
+        )
 
     except Exception as e:
         conn.rollback()
@@ -507,6 +571,17 @@ def process_one(conn) -> bool:
             status = requeue_or_fail(cur, task, f"{type(e).__name__}: {e}")
         conn.commit()
         print(f"  unexpected error -> {status}: {type(e).__name__}: {e}")
+        emit_trace(
+            trace_id,
+            "browser_task",
+            started_at=start,
+            tokens_in=0,
+            tokens_out=0,
+            cost_usd=0.0,
+            task_id=task["id"],
+            task_type=task["task_type"],
+            status=status,
+        )
 
     return True
 

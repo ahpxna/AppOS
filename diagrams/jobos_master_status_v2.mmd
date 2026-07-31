@@ -1,0 +1,360 @@
+%%{init: {"flowchart": {"htmlLabels": true, "curve": "basis"}, "maxTextSize": 200000}}%%
+
+flowchart TB
+
+%% =========================
+%% STYLES
+%% =========================
+classDef human fill:#FFF7D6,stroke:#B45309,color:#111827;
+classDef svc fill:#E0F2FE,stroke:#0369A1,color:#0F172A;
+classDef agent fill:#DCFCE7,stroke:#15803D,color:#052E16;
+classDef db fill:#F3E8FF,stroke:#7E22CE,color:#1E1B4B;
+classDef gate fill:#FEE2E2,stroke:#B91C1C,color:#450A0A;
+classDef ctrl fill:#EDE9FE,stroke:#6D28D9,color:#1E1B4B;
+classDef out fill:#ECFCCB,stroke:#4D7C0F,color:#1A2E05;
+classDef browser fill:#E5E7EB,stroke:#374151,color:#111827;
+classDef dropped fill:#F5F5F5,stroke:#9CA3AF,color:#9CA3AF,stroke-dasharray: 4 3,opacity:0.45;
+classDef partial stroke-width:3px,stroke-dasharray: 2 2;
+
+%% =========================
+%% L0 — HUMAN + CHANNELS
+%% =========================
+subgraph L0["L0 — HUMAN + CHANNELS"]
+direction LR
+U[/Bạn/]
+TG[/"Telegram Bot<br/>duyệt + lệnh nhanh<br/>(CHƯA XÂY — chỉ có CLI approval_service_v1.py)"/]
+EM[/"Email xin việc<br/>Gmail hoặc IMAP<br/>(CHƯA XÂY — không có poller/webhook)"/]
+LI[/"LinkedIn<br/>[BỎ — quyết định không automate, rủi ro ban vĩnh viễn]"/]
+HS[/"Handshake<br/>(hoãn, chưa cần)"/]
+RF[/"[x] Raw Files<br/>~41 PDF/DOCX thật trong data/profile_raw/"/]
+end
+
+%% =========================
+%% L1 — CONTROL PLANE
+%% =========================
+subgraph L1["L1 — CONTROL PLANE"]
+direction LR
+N8N["n8n container<br/>[BỎ khỏi vai trò orchestrator]<br/>→ thay bằng Python state machine ĐÃ XONG<br/>(orchestrator_v1.py, chạy thật, có test)"]
+APRV{{"[x] Approval Service<br/>sha256 hash + TTL + one-time + lockout<br/>approval_service_v1.py — XÁC NHẬN CHẠY ĐƯỢC"}}
+WH["Telegram Webhook<br/>(CHƯA XÂY — phụ thuộc TG)"]
+COST{{"[~] Cost Controller<br/>cost_controller_v1.py tồn tại + chạy được,<br/>NHƯNG không có script nào khác gọi nó → chưa phải gate thật"}}
+RULE["[x] No-LLM Filter<br/>load_rules/apply_rules trong orchestrator_v1.py — ĐÃ NỐI DÂY"]
+INTAKE["[~] Job + Message Intake<br/>hoạt động qua CLI thủ công (--jd-file),<br/>chưa có nguồn tự động (email/API)"]
+end
+
+%% =========================
+%% L2A — BUSINESS DATA
+%% =========================
+subgraph L2A["L2A — BUSINESS DATA"]
+direction LR
+APP[("[x] applications<br/>current_step/status — lõi hệ thống, đúng như PDF khuyến nghị")]
+MSG[("[x] message_threads")]
+DOC[("[x] generated_documents<br/>CHECK(approved=false OR qa_status='pass') xác nhận có")]
+FACT[("profile_facts / candidate_profile_facts<br/>[BỎ — pipeline atom-fact cũ đã deprecated<br/>(migration 026), thay bằng profile_assets bên dưới")]
+BRIEF[("[x] profile_briefs<br/>đã nối lại nguồn: profile_assets/profile_capabilities, KHÔNG còn từ FACT")]
+PACK[("[x] profile_context_packs<br/>build_profile_context_packs_v1.sql — dùng thật bởi analyze_job_fit_v1.py")]
+COMP[("[x] company_research_cache")]
+INTV[("[~] interviews<br/>bảng có, KHÔNG ai ghi vào (L9 chưa xây)")]
+CLED[("[x] cost_ledger / daily_budgets")]
+ASSET[("[x] profile_assets (MỚI, không có trong sơ đồ gốc)<br/>+ profile_document_sections + profile_evidence_units<br/>+ profile_capabilities — pipeline thật đang chạy")]
+end
+
+%% =========================
+%% L2B — OPERATIONAL STATE / QUEUES
+%% =========================
+subgraph L2B["L2B — OPERATIONAL STATE / QUEUES"]
+direction LR
+BTASK[("[x] browser_tasks<br/>persistent task table — FOR UPDATE SKIP LOCKED xác nhận")]
+APPRQ[("[x] approval_requests<br/>token_hash + TTL")]
+DLQ[("[x] dead_letter_tasks<br/>watchdog.py ghi thật")]
+SHOT[("[~] screenshots / evidence<br/>chưa có bảng riêng, tạm ở result_json")]
+end
+
+%% =========================
+%% L3 — BROWSER RUNTIME
+%% =========================
+subgraph L3["L3 — BROWSER RUNTIME"]
+direction LR
+BQ["[x] Browser Queue Worker<br/>browser_queue_worker.py — chạy được, error_message/result_json đúng schema"]
+BLock{{"[x] Browser Lock<br/>hiện thực bằng lease_expires_at + SKIP LOCKED (không phải service riêng)"}}
+BC["[~] Browser Controller<br/>check_domain() có trong autofill_agent_v1.py<br/>NHƯNG browser_queue_worker.py KHÔNG gọi whitelist"]
+WD(("[x] Browser Watchdog<br/>requeue_expired_tasks/dead_letter_expired_tasks xác nhận"))
+OC["OpenClaw<br/>[ĐỔI THIẾT KẾ] chạy NATIVE trên máy (không phải Docker)<br/>docker-compose.openclaw.yml còn trong repo nhưng KHÔNG dùng — mồ côi<br/>.openclaw config/workspace CHƯA đưa vào repo này (theo yêu cầu, tạm bỏ qua)"]
+CH["Chrome Session<br/>qua OpenClaw CLI (openclaw browser snapshot/fill/click)<br/>không qua CDP/socat như sơ đồ gốc"]
+end
+
+%% =========================
+%% L4 — PROFILE KNOWLEDGE LAYER
+%% =========================
+subgraph L4["L4 — PROFILE KNOWLEDGE LAYER"]
+direction LR
+FTC["[x] File Type Classifier<br/>classify_file_type() trong ingest_files.py"]
+PARSE["[x] Parser / OCR<br/>parse_pdf/parse_docx + ocr_profile_files.py<br/>ĐÃ VÁ: giữ heading structure (para.style.name)"]
+CHUNK["[x] Chunker<br/>chunk_text/split_large_block — chạy thật"]
+VEC[("[x] pgvector chunk index<br/>vector(768) + ivfflat, 2.17ms/query xác nhận (migration 039)")]
+CLM(("[x] Claim/Evidence Extractor<br/>ĐÃ ĐỔI PIPELINE: build_structured_evidence_units_qwen_v2.py<br/>(không phải extract_candidate_facts_local.py cũ — cái đó deprecated)"))
+DED(("Semantic Dedup<br/>[BỎ/GỘP — bảng candidate_fact_dedup_* thuộc pipeline cũ đã deprecated,<br/>pipeline mới không có bước dedup riêng"))
+CONF{{"Conflict Resolver<br/>[BỎ — đúng như PDF đề xuất, quyết định review tay thay vì code logic]"}}
+FG{"[~] Approve facts? Gate<br/>approve_drafts.sql — REVIEW TAY qua SQL, có ROLLBACK an toàn,<br/>KHÔNG phải service/gate tự động"}
+SAFE{{"[x] MỚI: jobos_safety.py<br/>word-boundary regex + downgrade-only rule + overclaim-sentence builder<br/>— lớp an toàn dùng chung, không có trong sơ đồ gốc<br/>13/13 test safety-regression PASS"}}
+BRGEN["[x] Brief Generator<br/>generate_profile_briefs_v1.sql — nguồn profile_assets, không phải FACT"]
+STALE{{"[~] Brief stale? Gate<br/>cột is_stale có, không tự động flip khi fact đổi"}}
+PPB["[x] Profile Pack Builder<br/>PDF đề xuất BỎ (gộp vào profile.yaml) nhưng team GIỮ LẠI —<br/>build_profile_context_packs_v1.sql chạy thật, được dùng bởi L5"]
+end
+
+%% =========================
+%% L5 — JOB ANALYSIS + RESEARCH
+%% =========================
+subgraph L5["L5 — JOB ANALYSIS + RESEARCH"]
+direction LR
+FIT(("[x] Fit Checker + JD Analyzer<br/>analyze_job_fit_v1.py — chạy thật qua Ollama qwen3:8b, 75.7s/job"))
+FGO{"[~] Fit score? gate<br/>ngưỡng <60/60-75/75+ có thật,<br/>NHƯNG nhánh 'ask_user' KHÔNG tự tạo approval_request"}
+RR["Research Router<br/>[CHƯA NỐI DÂY — chỉ có 1 dòng đăng ký component_registry,<br/>orchestrator NHẢY THẲNG fit_analyzed → docs_generated, bỏ qua research]"]
+SG{"Source? gate<br/>[KHÔNG TỒN TẠI — logic cache-hit nằm phẳng trong company_research_v1.py]"}
+SEA["[~] Search API / Fetch<br/>company_research_v1.py code đầy đủ + có validate() chặn self-source & yêu cầu supporting_quote<br/>NHƯNG không có gì gọi nó tự động"]
+HTTP["Company Site Fetch<br/>[GỘP CHUNG với SEA — cùng 1 file, không tách riêng]"]
+SAVE(["[~] Save only / reject"])
+end
+
+%% =========================
+%% L6 — DOCUMENT GENERATION + QA
+%% =========================
+subgraph L6["L6 — DOCUMENT GENERATION + QA"]
+direction LR
+WORK(("[~] Profile-Aware Worker<br/>không phải dispatcher riêng — generate_documents_v1.py chọn qua --doc-type"))
+RES(("[x] Resume Agent<br/>tự động chạy trong orchestrator"))
+COV(("[~] Cover Letter Agent<br/>code xong (build_cover_letter_prompt) nhưng KHÔNG tự động — chỉ CLI thủ công"))
+SHA(("[~] Short Answer Agent<br/>tương tự COV — code xong, chưa tự động"))
+QA(("[x] Truth + Quality Checker<br/>verify_document_truth_v1.py — NODE GIÁ TRỊ NHẤT, xác nhận hoạt động thật,<br/>đã sửa bug revision-chain vô hạn"))
+QGO{"[x] QA pass? gate<br/>advance_one() xử lý pass/fail thật"}
+RTRY{"[~] Retry ≤2 gate<br/>revision_round có theo dõi, CHƯA thấy chặn cứng '≤2' trong code đọc được"}
+HREV{"[~] Human Review<br/>docs_failed_qa step có requires_human=true,<br/>chưa có UI riêng ngoài approval_service_v1.py"}
+end
+
+%% =========================
+%% L7 — AUTOFILL + SUBMIT
+%% =========================
+subgraph L7["L7 — AUTOFILL + SUBMIT"]
+direction LR
+AF["[x] Autofill Agent<br/>autofill_agent_v1.py — 751 dòng, XÁC NHẬN KHÔNG có hàm click-submit nào (an toàn cứng)"]
+SEN{"[x] Sensitive field? gate<br/>always_pause_fields — SSN/DOB/salary/EEO chặn đúng thiết kế"}
+FSG{"[x] Final Submit Gate<br/>kiểm tra approval_requests hợp lệ trước khi cho submit"}
+SUB(["[~] Submitted<br/>THEO THIẾT KẾ: người tự bấm nộp, không có code tự submit — đây là an toàn có chủ đích, không phải thiếu sót"])
+PAUSE(["[x] Paused / needs user<br/>plan['pauses'] hoạt động thật"])
+end
+
+%% =========================
+%% L8 — UNIFIED MESSAGE REPLY
+%% =========================
+subgraph L8["L8 — UNIFIED MESSAGE REPLY"]
+direction LR
+MCL(("[x] Message Classifier<br/>cmd_classify — thật"))
+CTX["[x] Thread + Application Context<br/>fetch_thread/fetch_messages/fetch_assets"]
+REP(("[x] Reply Writer<br/>cmd_draft — thật, có validate_reply"))
+SGO{"[~] Approve send? gate<br/>chỉ IN HƯỚNG DẪN chạy approval_service_v1.py thủ công, chưa tự gọi"}
+SMTP["Gmail / SMTP Send<br/>[CHƯA XÂY — 0 dòng smtplib/imaplib/gmail API trong repo]"]
+BST["Browser Send Task<br/>[CHƯA XÂY — không có gì tạo browser_tasks để gửi tin]"]
+NR(["[~] No Reply"])
+end
+
+%% =========================
+%% L9 — INTERVIEW PREP
+%% =========================
+subgraph L9["L9 — INTERVIEW PREP"]
+direction LR
+IGO{"Interview invite? gate<br/>[CỜ CHẾT — cột triggers_l9 có nhưng không ai đọc lại sau khi load]"}
+PREP(("Interview Prep Agent<br/>[CHƯA XÂY — 0% , không có file nào]"))
+PPKG[("prep_package<br/>[CHƯA XÂY — không có bảng riêng]")]
+end
+
+%% =========================
+%% LEGEND
+%% =========================
+subgraph LEG["LEGEND — cách đọc sơ đồ này"]
+direction LR
+L_X["[x] = đã verify chạy thật (code + test/luồng thật)"]
+L_P["[~] = có code nhưng CHƯA nối dây tự động / chưa hoàn chỉnh"]
+L_N["Không nhãn = chưa xây (0 dòng code)"]
+L_D["Mờ + nét đứt = ĐÃ QUYẾT ĐỊNH BỎ / bị thay thế bởi thiết kế khác<br/>(vẫn giữ trên sơ đồ để nhớ lý do tại sao bỏ)"]
+end
+
+%% =========================
+%% HUMAN / APPROVAL FLOW
+%% =========================
+U -->|lệnh / duyệt| TG
+TG -->|command| N8N
+TG -->|button callback| WH
+WH -->|verify token| APPRQ
+WH -->|resume flow| N8N
+N8N -->|create approval| APRV
+APRV -->|store token_hash + TTL| APPRQ
+APRV -->|send buttons| TG
+
+%% =========================
+%% CORE CONTROL + COST
+%% =========================
+N8N -->|apply rules before AI| RULE
+N8N -->|budget check| COST
+COST -->|log spend| CLED
+COST -->|allow / throttle| N8N
+
+%% =========================
+%% INTAKE
+%% =========================
+EM -->|new mail trigger| INTAKE
+BC -->|extracted jobs/messages| INTAKE
+INTAKE -->|job candidate| RULE
+INTAKE -->|save thread| MSG
+
+%% =========================
+%% JOB FILTERING + FIT
+%% =========================
+RULE -->|duplicate / bad fit| SAVE
+SAVE -->|update status| APP
+RULE -->|possible job| FIT
+FIT -->|JD analysis + fit score| APP
+FIT -->|token usage| CLED
+FIT -->|route by score| FGO
+FGO -->|<60| SAVE
+FGO -->|60-75 ask user| APRV
+FGO -->|75+| RR
+
+%% =========================
+%% RESEARCH
+%% =========================
+RR -->|lookup cache| COMP
+RR -->|choose source| SG
+SG -->|cache hit| COMP
+SG -->|public web| SEA
+SG -->|company website| HTTP
+SG -->|LinkedIn page only| BTASK
+SEA -->|summary + sources| COMP
+HTTP -->|summary + sources| COMP
+
+%% =========================
+%% PROFILE INGESTION (đã đổi sang pipeline profile_assets)
+%% =========================
+RF -->|upload| FTC
+FTC -->|route parser| PARSE
+PARSE -->|text / OCR result| CHUNK
+CHUNK -->|embed chunks| VEC
+CHUNK -->|source text| CLM
+CLM -->|structured evidence units| SAFE
+SAFE -->|evidence đã hạ cấp an toàn| DED
+DED -->|assets nháp| CONF
+CONF -->|winner / loser / pending| FG
+FG -->|approved| ASSET
+FG -->|needs edit| TG
+ASSET -->|mark stale briefs| STALE
+STALE -->|regen if needed| BRGEN
+ASSET -->|approved facts| BRGEN
+BRGEN -->|write briefs| BRIEF
+FACT -.->|đường cũ, đã deprecated| BRGEN
+
+%% =========================
+%% PROFILE PACK BUILDING
+%% =========================
+FIT -->|role needs| PPB
+COMP -->|company context| PPB
+ASSET -->|approved facts| PPB
+BRIEF -->|career brief| PPB
+VEC -->|relevant chunks| PPB
+PPB -->|cache small context pack| PACK
+
+%% =========================
+%% DOC GENERATION + QA
+%% =========================
+PACK -->|job-specific context| WORK
+WORK -->|resume strategy| RES
+WORK -->|cover angle| COV
+WORK -->|form answers| SHA
+RES -->|draft + evidence_map| QA
+COV -->|draft + evidence_map| QA
+SHA -->|draft + evidence_map| QA
+QA -->|pass / fail| QGO
+QGO -->|pass| DOC
+QGO -->|fail| RTRY
+RTRY -->|yes| WORK
+RTRY -->|no| HREV
+DOC -->|review package| HREV
+HREV -->|approve package| APRV
+HREV -->|revise| WORK
+HREV -->|reject| APP
+
+%% =========================
+%% AUTOFILL + SUBMIT
+%% =========================
+APRV -->|approved_for_autofill| AF
+AF -->|create fill task| BTASK
+AF -->|write status| APP
+BC -->|filled form + proof| SHOT
+BTASK -->|task queue| BQ
+BQ -->|acquire lease| BLock
+BLock -->|execute 1 at a time| BC
+BC -->|call browser tool| OC
+OC -->|CLI subprocess| CH
+BC -->|result / status| BTASK
+BC -->|save proof| SHOT
+
+AF -->|check filled form| SEN
+SEN -->|yes: ask user| PAUSE
+PAUSE -->|notify| TG
+SEN -->|no / resolved| FSG
+FSG -->|need final token| APRV
+APRV -->|verified final_submit| N8N
+N8N -->|create submit task| BTASK
+BC -->|confirmation url + shot| SUB
+SUB -->|submitted_at / status| APP
+
+%% =========================
+%% WATCHDOG
+%% =========================
+WD -->|ping| OC
+WD -->|check session| CH
+WD -->|reap expired lease| BTASK
+WD -->|retry if possible| BTASK
+WD -->|max retry exceeded| DLQ
+DLQ -->|alert| TG
+
+%% =========================
+%% MESSAGES
+%% =========================
+INTAKE -->|incoming message| MCL
+MCL -->|classification| MSG
+MCL -->|needs reply?| IGO
+MCL -->|reply path| CTX
+CTX -->|thread + app state| MSG
+CTX -->|load profile pack| PACK
+PACK -->|reply context| REP
+CTX -->|message context| REP
+REP -->|draft reply| QA
+QA -->|message ok| SGO
+SGO -->|email| SMTP
+SGO -->|LinkedIn / Handshake| BST
+SGO -->|reject| NR
+SMTP -->|sent| MSG
+BST -->|create send task| BTASK
+NR -->|log| MSG
+
+%% =========================
+%% INTERVIEW PREP
+%% =========================
+IGO -->|yes| PREP
+PREP -->|JD + company + profile| PACK
+PREP -->|save prep pack| PPKG
+PPKG -->|store| INTV
+PPKG -->|notify| TG
+
+%% =========================
+%% CLASSES
+%% =========================
+class U,HS,RF human;
+class WH,INTAKE,RR,SEA,HTTP,FTC,PARSE,CHUNK,BRGEN,AF,LS svc;
+class FIT,WORK,RES,COV,SHA,QA,MCL,REP,PREP,CLM,WD,LA agent;
+class APP,MSG,DOC,BRIEF,PACK,COMP,INTV,CLED,BTASK,APPRQ,DLQ,SHOT,PPKG,ASSET db;
+class FGO,SG,QGO,RTRY,HREV,SEN,FSG,IGO,FG,LG gate;
+class APRV,COST,STALE,SAFE,LC ctrl;
+class SAVE,SUB,PAUSE,NR out;
+class BQ,BLock,BC,CH browser;
+class TG,EM,LI,N8N,FACT,DED,CONF,OC dropped;
+class COST,INTAKE,BC,COV,SHA,FGO,RTRY,HREV,STALE,SEA,HTTP,SAVE,WORK,SGO,NR,SUB,SHOT,INTV,FG partial;

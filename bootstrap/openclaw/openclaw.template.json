@@ -1,0 +1,350 @@
+{
+  "meta": {
+    "lastTouchedVersion": "2026.7.1-2",
+    "lastTouchedAt": "__NOW_ISO__"
+  },
+  "wizard": {
+    "lastRunAt": "__NOW_ISO__",
+    "lastRunVersion": "2026.7.1-2",
+    "lastRunCommand": "doctor",
+    "lastRunMode": "local"
+  },
+  "browser": {
+    "enabled": true,
+    "color": "#FF4500",
+    "headless": false,
+    "noSandbox": false,
+    "defaultProfile": "remote",
+    "profiles": {
+      "openclaw": {
+        "cdpPort": 9222,
+        "color": "#FF4500"
+      },
+      "work": {
+        "cdpPort": 18801,
+        "color": "#0066CC"
+      },
+      "chrome": {
+        "driver": "existing-session",
+        "attachOnly": true,
+        "color": "#4285F4"
+      },
+      "remote": {
+        "cdpUrl": "http://127.0.0.1:9222",
+        "attachOnly": true,
+        "color": "#00FF00"
+      }
+    }
+  },
+  "auth": {
+    "profiles": {
+      "openrouter:default": {
+        "provider": "openrouter",
+        "mode": "api_key"
+      }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "openrouter/google/gemini-2.5-flash",
+        "fallbacks": [
+          "ollama/deepseek-r1:14b"
+        ]
+      },
+      "models": {
+        "openrouter/auto": {
+          "alias": "OpenRouter"
+        },
+        "openrouter/google/gemini-2.5-flash": {},
+        "openrouter/free": {},
+        "openrouter/meta-llama/llama-3.3-70b-instruct:free": {}
+      },
+      "workspace": "~/.openclaw/workspace-main",
+      "compaction": {
+        "mode": "safeguard"
+      },
+      "thinkingDefault": "high",
+      "sandbox": {
+        "mode": "off"
+      },
+      "maxConcurrent": 4,
+      "subagents": {
+        "maxConcurrent": 8,
+        "archiveAfterMinutes": 60
+      }
+    },
+    "list": [
+      {
+        "id": "main",
+        "workspace": "~/.openclaw/workspace-main"
+      },
+      {
+        "id": "resume",
+        "name": "resume",
+        "workspace": "~/.openclaw/workspace-resume",
+        "agentDir": "~/.openclaw/agents/resume/agent",
+        "model": "openrouter/auto"
+      },
+      {
+        "id": "cover_letter",
+        "name": "cover_letter",
+        "workspace": "~/.openclaw/workspace-cover_letter",
+        "agentDir": "~/.openclaw/agents/cover_letter/agent",
+        "model": "openrouter/auto"
+      }
+    ]
+  },
+  "tools": {
+    "profile": "full",
+    "web": {
+      "search": {
+        "enabled": true,
+        "provider": "gemini",
+        "gemini": {
+          "apiKey": "__GOOGLE_WEBSEARCH_API_KEY__"
+        }
+      },
+      "fetch": {
+        "enabled": true
+      }
+    },
+    "deny": [
+      "exec",
+      "process",
+      "write",
+      "edit",
+      "apply_patch",
+      "file_write"
+    ]
+  },
+  "commands": {
+    "native": "auto",
+    "nativeSkills": "auto",
+    "restart": true,
+    "ownerDisplay": "raw"
+  },
+  "session": {
+    "scope": "global",
+    "dmScope": "per-channel-peer",
+    "threadBindings": {
+      "enabled": true
+    }
+  },
+  "hooks": {
+    "enabled": true,
+    "path": "/hooks",
+    "allowedSessionKeyPrefixes": [
+      "hook:"
+    ],
+    "token": "__HOOKS_TOKEN__",
+    "allowedAgentIds": [
+      "hooks",
+      "main"
+    ],
+    "presets": [
+      "gmail"
+    ],
+    "mappings": [
+      {
+        "match": {
+          "path": "gmail"
+        },
+        "action": "agent",
+        "wakeMode": "now",
+        "name": "Gmail",
+        "sessionKey": "hook:gmail:{{messages[0].id}}",
+        "messageTemplate": "New email from {{messages[0].from}}\nSubject: {{messages[0].subject}}\n{{messages[0].snippet}}\n{{messages[0].body}}",
+        "deliver": true,
+        "channel": "last",
+        "model": "openrouter/meta-llama/llama-3.3-70b-instruct:free"
+      }
+    ],
+    "gmail": {
+      "account": "__GMAIL_ACCOUNT__",
+      "label": "INBOX",
+      "topic": "__GMAIL_TOPIC__",
+      "subscription": "__GMAIL_SUBSCRIPTION__",
+      "pushToken": "__GMAIL_PUSH_TOKEN__",
+      "hookUrl": "http://127.0.0.1:18789/hooks/gmail",
+      "includeBody": true,
+      "maxBytes": 20000,
+      "renewEveryMinutes": 720,
+      "serve": {
+        "bind": "127.0.0.1",
+        "port": 8788,
+        "path": "/"
+      },
+      "tailscale": {
+        "mode": "off",
+        "path": "/gmail-pubsub"
+      },
+      "model": "openrouter/meta-llama/llama-3.3-70b-instruct:free",
+      "thinking": "medium"
+    },
+    "internal": {
+      "enabled": true,
+      "entries": {
+        "boot-md": {
+          "enabled": true
+        },
+        "bootstrap-extra-files": {
+          "enabled": true
+        },
+        "command-logger": {
+          "enabled": true
+        },
+        "session-memory": {
+          "enabled": true
+        }
+      }
+    }
+  },
+  "channels": {
+    "telegram": {
+      "enabled": true,
+      "dmPolicy": "pairing",
+      "botToken": "__TELEGRAM_BOT_TOKEN__",
+      "allowFrom": "__TELEGRAM_ALLOW_FROM__",
+      "groupPolicy": "allowlist",
+      "streaming": "partial"
+    }
+  },
+  "gateway": {
+    "port": 18789,
+    "mode": "local",
+    "bind": "loopback",
+    "controlUi": {
+      "enabled": true,
+      "allowedOrigins": [
+        "http://localhost:18789"
+      ],
+      "dangerouslyAllowHostHeaderOriginFallback": true
+    },
+    "auth": {
+      "mode": "token",
+      "token": "__GATEWAY_TOKEN__"
+    },
+    "remote": {
+      "token": "__GATEWAY_TOKEN__"
+    },
+    "tailscale": {
+      "mode": "off",
+      "resetOnExit": true
+    },
+    "nodes": {
+      "denyCommands": [
+        "camera.snap",
+        "camera.clip",
+        "screen.record",
+        "contacts.add",
+        "calendar.add",
+        "reminders.add",
+        "sms.send"
+      ]
+    }
+  },
+  "skills": {
+    "install": {
+      "nodeManager": "npm"
+    },
+    "entries": {
+      "coding-agent": {
+        "enabled": false
+      },
+      "1password": {
+        "enabled": false
+      },
+      "apple-reminders": {
+        "enabled": false
+      },
+      "bear-notes": {
+        "enabled": false
+      },
+      "blogwatcher": {
+        "enabled": false
+      },
+      "blucli": {
+        "enabled": false
+      },
+      "camsnap": {
+        "enabled": false
+      },
+      "eightctl": {
+        "enabled": false
+      },
+      "gifgrep": {
+        "enabled": false
+      },
+      "goplaces": {
+        "enabled": false
+      },
+      "model-usage": {
+        "enabled": false
+      },
+      "obsidian": {
+        "enabled": false
+      },
+      "openai-whisper-api": {
+        "enabled": false
+      },
+      "openhue": {
+        "enabled": false
+      },
+      "sag": {
+        "enabled": false
+      },
+      "session-logs": {
+        "enabled": false
+      },
+      "sherpa-onnx-tts": {
+        "enabled": false
+      },
+      "songsee": {
+        "enabled": false
+      },
+      "sonoscli": {
+        "enabled": false
+      },
+      "spotify-player": {
+        "enabled": false
+      },
+      "tmux": {
+        "enabled": false
+      },
+      "trello": {
+        "enabled": false
+      }
+    }
+  },
+  "plugins": {
+    "entries": {
+      "google": {
+        "enabled": true,
+        "config": {
+          "webSearch": {
+            "apiKey": "__GOOGLE_WEBSEARCH_API_KEY__"
+          }
+        }
+      },
+      "memory-core": {
+        "config": {}
+      },
+      "openrouter": {
+        "enabled": true
+      },
+      "browser": {
+        "enabled": true
+      },
+      "telegram": {
+        "enabled": true
+      }
+    }
+  },
+  "messages": {
+    "ackReactionScope": "group-mentions"
+  },
+  "cron": {
+    "maxConcurrentRuns": 8
+  }
+}

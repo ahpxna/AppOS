@@ -11,6 +11,9 @@ postgres_data/
 n8n_data/
 backups/
 logs/
+data/openclaw-config/
+data/openclaw-workspace/
+.openclaw/
 
 # === Personal profile data (PII: transcript, resume, coursework) ===
 data/profile_raw/
@@ -31,8 +34,9 @@ venv/
 *.bak.*
 *.dump
 *.DS_Store
+bootstrap/openclaw/secrets.local.json
+bootstrap/openclaw/*.bundle.tar.gz
 
 # === Editor ===
 .vscode/
 .idea/
-

@@ -13,6 +13,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import psycopg
 from psycopg.types.json import Jsonb
 
+from services.common.observability import emit_trace, make_trace_id
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -705,7 +707,7 @@ def main() -> int:
                 print("===== END PROMPT =====")
                 print("")
 
-            start = time.time()
+            start = time.perf_counter()
             raw_output = ollama_generate(
                 model=args.model,
                 prompt=prompt,
@@ -714,7 +716,17 @@ def main() -> int:
                 temperature=args.temperature,
                 num_ctx=args.ctx,
             )
-            elapsed = time.time() - start
+            elapsed = time.perf_counter() - start
+            emit_trace(
+                make_trace_id("fit", app["id"]),
+                "fit_analysis",
+                started_at=start,
+                tokens_in=estimate_tokens(prompt),
+                tokens_out=estimate_tokens(raw_output),
+                cost_usd=0.0,
+                application_id=app["id"],
+                fit_decision="pending_parse",
+            )
 
             parsed = extract_json_object(raw_output)
             analysis = normalize_analysis(parsed)
