@@ -31,14 +31,29 @@ a database it never touched. Each of these was checked individually:
   never reaches the fix — a strict runner turns a "harmless known issue" into a hard blocker.
   **Fixed in place** on 2026-08-01, same precedent as the 031 fix below: this file never
   successfully applied on any install, so there was nothing to preserve by leaving it broken.
-  `007_seed_mock_profile_fixed.sql` and `007a_fix_conflict_indexes.sql` were left as-is; they're
-  now redundant re-application of the same fix (harmless — `007_fixed` inserts one duplicate
-  set of mock chunk/fact/brief rows for the test application, `007a`'s extra full-unique-index
-  is just belt-and-suspenders on top of the partial index).
-  `024`/`024a`, `025`/`025a`/`025b` were re-checked against this same failure mode (`ON CONFLICT`
-  target vs. a *partial* unique index) — no other partial unique index exists anywhere in
-  `db/migrations/*.sql` besides the one above, so this specific hazard cannot recur elsewhere
-  in the current migration set.
+  A second pass the same day found `007_seed_mock_profile.sql` had the *identical* bug on its
+  `raw_files` insert too (`ON CONFLICT (sha256)` vs. the partial `idx_raw_files_sha256`,
+  `WHERE sha256 IS NOT NULL`) — confirmed live, a real install got past the first fix and
+  failed on this second one immediately after. `007_seed_mock_profile_fixed.sql` had the exact
+  same `sha256` bug (it was only ever fixed for `input_hash`, not `sha256`) and was fixed too,
+  so the file that's supposed to be "the fixed one" is now actually fully fixed, not just
+  partially. `007a_fix_conflict_indexes.sql` was left as-is; its full-unique-index on
+  `raw_files(sha256)` is now redundant belt-and-suspenders, harmless to keep.
+
+  There are **9 partial unique indexes** across `db/migrations/*.sql` in total (found by
+  grepping every `CREATE UNIQUE INDEX ... WHERE ... IS NOT NULL`, not by memory):
+  `browser_tasks.idempotency_key`, `browser_tasks.approval_request_id`,
+  `approval_requests.idempotency_key`, `raw_files.sha256`,
+  `profile_context_packs.input_hash`, `candidate_profile_facts.dedup_key`,
+  `applications.jd_hash`, `cost_ledger.component_run_id`, `messages.external_id`. Every
+  `ON CONFLICT` clause in every migration file was cross-checked against this list on
+  2026-08-01 — only the two `raw_files.sha256` / `profile_context_packs.input_hash` cases
+  above (both confined to the `007` pair) were missing their `WHERE ... IS NOT NULL`
+  predicate. (An earlier verification pass claimed "no other partial unique index exists" —
+  that was wrong, based on an incomplete grep that missed multi-line `CREATE UNIQUE INDEX`
+  statements. This note replaces that claim with the actual full list.)
+  `024`/`024a`, `025`/`025a`/`025b` don't touch any of the 9 columns above, so this failure
+  mode does not apply to them.
 - `030_profile_asset_deepseek_review_views.sql` (a view) vs `030_structured_profile_evidence_schema.sql`
   (unrelated ALTER TABLEs on `profile_documents`/`profile_document_sections`/`profile_evidence_units`).
   Checked: the view's actual dependencies (`profile_asset_audits`, `profile_asset_evidence_items`,

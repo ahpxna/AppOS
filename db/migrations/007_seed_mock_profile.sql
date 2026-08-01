@@ -56,7 +56,7 @@ raw AS (
     'manual_seed',
     true
   )
-  ON CONFLICT (sha256)
+  ON CONFLICT (sha256) WHERE sha256 IS NOT NULL
   DO UPDATE SET
     parse_status = EXCLUDED.parse_status,
     parser_used = EXCLUDED.parser_used,

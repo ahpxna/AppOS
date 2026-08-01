@@ -1,5 +1,13 @@
 -- DB-5 fixed: Seed a mock Profile Knowledge Layer
 -- Fix: ON CONFLICT for profile_context_packs must match partial unique index.
+--
+-- FIXED 2026-08-01 (2nd pass): this file's own ON CONFLICT (sha256) on
+-- raw_files had the exact same class of bug it was written to fix for
+-- input_hash -- idx_raw_files_sha256 is ALSO a partial unique index
+-- (`... WHERE sha256 IS NOT NULL`, see 003_extended_schema.sql), and a
+-- bare `ON CONFLICT (sha256)` doesn't match it. Confirmed live: after the
+-- 2026-08-01 fix to input_hash, a real install got past that conflict and
+-- failed on this one instead, in this file. Added the matching predicate.
 
 WITH target_app AS (
   SELECT id, jd_hash
@@ -33,7 +41,7 @@ raw AS (
     'manual_seed',
     true
   )
-  ON CONFLICT (sha256)
+  ON CONFLICT (sha256) WHERE sha256 IS NOT NULL
   DO UPDATE SET
     parse_status = EXCLUDED.parse_status,
     parser_used = EXCLUDED.parser_used,
