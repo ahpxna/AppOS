@@ -176,6 +176,16 @@ SELECT
   )) AS negative_retrieval_flags
 FROM flags;
 
+-- NOTE: CREATE OR REPLACE VIEW can only APPEND new columns at the very end
+-- of the existing SELECT list -- it cannot reorder or insert columns among
+-- ones that already exist in a previously-created version of this view
+-- (023_profile_retrieval_api.sql). The four new signal columns below
+-- (rerank_score, retrieval_bucket, retrieval_signal_score,
+-- negative_retrieval_flags) must stay after every column that already
+-- existed in 023's version, in their original order, or Postgres raises
+-- "cannot change name of view column ... to ...". Confirmed live: an
+-- earlier version of this file put the new columns before chunk_short_id,
+-- which failed on a real install with exactly that error.
 CREATE OR REPLACE VIEW v_profile_retrieval_latest_results AS
 SELECT
   q.id AS retrieval_query_id,
@@ -190,10 +200,6 @@ SELECT
   r.rank,
   r.similarity,
   r.distance,
-  r.rerank_score,
-  r.retrieval_bucket,
-  r.retrieval_signal_score,
-  r.negative_retrieval_flags,
   left(r.chunk_id::text, 8) AS chunk_short_id,
   r.file_name,
   r.file_role,
@@ -202,7 +208,13 @@ SELECT
   r.category,
   r.text_preview,
 
-  q.created_at
+  q.created_at,
+
+  -- new in this migration -- must stay appended at the end, see note above
+  r.rerank_score,
+  r.retrieval_bucket,
+  r.retrieval_signal_score,
+  r.negative_retrieval_flags
 FROM profile_retrieval_queries q
 JOIN profile_retrieval_results r
   ON r.retrieval_query_id = q.id

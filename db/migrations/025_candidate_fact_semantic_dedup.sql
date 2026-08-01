@@ -155,6 +155,19 @@ WHERE cpf.status IN ('pending', 'needs_edit', 'approved')
 GROUP BY cpf.status
 ORDER BY cpf.status;
 
+-- FIXED 2026-08-01: v_candidate_fact_dedup_review already existed from
+-- 010_semantic_dedup.sql with a completely different column layout
+-- (group_status/group_type swapped position, several columns renamed or
+-- removed). CREATE OR REPLACE VIEW cannot reorder/rename existing view
+-- columns, only append new ones at the end -- confirmed live, this failed
+-- a real install with "cannot change name of view column ... to ...",
+-- same failure class as the 024/v_profile_retrieval_latest_results bug
+-- fixed earlier the same day. DROP first, matching what
+-- 025a_fix_candidate_fact_dedup_schema.sql already does for this same
+-- view right after this file runs (so this is safe either way -- 025a's
+-- own DROP+CREATE re-establishes the real final shape regardless).
+DROP VIEW IF EXISTS v_candidate_fact_dedup_review;
+
 CREATE OR REPLACE VIEW v_candidate_fact_dedup_review AS
 SELECT
   g.id AS group_id,

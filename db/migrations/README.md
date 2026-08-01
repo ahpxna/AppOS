@@ -67,6 +67,41 @@ a database it never touched. Each of these was checked individually:
   successfully applied its own schema on any install — there is nothing to preserve by
   leaving it broken.
 
+## Second bug class found 2026-08-01: `CREATE OR REPLACE VIEW` column reorder
+
+`CREATE OR REPLACE VIEW` can only *append* new columns at the end of an existing view's
+column list — it cannot reorder, rename, or insert columns among ones that already exist,
+and raises `cannot change name of view column "X" to "Y"` if you try. Three migrations did
+this to a view that an earlier migration had already created with a different column
+layout, all confirmed live on a real install:
+
+- `024_profile_retrieval_signals.sql` — `v_profile_retrieval_latest_results` (first created
+  in `023_profile_retrieval_api.sql`) had 4 new signal columns inserted in the middle of the
+  SELECT list. **Fixed** by moving them to the end, after every column `023` already had, in
+  their original order.
+- `025_candidate_fact_semantic_dedup.sql` — `v_candidate_fact_dedup_review` (first created in
+  `010_semantic_dedup.sql`) was given an entirely different column layout with no `DROP VIEW`
+  first. **Fixed** by adding `DROP VIEW IF EXISTS` right before the `CREATE OR REPLACE VIEW`
+  — safe because `025a_fix_candidate_fact_dedup_schema.sql` already does its own
+  `DROP VIEW` + recreate for this same view right after, so the final shape is unaffected
+  either way; this just stops the run from aborting before reaching `025a`.
+- `031_profile_capability_builder_tables.sql` — `v_profile_capability_review` (first created
+  in `027_profile_intelligence_layer.sql`) inserted `builder_version`/`builder_model` before
+  `role_families`, shifting every later column. **Fixed** the same way: `DROP VIEW IF EXISTS`
+  added before the recreate, safe because `031b_recreate_profile_capability_review_views.sql`
+  already drops + recreates this view again right after.
+
+All `CREATE OR REPLACE VIEW <name>` occurrences across every migration file were
+cross-referenced (by view name, across files) to find every case where a later migration
+redefines a view an earlier one already created without a preceding `DROP VIEW` in the same
+file. This surfaced 9 such pairs; 3 had the bug above (now fixed), and the other 6 were
+checked column-by-column and confirmed to match exactly — `v_profile_asset_deepseek_review`,
+`v_profile_asset_approval_candidates`, `v_profile_asset_deepseek_audit_summary` (all
+`030_profile_asset_deepseek_review_views.sql` → `041_wiring_fixes_and_gates.sql`),
+`v_documents_pending_qa` (`034` → `041`), and `v_autofill_ready_values` (`038` → `041`) — all
+five are `041`'s own changes from the previous verification pass, and only changed `WHERE`
+clauses or appended trailing columns, never reordered anything, so no fix was needed there.
+
 ## If you add a new migration
 
 Use the next integer after the highest number present (currently `042`). Don't reuse a

@@ -34,6 +34,16 @@ CREATE INDEX IF NOT EXISTS idx_profile_capability_asset_links_asset
 CREATE INDEX IF NOT EXISTS idx_profile_capabilities_status_builder
   ON profile_capabilities(status, builder_version);
 
+-- FIXED 2026-08-01: v_profile_capability_review already existed from
+-- 027_profile_intelligence_layer.sql with a different column layout (this
+-- version inserts builder_version/builder_model before role_families,
+-- shifting every later column). CREATE OR REPLACE VIEW cannot reorder
+-- existing view columns, only append at the end -- confirmed live, same
+-- failure class as the 024 and 025 view bugs fixed the same day. DROP
+-- first, matching what 031b_recreate_profile_capability_review_views.sql
+-- already does for this same view right after this file runs.
+DROP VIEW IF EXISTS v_profile_capability_review;
+
 CREATE OR REPLACE VIEW v_profile_capability_review AS
 SELECT
   pc.id AS profile_capability_id,
