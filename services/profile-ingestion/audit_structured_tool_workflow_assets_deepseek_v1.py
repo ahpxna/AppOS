@@ -2,11 +2,18 @@ import argparse
 import json
 import os
 import re
+import sys
 import time
 import urllib.request
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import psycopg
+
+# Make `services.*` importable regardless of cwd/PYTHONPATH when this file
+# is run directly (`python services/profile-ingestion/<this file>.py`).
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from services.common.model_config import get_model  # noqa: E402
 
 
 DB_HOST = os.getenv("JOBOS_DB_HOST", "127.0.0.1")
@@ -21,7 +28,7 @@ DSN = (
 )
 
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
-DEFAULT_MODEL = os.getenv("PROFILE_ASSET_AUDITOR_MODEL", "deepseek-r1:14b")
+DEFAULT_MODEL = get_model("profile_asset_auditor")
 
 ASSET_COMPILER_VERSION = "structured_tool_workflow_asset_synthesizer_qwen_v1_2026_04_27"
 REQUIRED_DETERMINISTIC_AUDIT_TYPE = "deterministic_structured_asset_audit"

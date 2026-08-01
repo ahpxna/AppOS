@@ -17,6 +17,7 @@ _COMMON = _Path(__file__).resolve().parents[1] / "common"
 if str(_COMMON.parent) not in _sys.path:
     _sys.path.insert(0, str(_COMMON.parent))
 from common import jobos_safety as _safety  # noqa: E402
+from common import model_config as _model_config  # noqa: E402
 
 
 
@@ -32,7 +33,7 @@ DSN = (
 )
 
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
-DEFAULT_MODEL = os.getenv("STRUCTURED_EVIDENCE_UNIT_MODEL", "qwen3:8b")
+DEFAULT_MODEL = _model_config.get_model("structured_evidence_unit")
 
 STRUCTURED_SECTION_VERSION = "structured_section_boundary_v1_2026_04_27"
 VERSION = "structured_evidence_unit_builder_qwen_v2_2026_04_27"

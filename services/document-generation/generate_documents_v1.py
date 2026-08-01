@@ -27,12 +27,20 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import psycopg
 from psycopg.types.json import Jsonb
 
+# Make `services.*` importable regardless of cwd/PYTHONPATH when this file
+# is run directly. Without this, the import below raises
+# ModuleNotFoundError unless the caller happens to have the repo root on
+# PYTHONPATH already. Confirmed live 2026-08-01 (this file was already
+# broken this way before today's fix).
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from services.common.observability import emit_trace, make_trace_id
+from services.common.model_config import get_model
 
 DB_HOST = os.getenv("JOBOS_DB_HOST", "127.0.0.1")
 DB_PORT = int(os.getenv("JOBOS_DB_PORT", "5433"))
@@ -47,7 +55,7 @@ DSN = (
 
 GENERATOR_VERSION = "document_generator_v1_asset_grounded_2026_07_28"
 DEFAULT_OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
-DEFAULT_MODEL = os.getenv("JOBOS_DOCGEN_MODEL", "qwen3:8b")
+DEFAULT_MODEL = get_model("docgen")
 
 DOC_TYPES = ("resume", "cover_letter", "short_answers")
 

@@ -16,6 +16,7 @@ _COMMON = _Path(__file__).resolve().parents[1] / "common"
 if str(_COMMON.parent) not in _sys.path:
     _sys.path.insert(0, str(_COMMON.parent))
 from common import jobos_safety as _safety  # noqa: E402
+from common import model_config as _model_config  # noqa: E402
 
 
 
@@ -31,7 +32,7 @@ DSN = (
 )
 
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
-DEFAULT_MODEL = os.getenv("PROFILE_ASSET_SYNTHESIZER_MODEL", "qwen3:8b")
+DEFAULT_MODEL = _model_config.get_model("profile_asset_synthesizer")
 VERSION = "profile_asset_synthesizer_qwen_v1_2026_04_27"
 
 

@@ -46,19 +46,49 @@ services:
           memory: 4g
 
   browser:
-    # kasmweb/chrome gives a full desktop over noVNC, so sites requiring
-    # login (LinkedIn, Workday, Greenhouse) can be authenticated by hand
-    # once, in a visible browser, rather than scripted with stored passwords.
+    # kasmweb/chrome's own startup script wraps Chrome in a full Xvfb +
+    # window-manager + noVNC desktop. That's the right choice when you
+    # need to log into a site by hand once (LinkedIn, Workday), but its
+    # startup script does NOT take a --remote-debugging-port flag through
+    # to Chrome the way OpenClaw needs, and hand-rolling a bypass
+    # entrypoint that skips the script entirely (`bash -c "google-chrome
+    # --remote-debugging-port=9222 ..."`) fails for a different reason:
+    # there is no Xvfb running to give non-headless Chrome a DISPLAY, so
+    # the process exits immediately and 9222 never opens. Confirmed live
+    # 2026-08-01.
+    #
+    # Fix: run actual headless Chrome (--headless=new) instead of fighting
+    # the display requirement. CDP doesn't care whether Chrome is headed
+    # or headless -- OpenClaw's "remote" profile only needs a reachable
+    # CDP endpoint, not a visible desktop. This sacrifices the noVNC
+    # manual-login desktop (port 6901, VNC_PW) on purpose, same tradeoff
+    # already agreed: CDP first, VNC later if actually needed.
     image: kasmweb/chrome:1.16.0
     container_name: jobos-browser
     restart: unless-stopped
-    # Chrome crashes silently without enough shared memory.
+    user: root
+    entrypoint: []
+    command: >
+      google-chrome
+      --headless=new
+      --no-sandbox
+      --disable-dev-shm-usage
+      --disable-gpu
+      --remote-debugging-port=9222
+      --remote-debugging-address=0.0.0.0
+      --user-data-dir=/tmp/chrome-profile
+    # Chrome crashes silently without enough shared memory -- this still
+    # applies in headless mode. Do not drop this when editing the command
+    # above; it's not related to the entrypoint override.
     shm_size: 1gb
     ports:
-      - "127.0.0.1:6901:6901"     # noVNC desktop (manual login)
       - "127.0.0.1:9222:9222"     # CDP (consumed by openclaw)
-    environment:
-      VNC_PW: ${BROWSER_VNC_PASSWORD:?set BROWSER_VNC_PASSWORD in .env}
+    # Required so the openclaw container can resolve http://browser:9222
+    # by service name (see OPENCLAW_BROWSER_CDP_URL below). Dropping this
+    # network from an edited copy of this block silently breaks openclaw
+    # -> browser connectivity even though `curl localhost:9222` from the
+    # host still works fine (that path goes through the published port,
+    # not the internal network).
     networks:
       - jobos
     deploy:

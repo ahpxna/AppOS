@@ -13,10 +13,16 @@ from typing import Any, Dict, List, Optional, Tuple
 import psycopg
 from psycopg.types.json import Jsonb
 
-from services.common.observability import emit_trace, make_trace_id
-
-
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+# Make `services.*` importable regardless of cwd/PYTHONPATH when this file
+# is run directly. Without this, the import below raises
+# ModuleNotFoundError unless the caller happens to have the repo root on
+# PYTHONPATH already. Confirmed live 2026-08-01 (this file was already
+# broken this way before today's fix).
+sys.path.insert(0, str(PROJECT_ROOT))
+from services.common.observability import emit_trace, make_trace_id
+from services.common.model_config import get_model
 
 DB_HOST = os.getenv("JOBOS_DB_HOST", "127.0.0.1")
 DB_PORT = int(os.getenv("JOBOS_DB_PORT", "5433"))
@@ -654,7 +660,7 @@ def main() -> int:
     parser.add_argument("--job-url")
     parser.add_argument("--source", default="manual_jd_file")
 
-    parser.add_argument("--model", default="qwen3:8b")
+    parser.add_argument("--model", default=get_model("job_fit"))
     parser.add_argument("--ollama-url", default=DEFAULT_OLLAMA_URL)
     parser.add_argument("--timeout", type=int, default=240)
     parser.add_argument("--ctx", type=int, default=8192)

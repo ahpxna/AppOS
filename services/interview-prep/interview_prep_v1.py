@@ -18,12 +18,21 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import psycopg
 from psycopg.types.json import Jsonb
 
+# Make `services.*` importable regardless of cwd/PYTHONPATH when this file
+# is run directly (`python services/interview-prep/interview_prep_v1.py`),
+# which is how run_pipeline_chunk.sh and the README invoke every script.
+# Without this, `from services.common...` below raises ModuleNotFoundError
+# unless the caller happens to have the repo root on PYTHONPATH already.
+# Confirmed live 2026-08-01.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from services.common.observability import emit_trace, make_trace_id
+from services.common.model_config import get_model
 
 PYTHON = sys.executable
 COST_SCRIPT = os.path.join(
@@ -41,7 +50,7 @@ DSN = (
     f"user={DB_USER} password={DB_PASSWORD}"
 )
 
-MODEL = os.getenv("JOBOS_INTERVIEW_PREP_MODEL", os.getenv("JOBOS_REPLY_MODEL", "qwen3:8b"))
+MODEL = get_model("interview_prep")
 DEFAULT_OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
 PREP_VERSION = "interview_prep_v1_2026_07_31"
 

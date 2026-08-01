@@ -40,11 +40,17 @@ import socket
 import subprocess
 import sys
 import time
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 import psycopg
 from psycopg.types.json import Jsonb
 
+# Make `services.*` importable regardless of cwd/PYTHONPATH when this file
+# is run directly. Without this, `from services.common...` below raises
+# ModuleNotFoundError unless the caller happens to have the repo root on
+# PYTHONPATH already. Confirmed live 2026-08-01.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from services.common.observability import emit_trace, make_trace_id
 
 # ---------------------------------------------------------------- config

@@ -1,12 +1,19 @@
 import argparse
 import json
 import os
+import sys
 import time
 import urllib.request
 import urllib.error
+from pathlib import Path
 from typing import List, Optional
 
 import psycopg
+
+# Make `services.*` importable regardless of cwd/PYTHONPATH when this file
+# is run directly (`python services/profile-ingestion/<this file>.py`).
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from services.common.model_config import get_model  # noqa: E402
 
 
 DB_HOST = os.getenv("JOBOS_DB_HOST", "127.0.0.1")
@@ -21,7 +28,7 @@ DSN = (
 )
 
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
-MODEL = os.getenv("PROFILE_EMBED_MODEL", "nomic-embed-text")
+MODEL = get_model("embed")
 VERSION = "profile_chunk_embedder_v2_sources_2026_04_27"
 
 

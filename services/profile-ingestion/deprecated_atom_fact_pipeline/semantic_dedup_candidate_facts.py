@@ -3,11 +3,19 @@ import hashlib
 import json
 import os
 import re
+import sys
 from collections import defaultdict
+from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 import psycopg
 from psycopg.types.json import Jsonb
+
+# Make `services.*` importable regardless of cwd/PYTHONPATH when this file
+# is run directly. parents[3]: this file is one directory deeper
+# (deprecated_atom_fact_pipeline/) than its siblings.
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+from services.common.model_config import get_model  # noqa: E402
 
 
 DB_HOST = os.getenv("JOBOS_DB_HOST", "127.0.0.1")
@@ -16,7 +24,7 @@ DB_NAME = os.getenv("JOBOS_DB_NAME", "job_apply_os")
 DB_USER = os.getenv("JOBOS_DB_USER", "jobos")
 DB_PASSWORD = os.getenv("JOBOS_DB_PASSWORD", "jobos_local_dev_password_change_later")
 
-EMBED_MODEL = os.getenv("PROFILE_EMBED_MODEL", "nomic-embed-text")
+EMBED_MODEL = get_model("embed")
 
 COMPONENT_NAME = "semantic_dedup_worker"
 TASK_TYPE = "dedup_candidate_profile_facts"

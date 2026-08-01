@@ -15,6 +15,17 @@ Fallback:
 
 - `docker-compose.openclaw.yml` stays available as a containerized fallback when native installation is not practical.
 - If you use the container fallback, keep the browser gateway bound to loopback only and treat it as the only browser session that automation may touch.
+- As of 2026-08-01, the `browser` service runs **headless** Chrome directly instead of
+  `kasmweb/chrome`'s own noVNC desktop startup script. The Kasm image's script doesn't pass
+  `--remote-debugging-port` through to Chrome, so OpenClaw's CDP endpoint (port 9222) never
+  opened; overriding just the entrypoint to launch Chrome directly also failed, because
+  non-headless Chrome needs an X display (Xvfb) that the Kasm script would normally start,
+  and skipping the script skips that too. Headless Chrome sidesteps both problems -- CDP
+  doesn't care whether Chrome is headed or not. Traded away: the noVNC desktop at port 6901
+  for logging into sites by hand. If you need that back, you'd have to restore the original
+  `kasmweb/chrome` entrypoint (no override) and find a different way to get
+  `--remote-debugging-port` into its Chrome launch, which the image doesn't support out of
+  the box.
 
 Bootstrap for a fresh machine:
 

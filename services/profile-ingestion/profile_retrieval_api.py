@@ -1,11 +1,18 @@
 import argparse
 import json
 import os
+import sys
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import psycopg
 import requests
 from psycopg.types.json import Jsonb
+
+# Make `services.*` importable regardless of cwd/PYTHONPATH when this file
+# is run directly (`python services/profile-ingestion/<this file>.py`).
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from services.common.model_config import get_model  # noqa: E402
 
 
 DB_HOST = os.getenv("JOBOS_DB_HOST", "127.0.0.1")
@@ -15,7 +22,7 @@ DB_USER = os.getenv("JOBOS_DB_USER", "jobos")
 DB_PASSWORD = os.getenv("JOBOS_DB_PASSWORD", "jobos_local_dev_password_change_later")
 
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
-EMBED_MODEL = os.getenv("PROFILE_EMBED_MODEL", "nomic-embed-text")
+EMBED_MODEL = get_model("embed")
 EMBED_DIM = int(os.getenv("PROFILE_EMBED_DIM", "768"))
 
 COMPONENT_NAME = "profile_retrieval_api"
