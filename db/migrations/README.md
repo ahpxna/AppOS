@@ -19,8 +19,26 @@ a database it never touched. Each of these was checked individually:
 - `007_seed_mock_profile.sql` vs `007_seed_mock_profile_fixed.sql` vs `007a_fix_conflict_indexes.sql`,
   `024` vs `024a`, `025` vs `025a` vs `025b` — sibling "fix the previous file" patches for
   the deprecated atom-fact pipeline (see `026_deprecate_atom_fact_pipeline_and_create_profile_assets.sql`).
-  No ordering hazard: alphabetical sort already runs the base file before its `a`/`b`/`_fixed`
-  patch, which is what each patch assumes.
+  Alphabetical sort runs the base file before its `a`/`b`/`_fixed` patch, which is what each
+  patch assumes — **but this assumption silently depended on the runner tolerating errors on
+  the base file.** `007_seed_mock_profile.sql` specifically had a real bug (`ON CONFLICT
+  (input_hash)` didn't match the partial unique index on `profile_context_packs.input_hash`,
+  see `003_extended_schema.sql`) that made it fail on every fresh install, confirmed live by
+  a real install attempt on 2026-08-01. Under a lenient runner (errors printed, loop
+  continues) this was harmless in practice: `007_seed_mock_profile_fixed.sql` ran right after
+  and did the real seeding. Under `psql -v ON_ERROR_STOP=1` (used by `scripts/apply_migrations.sh`,
+  added after this file was first written), the base file's failure aborts the whole run and
+  never reaches the fix — a strict runner turns a "harmless known issue" into a hard blocker.
+  **Fixed in place** on 2026-08-01, same precedent as the 031 fix below: this file never
+  successfully applied on any install, so there was nothing to preserve by leaving it broken.
+  `007_seed_mock_profile_fixed.sql` and `007a_fix_conflict_indexes.sql` were left as-is; they're
+  now redundant re-application of the same fix (harmless — `007_fixed` inserts one duplicate
+  set of mock chunk/fact/brief rows for the test application, `007a`'s extra full-unique-index
+  is just belt-and-suspenders on top of the partial index).
+  `024`/`024a`, `025`/`025a`/`025b` were re-checked against this same failure mode (`ON CONFLICT`
+  target vs. a *partial* unique index) — no other partial unique index exists anywhere in
+  `db/migrations/*.sql` besides the one above, so this specific hazard cannot recur elsewhere
+  in the current migration set.
 - `030_profile_asset_deepseek_review_views.sql` (a view) vs `030_structured_profile_evidence_schema.sql`
   (unrelated ALTER TABLEs on `profile_documents`/`profile_document_sections`/`profile_evidence_units`).
   Checked: the view's actual dependencies (`profile_asset_audits`, `profile_asset_evidence_items`,

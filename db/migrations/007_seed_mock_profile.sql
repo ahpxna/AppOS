@@ -1,6 +1,28 @@
 -- DB-5: Seed a mock Profile Knowledge Layer
 -- This validates raw_files -> chunks -> facts -> briefs -> context_packs.
 -- Test data only.
+--
+-- FIXED 2026-08-01: the ON CONFLICT (input_hash) clause on the
+-- profile_context_packs insert did not match
+-- idx_profile_context_packs_input_hash, which is a PARTIAL unique index
+-- (`... WHERE input_hash IS NOT NULL`, see 003_extended_schema.sql). A bare
+-- `ON CONFLICT (input_hash)` cannot infer a partial index as its target,
+-- so this always failed with "no unique or exclusion constraint matching
+-- the ON CONFLICT specification" on every fresh install -- confirmed live
+-- by a real WSL/Ubuntu install attempt. Added the matching
+-- `WHERE input_hash IS NOT NULL` predicate, mirroring the fix that
+-- 007_seed_mock_profile_fixed.sql already had (that sibling file's fix was
+-- correct; this original file just never got the same fix applied to it).
+--
+-- Practical effect: on a fresh install this file now succeeds, and
+-- 007_seed_mock_profile_fixed.sql running right after it re-applies the
+-- same seed logic -- harmless for this table (mock/test data only, not
+-- read by any application code), except it will insert one duplicate set
+-- of 3 profile_chunks / 3 profile_facts / 1 profile_briefs row (those
+-- three inserts have no ON CONFLICT guard). Not fixed here on purpose: it
+-- is test fixture data for a single mock "Example Security Labs"
+-- application, not something any real pipeline logic depends on being
+-- exactly-once.
 
 WITH target_app AS (
   SELECT id, jd_hash
@@ -226,7 +248,7 @@ context_pack AS (
     'Context pack for mock cybersecurity application: emphasize CS + cybersecurity coursework, networking, Linux, Python, SQL, security fundamentals, documentation, and avoid claiming professional SOC experience or certifications not evidenced.',
     95
   FROM target_app, snapshot
-  ON CONFLICT (input_hash)
+  ON CONFLICT (input_hash) WHERE input_hash IS NOT NULL
   DO UPDATE SET
     context_text = EXCLUDED.context_text,
     token_count = EXCLUDED.token_count
