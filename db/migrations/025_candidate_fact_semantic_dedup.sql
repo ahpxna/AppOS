@@ -105,6 +105,48 @@ CREATE TABLE IF NOT EXISTS candidate_fact_dedup_groups (
   UNIQUE(dedup_version, group_fingerprint)
 );
 
+-- FIXED 2026-08-01: candidate_fact_dedup_groups already existed from
+-- 010_semantic_dedup.sql with an older, incompatible column set (status
+-- instead of group_status, no dedup_version/group_fingerprint/member_count/
+-- etc). `CREATE TABLE IF NOT EXISTS` above is a no-op on any install that
+-- already ran 010 (which is every fresh install, since 010 runs first) --
+-- it does NOT add the new columns to the pre-existing table. The very next
+-- statement then failed live with "column group_status does not exist"
+-- when creating an index on it. 025a_fix_candidate_fact_dedup_schema.sql
+-- already has the correct fix (ALTER TABLE ADD COLUMN IF NOT EXISTS for
+-- every column below, plus a backfill UPDATE for legacy rows) but runs
+-- after this file, so it never got a chance to. Mirroring 025a's column
+-- defs here so this file's own CREATE INDEX statements have something to
+-- index -- idempotent either way (no-op if the table was actually created
+-- fresh by the CREATE TABLE above).
+ALTER TABLE candidate_fact_dedup_groups
+ADD COLUMN IF NOT EXISTS component_run_id uuid REFERENCES component_runs(id) ON DELETE SET NULL;
+ALTER TABLE candidate_fact_dedup_groups
+ADD COLUMN IF NOT EXISTS dedup_version text;
+ALTER TABLE candidate_fact_dedup_groups
+ADD COLUMN IF NOT EXISTS group_fingerprint text;
+ALTER TABLE candidate_fact_dedup_groups
+ADD COLUMN IF NOT EXISTS group_status text DEFAULT 'pending_review';
+ALTER TABLE candidate_fact_dedup_groups
+ADD COLUMN IF NOT EXISTS member_count integer DEFAULT 0;
+ALTER TABLE candidate_fact_dedup_groups
+ADD COLUMN IF NOT EXISTS avg_similarity numeric;
+ALTER TABLE candidate_fact_dedup_groups
+ADD COLUMN IF NOT EXISTS max_similarity numeric;
+ALTER TABLE candidate_fact_dedup_groups
+ADD COLUMN IF NOT EXISTS group_confidence numeric;
+ALTER TABLE candidate_fact_dedup_groups
+ADD COLUMN IF NOT EXISTS representative_text text;
+ALTER TABLE candidate_fact_dedup_groups
+ADD COLUMN IF NOT EXISTS reasoning text;
+ALTER TABLE candidate_fact_dedup_groups
+ADD COLUMN IF NOT EXISTS updated_at timestamptz DEFAULT now();
+
+UPDATE candidate_fact_dedup_groups
+SET
+  group_status = COALESCE(group_status, 'pending_review'),
+  member_count = COALESCE(member_count, 0);
+
 CREATE INDEX IF NOT EXISTS idx_candidate_fact_dedup_groups_status
 ON candidate_fact_dedup_groups(group_status);
 
@@ -140,6 +182,16 @@ ON candidate_fact_dedup_group_members(group_id);
 
 CREATE INDEX IF NOT EXISTS idx_candidate_fact_dedup_members_fact
 ON candidate_fact_dedup_group_members(candidate_fact_id);
+
+-- Same reason as candidate_fact_dedup_groups above:
+-- candidate_fact_dedup_group_members also already existed from
+-- 010_semantic_dedup.sql, missing similarity_to_canonical/source_rank,
+-- which v_candidate_fact_dedup_review below selects. Without this, the
+-- view creation fails the same way group_status did above.
+ALTER TABLE candidate_fact_dedup_group_members
+ADD COLUMN IF NOT EXISTS similarity_to_canonical numeric;
+ALTER TABLE candidate_fact_dedup_group_members
+ADD COLUMN IF NOT EXISTS source_rank integer;
 
 CREATE OR REPLACE VIEW v_candidate_fact_embedding_status AS
 SELECT

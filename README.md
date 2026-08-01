@@ -45,6 +45,7 @@ Postgres expose ở `127.0.0.1:${POSTGRES_HOST_PORT}` (mặc định `5433`), n8
 ## 4. Chạy migrations
 
 ```bash
+python scripts/migration_lint.py   # kiểm tra tĩnh, không cần DB — xem db/migrations/README.md
 chmod +x scripts/apply_migrations.sh
 ./scripts/apply_migrations.sh
 ```

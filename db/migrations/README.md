@@ -3,6 +3,19 @@
 Apply order is plain filename sort. `for f in db/migrations/*.sql; do psql ... -f "$f"; done`
 in that order, every time, including on a brand-new database.
 
+## Before running against a real database
+
+Run `python scripts/migration_lint.py` from the repo root first. It statically simulates the
+whole migration sequence in order (no database needed) and catches the three bug classes
+documented below — bad `ON CONFLICT` targets against partial unique indexes, `CREATE OR
+REPLACE VIEW` column reorders, and `CREATE TABLE IF NOT EXISTS` no-ops against a table an
+earlier file already created with a different schema — across every file in one pass, before
+you spend time on a real install. It's not a full SQL engine (see its own docstring for exact
+limits) but it's what found and confirmed the fixes below, and it's self-tested against
+synthetic bad input (4/4 cases) so a clean run means something. It exits non-zero and prints
+every issue with a file reference if it finds anything; exit 0 and "No issues found" means
+none of these three bug classes exist anywhere in the current 49 files.
+
 ## Known duplicate/lettered numbers (historical, left as-is)
 
 A few numbers exist more than once: `007` / `007_seed_mock_profile_fixed` / `007a`,
@@ -101,6 +114,34 @@ checked column-by-column and confirmed to match exactly — `v_profile_asset_dee
 `v_documents_pending_qa` (`034` → `041`), and `v_autofill_ready_values` (`038` → `041`) — all
 five are `041`'s own changes from the previous verification pass, and only changed `WHERE`
 clauses or appended trailing columns, never reordered anything, so no fix was needed there.
+
+## Third bug class found 2026-08-01: `CREATE TABLE IF NOT EXISTS` on a table an earlier migration already created with a different schema
+
+`CREATE TABLE IF NOT EXISTS` is a full no-op if the table already exists — it does not add
+new columns, so a later migration that assumes a richer schema than an earlier migration
+already committed will fail the moment it tries to index or select a column that was never
+added. `025_candidate_fact_semantic_dedup.sql` did this against `010_semantic_dedup.sql`,
+confirmed live: `010` creates `candidate_fact_dedup_groups` with `status`/no `dedup_version`
+etc.; `025`'s `CREATE TABLE IF NOT EXISTS` for the same table (with `group_status`,
+`dedup_version`, `member_count`, and 8 more new columns) is a silent no-op on any install
+that already ran `010` — which is every fresh install — and the next statement,
+`CREATE INDEX ... ON candidate_fact_dedup_groups(group_status)`, fails with
+`column "group_status" does not exist`. The same problem exists one table over:
+`candidate_fact_dedup_group_members` (also first created by `010`) is missing
+`similarity_to_canonical`/`source_rank`, which `v_candidate_fact_dedup_review` selects.
+
+`025a_fix_candidate_fact_dedup_schema.sql` already has the correct fix for both tables
+(`ALTER TABLE ... ADD COLUMN IF NOT EXISTS` for every new column, plus a backfill `UPDATE`
+for legacy rows) but runs after `025`, so — same story as the other two bug classes — it
+never got a chance to under a strict runner. **Fixed** by adding the same
+`ALTER TABLE ... ADD COLUMN IF NOT EXISTS` statements directly into `025`, mirroring `025a`'s
+column definitions, right after each `CREATE TABLE IF NOT EXISTS` and before the first
+statement that needs the new columns. Idempotent either way: a no-op if `025`'s own
+`CREATE TABLE` did fire (fresh table, columns already present).
+
+Cross-checked every `CREATE TABLE IF NOT EXISTS <name>` across all 44 files for the same
+table name appearing in more than one file with a later file assuming extra columns — only
+these two tables had the problem, both confined to `025`, both fixed above.
 
 ## If you add a new migration
 
