@@ -176,6 +176,14 @@ def bootstrap(target_home: Path, template_path: Path, values: Dict[str, Any], al
     for name in ("agents", "skills", "logs", "memory", "state", "subagents", "tmp", "workspace-main",
                  "workspace-resume", "workspace-cover_letter", "workspace"):
         ensure_dir(openclaw_home / name)
+    # The "resume" and "cover_letter" agent profiles in openclaw.template.json
+    # declare an explicit agentDir (~/.openclaw/agents/<id>/agent). Without
+    # these existing, those two agent profiles can fail to start even though
+    # the config JSON itself renders fine -- create them up front so
+    # `openclaw agent --agent resume` / `--agent cover_letter` have
+    # somewhere to write their agent-specific state.
+    for agent_id in ("resume", "cover_letter"):
+        ensure_dir(openclaw_home / "agents" / agent_id / "agent")
 
     config = render_template(template_path, values, allow_missing=allow_missing)
     write_json(openclaw_home / "openclaw.json", config)

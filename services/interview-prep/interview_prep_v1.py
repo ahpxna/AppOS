@@ -13,6 +13,7 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 import urllib.error
@@ -23,6 +24,11 @@ import psycopg
 from psycopg.types.json import Jsonb
 
 from services.common.observability import emit_trace, make_trace_id
+
+PYTHON = sys.executable
+COST_SCRIPT = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "cost", "cost_controller_v1.py"
+)
 
 DB_HOST = os.getenv("JOBOS_DB_HOST", "127.0.0.1")
 DB_PORT = int(os.getenv("JOBOS_DB_PORT", "5433"))
@@ -38,6 +44,26 @@ DSN = (
 MODEL = os.getenv("JOBOS_INTERVIEW_PREP_MODEL", os.getenv("JOBOS_REPLY_MODEL", "qwen3:8b"))
 DEFAULT_OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
 PREP_VERSION = "interview_prep_v1_2026_07_31"
+
+
+def check_cost_budget(task: str) -> tuple[bool, str]:
+    """Best-effort cost gate, mirrors orchestrator_v1.check_cost_budget().
+
+    Non-fatal by design: if cost_controller_v1.py itself is broken or the
+    DB is briefly unreachable, we don't want that to block generating an
+    interview prep package the candidate may need in the next hour. A
+    failure here is logged and prep proceeds; an explicit budget rejection
+    (returncode != 0 for a real over-budget check) still blocks.
+    """
+    try:
+        proc = subprocess.run(
+            [PYTHON, COST_SCRIPT, "check", "--task", task, "--increment"],
+            capture_output=True, text=True, timeout=30,
+        )
+        out = (proc.stdout or "") + (proc.stderr or "")
+        return proc.returncode == 0, out
+    except Exception as e:  # pragma: no cover - defensive, script may be absent
+        return True, f"cost gate skipped (best-effort): {e}"
 
 
 def estimate_tokens(text: str) -> int:
@@ -199,8 +225,25 @@ def cmd_prep(conn, args) -> int:
             print("Nothing to prep.")
             return 0
 
+        if args.list_only:
+            for interview in interviews:
+                print(
+                    f"  {interview['interview_id']}  {interview['company']} / "
+                    f"{interview['job_title']}  ({interview['interview_type'] or 'unknown'}, "
+                    f"scheduled {interview['scheduled_at'] or 'unscheduled'})"
+                )
+            print(f"\n{len(interviews)} interview(s) pending prep.")
+            return 0
+
         context_pack = fetch_context_pack(cur)
         for interview in interviews:
+            if args.apply:
+                ok, cost_out = check_cost_budget("single_call")
+                if not ok:
+                    print(f"\n  SKIP {interview['company']} / {interview['job_title']}: cost gate blocked")
+                    print(f"    {cost_out.strip()}")
+                    continue
+
             prompt = build_prompt(interview, context_pack, fetch_research(cur, interview["company"]))
             trace_id = make_trace_id("interview-prep", interview["interview_id"])
             start = time.perf_counter()
@@ -276,6 +319,8 @@ def main() -> int:
     p = argparse.ArgumentParser(description="JobOS L9 interview prep")
     p.add_argument("--interview-id")
     p.add_argument("--apply", action="store_true")
+    p.add_argument("--list-only", action="store_true",
+                    help="Print the pending-prep queue and exit; no LLM calls, no writes.")
     p.add_argument("--model", default=MODEL)
     p.add_argument("--ollama-url", default=DEFAULT_OLLAMA_URL)
     p.add_argument("--timeout", type=int, default=300)
