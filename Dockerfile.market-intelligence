@@ -1,0 +1,9 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# This worker only needs PostgreSQL transport; source code is mounted
+# read-only by Compose so it cannot silently rewrite the project.
+RUN pip install --no-cache-dir "psycopg[binary]"
+
+CMD ["python", "services/discovery/market_demand_intelligence_v1.py", "process", "--apply"]

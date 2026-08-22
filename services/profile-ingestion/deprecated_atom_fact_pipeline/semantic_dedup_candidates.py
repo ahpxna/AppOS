@@ -14,6 +14,7 @@ from psycopg.types.json import Jsonb
 # (deprecated_atom_fact_pipeline/) than its siblings.
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 from services.common.model_config import get_model  # noqa: E402
+from services.common.llm_gateway import chat_text, resolve_config  # noqa: E402
 
 
 DB_HOST = os.getenv("JOBOS_DB_HOST", "127.0.0.1")
@@ -190,46 +191,36 @@ def fetch_candidates(conn, limit: int) -> List[Dict[str, Any]]:
 
 
 def call_ollama(candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
-    body = {
-        "model": LOCAL_LLM_MODEL,
-        "stream": False,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": json.dumps(
-                    {
-                        "task": "Deduplicate these candidate profile facts.",
-                        "schema": DEDUP_SCHEMA,
-                        "candidates": candidates,
-                    },
-                    ensure_ascii=False,
-                ),
-            },
-        ],
-        "format": DEDUP_SCHEMA,
-        "options": {
-            "temperature": 0,
-            "top_p": 0.9,
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": json.dumps(
+                {
+                    "task": "Deduplicate these candidate profile facts.",
+                    "schema": DEDUP_SCHEMA,
+                    "candidates": candidates,
+                },
+                ensure_ascii=False,
+            ),
         },
-    }
-
-    response = requests.post(
-        f"{LOCAL_LLM_BASE_URL}/api/chat",
-        headers={"Content-Type": "application/json"},
-        data=json.dumps(body),
-        timeout=180,
+    ]
+    config = resolve_config(
+        role="legacy_local_llm", model=LOCAL_LLM_MODEL, local_url=LOCAL_LLM_BASE_URL
     )
-
-    if response.status_code >= 400:
-        raise RuntimeError(f"Ollama error {response.status_code}: {response.text[:1200]}")
-
-    data = response.json()
-    parsed = parse_ollama_message_content(data)
+    content = chat_text(
+        role="legacy_local_llm",
+        model=LOCAL_LLM_MODEL,
+        local_url=LOCAL_LLM_BASE_URL,
+        messages=messages,
+        timeout=180,
+        temperature=0,
+        json_schema=DEDUP_SCHEMA,
+    )
+    parsed = parse_ollama_message_content({"message": {"content": content}})
     parsed["_ollama_meta"] = {
-        "model": data.get("model"),
-        "prompt_eval_count": data.get("prompt_eval_count"),
-        "eval_count": data.get("eval_count"),
+        "model": config.model,
+        "backend": config.backend,
     }
     return parsed
 

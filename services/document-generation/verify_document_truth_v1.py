@@ -47,6 +47,7 @@ from psycopg.types.json import Jsonb
 # broken this way before today's fix).
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from services.common.observability import emit_trace, make_trace_id
+from services.common.llm_gateway import generate_text
 from services.common.model_config import get_model
 
 DB_HOST = os.getenv("JOBOS_DB_HOST", "127.0.0.1")
@@ -91,20 +92,9 @@ def ollama_generate(
     *, model: str, prompt: str, ollama_url: str,
     timeout: int, temperature: float, num_ctx: int,
 ) -> str:
-    payload = {
-        "model": model, "prompt": prompt, "stream": False,
-        "options": {"temperature": temperature, "num_ctx": num_ctx},
-    }
-    req = urllib.request.Request(
-        ollama_url.rstrip("/") + "/api/generate",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"}, method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode("utf-8", errors="replace")).get("response", "")
-    except urllib.error.URLError as e:
-        raise RuntimeError(f"Ollama request failed: {e}") from e
+    return generate_text(role="verifier", model=model, prompt=prompt,
+                         local_url=ollama_url, timeout=timeout,
+                         temperature=temperature, num_ctx=num_ctx)
 
 
 # ---------------------------------------------------------------- data access
@@ -152,6 +142,32 @@ def fetch_asset(cur, asset_id: str) -> Optional[Dict[str, Any]]:
         "id": r[0], "title": r[1], "type": r[2],
         "summary": r[3] or "", "bullets": r[4] or "",
         "positioning": r[5] or "", "rules": r[6] or [],
+    }
+
+
+def fetch_company_source_urls(cur, application_id: str) -> set[str]:
+    """Load URLs from the company cache without reinterpreting company facts.
+
+    Generated documents retain their own evidence map. This lookup only checks
+    that a URL the cover-letter generator recorded came from the company's
+    cache, not that it is still fresh today.
+    """
+    cur.execute(
+        """
+        SELECT crc.sources
+        FROM applications a
+        JOIN company_research_cache crc
+          ON lower(crc.company_name) = lower(a.company)
+        WHERE a.id = %s
+        ORDER BY crc.last_refreshed_at DESC NULLS LAST, crc.created_at DESC;
+        """,
+        (application_id,),
+    )
+    return {
+        url.strip()
+        for (sources,) in cur.fetchall()
+        for url in (sources or [])
+        if isinstance(url, str) and url.strip().startswith(("https://", "http://"))
     }
 
 
@@ -206,6 +222,7 @@ Return ONLY valid JSON:
 def verify_claims(
     cur, claims: List[Dict[str, Any]], *, model: str, ollama_url: str,
     timeout: int, temperature: float, num_ctx: int, verbose: bool,
+    valid_company_source_urls: set[str],
 ) -> List[Dict[str, Any]]:
     results = []
     tokens_in = tokens_out = 0
@@ -213,6 +230,25 @@ def verify_claims(
     for i, c in enumerate(claims, 1):
         claim_text = c.get("claim", "")
         asset_id = c.get("source_asset_id")
+        raw_company_urls = c.get("company_source_urls") or []
+        company_urls = [url for url in raw_company_urls if isinstance(url, str)] \
+            if isinstance(raw_company_urls, list) else []
+        uses_company_context = bool(c.get("uses_company_context")) or bool(company_urls)
+        company_evidence = {
+            "uses_company_context": uses_company_context,
+            "company_source_urls": company_urls,
+        }
+        if uses_company_context and (
+            not company_urls or any(url not in valid_company_source_urls for url in company_urls)
+        ):
+            results.append({
+                "claim": claim_text, "source_asset_id": asset_id,
+                "verdict": "unsupported",
+                "reason": "Company-context claim has no known company research source URL.",
+                "safe_rewrite": "",
+                **company_evidence,
+            })
+            continue
 
         if c.get("answerable") is False:
             results.append({
@@ -220,6 +256,7 @@ def verify_claims(
                 "verdict": "supported",
                 "reason": "Flagged for user input; makes no factual claim.",
                 "safe_rewrite": "",
+                **company_evidence,
             })
             continue
 
@@ -229,6 +266,7 @@ def verify_claims(
                 "verdict": "supported",
                 "reason": "Structural text with no factual claim.",
                 "safe_rewrite": "",
+                **company_evidence,
             })
             continue
 
@@ -239,6 +277,7 @@ def verify_claims(
                 "verdict": "unsupported",
                 "reason": "Cited asset is not approved or no longer exists.",
                 "safe_rewrite": "",
+                **company_evidence,
             })
             continue
 
@@ -264,6 +303,7 @@ def verify_claims(
             "asset_title": asset["title"], "verdict": verdict,
             "reason": parsed.get("reason", ""),
             "safe_rewrite": parsed.get("safe_rewrite", ""),
+            **company_evidence,
         })
 
         if verbose:
@@ -332,6 +372,10 @@ def insert_revision(
         "doc_type": doc["doc_type"],
         "claims": [
             {"claim": r["claim"], "source_asset_id": r["source_asset_id"]}
+            | ({
+                "uses_company_context": r.get("uses_company_context", False),
+                "company_source_urls": r.get("company_source_urls", []),
+            } if r.get("uses_company_context") else {})
             for r in results if r["verdict"] == "supported"
         ],
         "removed_by_truth_checker": [
@@ -382,6 +426,7 @@ def process_document(
         cur, claims, model=args.model, ollama_url=args.ollama_url,
         timeout=args.timeout, temperature=args.temperature,
         num_ctx=args.ctx, verbose=verbose,
+        valid_company_source_urls=fetch_company_source_urls(cur, doc["application_id"]),
     )
     elapsed = time.time() - start
 

@@ -1,0 +1,218 @@
+{
+  "report_type": "jobos_implementation_progress",
+  "last_updated": "2026-08-21",
+  "scope": "Job discovery, user-owned LinkedIn intake, profile matching, market-demand intelligence, pointer telemetry, repository evidence and isolated auditing, and interchangeable local/API LLM transport.",
+  "code_change_notes": [
+    {
+      "files": [
+        "services/common/llm_gateway.py",
+        "services/profile-ingestion/*.py",
+        "services/document-generation/*.py",
+        "services/job-analysis/analyze_job_fit_v1.py",
+        "services/interview-prep/interview_prep_v1.py",
+        "services/messaging/message_reply_v1.py"
+      ],
+      "summary": "Added one local-Ollama/OpenAI-compatible API gateway. Generation, chat, and embedding callers use the same global or per-role backend switch; explicit DeepSeek URL-style support prevents an incorrect /v1 suffix, and the embed role fails clearly if configured with that text-only route. Tokens remain environment-only."
+    },
+    {
+      "files": [
+        "db/migrations/045_profile_job_search_and_linkedin_intake.sql",
+        "db/migrations/049_linkedin_browser_discovery.sql",
+        "services/discovery/linkedin_intake_v1.py",
+        "services/discovery/linkedin_discovery_v1.py",
+        "services/browser-controller/browser_queue_worker.py",
+        "scripts/launch_jobos_browser.py",
+        "services/discovery/profile_job_search_v1.py",
+        "services/common/profile_job_matching.py"
+      ],
+      "summary": "Added approved-profile search terms, transparent ranking, and a dedicated JobOS LinkedIn browser profile. The native browser launcher creates a loopback-CDP Chrome profile that the user signs into manually once; no password/cookie transfer occurs. A user-created, bounded discovery task can search supplied terms, read at most five job-detail pages, validate structured JD output, and auto-ingest it into applications. It cannot authenticate, solve CAPTCHA, save jobs, set alerts, change preferences, message, fill forms, or submit."
+    },
+    {
+      "files": [
+        "services/common/pointer_dynamics.py",
+        "services/pointer-dynamics/record_pointer_trace.py",
+        "services/pointer-dynamics/fit_pointer_regimes.py"
+      ],
+      "summary": "Added consented local pointer telemetry and rolling Theil-Sen drift plus MAD diffusion estimates. Output keeps multiple time-ordered regimes and raw drift samples; it has no cursor playback or automation capability."
+    },
+    {
+      "files": [
+        "db/migrations/046_market_demand_intelligence.sql",
+        "db/migrations/048_llm_market_requirement_pipeline.sql",
+        "services/discovery/market_demand_intelligence_v1.py",
+        "Dockerfile.market-intelligence",
+        "docker-compose.yml"
+      ],
+      "summary": "Replaced the static technical-term extractor with an LLM-first queued pipeline. A database trigger queues every captured JD before filtering, including filtered_out and fit_rejected jobs; the worker maps long JDs by chunk and persists a requirement only when its LLM-provided quote is found verbatim in the source. Queue state, attempts, backend/model metadata, and failures are inspectable and retryable; requirements aggregate by fit role_family or normalized job title for early-discarded jobs. An opt-in Compose profile provides a retrying, read-only source-mounted worker once an LLM route is configured."
+    },
+    {
+      "files": [
+        "docker-compose.repo-audit.yml",
+        "services/repo-audit/repo_inventory_v1.py",
+        "services/repo-audit/repo_worker_v1.py",
+        "services/repo-audit/repo_coordinator_v1.py",
+        "db/migrations/047_repository_evidence_sources.sql",
+        "services/repo-audit/repository_evidence_v1.py"
+      ],
+      "summary": "Added read-only GitHub inventory, an isolated offline audit worker, and a separate repository-evidence store. GitHub metadata and test reports require ownership confirmation and a second human asset approval before document generation can use them."
+    },
+    {
+      "files": [
+        "services/browser-controller/browser_queue_worker.py",
+        "docker-compose.openclaw.yml",
+        "docs/openclaw.md"
+      ],
+      "summary": "Fixed the dead-letter error-column mapping, added queue-wide allowed-domain enforcement, and configured the Chrome sidecar with an explicit CDP port. Browser execution still depends on a reachable OpenClaw gateway and a running sidecar."
+    },
+    {
+      "files": [
+        "services/orchestrator/pipeline_preflight_v1.py",
+        "services/profile-ingestion/prepare_profile_for_pipeline_v1.py",
+        "README.md"
+      ],
+      "summary": "Added a read-only end-to-end preflight that explains profile-context, schema, LLM, job, allow-list, and optional browser gates. Added a deterministic profile brief/context-pack builder that runs only after human-approved assets and capabilities; it never auto-approves evidence."
+    },
+    {
+      "files": [
+        "scripts/setup_openclaw_jobos.py",
+        "scripts/start_openclaw_jobos.py",
+        "scripts/openclaw_bootstrap.py",
+        "bootstrap/openclaw/workspace-profiles/*",
+        "docker-compose.openclaw.yml",
+        "docs/openclaw.md"
+      ],
+      "summary": "Added non-interactive OpenClaw setup for native or Docker mode. It generates a private gateway token when missing, renders four isolated agent workspaces, correct CDP network endpoints, optional-provider gating, and a deny policy for process/filesystem mutation. The private launcher pins JobOS to its tested Node 24/OpenClaw runtime instead of a global Homebrew installation. Provider keys are staged only in the untracked runtime .env when the operator supplies them."
+    }
+  ],
+  "gemini_windows_log_audit": {
+    "reviewed_sources": [
+      "diagrams/Hướng dẫn cài đặt OpenClaw - Google Gemini.pdf",
+      "diagrams/Hướng dẫn kiểm tra cấu trúc bảng PostgreSQL - Google Gemini.pdf"
+    ],
+    "confirmed_fixed_in_code_or_schema": [
+      "Dead-letter archival maps browser_tasks.error_message to dead_letter_tasks.last_error.",
+      "The applications JD hash has a partial unique index; the current database has no duplicate non-null JD hashes.",
+      "The messages external-id partial unique index exists and the ingest query matches it.",
+      "Company research uses summary text plus recent_news, risks, and sources JSON fields; cover-letter grounding verifies company source URLs.",
+      "Document QA revision flow has a bounded retry limit and excludes revision-parent loops.",
+      "The browser queue rejects unsupported task types and enforces allowed_domains before invoking OpenClaw."
+    ],
+    "expected_not_a_bug": [
+      "test_open_url is not a supported browser task; use the defined read-only capture task types.",
+      "A worker without --once is a polling daemon and is expected to wait while its queue is empty.",
+      "Duplicate JD content is intentionally deduplicated by hash."
+    ],
+    "still_blocked_or_requires_operator_input": [
+      "No approved profile assets or capabilities are present in the live database, so a base_fit_check_support context pack cannot be built. This must be resolved through evidence review, not bulk automatic approval.",
+      "The native OpenClaw gateway is now reachable on loopback, but the dedicated Chrome CDP profile is not yet running/logged in. The legacy Kasm Chrome image remains unavailable because Docker Desktop image pulls returned Keychain Error (-67674).",
+      "The historical run was on Windows, but this verification ran on macOS. Current documented Windows support is WSL2 with Docker Desktop WSL integration; raw PowerShell execution is not verified.",
+      "No user-owned authenticated LinkedIn session, captured JDs, GitHub inventory, or approved profile evidence has been supplied for a live end-to-end run."
+    ],
+    "rejected_historical_advice": [
+      "Do not bulk-update profile assets to approved merely to unblock a pipeline; that would bypass the candidate-evidence review gate.",
+      "Do not replace the OpenClaw CLI transport with undocumented HTTP endpoints or print gateway tokens for diagnosis."
+    ]
+  },
+  "decision_log": [
+    {
+      "topic": "LinkedIn integration",
+      "decision": "Allow only a user-created, bounded discovery task against the manually authorized dedicated LinkedIn profile; no automated login, cursor simulation, or application submission.",
+      "reason": "Keeps intake auditable while allowing the JobOS browser executor to collect a small, explicit set of full JDs.",
+      "status": "operationally_verified"
+    },
+    {
+      "topic": "Profile job matching",
+      "decision": "Use only approved capability names, tool tags, competency tags, and role families to generate terms and rank captured jobs.",
+      "reason": "Avoids treating draft profile data as candidate evidence.",
+      "status": "implemented"
+    },
+    {
+      "topic": "Pointer dynamics",
+      "decision": "Record local consented telemetry and estimate time-varying regimes with Theil-Sen drift and MAD diffusion. No global mean and no playback capability.",
+      "reason": "Preserves local variation while preventing browser-evasion automation.",
+      "status": "implemented"
+    },
+    {
+      "topic": "Repository auditing",
+      "decision": "GitHub inventory is read-only; tests run in an unprivileged offline container; the coordinator reads structured reports rather than hidden reasoning.",
+      "reason": "Limits supply-chain and host-execution risk while retaining traceable findings.",
+      "status": "implemented"
+    },
+    {
+      "topic": "Repository facts in the candidate profile",
+      "decision": "Store GitHub metadata, audit outputs, and explicit user ownership confirmation in repository_evidence_* tables, separate from profile chunks. Compile them to a needs-review project asset; only a later explicit asset approval makes the evidence eligible for L6 documents.",
+      "reason": "A repository can show metadata and test output but cannot establish authorship, employment, impact, or implementation responsibility by itself.",
+      "status": "implemented"
+    },
+    {
+      "topic": "Market demand",
+      "decision": "Queue every captured JD independent of filter/fit outcome. Use an LLM to identify explicit tools, skills, methods, standards, qualifications, and responsibilities without a static technology allowlist; save only model items whose quoted evidence is located in the original JD. Project ideas start as reviewable proposed backlog entries.",
+      "reason": "Keeps poor-fit and early-discarded postings as useful market evidence, supports unfamiliar technologies, and prevents hallucinated requirements from becoming database facts or candidate claims.",
+      "status": "implemented"
+    },
+    {
+      "topic": "LinkedIn browser discovery",
+      "decision": "Use a persistent, isolated Chrome CDP profile that the user logs into manually, then permit only explicit JobOS discovery tasks with a small result cap and validated structured JD output.",
+      "reason": "Allows the JobOS browser executor to read a user-authorized LinkedIn session without credential/cookie transfer or any apply/messaging/account-changing behavior.",
+      "status": "implemented_pending_runtime_login"
+    },
+    {
+      "topic": "Company context in documents",
+      "decision": "A fresh company-research cache with source URLs is passed to cover-letter generation separately from candidate assets; a paragraph using it must retain known company-source URLs in the evidence map.",
+      "reason": "The letter can be tailored to the company without treating company facts as candidate experience or accepting unsourced company claims.",
+      "status": "implemented"
+    },
+    {
+      "topic": "LLM transport",
+      "decision": "Route every Python chat, generation, and embedding call through services/common/llm_gateway.py. Select Ollama or an OpenAI-compatible token API globally or per role; render OpenClaw agent model choices from OPENCLAW_*_MODEL variables.",
+      "reason": "A machine can use local models, token APIs, or a controlled mix without editing individual service files. API keys remain environment-only and are never included in reports or source control.",
+      "status": "implemented"
+    }
+  ],
+  "verification": {
+    "passed": [
+      "Python compileall for services",
+      "migration_lint.py after dependency repair",
+      "test_safety_regression.py",
+      "test_job_discovery_and_pointer.py",
+      "test_llm_gateway.py (local default, per-role API transport, API embeddings)",
+      "test_document_generation_grounding.py (generator and truth-checker company-source validation in cover letters)",
+      "Direct-import checks for all active profile-ingestion LLM and embedding scripts",
+      "OpenClaw template JSON parse",
+      "OpenClaw bootstrap model override render check using an Ollama model name",
+      "OpenClaw non-interactive Docker-mode setup smoke test with placeholder-free test token; config validate passed and all four workspaces/tool gates were verified",
+      "Pipeline preflight and deterministic profile-preparation status against the live PostgreSQL database (correctly reported the missing approved profile evidence/base packs without writes)",
+      "LLM gateway tests for DeepSeek endpoint style and an explicit DeepSeek-embedding rejection",
+      "Repository evidence unit tests (inventory metadata, audit evidence, and conservative asset material)",
+      "base and repo-audit Docker Compose config validation with placeholder environment values",
+      "Runtime Docker smoke test: PostgreSQL and n8n started from local arm64 images; n8n /healthz returned status ok",
+      "All 52 SQL migrations applied to the running PostgreSQL instance; schema smoke check found applications, market-demand, company-research, profile-search, and repository-evidence relations",
+      "Repository-evidence CLI review against the live database; repository_evidence_item_id and L2 component_registry entry verified",
+      "Browser queue worker health preflight: OpenClaw binary was found and the expected loopback gateway failure was reported without a task or model invocation"
+      ,"Market-requirement LLM pipeline unit test: unfamiliar tool retained only with a literal JD quote; hallucinated item rejected"
+      ,"Migration 048 applied to the running PostgreSQL database; trigger queued existing captured JD and dry-run worker found it without invoking an LLM"
+      ,"Pointer telemetry fit completed from a user-recorded 14,962-sample trace: 373 time-ordered Theil-Sen/MAD regimes written to an ignored local JSON file"
+      ,"LinkedIn browser discovery tests: nested agent JSON parsing, result-cap rejection, job-URL validation, and full-JD minimum were checked without browser or model invocation"
+      ,"Migration 049 applied to running PostgreSQL; Compose configuration validated with non-secret placeholder values"
+      ,"Private OpenClaw 2026.7.1-2 installed with project-managed Node 24.15.0; native bootstrap passed, gateway RPC connectivity passed, and all four agents were visible without invoking an LLM"
+      ,"Browser queue worker now automatically selects the project Node runtime; its RPC health check passed against the live gateway without a model call"
+      ,"Dedicated Chrome CDP session verified on the LinkedIn Jobs page after manual user login; OpenClaw browser doctor, status, tab listing, and snapshot checks passed"
+      ,"Live LinkedIn discovery completed through the JobOS OpenClaw executor using the attach-only remote CDP profile: one IBM posting was validated, canonicalized, and stored with a 4,578-character JD; its market-requirement extraction run was automatically queued"
+    ],
+    "blocked_by_environment": [
+      "The Chrome sidecar image kasmweb/chrome:1.16.0 is not present; Docker Desktop image pulls currently fail before download with Keychain Error (-67674).",
+      "OpenAI API authentication is recognized but currently returns insufficient_quota; the configured OpenRouter paid model key hit its daily limit, so the successful browser smoke run used the API-only openrouter/free route."
+    ]
+  },
+  "next_operator_actions": [
+    "Start Docker Desktop, then run scripts/apply_migrations.sh.",
+    "Configure JOBOS_MARKET_INTELLIGENCE_LLM_BACKEND/API values (or the global gateway) and run market_demand_intelligence_v1.py process --apply; use --retry-failed only after a provider/runtime failure is resolved.",
+    "Approve profile capabilities before expecting profile-driven search terms or market gap results.",
+    "Top up either the OpenAI API quota or the paid OpenRouter daily limit before using a stronger model; the API-only openrouter/free route is sufficient for the current bounded browser smoke path.",
+    "Run repo_inventory_v1.py, then import-inventory → explicit confirm-ownership → build-asset → human review → approve-asset for every GitHub project that should be usable as portfolio evidence.",
+    "Set JOBOS_LLM_BACKEND and, if using a token API, its base URL/key/model in untracked .env; use per-role overrides only where needed.",
+    "Repair Docker Desktop Keychain access or load kasmweb/chrome:1.16.0 through an approved registry path, then start the OpenClaw + browser overlay with an environment-only OPENCLAW_GATEWAY_TOKEN.",
+    "Configure OpenClaw model names and re-run scripts/openclaw_bootstrap.py bootstrap --force after reviewing backups."
+  ],
+  "privacy_note": "This is a decision/progress report. It intentionally excludes private chain-of-thought and secrets."
+}

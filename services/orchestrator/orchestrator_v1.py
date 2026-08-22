@@ -60,6 +60,9 @@ DOCGEN_SCRIPT = os.path.join(REPO_ROOT, "services", "document-generation", "gene
 VERIFY_SCRIPT = os.path.join(REPO_ROOT, "services", "document-generation", "verify_document_truth_v1.py")
 COST_SCRIPT = os.path.join(REPO_ROOT, "services", "cost", "cost_controller_v1.py")
 RESEARCH_SCRIPT = os.path.join(REPO_ROOT, "services", "research", "company_research_v1.py")
+MARKET_INTELLIGENCE_SCRIPT = os.path.join(
+    REPO_ROOT, "services", "discovery", "market_demand_intelligence_v1.py"
+)
 
 FIT_REVIEW_TTL_HOURS = 48  # long on purpose: a human sleeps (see architecture review)
 
@@ -429,6 +432,18 @@ def advance_one(cur, application_id: str, *, apply: bool) -> None:
             "UPDATE applications SET fit_score = %s, fit_decision = %s WHERE id = %s;",
             (score, decision, application_id),
         )
+
+        # Preserve market observations even when this application is rejected.
+        # The DB trigger queues every intake before filtering; this call drains
+        # the same LLM/evidence-grounded queue for this application when it
+        # reaches fit analysis. It never changes the fit decision.
+        mok, mout, _ = run_step(
+            MARKET_INTELLIGENCE_SCRIPT,
+            ["process", "--application-id", application_id, "--apply"],
+        )
+        if not mok:
+            tail = mout.strip().splitlines()[-1] if mout.strip() else "unavailable"
+            print(f"    market intelligence: skipped (non-fatal) -- {tail[:160]}")
 
         if decision == "reject":
             transition(cur, application_id=application_id, to_step="fit_rejected",

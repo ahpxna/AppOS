@@ -1,0 +1,22 @@
+# Run only with intentionally selected repository *copies* mounted at /input:
+# JOBOS_REPO_AUDIT_INPUT=/absolute/path/to/repo-copies \
+#   docker compose -f docker-compose.repo-audit.yml run --rm repo-audit \
+#   --repo /input/my-repo --check python_compile
+services:
+  repo-audit:
+    build:
+      context: ./services/repo-audit
+    profiles: ["repo-audit"]
+    read_only: true
+    network_mode: "none"
+    user: "10001:10001"
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 256
+    mem_limit: 2g
+    cpus: 2
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=512m
+    volumes:
+      - ${JOBOS_REPO_AUDIT_INPUT:?set_an_absolute_path_to_selected_repo_copies}:/input:ro
+      - ./data/repo-audit-reports:/reports

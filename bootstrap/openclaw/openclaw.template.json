@@ -30,7 +30,7 @@
         "color": "#4285F4"
       },
       "remote": {
-        "cdpUrl": "http://127.0.0.1:9222",
+        "cdpUrl": "__BROWSER_CDP_URL__",
         "attachOnly": true,
         "color": "#00FF00"
       }
@@ -47,12 +47,13 @@
   "agents": {
     "defaults": {
       "model": {
-        "primary": "openrouter/google/gemini-2.5-flash",
+        "primary": "__MODEL_PRIMARY__",
         "fallbacks": [
-          "ollama/deepseek-r1:14b"
+          "__MODEL_FALLBACK__"
         ]
       },
       "models": {
+        "openai/gpt-5.4-mini": {},
         "openrouter/auto": {
           "alias": "OpenRouter"
         },
@@ -84,27 +85,42 @@
         "name": "resume",
         "workspace": "~/.openclaw/workspace-resume",
         "agentDir": "~/.openclaw/agents/resume/agent",
-        "model": "openrouter/auto"
+        "model": {
+          "primary": "__RESUME_MODEL__",
+          "fallbacks": [
+            "__MODEL_FALLBACK__"
+          ]
+        }
       },
       {
         "id": "cover_letter",
         "name": "cover_letter",
         "workspace": "~/.openclaw/workspace-cover_letter",
         "agentDir": "~/.openclaw/agents/cover_letter/agent",
-        "model": "openrouter/auto"
+        "model": {
+          "primary": "__COVER_MODEL__",
+          "fallbacks": [
+            "__MODEL_FALLBACK__"
+          ]
+        }
+      },
+      {
+        "id": "repo_coordinator",
+        "name": "repo_coordinator",
+        "workspace": "~/.openclaw/workspace-repo_coordinator",
+        "agentDir": "~/.openclaw/agents/repo_coordinator/agent",
+        "model": {
+          "primary": "__REPO_COORDINATOR_MODEL__",
+          "fallbacks": [
+            "__MODEL_FALLBACK__"
+          ]
+        }
       }
     ]
   },
   "tools": {
     "profile": "full",
     "web": {
-      "search": {
-        "enabled": true,
-        "provider": "gemini",
-        "gemini": {
-          "apiKey": "__GOOGLE_WEBSEARCH_API_KEY__"
-        }
-      },
       "fetch": {
         "enabled": true
       }
@@ -157,7 +173,7 @@
         "messageTemplate": "New email from {{messages[0].from}}\nSubject: {{messages[0].subject}}\n{{messages[0].snippet}}\n{{messages[0].body}}",
         "deliver": true,
         "channel": "last",
-        "model": "openrouter/meta-llama/llama-3.3-70b-instruct:free"
+        "model": "__HOOKS_MODEL__"
       }
     ],
     "gmail": {
@@ -179,7 +195,7 @@
         "mode": "off",
         "path": "/gmail-pubsub"
       },
-      "model": "openrouter/meta-llama/llama-3.3-70b-instruct:free",
+      "model": "__GMAIL_MODEL__",
       "thinking": "medium"
     },
     "internal": {
@@ -207,7 +223,9 @@
       "botToken": "__TELEGRAM_BOT_TOKEN__",
       "allowFrom": "__TELEGRAM_ALLOW_FROM__",
       "groupPolicy": "allowlist",
-      "streaming": "partial"
+      "streaming": {
+        "mode": "partial"
+      }
     }
   },
   "gateway": {
@@ -218,8 +236,7 @@
       "enabled": true,
       "allowedOrigins": [
         "http://localhost:18789"
-      ],
-      "dangerouslyAllowHostHeaderOriginFallback": true
+      ]
     },
     "auth": {
       "mode": "token",

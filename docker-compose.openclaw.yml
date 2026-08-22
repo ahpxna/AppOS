@@ -8,12 +8,11 @@
 #
 #   docker compose -f docker-compose.yml -f docker-compose.openclaw.yml up -d
 #
-# First run only:
-#   docker compose -f docker-compose.yml -f docker-compose.openclaw.yml \
-#     run --rm openclaw onboard
+# First run only (from the host, before compose up):
+#   python scripts/setup_openclaw_jobos.py --mode docker
 #
-# Then open http://127.0.0.1:18789 and paste OPENCLAW_GATEWAY_TOKEN
-# into Settings -> token.
+# The setup script renders ./data/openclaw-runtime/.openclaw with a
+# container-network CDP endpoint and the same environment-only gateway token.
 # =========================================================
 
 services:
@@ -33,8 +32,7 @@ services:
       OPENCLAW_BROWSER_CDP_URL: http://browser:9222
       OPENCLAW_BROWSER_ALLOW_EVAL: "false"
     volumes:
-      - ./data/openclaw-config:/root/.openclaw
-      - ./data/openclaw-workspace:/workspace
+      - ./data/openclaw-runtime/.openclaw:/root/.openclaw
     depends_on:
       - browser
     networks:
@@ -63,7 +61,7 @@ services:
     # CDP endpoint, not a visible desktop. This sacrifices the noVNC
     # manual-login desktop (port 6901, VNC_PW) on purpose, same tradeoff
     # already agreed: CDP first, VNC later if actually needed.
-    image: kasmweb/chrome:1.16.0
+    image: ${JOBOS_BROWSER_IMAGE:-kasmweb/chrome:1.16.0}
     container_name: jobos-browser
     restart: unless-stopped
     user: root

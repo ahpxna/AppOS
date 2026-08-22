@@ -39,6 +39,34 @@ services:
     volumes:
       - n8n_data:/home/node/.n8n
 
+  # Opt-in background LLM worker. It is intentionally profile-gated: enabling
+  # a token API can incur cost, so it never starts merely because Postgres does.
+  # Once enabled it drains every queued JD, including filtered-out postings.
+  market-intelligence-worker:
+    profiles: ["market-intelligence"]
+    build:
+      context: .
+      dockerfile: Dockerfile.market-intelligence
+    container_name: jobos-market-intelligence
+    restart: unless-stopped
+    depends_on:
+      - postgres
+    env_file:
+      - .env
+    environment:
+      JOBOS_DB_HOST: postgres
+      JOBOS_DB_PORT: 5432
+    volumes:
+      - ./:/app:ro
+    command:
+      - /bin/sh
+      - -c
+      - >-
+        while true; do
+          python services/discovery/market_demand_intelligence_v1.py process --apply || true;
+          sleep "$$JOBOS_MARKET_WORKER_POLL_SECONDS";
+        done
+
 volumes:
   postgres_data:
   n8n_data:

@@ -22,6 +22,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 # broken this way before today's fix).
 sys.path.insert(0, str(PROJECT_ROOT))
 from services.common.observability import emit_trace, make_trace_id
+from services.common.llm_gateway import generate_text
 from services.common.model_config import get_model
 
 DB_HOST = os.getenv("JOBOS_DB_HOST", "127.0.0.1")
@@ -97,33 +98,9 @@ def ollama_generate(
     temperature: float,
     num_ctx: int,
 ) -> str:
-    url = ollama_url.rstrip("/") + "/api/generate"
-    payload = {
-        "model": model,
-        "prompt": prompt,
-        "stream": False,
-        "options": {
-            "temperature": temperature,
-            "num_ctx": num_ctx,
-        },
-    }
-
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=data,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            body = resp.read().decode("utf-8", errors="replace")
-    except urllib.error.URLError as e:
-        raise RuntimeError(f"Ollama request failed: {e}") from e
-
-    parsed = json.loads(body)
-    return parsed.get("response", "")
+    return generate_text(role="job_fit", model=model, prompt=prompt,
+                         local_url=ollama_url, timeout=timeout,
+                         temperature=temperature, num_ctx=num_ctx)
 
 
 def fetch_profile_pack(cur) -> Tuple[str, str, str]:

@@ -10,10 +10,40 @@ import tarfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict
+from urllib.parse import urlparse
 
 
 PLACEHOLDERS = {
     "__NOW_ISO__": lambda _: datetime.now(timezone.utc).isoformat(),
+}
+
+# These integrations are optional to the JobOS browser/runtime path.  Give
+# absent values inert defaults and disable their config blocks below; only the
+# gateway token is mandatory for a usable OpenClaw installation.
+OPTIONAL_SECRET_DEFAULTS: Dict[str, Any] = {
+    "HOOKS_TOKEN": "",
+    "TELEGRAM_BOT_TOKEN": "",
+    "TELEGRAM_ALLOW_FROM": [],
+    "GMAIL_ACCOUNT": "",
+    "GMAIL_TOPIC": "",
+    "GMAIL_SUBSCRIPTION": "",
+    "GMAIL_PUSH_TOKEN": "",
+    "GOOGLE_WEBSEARCH_API_KEY": "",
+}
+
+# Configuration defaults are safe to persist in generated config and keep the
+# callable bootstrap API useful for tests or automation that does not enter
+# through ``load_env_values`` first.
+MODEL_DEFAULTS: Dict[str, str] = {
+    "MODEL_PRIMARY": "openai/gpt-5.4-mini",
+    # Keep the standard installation API-only. Operators can explicitly set
+    # an Ollama model when the host has enough resources for local inference.
+    "MODEL_FALLBACK": "openrouter/free",
+    "RESUME_MODEL": "openrouter/auto",
+    "COVER_MODEL": "openrouter/auto",
+    "REPO_COORDINATOR_MODEL": "openrouter/auto",
+    "HOOKS_MODEL": "openrouter/meta-llama/llama-3.3-70b-instruct:free",
+    "GMAIL_MODEL": "openrouter/meta-llama/llama-3.3-70b-instruct:free",
 }
 
 
@@ -80,6 +110,22 @@ def load_env_values() -> Dict[str, Any]:
         value = os.getenv(f"OPENCLAW_{key}") or os.getenv(key)
         if value:
             values[key] = value
+    # Models are configuration, not secrets. Defaults preserve the original
+    # template behavior while allowing every OpenClaw agent to move between a
+    # local Ollama model and an API-backed provider through one env surface.
+    for key, default in MODEL_DEFAULTS.items():
+        values[key] = os.getenv(f"OPENCLAW_{key}") or os.getenv(key) or default
+    # The native CLI reaches a loopback Chrome sidecar.  The Docker overlay
+    # renders the same template with http://browser:9222 before its config
+    # volume is mounted, so the URL is not accidentally hard-coded for the
+    # wrong network namespace.
+    values["BROWSER_CDP_URL"] = (
+        os.getenv("OPENCLAW_BROWSER_CDP_URL")
+        or os.getenv("JOBOS_BROWSER_CDP_URL")
+        or "http://127.0.0.1:9222"
+    )
+    for key, default in OPTIONAL_SECRET_DEFAULTS.items():
+        values.setdefault(key, default)
     return values
 
 
@@ -93,7 +139,63 @@ def normalize_values(values: Dict[str, Any]) -> Dict[str, Any]:
         else:
             items = [item.strip() for item in text.split(",") if item.strip()]
             normalized["TELEGRAM_ALLOW_FROM"] = [int(item) if item.isdigit() else item for item in items]
+    cdp_url = str(normalized.get("BROWSER_CDP_URL") or "").strip().rstrip("/")
+    parsed = urlparse(cdp_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise SystemExit(
+            "OPENCLAW_BROWSER_CDP_URL must be an absolute http(s) URL, "
+            "for example http://127.0.0.1:9222 or http://browser:9222."
+        )
+    normalized["BROWSER_CDP_URL"] = cdp_url
     return normalized
+
+
+def validate_gateway_token(values: Dict[str, Any], *, allow_missing: bool) -> None:
+    """Refuse placeholder gateway credentials before rendering a live config.
+
+    The browser gateway is a privileged local control plane.  A placeholder
+    token is functionally equivalent to no authentication, so it must never be
+    accepted for a normal bootstrap.  ``--allow-missing-secrets`` remains only
+    for non-running template inspection.
+    """
+    token = str(values.get("GATEWAY_TOKEN") or "").strip()
+    unsafe = not token or token.casefold() in {"change-me", "change_me"} or "change_me" in token.casefold()
+    if unsafe and not allow_missing:
+        raise SystemExit(
+            "Set OPENCLAW_GATEWAY_TOKEN (or GATEWAY_TOKEN) to a real random "
+            "value before bootstrapping. Do not use CHANGE_ME."
+        )
+
+
+def disable_unconfigured_optional_features(config: Dict[str, Any], values: Dict[str, Any]) -> Dict[str, Any]:
+    """Disable optional channels instead of emitting a config with fake secrets.
+
+    This makes the browser-only setup runnable with a gateway token alone.
+    Adding a real secret and re-running bootstrap explicitly enables the
+    matching integration; no optional channel starts by accident.
+    """
+    # Web search is now owned entirely by the Google plugin.  Keeping an old
+    # tools.web.search block makes current OpenClaw reject the configuration.
+    google_enabled = bool(str(values.get("GOOGLE_WEBSEARCH_API_KEY") or "").strip())
+    if google_enabled:
+        config["plugins"]["entries"]["google"]["enabled"] = True
+    else:
+        # Omit an unconfigured provider rather than leaving a disabled plugin
+        # with secret-shaped config, which current OpenClaw warns about.
+        config["plugins"]["entries"].pop("google", None)
+
+    telegram_enabled = bool(str(values.get("TELEGRAM_BOT_TOKEN") or "").strip()) and bool(
+        values.get("TELEGRAM_ALLOW_FROM")
+    )
+    config["channels"]["telegram"]["enabled"] = telegram_enabled
+    config["plugins"]["entries"]["telegram"]["enabled"] = telegram_enabled
+
+    gmail_fields = ("HOOKS_TOKEN", "GMAIL_ACCOUNT", "GMAIL_TOPIC", "GMAIL_SUBSCRIPTION", "GMAIL_PUSH_TOKEN")
+    gmail_enabled = all(bool(str(values.get(key) or "").strip()) for key in gmail_fields)
+    config["hooks"]["enabled"] = gmail_enabled
+    if not gmail_enabled:
+        config["hooks"]["mappings"] = []
+    return config
 
 
 def resolve(node: Any, values: Dict[str, Any]) -> Any:
@@ -116,6 +218,15 @@ def ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
+def copy_workspace_files(source_dir: Path, target_dir: Path) -> None:
+    """Copy tracked workspace instructions without copying agent state or secrets."""
+    if not source_dir.exists():
+        return
+    for source_file in source_dir.iterdir():
+        if source_file.is_file():
+            shutil.copy2(source_file, target_dir / source_file.name)
+
+
 def write_json(path: Path, value: Any) -> None:
     path.write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
@@ -133,6 +244,7 @@ def backup_existing(path: Path) -> None:
 
 def render_template(template_path: Path, values: Dict[str, Any], allow_missing: bool) -> Any:
     template = load_json(template_path)
+    values = {**OPTIONAL_SECRET_DEFAULTS, **values}
     missing: list[str] = []
 
     def resolve_with_tracking(node: Any) -> Any:
@@ -158,11 +270,18 @@ def render_template(template_path: Path, values: Dict[str, Any], allow_missing: 
             f"Missing OpenClaw secrets for template placeholders: {unique}\n"
             "Provide them via --secrets-file or OPENCLAW_* environment variables."
         )
-    return rendered
+    return disable_unconfigured_optional_features(rendered, values)
 
 
 def bootstrap(target_home: Path, template_path: Path, values: Dict[str, Any], allow_missing: bool,
               force: bool) -> None:
+    """Render an isolated OpenClaw home with an explicit browser endpoint.
+
+    The generated configuration uses a gateway token, separate agent
+    workspaces, and only optional integrations whose real credentials exist.
+    """
+    values = normalize_values({**OPTIONAL_SECRET_DEFAULTS, **MODEL_DEFAULTS, **values})
+    validate_gateway_token(values, allow_missing=allow_missing)
     openclaw_home = target_home / ".openclaw"
     if openclaw_home.exists() and not force:
         raise SystemExit(
@@ -174,7 +293,7 @@ def bootstrap(target_home: Path, template_path: Path, values: Dict[str, Any], al
 
     ensure_dir(openclaw_home)
     for name in ("agents", "skills", "logs", "memory", "state", "subagents", "tmp", "workspace-main",
-                 "workspace-resume", "workspace-cover_letter", "workspace"):
+                 "workspace-resume", "workspace-cover_letter", "workspace-repo_coordinator", "workspace"):
         ensure_dir(openclaw_home / name)
     # The "resume" and "cover_letter" agent profiles in openclaw.template.json
     # declare an explicit agentDir (~/.openclaw/agents/<id>/agent). Without
@@ -182,7 +301,7 @@ def bootstrap(target_home: Path, template_path: Path, values: Dict[str, Any], al
     # the config JSON itself renders fine -- create them up front so
     # `openclaw agent --agent resume` / `--agent cover_letter` have
     # somewhere to write their agent-specific state.
-    for agent_id in ("resume", "cover_letter"):
+    for agent_id in ("resume", "cover_letter", "repo_coordinator"):
         ensure_dir(openclaw_home / "agents" / agent_id / "agent")
 
     config = render_template(template_path, values, allow_missing=allow_missing)
@@ -190,17 +309,22 @@ def bootstrap(target_home: Path, template_path: Path, values: Dict[str, Any], al
     write_json(openclaw_home / "openclaw.json.last-good", config)
 
     workspace_seed = template_path.parent / "workspace"
+    profile_seed_root = template_path.parent / "workspace-profiles"
     workspace_targets = {
         "workspace": workspace_seed,
         "workspace-main": workspace_seed,
         "workspace-resume": workspace_seed,
         "workspace-cover_letter": workspace_seed,
+        "workspace-repo_coordinator": workspace_seed,
     }
     for target_name, source_dir in workspace_targets.items():
         target_dir = openclaw_home / target_name
-        for source_file in source_dir.iterdir():
-            if source_file.is_file():
-                shutil.copy2(source_file, target_dir / source_file.name)
+        copy_workspace_files(source_dir, target_dir)
+        # Each named agent receives a small role overlay after the shared
+        # safety/tool policy. This keeps its operating instructions visible in
+        # its own workspace rather than hidden in a central coordinator prompt.
+        profile_name = target_name.removeprefix("workspace-")
+        copy_workspace_files(profile_seed_root / profile_name, target_dir)
 
     print(f"Bootstrapped OpenClaw under {openclaw_home}")
 

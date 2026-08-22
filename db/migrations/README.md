@@ -145,7 +145,7 @@ these two tables had the problem, both confined to `025`, both fixed above.
 
 ## If you add a new migration
 
-Use the next integer after the highest number present (currently `042`). Don't reuse a
+Use the next integer after the highest number present (currently `049`). Don't reuse a
 letter suffix pattern (`041a`, `041b`) unless you are patching a migration that has
 *already shipped and been applied by someone* and you specifically do not want to touch
 the original file's already-executed statements. Otherwise just take the next number.

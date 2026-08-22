@@ -40,6 +40,9 @@ import socket
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
+from urllib.parse import urlencode
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -52,6 +55,11 @@ from psycopg.types.json import Jsonb
 # PYTHONPATH already. Confirmed live 2026-08-01.
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from services.common.observability import emit_trace, make_trace_id
+from services.discovery.linkedin_discovery_v1 import (
+    LinkedInDiscoveryError,
+    ingest_discovered_jobs,
+    validate_search_request,
+)
 
 # ---------------------------------------------------------------- config
 
@@ -66,11 +74,23 @@ DSN = (
     f"user={DB_USER} password={DB_PASSWORD}"
 )
 
-OPENCLAW_BIN = os.getenv("OPENCLAW_BIN", "openclaw")
+# Prefer the pinned JobOS runtime when setup installed it.  A global OpenClaw
+# can otherwise inherit an unsupported Node version or a different plugin set.
+REPO_ROOT = Path(__file__).resolve().parents[2]
+PRIVATE_OPENCLAW_BIN = REPO_ROOT / "data" / "openclaw-runtime" / "node" / "node_modules" / ".bin" / "openclaw"
+OPENCLAW_BIN = os.getenv("OPENCLAW_BIN") or (str(PRIVATE_OPENCLAW_BIN) if PRIVATE_OPENCLAW_BIN.is_file() else "openclaw")
 # Agent ids as defined in ~/.openclaw/openclaw.json -> agents.list
 OPENCLAW_AGENT_BROWSE = os.getenv("OPENCLAW_AGENT_BROWSE", "main")
 OPENCLAW_AGENT_RESUME = os.getenv("OPENCLAW_AGENT_RESUME", "resume")
 OPENCLAW_AGENT_COVER = os.getenv("OPENCLAW_AGENT_COVER", "cover_letter")
+# This is a host-side probe. For the Docker overlay, OpenClaw itself is
+# configured with http://browser:9222 while the host worker uses the loopback
+# port published by docker-compose.openclaw.yml.
+BROWSER_CDP_URL = (
+    os.getenv("JOBOS_BROWSER_CDP_URL")
+    or os.getenv("OPENCLAW_BROWSER_CDP_URL")
+    or "http://127.0.0.1:9222"
+).rstrip("/")
 
 WORKER_VERSION = "browser_queue_worker_v2_openclaw_cli_2026_07_28"
 WORKER_ID = f"{socket.gethostname()}:{os.getpid()}"
@@ -78,6 +98,7 @@ LEASE_SECONDS = int(os.getenv("JOBOS_BROWSER_LEASE_SECONDS", "600"))
 
 SUPPORTED_TASKS = {
     "fetch_job_description",
+    "discover_linkedin_jobs",
     "capture_page_snapshot",
     "fill_application_form",
 }
@@ -94,6 +115,18 @@ class TransientTaskError(Exception):
 
 # ---------------------------------------------------------------- openclaw CLI
 
+def openclaw_runtime_env() -> Dict[str, str]:
+    """Run the bundled CLI with its compatible Node runtime when present."""
+    env = dict(os.environ)
+    explicit = os.getenv("OPENCLAW_NODE_BIN", "").strip()
+    candidates = [Path(explicit)] if explicit else sorted(
+        (REPO_ROOT / "data" / "openclaw-runtime").glob("node-runtime-*/bin"), reverse=True
+    )
+    if candidates and (candidates[0] / "node").is_file():
+        env["PATH"] = f"{candidates[0]}{os.pathsep}{env.get('PATH', '')}"
+    return env
+
+
 def run_openclaw(args, *, timeout: int) -> subprocess.CompletedProcess:
     if shutil.which(OPENCLAW_BIN) is None:
         raise PermanentTaskError(
@@ -104,6 +137,7 @@ def run_openclaw(args, *, timeout: int) -> subprocess.CompletedProcess:
         return subprocess.run(
             [OPENCLAW_BIN, *args],
             capture_output=True, text=True, timeout=timeout,
+            env=openclaw_runtime_env(),
         )
     except subprocess.TimeoutExpired as e:
         raise TransientTaskError(f"openclaw timed out after {timeout}s") from e
@@ -174,6 +208,27 @@ def openclaw_health():
     return ok, out[:1500]
 
 
+def browser_cdp_health() -> tuple[bool, str]:
+    """Probe Chrome's standard CDP metadata endpoint without driving a tab.
+
+    A successful gateway response alone is insufficient: the historical
+    browser failure was a Chrome process with no CDP listener. This request
+    neither invokes a model nor reads browser cookies, page content, or tabs.
+    """
+    url = BROWSER_CDP_URL + "/json/version"
+    try:
+        request = urllib.request.Request(url, headers={"Accept": "application/json"})
+        with urllib.request.urlopen(request, timeout=5) as response:
+            payload = json.loads(response.read().decode("utf-8", errors="replace"))
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ValueError, json.JSONDecodeError) as exc:
+        return False, f"CDP unavailable at {BROWSER_CDP_URL}: {exc}"
+    browser = payload.get("Browser") if isinstance(payload, dict) else None
+    websocket = payload.get("webSocketDebuggerUrl") if isinstance(payload, dict) else None
+    if not browser or not websocket:
+        return False, f"CDP returned an incomplete version payload at {BROWSER_CDP_URL}."
+    return True, f"CDP reachable at {BROWSER_CDP_URL} ({browser})"
+
+
 # ---------------------------------------------------------------- queue
 
 def reap_expired_leases(cur) -> int:
@@ -192,6 +247,12 @@ def reap_expired_leases(cur) -> int:
 
 
 def dead_letter_exhausted(cur) -> int:
+    """Archive exhausted tasks using the live-to-archive error-column mapping.
+
+    Fix note: ``browser_tasks`` returns ``error_message`` whereas
+    ``dead_letter_tasks`` stores it as ``last_error``. The explicit mapping
+    prevents the historical CTE column error recorded in the Windows log.
+    """
     cur.execute(
         """
         WITH dead AS (
@@ -372,6 +433,7 @@ def check_domain(cur, url: str) -> None:
 
 
 def require_url(cur, input_json: Dict[str, Any]) -> str:
+    """Require an HTTP(S) URL and enforce the central allowed-domain gate."""
     url = (input_json.get("url") or "").strip()
     if not url:
         raise PermanentTaskError("input_json.url is required.")
@@ -399,6 +461,71 @@ def handle_fetch_job_description(cur, task) -> Dict[str, Any]:
             timeout=task["timeout_seconds"],
             session_id=f"jobos-task-{task['id']}", 
         ),
+    }
+
+
+def handle_discover_linkedin_jobs(cur, task) -> Dict[str, Any]:
+    """Search a linked LinkedIn profile under a small user-requested quota.
+
+    The search happens only for a queued task bearing user_initiated=true.
+    The agent is not allowed to authenticate, create alerts, save jobs,
+    message anyone, alter preferences, or apply; it merely reads at most the
+    requested number of result detail pages and returns their JDs as JSON.
+    """
+    inp = task["input_json"]
+    if inp.get("user_initiated") is not True:
+        raise PermanentTaskError("LinkedIn discovery requires explicit user_initiated=true.")
+    try:
+        request = validate_search_request(
+            str(inp.get("keywords") or ""), str(inp.get("location") or ""),
+            inp.get("max_results"),
+        )
+    except LinkedInDiscoveryError as exc:
+        raise PermanentTaskError(str(exc)) from exc
+    search_url = "https://www.linkedin.com/jobs/search/?" + urlencode({
+        "keywords": request["keywords"], "location": request["location"],
+    })
+    check_domain(cur, search_url)
+    msg = (
+        "Use the OpenClaw browser tool with profile exactly `remote`; it is the attach-only "
+        "JobOS Chrome CDP profile that is already signed in to LinkedIn. Never use or start "
+        "a profile named `linkedin`, `work`, `openclaw`, or `chrome`. "
+        "Search the URL below. "
+        "This is a bounded, read-only user-requested discovery task.\n"
+        f"Search URL: {search_url}\n"
+        f"Read no more than {request['max_results']} result detail pages.\n\n"
+        "First list/focus tabs for profile `remote`. If a LinkedIn jobs-search tab "
+        "already has these keywords and location, snapshot it and do not navigate again. "
+        "If navigation reports a timeout, immediately list tabs and snapshot the current "
+        "page: LinkedIn may have completed navigation even though its background requests "
+        "did not become idle. Never treat a navigation timeout alone as a failed page.\n\n"
+        "Do not authenticate, use credentials, solve CAPTCHA, change job preferences, "
+        "create alerts, save jobs, message anyone, upload, fill fields, click Easy Apply, "
+        "or submit anything. If the existing browser session is not signed in or a "
+        "CAPTCHA appears, stop and report that exact blocker.\n\n"
+        "Open only the first eligible result detail if its details are not already visible. "
+        "Snapshot the detail pane and copy the complete visible `About the job` text. "
+        "Use a canonical URL exactly like https://www.linkedin.com/jobs/view/<numeric-id>/; "
+        "discard tracking query parameters.\n\n"
+        "For each read result return ONLY one JSON object in this exact form:\n"
+        "{\"jobs\":[{\"company\":\"...\",\"title\":\"...\",\"location\":\"...\","
+        "\"work_mode\":\"remote|hybrid|on-site|unknown\",\"url\":\"https://www.linkedin.com/jobs/...\","
+        "\"jd_text\":\"full visible job description text\"}]}\n"
+        "Include only pages with a full visible JD of at least 200 characters. Do not "
+        "summarise, infer, invent a URL, or include jobs beyond the cap. If extraction "
+        "cannot be grounded in the snapshot, return {\"jobs\":[]} rather than guessing."
+    )
+    agent_response = openclaw_agent(
+        agent=OPENCLAW_AGENT_BROWSE, message=msg, timeout=task["timeout_seconds"],
+        session_id=f"jobos-task-{task['id']}",
+    )
+    try:
+        intake = ingest_discovered_jobs(cur, task["id"], inp, agent_response)
+    except LinkedInDiscoveryError as exc:
+        raise PermanentTaskError(f"LinkedIn discovery result refused: {exc}") from exc
+    return {
+        "search_url": search_url, "search": request, "submitted": False,
+        "auto_ingest": intake, "agent_response": agent_response,
     }
 
 
@@ -469,6 +596,7 @@ def handle_fill_application_form(cur, task) -> Dict[str, Any]:
 
 HANDLERS = {
     "fetch_job_description": handle_fetch_job_description,
+    "discover_linkedin_jobs": handle_discover_linkedin_jobs,
     "capture_page_snapshot": handle_capture_page_snapshot,
     "fill_application_form": handle_fill_application_form,
 }
@@ -602,13 +730,15 @@ def main() -> int:
     if args.health:
         print(f"OpenClaw binary: {shutil.which(OPENCLAW_BIN) or 'NOT FOUND'}")
         try:
-            ok, out = openclaw_health()
+            gateway_ok, out = openclaw_health()
         except (PermanentTaskError, TransientTaskError) as e:
             print(f"FAIL: {e}")
             return 1
         print(out)
-        print("\nRPC reachable" if ok else "\nRPC NOT reachable")
-        return 0 if ok else 1
+        cdp_ok, cdp_out = browser_cdp_health()
+        print("\nRPC reachable" if gateway_ok else "\nRPC NOT reachable")
+        print(cdp_out)
+        return 0 if gateway_ok and cdp_ok else 1
 
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)

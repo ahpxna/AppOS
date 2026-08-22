@@ -27,9 +27,116 @@ Fallback:
   `--remote-debugging-port` into its Chrome launch, which the image doesn't support out of
   the box.
 
-Bootstrap for a fresh machine:
+## Browser runtime readiness
 
-- Run `python scripts/openclaw_bootstrap.py bootstrap` from this repo to render a local `~/.openclaw`.
+The queue worker can be checked without executing a browser task or invoking a
+model:
+
+```bash
+python services/browser-controller/browser_queue_worker.py --health
+```
+
+It needs all of the following before `fetch_job_description` can run:
+
+1. A reachable OpenClaw gateway on loopback (`127.0.0.1:18789`) with the same
+   configured gateway token on client and gateway.
+2. A reachable CDP browser at the configured remote profile endpoint
+   (`http://browser:9222` inside the compose network for the container setup).
+3. A dedicated JobOS Chrome profile that the user has signed into manually.
+   JobOS never imports a cookie or password from the user's everyday browser.
+   A user-initiated LinkedIn discovery task may read a small explicit result
+   cap and auto-ingest validated JDs. It may not authenticate, solve CAPTCHA,
+   create alerts, save jobs, message users, change preferences, or apply.
+
+The health command and CDP browser do not require a local LLM. If a browser
+task uses an OpenClaw agent, select its model via `OPENCLAW_*_MODEL`; it may be
+an authenticated API provider rather than a local model. Do not put provider
+tokens in this repository.
+
+## Non-interactive JobOS setup
+
+Use the JobOS setup script instead of the interactive `openclaw onboard` wizard.
+It creates the isolated config, four named agent workspaces, the remote CDP
+profile, and the tool-deny policy in one run. It does **not** invoke a model,
+open a browser page, or print a token.
+
+`--generate-gateway-token` generates and privately saves a random
+`OPENCLAW_GATEWAY_TOKEN` in the untracked `.env` when it is missing. Optional
+`DEEPSEEK_API_KEY`, `OPENAI_API_KEY`, and `OPENROUTER_API_KEY` values may be
+kept in that same untracked file. The script copies only those provider keys to
+the private OpenClaw runtime `.env`, with mode `0600`; it never stores them in
+the JSON template, Git, reports, or agent workspace.
+
+Native gateway under the dedicated OS user:
+
+```bash
+python scripts/setup_openclaw_jobos.py --mode native --force --generate-gateway-token
+# Private Node 24 + OpenClaw, not the system/global OpenClaw installation.
+python scripts/start_openclaw_jobos.py gateway
+```
+
+Docker browser/gateway overlay:
+
+```bash
+python scripts/setup_openclaw_jobos.py --mode docker --force
+# optional: downloads the official provider plugin; no API key appears on CLI
+python scripts/setup_openclaw_jobos.py --mode docker --force --install-deepseek-plugin
+docker compose -f docker-compose.yml -f docker-compose.openclaw.yml up -d
+python services/orchestrator/pipeline_preflight_v1.py --check-browser
+```
+
+Docker mode writes the config under `data/openclaw-runtime/.openclaw` and
+renders the remote CDP endpoint as `http://browser:9222`, the correct address
+inside the Compose network. Native mode renders `http://127.0.0.1:9222` for a
+locally exposed Chrome CDP listener. The host-side queue health check probes
+both the OpenClaw RPC gateway and `GET /json/version` on CDP, without invoking
+an LLM or opening a tab.
+
+The four workspaces have distinct roles:
+
+| Agent | Workspace | Autonomous safe work |
+|---|---|---|
+| `main` | `workspace-main` | User-initiated job/JD capture and public company research |
+| `resume` | `workspace-resume` | Evidence-grounded resume drafts |
+| `cover_letter` | `workspace-cover_letter` | Source-backed company-tailored letter drafts |
+| `repo_coordinator` | `workspace-repo_coordinator` | Summarise isolated worker reports only |
+
+All four proceed without asking for confirmation for well-scoped, read-only
+work. The config structurally denies shell/process execution and filesystem
+writes. They must still stop for authentication, sending, uploading, form
+submission, external modification, missing source evidence, or a request that
+would create an unsupported candidate claim. They share concise reports and
+evidence, not hidden reasoning.
+
+### Provider routing
+
+The Python JobOS pipeline and OpenClaw are separate consumers of model keys:
+
+- Python stages use `services/common/llm_gateway.py`. It supports local Ollama,
+  OpenAI-style APIs, and the DeepSeek URL style. Use per-role settings in
+  `.env.example`: DeepSeek is suitable for bounded analysis/coordinator work;
+  use an embedding-capable provider for `embed`, and choose a stronger provider
+  for document generation/truth verification if desired.
+- OpenClaw reads `DEEPSEEK_API_KEY`, `OPENAI_API_KEY`, and
+  `OPENROUTER_API_KEY` from its private runtime
+  `.env`. The official DeepSeek plugin is installed only with
+  `--install-deepseek-plugin`; then model IDs can be set to
+  `deepseek/deepseek-v4-flash` or `deepseek/deepseek-v4-pro`. OpenAI model IDs
+  use `openai/...` after its normal provider authentication. Re-run the setup
+  script after changing `OPENCLAW_*_MODEL` values.
+
+The setup script validates the generated config without reaching a model. The
+private runtime launcher keeps JobOS on its tested Node/OpenClaw pair. Run
+`openclaw models status --check` only after configuring the desired provider
+key/auth profile; add `--probe` only when you intentionally want a live API
+call.
+
+Legacy bootstrap details:
+
+- `python scripts/openclaw_bootstrap.py bootstrap` remains available for a
+  custom template/target, but `setup_openclaw_jobos.py` should be used for the
+  standard JobOS deployment because it selects the right CDP network address.
+
 - Put your machine-specific secrets in `bootstrap/openclaw/secrets.local.json` or export them as `OPENCLAW_*` env vars.
 - If you have an old machine, first create a bundle with `python scripts/openclaw_bootstrap.py export --bundle /tmp/openclaw.bundle.tar.gz`, then restore it on the new one with `python scripts/openclaw_bootstrap.py import --bundle /tmp/openclaw.bundle.tar.gz --force`.
 - The bootstrap keeps secrets out of git; only the template and workspace seed files live in the repo.
@@ -40,9 +147,9 @@ For the Windows box you mentioned:
 - Give that user a separate Chrome profile and keep the automation tab there, not in the primary user's browser.
 - If that separation is not possible, use the container fallback and keep the automation browser isolated from normal work.
 
-## Agent profiles (main / resume / cover_letter)
+## Agent profiles (main / resume / cover_letter / repo_coordinator)
 
-`bootstrap/openclaw/openclaw.template.json` defines three named agent profiles under
+`bootstrap/openclaw/openclaw.template.json` defines four named agent profiles under
 `agents.list`, each with its own workspace so a resume-drafting agent and a
 cover-letter-drafting agent don't share conversation context:
 
@@ -51,30 +158,26 @@ cover-letter-drafting agent don't share conversation context:
 | `main` | `OPENCLAW_AGENT_RESEARCH`, `OPENCLAW_AGENT_BROWSE` | `services/research/company_research_v1.py`, `services/browser-controller/browser_queue_worker.py` |
 | `resume` | `OPENCLAW_AGENT_RESUME` | `services/browser-controller/browser_queue_worker.py` (doc_type == "resume") |
 | `cover_letter` | `OPENCLAW_AGENT_COVER` | `services/browser-controller/browser_queue_worker.py` (doc_type == "cover_letter") |
+| `repo_coordinator` | `OPENCLAW_AGENT_REPO_COORDINATOR` | `services/repo-audit/repo_coordinator_v1.py` |
 
-`scripts/openclaw_bootstrap.py bootstrap` creates all three workspaces
-(`~/.openclaw/workspace-main`, `-resume`, `-cover_letter`) and, as of
-2026-07-31, the `agentDir` folders the `resume` and `cover_letter` profiles
-declare (`~/.openclaw/agents/resume/agent`, `~/.openclaw/agents/cover_letter/agent`)
+`scripts/openclaw_bootstrap.py bootstrap` creates all four workspaces
+(`~/.openclaw/workspace-main`, `-resume`, `-cover_letter`, `-repo_coordinator`)
+and the `agentDir` folders the `resume`, `cover_letter`, and `repo_coordinator`
+profiles declare.
 — earlier bootstrap runs left those two directories missing, which could make
 those two profiles fail to start even though `openclaw.json` itself rendered
 fine. Re-run `python scripts/openclaw_bootstrap.py bootstrap --force` if your
 `~/.openclaw` predates this fix.
 
-All three workspaces are seeded from the same generic files in
-`bootstrap/openclaw/workspace/` (`AGENTS.md`, `IDENTITY.md`, `SOUL.md`, etc.) —
-nothing differentiates the resume persona from the cover-letter persona beyond
-their `id` and workspace path. If you want them to actually behave
-differently (e.g. resume agent stays terse and bullet-driven, cover letter
-agent writes prose), edit `~/.openclaw/workspace-resume/*.md` and
-`~/.openclaw/workspace-cover_letter/*.md` by hand after bootstrapping — the
-repo only ships one shared seed.
+All workspaces receive the shared safety/tool policy from
+`bootstrap/openclaw/workspace/`, then receive a role-specific overlay from
+`bootstrap/openclaw/workspace-profiles/`. These tracked files define the
+resume, cover-letter, browser/research, and report-only coordinator boundaries;
+edit the relevant overlay and re-run setup if the policy needs to evolve.
 
-**Model note:** `resume` and `cover_letter` use `openrouter/auto` as their
-model (template line ~87/94), and the shared `agents.defaults.model` block
-primary is `openrouter/google/gemini-2.5-flash` with `ollama/deepseek-r1:14b`
-as fallback — meaning, unless you run `openclaw auth login` for an OpenRouter
-account, these two agents fall back to your local Ollama model instead of
-OpenRouter. That's a real, working fallback (not a crash), but if you expect
-OpenRouter-quality output and don't see it, this is why — check `openclaw
-auth` status before assuming something is broken.
+**Model note:** the template reads `OPENCLAW_*_MODEL` variables when bootstrap
+runs. Each value can be a local model such as `ollama/qwen3:8b` or an
+authenticated API-provider model such as `openrouter/auto`; defaults preserve
+the prior OpenRouter-first/Ollama-fallback behavior. Re-run bootstrap with
+`--force` after changing the variables. If you expect API-quality output and
+don't see it, check `openclaw auth` status before assuming something is broken.

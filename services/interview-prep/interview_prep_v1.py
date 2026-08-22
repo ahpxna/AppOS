@@ -32,6 +32,7 @@ from psycopg.types.json import Jsonb
 # Confirmed live 2026-08-01.
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from services.common.observability import emit_trace, make_trace_id
+from services.common.llm_gateway import generate_text
 from services.common.model_config import get_model
 
 PYTHON = sys.executable
@@ -96,23 +97,9 @@ def extract_json_object(raw: str) -> Dict[str, Any]:
 
 def ollama_generate(*, model: str, prompt: str, ollama_url: str,
                     timeout: int, temperature: float, num_ctx: int) -> str:
-    payload = {
-        "model": model,
-        "prompt": prompt,
-        "stream": False,
-        "options": {"temperature": temperature, "num_ctx": num_ctx},
-    }
-    req = urllib.request.Request(
-        ollama_url.rstrip("/") + "/api/generate",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode("utf-8", errors="replace")).get("response", "")
-    except urllib.error.URLError as e:
-        raise RuntimeError(f"Ollama request failed: {e}") from e
+    return generate_text(role="interview_prep", model=model, prompt=prompt,
+                         local_url=ollama_url, timeout=timeout,
+                         temperature=temperature, num_ctx=num_ctx)
 
 
 def fetch_context_pack(cur) -> str:

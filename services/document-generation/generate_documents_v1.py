@@ -40,6 +40,7 @@ from psycopg.types.json import Jsonb
 # broken this way before today's fix).
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from services.common.observability import emit_trace, make_trace_id
+from services.common.llm_gateway import generate_text
 from services.common.model_config import get_model
 
 DB_HOST = os.getenv("JOBOS_DB_HOST", "127.0.0.1")
@@ -53,7 +54,7 @@ DSN = (
     f"user={DB_USER} password={DB_PASSWORD}"
 )
 
-GENERATOR_VERSION = "document_generator_v1_asset_grounded_2026_07_28"
+GENERATOR_VERSION = "document_generator_v1_asset_and_company_grounded_2026_08_20"
 DEFAULT_OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
 DEFAULT_MODEL = get_model("docgen")
 
@@ -93,24 +94,9 @@ def ollama_generate(
     *, model: str, prompt: str, ollama_url: str,
     timeout: int, temperature: float, num_ctx: int,
 ) -> str:
-    payload = {
-        "model": model,
-        "prompt": prompt,
-        "stream": False,
-        "options": {"temperature": temperature, "num_ctx": num_ctx},
-    }
-    req = urllib.request.Request(
-        ollama_url.rstrip("/") + "/api/generate",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            body = resp.read().decode("utf-8", errors="replace")
-    except urllib.error.URLError as e:
-        raise RuntimeError(f"Ollama request failed: {e}") from e
-    return json.loads(body).get("response", "")
+    return generate_text(role="docgen", model=model, prompt=prompt,
+                         local_url=ollama_url, timeout=timeout,
+                         temperature=temperature, num_ctx=num_ctx)
 
 
 # ---------------------------------------------------------------- data access
@@ -148,7 +134,7 @@ def fetch_application_context(cur, application_id: str) -> Dict[str, Any]:
             "Override intentionally with --force if you disagree with the verdict."
         )
 
-    return {
+    app = {
         "id": row[0], "company": row[1], "job_title": row[2], "jd_text": row[3] or "",
         "fit_score": row[4], "fit_decision": row[5],
         "role_family": row[6], "seniority_level": row[7],
@@ -156,6 +142,47 @@ def fetch_application_context(cur, application_id: str) -> Dict[str, Any]:
         "missing_or_weak_requirements": row[9] or [],
         "hard_blockers": row[10] or [],
         "risk_flags": row[11] or [],
+    }
+    app["company_context"] = fetch_company_context(cur, app["company"])
+    return app
+
+
+def fetch_company_context(cur, company: Optional[str]) -> Dict[str, Any]:
+    """Return fresh, source-bearing company facts for cover-letter motivation.
+
+    This is intentionally separate from profile assets: company facts never
+    become candidate evidence and an unavailable/stale cache simply yields an
+    empty context rather than blocking document generation.
+    """
+    if not company:
+        return {}
+    cur.execute(
+        """
+        SELECT company_domain, summary, mission, products, recent_news, sources
+        FROM company_research_cache
+        WHERE lower(company_name) = lower(%s)
+          AND (expires_at IS NULL OR expires_at > now())
+        ORDER BY last_refreshed_at DESC NULLS LAST, created_at DESC
+        LIMIT 1;
+        """,
+        (company,),
+    )
+    row = cur.fetchone()
+    if not row:
+        return {}
+    sources = sorted({
+        value.strip() for value in (row[5] or [])
+        if isinstance(value, str) and value.strip().startswith(("https://", "http://"))
+    })
+    if not sources:
+        return {}
+    return {
+        "company_domain": row[0] or "",
+        "summary": row[1] or "",
+        "mission": row[2] or "",
+        "products": row[3] or "",
+        "recent_news": row[4] or [],
+        "sources": sources,
     }
 
 
@@ -264,9 +291,11 @@ Produce at most {max_bullets} bullets. Fewer strong grounded bullets beats more 
 
 
 def build_cover_letter_prompt(app: Dict[str, Any], catalog: str) -> str:
+    company_context = app.get("company_context") or {}
     return f"""You are JobOS Cover Letter Agent V1.
 
-Write a short cover letter for this job using ONLY the approved assets below.
+Write a short cover letter using approved candidate assets and the separately
+sourced company context below.
 
 TARGET ROLE: {app['job_title']} at {app['company']}
 FIT SCORE: {app['fit_score']} ({app['fit_decision']})
@@ -277,7 +306,15 @@ RISK FLAGS RAISED BY THE FIT ANALYSIS (address honestly or stay silent, never co
 {GROUNDING_RULES}
 9. State the candidate's actual level plainly. If the evidence is academic,
    the letter must read as a capable new graduate, not a seasoned practitioner.
-10. Do not claim familiarity with the company beyond what the JD states.
+10. Company facts may be used only from the SOURCED COMPANY CONTEXT below.
+    For every paragraph that uses a company fact, set "uses_company_context"
+    true and copy one or more matching URLs exactly into "company_source_urls".
+11. Company facts are not candidate evidence: they never replace a real
+    source_asset_id for a paragraph about the candidate.
+12. If the company context is empty, do not claim familiarity beyond the JD.
+
+SOURCED COMPANY CONTEXT (may be empty):
+{json.dumps(company_context, indent=2, ensure_ascii=False)}
 
 APPROVED ASSETS:
 {catalog}
@@ -288,7 +325,9 @@ Return ONLY valid JSON:
     {{
       "text": "one paragraph, 2-4 sentences",
       "source_asset_id": "<uuid, or the string \\"none\\" for the opening/closing paragraph>",
-      "purpose": "opening | evidence | motivation | closing"
+      "purpose": "opening | evidence | motivation | closing",
+      "uses_company_context": false,
+      "company_source_urls": ["<exact URL from SOURCED COMPANY CONTEXT, or omit when unused>"]
     }}
   ],
   "not_supported": ["claims deliberately left out"],
@@ -336,6 +375,7 @@ Return ONLY valid JSON:
 
 def validate_and_render(
     doc_type: str, parsed: Dict[str, Any], valid_asset_ids: set,
+    valid_company_urls: Optional[set] = None,
 ) -> Tuple[str, List[str], Dict[str, Any], List[str]]:
     """Drop any claim citing an unknown asset. Returns
     (content, asset_ids_used, evidence_map, dropped)."""
@@ -343,6 +383,7 @@ def validate_and_render(
     used: List[str] = []
     lines: List[str] = []
     evidence: Dict[str, Any] = {"doc_type": doc_type, "claims": []}
+    valid_company_urls = valid_company_urls or set()
 
     def check(src: Optional[str], text: str, allow_none: bool = False) -> bool:
         if allow_none and (src in (None, "", "none")):
@@ -371,6 +412,18 @@ def validate_and_render(
             text, src = (p.get("text") or "").strip(), p.get("source_asset_id")
             if not text or not check(src, text, allow_none=True):
                 continue
+            requested_urls = p.get("company_source_urls") or []
+            if not isinstance(requested_urls, list):
+                requested_urls = []
+            company_urls = [url for url in requested_urls if isinstance(url, str)]
+            invalid_urls = [url for url in company_urls if url not in valid_company_urls]
+            uses_company_context = bool(p.get("uses_company_context")) or bool(company_urls)
+            if invalid_urls:
+                dropped.append(f"{text[:70]}... (cited unknown company URL)")
+                continue
+            if uses_company_context and not company_urls:
+                dropped.append(f"{text[:70]}... (company claim has no source URL)")
+                continue
             lines.append(text)
             if src in valid_asset_ids:
                 used.append(src)
@@ -378,6 +431,8 @@ def validate_and_render(
                 "claim": text,
                 "source_asset_id": src,
                 "purpose": p.get("purpose", ""),
+                "uses_company_context": uses_company_context,
+                "company_source_urls": company_urls,
             })
 
     elif doc_type == "short_answers":
@@ -515,6 +570,7 @@ def main() -> int:
                         "role_family": None, "seniority_level": "",
                         "matched_requirements": [], "missing_or_weak_requirements": [],
                         "hard_blockers": [], "risk_flags": [],
+                        "company_context": {},
                     }
                     print("WARNING: generating against a rejected application (--force).\n")
                 else:
@@ -527,6 +583,7 @@ def main() -> int:
                 return 1
 
             valid_ids = {a["profile_asset_id"] for a in assets}
+            valid_company_urls = set((app.get("company_context") or {}).get("sources") or [])
 
             field = {
                 "resume": "resume_bullet_bank",
@@ -572,7 +629,7 @@ def main() -> int:
 
             parsed = extract_json_object(raw)
             content, used, evidence, dropped = validate_and_render(
-                args.doc_type, parsed, valid_ids
+                args.doc_type, parsed, valid_ids, valid_company_urls
             )
 
             print("===== GENERATED =====")
@@ -611,6 +668,7 @@ def main() -> int:
                     "doc_type": args.doc_type,
                     "generator_version": GENERATOR_VERSION,
                     "approved_asset_count": len(assets),
+                    "company_context_source_count": len(valid_company_urls),
                     "questions": args.question,
                 },
                 output_json=evidence, raw_output=raw, prompt=prompt,

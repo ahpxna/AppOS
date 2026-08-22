@@ -16,3 +16,12 @@
 -r services/browser-controller/requirements.txt
 -r services/document-generation/requirements.txt
 -r services/profile-ingestion/requirements.txt
+
+# Developer/runtime tools referenced by README and the local services.
+# Keep these here so a clean `pip install -r requirements.txt` can actually
+# run the migration linter and regression suite documented in README.md.
+pglast>=7,<9
+pytest>=8.0,<9
+
+# Needed only when the consent-based pointer recorder is used locally.
+pynput>=1.7,<2

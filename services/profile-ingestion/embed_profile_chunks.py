@@ -13,6 +13,7 @@ from psycopg.types.json import Jsonb
 # is run directly (`python services/profile-ingestion/<this file>.py`).
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from services.common.model_config import get_model  # noqa: E402
+from services.common.llm_gateway import embed_texts  # noqa: E402
 
 
 DB_HOST = os.getenv("JOBOS_DB_HOST", "127.0.0.1")
@@ -68,25 +69,9 @@ def build_embedding_text(row) -> str:
 
 
 def embed_text(text: str) -> List[float]:
-    resp = requests.post(
-        f"{OLLAMA_BASE_URL}/api/embeddings",
-        headers={"Content-Type": "application/json"},
-        data=json.dumps(
-            {
-                "model": EMBED_MODEL,
-                "prompt": text,
-            }
-        ),
-        timeout=120,
-    )
-
-    if resp.status_code >= 400:
-        raise RuntimeError(f"Ollama embedding error {resp.status_code}: {resp.text[:1000]}")
-
-    data = resp.json()
-    emb = data.get("embedding")
-    if not isinstance(emb, list):
-        raise RuntimeError(f"No embedding returned: {data}")
+    emb = embed_texts(
+        texts=[text], model=EMBED_MODEL, local_url=OLLAMA_BASE_URL, timeout=120
+    )[0]
 
     if len(emb) != EMBED_DIM:
         raise RuntimeError(
@@ -94,7 +79,7 @@ def embed_text(text: str) -> List[float]:
             f"Change PROFILE_EMBED_DIM and migration/table if using another model."
         )
 
-    return emb
+    return [float(value) for value in emb]
 
 
 def fetch_chunks(cur, limit: int):

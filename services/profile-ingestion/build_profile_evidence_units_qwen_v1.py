@@ -14,6 +14,7 @@ import psycopg
 # is run directly (`python services/profile-ingestion/<this file>.py`).
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from services.common.model_config import get_model  # noqa: E402
+from services.common.llm_gateway import chat_text  # noqa: E402
 
 
 DB_HOST = os.getenv("JOBOS_DB_HOST", "127.0.0.1")
@@ -91,42 +92,29 @@ def parse_json_content(content: str) -> Dict[str, Any]:
 
 
 def call_ollama_json(prompt: str, model: str, retries: int = 2) -> Dict[str, Any]:
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": prompt},
-        ],
-        "stream": False,
-        "format": "json",
-        "options": {
-            "temperature": 0.05,
-            "num_ctx": 8192,
-        },
-    }
-
-    body = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        f"{OLLAMA_URL}/api/chat",
-        data=body,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-
     last_error: Optional[Exception] = None
-
     for attempt in range(1, retries + 1):
         try:
-            with urllib.request.urlopen(req, timeout=600) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                content = data.get("message", {}).get("content", "")
-                return parse_json_content(content)
+            content = chat_text(
+                role="profile_evidence_unit",
+                model=model,
+                local_url=OLLAMA_URL,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+                timeout=600,
+                temperature=0.05,
+                num_ctx=8192,
+                json_mode=True,
+            )
+            return parse_json_content(content)
         except Exception as e:
             last_error = e
             if attempt < retries:
                 time.sleep(2 * attempt)
 
-    raise RuntimeError(f"Ollama JSON call failed after {retries} retries: {last_error}")
+    raise RuntimeError(f"LLM JSON call failed after {retries} retries: {last_error}")
 
 
 def clean_list(value: Any) -> List[str]:

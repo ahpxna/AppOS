@@ -14,6 +14,7 @@ import psycopg
 # is run directly (`python services/profile-ingestion/<this file>.py`).
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from services.common.model_config import get_model  # noqa: E402
+from services.common.llm_gateway import embed_texts  # noqa: E402
 
 
 DB_HOST = os.getenv("JOBOS_DB_HOST", "127.0.0.1")
@@ -33,29 +34,21 @@ VERSION = "profile_chunk_embedder_v2_sources_2026_04_27"
 
 
 def embed_text(text: str, model: str = MODEL, retries: int = 3) -> List[float]:
-    payload = json.dumps({"model": model, "prompt": text}).encode("utf-8")
-    req = urllib.request.Request(
-        f"{OLLAMA_URL}/api/embeddings",
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-
     last_error: Optional[Exception] = None
     for attempt in range(1, retries + 1):
         try:
-            with urllib.request.urlopen(req, timeout=180) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                emb = data.get("embedding")
-                if not isinstance(emb, list) or not emb:
-                    raise RuntimeError(f"Invalid embedding response: {data}")
-                return [float(x) for x in emb]
-        except (urllib.error.URLError, TimeoutError, RuntimeError) as e:
+            embedding = embed_texts(
+                texts=[text], model=model, local_url=OLLAMA_URL, timeout=180
+            )[0]
+            if not embedding:
+                raise RuntimeError("Embedding backend returned an empty vector.")
+            return [float(value) for value in embedding]
+        except Exception as e:
             last_error = e
             if attempt < retries:
                 time.sleep(2 * attempt)
 
-    raise RuntimeError(f"Embedding failed after {retries} retries: {last_error}")
+    raise RuntimeError(f"LLM embedding failed after {retries} retries: {last_error}")
 
 
 def vector_literal(values: List[float]) -> str:

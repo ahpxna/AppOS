@@ -52,6 +52,10 @@ MODELS: dict[str, str] = {
     ),
     # services/job-analysis/
     "job_fit": os.getenv("JOBOS_FIT_MODEL", DEFAULT_CHAT_MODEL),
+    # services/discovery/ -- extracts market requirements from every captured JD.
+    # Kept separate from job_fit because this worker must also run for jobs
+    # that are filtered out before fit analysis.
+    "market_intelligence": os.getenv("JOBOS_MARKET_INTELLIGENCE_MODEL", DEFAULT_CHAT_MODEL),
     # services/profile-ingestion/
     "profile_asset_synthesizer": os.getenv("PROFILE_ASSET_SYNTHESIZER_MODEL", DEFAULT_CHAT_MODEL),
     "profile_asset_auditor": os.getenv("PROFILE_ASSET_AUDITOR_MODEL", DEFAULT_AUDIT_MODEL),
