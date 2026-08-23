@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 from pathlib import Path
 import sys
@@ -41,6 +42,21 @@ def load_tailoring(cur, application_id: str) -> tuple[str, dict]:
     return row[0], tailoring
 
 
+def register_artifact(cur, application_id: str, document_id: str, path: Path) -> None:
+    """Register the exact local resume file allowed for a later upload action."""
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    cur.execute(
+        """
+        INSERT INTO generated_document_artifacts
+          (generated_document_id, application_id, artifact_type, file_path, filename, sha256)
+        VALUES (%s, %s, 'resume', %s, %s, %s)
+        ON CONFLICT (generated_document_id, artifact_type, sha256) DO UPDATE
+        SET file_path = EXCLUDED.file_path, filename = EXCLUDED.filename;
+        """,
+        (document_id, application_id, str(path.resolve()), path.name, digest),
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Write a verified JobOS resume into the fixed local Word template.")
     parser.add_argument("--application-id", required=True)
@@ -64,6 +80,9 @@ def main() -> int:
         )
     except ResumeTemplateError as exc:
         raise SystemExit(f"Resume export blocked: {exc}") from exc
+    with psycopg.connect(DSN, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            register_artifact(cur, args.application_id, document_id, docx_path)
     print(f"DOCX: {docx_path}\nNext: open this file in Word and Print/Save as PDF after review.")
     return 0
 

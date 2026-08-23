@@ -31,6 +31,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -60,6 +61,11 @@ from services.discovery.linkedin_discovery_v1 import (
     ingest_discovered_jobs,
     validate_search_request,
 )
+from services.autofill.autofill_agent_v1 import parse_snapshot
+from services.autofill.autofill_executor_v1 import OpenClawTransport, TransportError
+from services.autofill.autofill_planner_v1 import plan_autofill
+from services.autofill.autofill_session_v1 import AutofillSession, SessionError, SnapshotState
+from services.autofill.form_inspector_v1 import inspect_nodes, inspect_question_groups
 
 # ---------------------------------------------------------------- config
 
@@ -92,7 +98,7 @@ BROWSER_CDP_URL = (
     or "http://127.0.0.1:9222"
 ).rstrip("/")
 
-WORKER_VERSION = "browser_queue_worker_v3_fail_closed_form_write_2026_08_23"
+WORKER_VERSION = "browser_queue_worker_v4_deterministic_form_session_2026_08_23"
 WORKER_ID = f"{socket.gethostname()}:{os.getpid()}"
 LEASE_SECONDS = int(os.getenv("JOBOS_BROWSER_LEASE_SECONDS", "600"))
 
@@ -508,6 +514,86 @@ def require_url(cur, input_json: Dict[str, Any]) -> str:
     return url
 
 
+def load_autofill_profile(cur, application_id: str, document_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Load only approved values needed by the deterministic planner.
+
+    This is intentionally a structured DB read, not a prompt.  Immigration
+    answers are published only under their exact semantic question class and
+    only after the candidate confirmed the profile.
+    """
+    cur.execute("SELECT field_name, field_value FROM v_autofill_ready_values;")
+    identity = {str(name): str(value) for name, value in cur.fetchall() if str(value).strip() and str(value) != "FILL_ME"}
+    profile: dict[str, Any] = {"personal": {}, "address": {}, "education": {}, "employment": {}, "documents": {}}
+    mapping = {
+        "legal_first_name": ("personal", "first_name"), "legal_last_name": ("personal", "last_name"),
+        "preferred_name": ("personal", "preferred_name"), "email": ("personal", "email"),
+        "phone": ("personal", "phone"), "linkedin_url": ("personal", "linkedin"),
+        "github_url": ("personal", "github"), "portfolio_url": ("personal", "portfolio"),
+        "address_line1": ("address", "line1"), "address_line2": ("address", "line2"),
+        "address_city": ("address", "city"), "address_state": ("address", "state"),
+        "address_postal": ("address", "postal"), "address_country": ("address", "country"),
+        "university_name": ("education", "university"), "major": ("education", "major"),
+        "graduation_date": ("education", "graduation_date"), "degree": ("education", "degree"),
+    }
+    for source, target in mapping.items():
+        if source in identity:
+            profile[target[0]][target[1]] = identity[source]
+    if profile["personal"].get("first_name") and profile["personal"].get("last_name"):
+        profile["personal"]["full_name"] = f"{profile['personal']['first_name']} {profile['personal']['last_name']}"
+
+    cur.execute(
+        """
+        SELECT gd.doc_type, gda.file_path, gda.filename, gda.sha256
+        FROM generated_document_artifacts gda
+        JOIN generated_documents gd ON gd.id = gda.generated_document_id
+        WHERE gda.generated_document_id = %s AND gda.application_id = %s
+          AND gd.application_id = %s AND gd.qa_status = 'pass' AND gd.approved = true;
+        """,
+        (document_id, application_id, application_id),
+    )
+    for doc_type, file_path, filename, digest in cur.fetchall():
+        path = Path(str(file_path)).expanduser().resolve()
+        allowed_root = (REPO_ROOT / "data").resolve()
+        if not path.is_file() or allowed_root not in path.parents:
+            continue
+        if hashlib.sha256(path.read_bytes()).hexdigest() != str(digest):
+            continue
+        if str(doc_type) in {"resume", "cover_letter"} and path.name == str(filename):
+            profile["documents"][str(doc_type)] = str(path)
+
+    cur.execute(
+        """
+        SELECT current_work_authorization, requires_sponsorship_to_start,
+               requires_future_sponsorship, us_citizen, us_person,
+               permanent_work_authorization, stem_extension_eligible, user_confirmed_at
+               , confirmation_version
+        FROM immigration_profiles WHERE profile_key = 'primary';
+        """
+    )
+    row = cur.fetchone()
+    answers: dict[str, Any] = {}
+    if row and row[7] and int(row[8] or 0) >= 1:
+        confirmed_at = str(row[7])
+        semantic_values = {
+            "CURRENT_AUTHORIZATION": row[0], "SPONSORSHIP_TO_START": row[1],
+            "SPONSORSHIP_NOW_OR_FUTURE": row[2], "US_CITIZENSHIP": row[3],
+            "US_PERSON": row[4], "PERMANENT_WORK_AUTHORIZATION": row[5],
+            "STEM_OPT_EMPLOYER_REQUIREMENT": "yes" if row[6] is True else ("no" if row[6] is False else None),
+        }
+        for question_class, value in semantic_values.items():
+            if str(value).casefold() in {"yes", "no"}:
+                answers[question_class] = {
+                    "value": str(value).title(), "confirmed_at": confirmed_at,
+                    "confirmation_version": int(row[8]),
+                }
+    return profile, answers
+
+
+def snapshot_state(transport: OpenClawTransport) -> SnapshotState:
+    nodes = parse_snapshot(transport.snapshot())
+    return SnapshotState(tuple(inspect_nodes(nodes)), tuple(inspect_question_groups(nodes)))
+
+
 # ---------------------------------------------------------------- handlers
 
 def handle_fetch_job_description(cur, task) -> Dict[str, Any]:
@@ -614,16 +700,44 @@ def handle_capture_page_snapshot(cur, task) -> Dict[str, Any]:
 
 
 def handle_fill_application_form(cur, task) -> Dict[str, Any]:
-    # This used to send an application page and applicant document to an LLM
-    # browser agent.  That contradicted the deterministic L7 architecture and
-    # made radio/checkbox correctness impossible to prove.  Do not re-enable
-    # it until a deterministic engine re-checks the current origin before each
-    # side effect, verifies the state of every control, and calls
-    # consume_bound_approval() only after post-write verification.
-    raise PermanentTaskError(
-        "LLM-driven form filling is disabled. Use the deterministic autofill plan "
-        "for review only; no browser worker may write a real application form yet."
-    )
+    binding = require_bound_approval(cur, task)
+    document = require_verified_document(cur, binding["document_id"], task["application_id"])
+    document_hash = hashlib.sha256((document["content"] or "").encode("utf-8")).hexdigest()
+    if document_hash != task["document_sha256"]:
+        raise PermanentTaskError("Bound generated document content changed after approval; reissue approval.")
+
+    profile, sensitive_answers = load_autofill_profile(cur, task["application_id"], binding["document_id"])
+    transport = OpenClawTransport(binary=OPENCLAW_BIN, profile=os.getenv("JOBOS_BROWSER_PROFILE", "remote"),
+                                  timeout=min(int(task["timeout_seconds"]), 90), environment=openclaw_runtime_env())
+    try:
+        initial = snapshot_state(transport)
+        actions, _ = plan_autofill(
+            list(initial.fields), profile, question_groups=list(initial.groups),
+            approved_sensitive_answers=sensitive_answers,
+        )
+        executable = [action for action in actions if action.action in {"fill", "select", "check", "upload"}]
+        if not executable:
+            return {
+                "status": "needs_review", "reason": "No exact, verified-safe form actions were available.",
+                "paused": [action.question_label or action.reason for action in actions if action.action == "pause"],
+                "approval_consumed": False,
+            }
+        session = AutofillSession(
+            transport=transport, expected_origin=binding["expected_origin"],
+            snapshot_state=lambda: snapshot_state(transport), origin_allowed=lambda url: check_domain(cur, url),
+        )
+        result = session.execute(actions, on_first_verified_write=lambda: consume_bound_approval(cur, binding["id"], task))
+    except SessionError as exc:
+        raise PermanentTaskError(str(exc)) from exc
+    except TransportError as exc:
+        raise TransientTaskError(str(exc)) from exc
+    return {
+        "status": result.status, "verified_refs": list(result.verified_refs),
+        "failed_refs": list(result.failed_refs), "executed_refs": list(result.executed_refs),
+        "paused": [action.question_label or action.reason for action in actions if action.action == "pause"],
+        "approval_consumed": bool(result.verified_refs),
+        "submitted": False,
+    }
 
 
 HANDLERS = {

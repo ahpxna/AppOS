@@ -58,7 +58,7 @@ def cmd_show(cur) -> int:
                stem_extension_eligible, stem_cip_code,
                requires_sponsorship_to_start, requires_future_sponsorship,
                us_citizen, us_person, permanent_work_authorization,
-               user_confirmed_at, confirmation_note
+               user_confirmed_at, confirmation_note, confirmation_version
         FROM immigration_profiles WHERE profile_key = 'primary';
         """
     )
@@ -74,6 +74,7 @@ def cmd_show(cur) -> int:
             "us_citizen": row[10], "us_person": row[11],
             "permanent_work_authorization": row[12],
             "user_confirmed_at": str(row[13] or ""), "confirmation_note": row[14],
+            "confirmation_version": row[15],
         },
         "warning": "This profile does not answer employer questions automatically.",
     }, indent=2))
@@ -92,8 +93,33 @@ def cmd_set(conn, args) -> int:
     if opt_start and opt_end and opt_start > opt_end:
         print("ERROR: OPT start date must not be after OPT end date.")
         return 1
-    values = {
-        "current_status": args.current_status.strip() or "unconfirmed",
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT current_status, current_work_authorization, opt_eligible, opt_start_date,
+                   opt_end_date, stem_extension_eligible, stem_cip_code,
+                   requires_sponsorship_to_start, requires_future_sponsorship,
+                   us_citizen, us_person, permanent_work_authorization, confirmation_note,
+                   confirmation_version
+            FROM immigration_profiles WHERE profile_key = 'primary';
+            """
+        )
+        prior = cur.fetchone()
+    prior_values = dict(zip((
+        "current_status", "current_work_authorization", "opt_eligible", "opt_start_date",
+        "opt_end_date", "stem_extension_eligible", "stem_cip_code",
+        "requires_sponsorship_to_start", "requires_future_sponsorship",
+        "us_citizen", "us_person", "permanent_work_authorization", "confirmation_note",
+        "confirmation_version",
+    ), prior or ()))
+    defaults = {
+        "current_status": "unconfirmed", "current_work_authorization": "unconfirmed",
+        "requires_sponsorship_to_start": "unconfirmed", "requires_future_sponsorship": "unconfirmed",
+        "us_citizen": "unconfirmed", "us_person": "unconfirmed",
+        "permanent_work_authorization": "unconfirmed",
+    }
+    requested = {
+        "current_status": args.current_status.strip() if args.current_status else None,
         "current_work_authorization": args.current_work_authorization,
         "opt_eligible": args.opt_eligible,
         "opt_start_date": opt_start,
@@ -106,6 +132,13 @@ def cmd_set(conn, args) -> int:
         "us_person": args.us_person,
         "permanent_work_authorization": args.permanent_work_authorization,
         "confirmation_note": (args.confirmation_note or "").strip() or None,
+        "confirmation_version": int(prior_values.get("confirmation_version") or 0) + 1,
+    }
+    # argparse defaults are None for every mutable field. A profile update is
+    # a patch: unspecified values retain the candidate-confirmed prior value.
+    values = {
+        key: (value if value is not None else prior_values.get(key, defaults.get(key)))
+        for key, value in requested.items()
     }
     with conn.cursor() as cur:
         cur.execute(
@@ -115,12 +148,12 @@ def cmd_set(conn, args) -> int:
                opt_start_date, opt_end_date, stem_extension_eligible, stem_cip_code,
                requires_sponsorship_to_start, requires_future_sponsorship,
                us_citizen, us_person, permanent_work_authorization,
-               user_confirmed_at, confirmation_note)
+               user_confirmed_at, confirmation_note, confirmation_version)
             VALUES ('primary', %(current_status)s, %(current_work_authorization)s, %(opt_eligible)s,
                     %(opt_start_date)s, %(opt_end_date)s, %(stem_extension_eligible)s, %(stem_cip_code)s,
                     %(requires_sponsorship_to_start)s, %(requires_future_sponsorship)s,
                     %(us_citizen)s, %(us_person)s, %(permanent_work_authorization)s,
-                    now(), %(confirmation_note)s)
+                    now(), %(confirmation_note)s, %(confirmation_version)s)
             ON CONFLICT (profile_key) DO UPDATE
             SET current_status = EXCLUDED.current_status,
                 current_work_authorization = EXCLUDED.current_work_authorization,
@@ -133,7 +166,8 @@ def cmd_set(conn, args) -> int:
                 requires_future_sponsorship = EXCLUDED.requires_future_sponsorship,
                 us_citizen = EXCLUDED.us_citizen, us_person = EXCLUDED.us_person,
                 permanent_work_authorization = EXCLUDED.permanent_work_authorization,
-                user_confirmed_at = now(), confirmation_note = EXCLUDED.confirmation_note;
+                user_confirmed_at = now(), confirmation_note = EXCLUDED.confirmation_note,
+                confirmation_version = EXCLUDED.confirmation_version;
             """,
             values,
         )
@@ -194,12 +228,12 @@ def main() -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("show")
     set_parser = sub.add_parser("set")
-    set_parser.add_argument("--current-status", default="unconfirmed")
+    set_parser.add_argument("--current-status")
     for name in (
         "current-work-authorization", "requires-sponsorship-to-start", "requires-future-sponsorship",
         "us-citizen", "us-person", "permanent-work-authorization",
     ):
-        set_parser.add_argument(f"--{name}", choices=("yes", "no", "unconfirmed"), default="unconfirmed")
+        set_parser.add_argument(f"--{name}", choices=("yes", "no", "unconfirmed"), default=None)
     set_parser.add_argument("--opt-eligible", action=argparse.BooleanOptionalAction, default=None)
     set_parser.add_argument("--opt-start-date")
     set_parser.add_argument("--opt-end-date")

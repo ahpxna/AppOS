@@ -8,12 +8,13 @@ Accessibility/DOM snapshot
         -> form_inspector
         -> field_matcher
         -> autofill_planner + policy
+        -> AutofillSession capability gate
         -> narrow executor adapter (OpenClaw | Playwright | CDP)
         -> fresh snapshot
         -> autofill_verifier
 ```
 
-`OpenClaw` is an execution adapter only. It receives one command such as
+`OpenClawTransport` is an execution adapter only. It receives one command such as
 `{action, target, value}` for the field being written; it never receives a
 giant profile prompt or authority to browse and decide freely. Playwright and
 CDP adapters implement the same command contract, so the matching and policy
@@ -28,13 +29,21 @@ logic remains unchanged.
 | Sensitive/legal | Pause by default. Immigration, citizenship, US-person, EEO, export-control and similar prompts need an exact user-confirmed semantic answer. |
 | Unknown | Leave blank and show it for review. |
 
-Radio/checkbox controls are never blindly toggled: an adapter must expose the
-question group, option label, and selected state; the verifier confirms the
-requested option after the action. A run is `completed` only when every planned
-write verifies. Any failed write is `partial`; any paused field is
-`needs_review`.
+Radio/checkbox controls are never blindly toggled: the inspector builds a
+`QuestionGroup` with option reference, label and selected state. An immigration
+answer is planned only when the exact question class has a user-confirmed
+answer, e.g. `SPONSORSHIP_NOW_OR_FUTURE`; generic keyword matching is rejected.
+The session reads the focused tab URL before every write and after it, requires
+the approval-bound origin and allowed domain, then snapshots and verifies the
+write. It consumes the exact approval on the first verified side effect, so a
+crash cannot replay the capability in another task.
 
-The existing `autofill_agent_v1.py` remains a read-only OpenClaw snapshot
-compatibility CLI while the adapter integrations are wired to these contracts.
-Its write path is intentionally disabled, so no user data is exposed to an
-LLM or sent to a browser without this plan/verify pipeline.
+Resume/cover-letter upload is limited to a QA-passed, user-approved artifact
+registered for the approval-bound document. The artifact SHA-256 is rechecked
+before upload; post-upload verification compares its filename/attached value,
+not the browser's fake local path.
+
+`browser_queue_worker.py` is the only production caller of this pipeline. It
+creates the session only for a queued, exact application/document/origin-bound
+approval; no LLM is in its form-write path. The legacy `autofill_agent_v1.py`
+remains a read-only snapshot/plan compatibility CLI.

@@ -52,6 +52,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import psycopg
 
 from services.common.immigration_semantics import legal_question_pause_reason
+from services.autofill.field_matcher_v1 import FieldClass, match_field as deterministic_match
+from services.autofill.form_inspector_v1 import FormField
 
 DB_HOST = os.getenv("JOBOS_DB_HOST", "127.0.0.1")
 DB_PORT = int(os.getenv("JOBOS_DB_PORT", "5433"))
@@ -75,50 +77,6 @@ TEXT_ROLES = {"textbox", "searchbox", "spinbutton"}
 CHOICE_ROLES = {"combobox", "listbox", "select"}
 TOGGLE_ROLES = {"checkbox", "radio"}
 INPUT_ROLES = TEXT_ROLES | CHOICE_ROLES | TOGGLE_ROLES
-
-# First match wins, so specific patterns precede general ones.
-# Broadened 2026-07-31 to cover fields recurring across Greenhouse, Lever,
-# Ashby, Workday, iCIMS, and SmartRecruiters application forms -- the
-# matcher itself is already platform-agnostic (it reads label TEXT, not
-# DOM structure), so widening this table is what "works on every ATS"
-# actually means in this design, not a per-platform integration.
-FIELD_PATTERNS: List[Tuple[str, str]] = [
-    (r"(?i)^(your\s+)?(full\s+)?name$",                "full_name"),
-    (r"(?i)\b(full|legal)\s*name\b",                   "full_name"),
-    (r"(?i)\b(first|given)\s*name\b",                  "legal_first_name"),
-    (r"(?i)\b(last|family|sur)\s*name\b",              "legal_last_name"),
-    (r"(?i)\bmiddle\s*name\b",                         "middle_name"),
-    (r"(?i)\bmiddle\s*initial\b",                      "middle_name"),
-    (r"(?i)\bpreferred\s*name\b",                      "preferred_name"),
-    (r"(?i)\bpronouns\b",                              "pronouns"),
-    (r"(?i)\be-?mail\b",                               "email"),
-    (r"(?i)\bcountry\s*code\b",                        "phone_country_code"),
-    (r"(?i)\b(phone|mobile|telephone|cell)\b",         "phone"),
-    (r"(?i)address\s*line\s*2|\bapt\.?\s*/?\s*suite\b","address_line2"),
-    (r"(?i)\b(street|address\s*line\s*1|address1)\b",  "address_line1"),
-    (r"(?i)postal\s*code\s*extension",                 "address_postal_ext"),
-    (r"(?i)\b(zip|postal)\b",                          "address_postal"),
-    (r"(?i)\bcity\b",                                  "address_city"),
-    (r"(?i)\bcounty\b",                                "address_county"),
-    (r"(?i)\b(state|province|region)\b",               "address_state"),
-    (r"(?i)\bcountry\b",                               "address_country"),
-    (r"(?i)linked-?in",                                "linkedin_url"),
-    (r"(?i)\b(x|twitter)\s*(profile|handle|url)?\b",   "twitter_url"),
-    (r"(?i)github",                                    "github_url"),
-    (r"(?i)\b(portfolio|website|personal\s*site)\b",   "portfolio_url"),
-    (r"(?i)\bother\s*(url|link|profile)\b",            "other_url"),
-    # -- education --
-    (r"(?i)\b(university|college|school)\s*(name|attended)?\b", "university_name"),
-    (r"(?i)\bdegree\b",                                "degree"),
-    (r"(?i)\b(major|field\s*of\s*study|concentration)\b", "major"),
-    (r"(?i)\bgraduation\s*(date|year)?\b",             "graduation_date"),
-    # -- work history / target role --
-    (r"(?i)\bcurrent\s*(employer|company)\b",          "current_employer"),
-    (r"(?i)\bcurrent\s*(job\s*)?title\b",              "current_title"),
-    (r"(?i)\bdesired\s*(job\s*)?title\b",               "desired_title"),
-    (r"(?i)\byears?\s*of\s*experience\b",              "years_experience"),
-    (r"(?i)how\s*did\s*you\s*hear\s*about\s*(us|this\s*(role|position|job))", "referral_source"),
-]
 
 # Controls that parse a resume and populate fields automatically. Reported,
 # never clicked: their parsing is frequently wrong, and typing verified
@@ -232,8 +190,13 @@ def parse_snapshot(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
         role = (m.group("role") or "").lower()
         name = (m.group("name") or "").strip()
         value = _clean_value(m.group("value"))
-        rm = SNAP_REF.search(m.group("attrs") or "")
+        attrs = m.group("attrs") or ""
+        rm = SNAP_REF.search(attrs)
         ref = rm.group(1) if rm else None
+        attrs_lower = attrs.casefold()
+        selected = True if any(token in attrs_lower for token in ("[checked", "[selected", "[aria-checked=true")) else (
+            False if "[aria-checked=false" in attrs_lower else None
+        )
 
         while stack and stack[-1][0] >= indent:
             stack.pop()
@@ -264,6 +227,7 @@ def parse_snapshot(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "indent": indent,
                 "parent": parent_idx,
                 "required": False,
+                "selected": selected,
                 "children": [],
             })
             if parent_idx is not None:
@@ -276,6 +240,7 @@ def parse_snapshot(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "ref": None, "role": role, "label": name, "value": value,
                 "indent": indent, "parent": parent_idx,
                 "required": False, "children": [],
+                "selected": selected,
             })
             if parent_idx is not None:
                 nodes[parent_idx]["children"].append(len(nodes) - 1)
@@ -375,13 +340,35 @@ def match_field(label: str, pause_patterns, hints, values) -> Dict[str, Any]:
                 return {"decision": "value", "field_name": field_name,
                         "value": answer, "source": kind}
 
-    for pattern, field_name in FIELD_PATTERNS:
-        if re.search(pattern, label):
-            if field_name in values:
-                return {"decision": "value", "field_name": field_name,
-                        "value": values[field_name], "source": "identity"}
-            return {"decision": "missing", "field_name": field_name,
-                    "reason": "no approved value in database"}
+    # The compatibility CLI delegates normal labels to the production matcher
+    # rather than maintaining a second, diverging pattern table.
+    matched = deterministic_match(FormField(ref="legacy", label=label, role="textbox"))
+    if matched.field_class is FieldClass.SENSITIVE:
+        return {"decision": "pause", "reason": matched.reason}
+    legacy_keys = {
+        "personal.full_name": "full_name", "personal.first_name": "legal_first_name",
+        "personal.last_name": "legal_last_name", "personal.middle_name": "middle_name",
+        "personal.preferred_name": "preferred_name", "personal.pronouns": "pronouns",
+        "personal.email": "email", "personal.phone": "phone", "personal.linkedin": "linkedin_url",
+        "personal.phone_country_code": "phone_country_code", "personal.github": "github_url",
+        "personal.portfolio": "portfolio_url", "personal.twitter": "twitter_url", "personal.other_url": "other_url",
+        "address.line1": "address_line1", "address.line2": "address_line2",
+        "address.city": "address_city", "address.state": "address_state",
+        "address.postal": "address_postal", "address.postal_extension": "address_postal_ext",
+        "address.county": "address_county", "address.country": "address_country",
+        "education.university": "university_name", "education.degree": "degree",
+        "education.major": "major", "education.graduation_date": "graduation_date",
+        "employment.current_employer": "current_employer", "employment.current_title": "current_title",
+        "employment.desired_title": "desired_title", "preferences.referral_source": "referral_source",
+        "derived.years_experience": "years_experience",
+    }
+    field_name = legacy_keys.get(matched.profile_key or "")
+    if field_name:
+        if field_name in values:
+            return {"decision": "value", "field_name": field_name,
+                    "value": values[field_name], "source": "identity"}
+        return {"decision": "missing", "field_name": field_name,
+                "reason": "no approved value in database"}
 
     return {"decision": "unknown", "reason": "no rule matches this label"}
 

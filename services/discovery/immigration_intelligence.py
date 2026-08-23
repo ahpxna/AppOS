@@ -9,8 +9,6 @@ from __future__ import annotations
 import re
 from typing import Any, Mapping
 
-from psycopg.types.json import Jsonb
-
 from services.common.immigration_semantics import (
     ImmigrationAssessment,
     RestrictionType,
@@ -62,9 +60,18 @@ def synthesize_immigration_fit(
             return "BLOCKED", "JD explicitly declines sponsorship and conflicts with the candidate-confirmed sponsorship need."
         return "LOW", "JD explicitly declines sponsorship; no compatibility may be inferred without a confirmed profile."
 
+    profile_complete_for_high = (
+        confirmed
+        and status not in {"", "unconfirmed"}
+        and start_sponsorship in {"yes", "no"}
+        and future_sponsorship in {"yes", "no"}
+        # JobOS's target workflow is STEM-OPT aware. Do not promote an F-1
+        # profile to HIGH until its STEM-extension status was explicitly set.
+        and (status != "f1" or profile.get("stem_extension_eligible") is not None)
+    )
     employer_positive = everify_status == "verified" and h1b_history_status == "positive"
     policy_compatible = kind in {RestrictionType.OPT_COMPATIBLE, RestrictionType.STEM_OPT_COMPATIBLE}
-    if confirmed and employer_positive:
+    if profile_complete_for_high and employer_positive:
         return (
             "HIGH",
             "JD has no conflicting restriction and the employer has recorded E-Verify and positive H-1B-history evidence; this is evidence, not a sponsorship promise.",
@@ -80,7 +87,7 @@ def synthesize_immigration_fit(
 def _candidate_profile(cur: Any) -> dict[str, Any]:
     cur.execute(
         """
-        SELECT current_status, us_citizen, us_person, permanent_work_authorization,
+        SELECT current_status, stem_extension_eligible, us_citizen, us_person, permanent_work_authorization,
                requires_sponsorship_to_start, requires_future_sponsorship,
                user_confirmed_at
         FROM immigration_profiles WHERE profile_key = 'primary';
@@ -88,7 +95,7 @@ def _candidate_profile(cur: Any) -> dict[str, Any]:
     )
     row = cur.fetchone()
     keys = (
-        "current_status", "us_citizen", "us_person", "permanent_work_authorization",
+        "current_status", "stem_extension_eligible", "us_citizen", "us_person", "permanent_work_authorization",
         "requires_sponsorship_to_start", "requires_future_sponsorship", "user_confirmed_at",
     )
     return dict(zip(keys, row)) if row else {}
@@ -149,6 +156,8 @@ def _latest_employer_statuses(cur: Any, employer_id: str | None) -> tuple[str, s
 
 def record_jd_immigration_assessment(cur: Any, application_id: str, jd_text: str) -> dict[str, Any]:
     """Upsert job policy plus a synthesized fit as soon as a JD is stored."""
+    from psycopg.types.json import Jsonb
+
     policy = assess_jd_immigration_policy(jd_text)
     employer_id = _ensure_employer(cur, application_id)
     everify, h1b, everify_evidence, h1b_evidence = _latest_employer_statuses(cur, employer_id)

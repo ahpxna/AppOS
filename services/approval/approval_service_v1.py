@@ -456,6 +456,26 @@ def redeem(conn, token: str, *, decision: str, note: str, actor: str) -> int:
             print("  Request changed state concurrently. Nothing done.")
             return 1
 
+        if application_id and new_status == "approved" and atype == "autofill_form":
+            payload = payload_request["payload_json"]
+            cur.execute(
+                """
+                INSERT INTO browser_tasks
+                  (task_type, requested_by, application_id, status, priority,
+                   input_json, approval_request_id, expected_origin,
+                   generated_document_id, document_sha256, timeout_seconds,
+                   idempotency_key, created_at)
+                VALUES ('fill_application_form', %s, %s, 'queued', 'high',
+                        '{}'::jsonb, %s, %s, %s, %s, 300, %s, now())
+                ON CONFLICT (approval_request_id) WHERE approval_request_id IS NOT NULL DO NOTHING;
+                """,
+                (actor, application_id, request_id, payload["expected_origin"],
+                 payload["document_id"], payload["document_sha256"], f"autofill:{request_id}"),
+            )
+            log_event(cur, request_id, "autofill_task_queued", actor, {
+                "expected_origin": payload["expected_origin"], "document_id": payload["document_id"],
+            })
+
         log_event(cur, request_id, new_status, actor, {"note": note})
         conn.commit()
 
@@ -465,8 +485,8 @@ def redeem(conn, token: str, *, decision: str, note: str, actor: str) -> int:
         print(f"  summary:     {summary}")
         if application_id and new_status == "approved" and atype == "autofill_form":
             print("\n  One document/origin-bound autofill capability is approved.")
-            print("  Current JobOS policy still disables real browser writes until the deterministic")
-            print("  engine can re-check origin and selected state after every side effect.")
+            print("  A deterministic one-time browser task was queued; it re-checks origin and")
+            print("  verifies every write. It never submits the application.")
         return 0
 
 

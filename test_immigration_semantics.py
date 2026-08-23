@@ -42,7 +42,9 @@ def test_citizenship_is_not_conflated_with_sponsorship():
 def test_high_requires_confirmed_profile_and_two_distinct_employer_signals():
     policy = assess_jd_immigration_policy("Build distributed services in Python.")
     status, _ = synthesize_immigration_fit(
-        {"user_confirmed_at": "today", "current_status": "F1"}, policy,
+        {"user_confirmed_at": "today", "current_status": "F1",
+         "requires_sponsorship_to_start": "no", "requires_future_sponsorship": "yes",
+         "stem_extension_eligible": True}, policy,
         everify_status="verified", h1b_history_status="positive",
     )
     assert status == "HIGH"

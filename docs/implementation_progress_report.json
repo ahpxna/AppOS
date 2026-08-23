@@ -129,7 +129,7 @@
         "services/document-generation/generate_documents_v1.py",
         "services/document-generation/verify_document_truth_v1.py"
       ],
-      "summary": "Disabled the LLM-driven real-form write path. New approval data binds one application, document hash, target action, and origin for a future deterministic engine, while legacy unbound approvals fail closed. The direct planner refuses writes until active-origin and state-aware radio/checkbox verification exist. Cover-letter structure is deterministic; all substantive paragraphs require candidate evidence, company claims require source-quote entailment verification, and a partially failing resume is regenerated instead of flattened into a template-breaking revision."
+      "summary": "Disabled the LLM-driven real-form write path and retained strict approval binding. Cover-letter structure is deterministic; all substantive paragraphs require candidate evidence, company claims require source-quote entailment verification, and a partially failing resume is regenerated instead of flattened into a template-breaking revision."
     },
     {
       "files": [
@@ -150,6 +150,16 @@
         "services/autofill/autofill_verifier_v1.py"
       ],
       "summary": "Added transport-neutral deterministic autofill contracts: inspect fields, map exact static values, pause derived/sensitive/unknown values, emit least-privilege per-field commands, and require post-write verification before completed status. OpenClaw, Playwright, and CDP are adapter choices; no adapter receives a full candidate profile or authority to decide form answers."
+    },
+    {
+      "files": [
+        "services/autofill/autofill_executor_v1.py",
+        "services/autofill/autofill_session_v1.py",
+        "services/browser-controller/browser_queue_worker.py",
+        "services/approval/approval_service_v1.py",
+        "db/migrations/052_autofill_execution_artifacts.sql"
+      ],
+      "summary": "Wired the production autofill task to a concrete OpenClaw browser transport, not an LLM agent. Approval redemption queues one exact task. The session rechecks focused-tab origin and allowlist before and after each action, executes one narrow action, snapshots to verify it, and consumes the capability after the first verified write. Radio/checkbox work requires an explicit QuestionGroup/Option state model. Immigration answers are available only through exact semantic classes with a candidate confirmation timestamp and version. Resume upload accepts only a registered QA-passed artifact, validates SHA-256 before upload, and verifies the attached filename rather than an absolute browser fakepath."
     }
   ],
   "gemini_windows_log_audit": {
@@ -281,6 +291,7 @@
       ,"Targeted regression suite for immigration semantics, document grounding, and fixed-template resume rules passed (14 tests); Python compilation passed for the changed safety modules. No browser or LLM invocation was used."
       ,"Python syntax compilation and whitespace checks passed for the Ubuntu bootstrap, migration ledger, immigration synthesis, approval reissue change, and deterministic autofill contracts."
       ,"Pure immigration classification and deterministic autofill plan/verify smoke checks passed without a database, browser, LLM, or external call."
+      ,"Deterministic session smoke check passed with a fake transport: a semantic sponsorship answer selected the explicit Yes option, a static field verified after a write, and an incomplete immigration profile could not reach HIGH. No browser command was invoked."
     ],
     "blocked_by_environment": [
       "The Chrome sidecar image kasmweb/chrome:1.16.0 is not present; Docker Desktop image pulls currently fail before download with Keychain Error (-67674).",
