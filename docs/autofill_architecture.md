@@ -54,3 +54,19 @@ the browser's fake local path.
 creates the session only for a queued, exact application/document/origin-bound
 approval; no LLM is in its form-write path. The legacy `autofill_agent_v1.py`
 remains a read-only snapshot/plan compatibility CLI.
+
+## Database integration check
+
+Run this only against a disposable database after applying migrations through
+`054`; the test refuses to use an unspecified or non-test DSN and rolls back
+its fixture data.
+
+```bash
+JOBOS_TEST_DSN='host=127.0.0.1 port=5433 dbname=jobos_autofill_test user=jobos password=...' \
+JOBOS_RUN_DB_INTEGRATION=1 \
+pytest -q test_autofill_execution_db_integration.py
+```
+
+It verifies the actual schema and state path `approved → executing → journal
+verified → consumed → task completed`. Pure form/matching tests remain in
+`test_autofill_pipeline.py`.

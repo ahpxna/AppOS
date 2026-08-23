@@ -157,11 +157,12 @@ GPU workstation.
 ## 7. OpenClaw (tuỳ chọn — chỉ cần cho L3 browser runtime / discovery đọc JD)
 
 ```bash
-# tự tạo token private nếu chưa có, rồi render 4 agent/workspace
-python scripts/setup_openclaw_jobos.py --mode native --force --generate-gateway-token
+# tải private Node/OpenClaw đã pin, tự tạo token nếu cần, rồi render 4 agent/workspace
+python scripts/setup_openclaw_jobos.py --mode native --install-runtime --force --generate-gateway-token
 ```
 
-Script tạo config riêng, bốn agent/workspace (`main`, `resume`,
+`--install-runtime` tải Node/OpenClaw private đã pin vào thư mục local ignored,
+không đổi system Node. Script sau đó tạo config riêng, bốn agent/workspace (`main`, `resume`,
 `cover_letter`, `repo_coordinator`), remote CDP profile và policy tool theo
 least privilege, không chạy model/browser. Với Docker fallback, dùng
 `python scripts/setup_openclaw_jobos.py --mode docker --force` trước khi chạy
@@ -188,10 +189,11 @@ Entry point chính là `services/orchestrator/orchestrator_v1.py` — xem
 `--help` để biết các lệnh (`advance`, `approve`, `deny`, v.v). Toàn bộ các
 bước tốn tiền/nhạy cảm (fit-review khi điểm biên, gửi tin nhắn, generate
 research) đều dừng lại chờ approval qua `services/approval/approval_service_v1.py`
-trước khi tiếp tục — không có bước nào tự động submit đơn. Form write đang bị
-fail-closed: OpenClaw chỉ được dùng để discovery/read-only; deterministic
-autofill chỉ tạo plan để bạn review cho đến khi origin và checkbox/radio state
-được verify đầy đủ.
+trước khi tiếp tục — không có bước nào tự động submit đơn. Form write không
+dùng LLM agent: khi có approval một-lần, document/artifact đúng hash, allowed
+origin, và mapping deterministic đủ chắc chắn, worker fill/select/check/upload
+từng field rồi snapshot xác nhận. Nó không đoán field sensitive; crash/partial
+write chuyển sang `needs_reconciliation`, không retry mù.
 
 Nếu preflight báo thiếu `base_fit_check_support`, không auto-approve dữ liệu.
 Review/approve evidence trước, rồi build các pack deterministic:
@@ -201,6 +203,10 @@ python services/profile-ingestion/prepare_profile_for_pipeline_v1.py status
 python services/profile-ingestion/prepare_profile_for_pipeline_v1.py build --apply
 python services/orchestrator/pipeline_preflight_v1.py --json
 ```
+
+Máy mới chưa có profile riêng: xem [profile onboarding](docs/profile_onboarding.md)
+để stage Word template, resume/transcript/project evidence, parse/ingest và
+review đúng thứ tự.
 
 ## 9.1 — Cửa sổ dán JD (khuyến nghị, không cần browser)
 
@@ -285,7 +291,7 @@ chạy.
 
 ```bash
 python scripts/launch_jobos_browser.py
-python scripts/setup_openclaw_jobos.py --mode native --force --generate-gateway-token
+python scripts/setup_openclaw_jobos.py --mode native --install-runtime --force --generate-gateway-token
 # Keep this terminal running; it starts the private OpenClaw runtime.
 python scripts/start_openclaw_jobos.py gateway
 # In another terminal, confirm the gateway and CDP browser are reachable.

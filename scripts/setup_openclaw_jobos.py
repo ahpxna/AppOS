@@ -29,6 +29,7 @@ from typing import Any, Iterator
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BOOTSTRAP_PATH = REPO_ROOT / "scripts" / "openclaw_bootstrap.py"
+RUNTIME_INSTALLER = REPO_ROOT / "scripts" / "install_openclaw_runtime.py"
 REQUIRED_AGENTS = {"main", "resume", "cover_letter", "repo_coordinator"}
 REQUIRED_DENIES = {"exec", "process", "write", "edit", "apply_patch", "file_write"}
 RUNTIME_PROVIDER_KEYS = ("DEEPSEEK_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY")
@@ -208,6 +209,24 @@ def install_deepseek_plugin(target_home: Path, binary: str) -> dict[str, str]:
     }
 
 
+def install_private_runtime() -> dict[str, str]:
+    """Run the explicit networked runtime installer without exposing secrets."""
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(RUNTIME_INSTALLER), "--json"],
+            capture_output=True, text=True, timeout=720,
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("Pinned Node/OpenClaw runtime installation timed out.")
+    try:
+        result = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Runtime installer returned invalid status output.") from exc
+    if proc.returncode != 0 or result.get("status") != "ok":
+        raise RuntimeError(str(result.get("error") or "Pinned runtime installation failed."))
+    return {"name": "private_openclaw_runtime", "status": "pass", "detail": result.get("openclaw", "installed")}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Set up isolated JobOS OpenClaw agents non-interactively.")
     parser.add_argument("--mode", choices=("native", "docker"), default="native")
@@ -215,9 +234,9 @@ def main() -> int:
     parser.add_argument("--env-file", type=Path, default=REPO_ROOT / ".env")
     parser.add_argument("--secrets-file", type=Path, help="Optional OpenClaw-only secrets file.")
     parser.add_argument("--cdp-url", help="Override remote Chrome CDP URL for this setup.")
-    private_runtime_bin = REPO_ROOT / "data" / "openclaw-runtime" / "node" / "node_modules" / ".bin" / "openclaw"
-    default_openclaw_bin = os.getenv("OPENCLAW_BIN") or (str(private_runtime_bin) if private_runtime_bin.is_file() else "openclaw")
-    parser.add_argument("--openclaw-bin", default=default_openclaw_bin)
+    parser.add_argument("--openclaw-bin", help="Override the private OpenClaw binary (normally unnecessary).")
+    parser.add_argument("--install-runtime", action="store_true",
+                        help="Download and verify the pinned private Node/OpenClaw runtime before rendering config.")
     parser.add_argument("--force", action="store_true", help="Refresh an existing generated OpenClaw home with backups.")
     parser.add_argument("--dry-run", action="store_true", help="Render and inspect only; do not write files.")
     parser.add_argument("--install-deepseek-plugin", action="store_true", help="Install the official provider plugin after setup.")
@@ -225,6 +244,18 @@ def main() -> int:
                         help="Generate and privately append a gateway token to .env when none exists.")
     parser.add_argument("--skip-cli-validation", action="store_true")
     args = parser.parse_args()
+
+    runtime_check = None
+    if args.install_runtime and not args.dry_run:
+        try:
+            runtime_check = install_private_runtime()
+        except RuntimeError as exc:
+            print(json.dumps({"status": "error", "stage": "private_openclaw_runtime", "error": str(exc)}, indent=2))
+            return 1
+    private_runtime_bin = REPO_ROOT / "data" / "openclaw-runtime" / "node" / "node_modules" / ".bin" / "openclaw"
+    args.openclaw_bin = args.openclaw_bin or os.getenv("OPENCLAW_BIN") or (
+        str(private_runtime_bin) if private_runtime_bin.is_file() else "openclaw"
+    )
 
     target_home = args.target_home
     if target_home is None:
@@ -283,6 +314,8 @@ def main() -> int:
 
     config_path = target_home / ".openclaw" / "openclaw.json"
     checks = inspect_rendered_config(config_path)
+    if runtime_check:
+        checks.append(runtime_check)
     for agent_id in sorted(REQUIRED_AGENTS):
         workspace = target_home / ".openclaw" / f"workspace-{agent_id}"
         if agent_id == "main":

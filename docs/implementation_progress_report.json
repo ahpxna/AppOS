@@ -171,6 +171,17 @@
         "docker-compose.openclaw.yml"
       ],
       "summary": "Corrected the concrete OpenClaw command contracts: textbox values use fill --fields JSON and uploads stage a checksum-verified artifact into OpenClaw's managed upload directory before upload --ref. A session pins one stable tab id, passes it to every command, re-snapshots and rematches after every browser side effect, and never reuses stale refs. Approval binds the exact artifact id/SHA/filename. Before the first write a separate committed transaction moves the capability to executing; each action is journaled before execution. Any ambiguous failure becomes needs_reconciliation rather than retrying a partially changed form."
+    },
+    {
+      "files": [
+        "db/migrations/054_autofill_execution_journal.sql",
+        "test_autofill_execution_db_integration.py",
+        "scripts/install_openclaw_runtime.py",
+        "scripts/setup_openclaw_jobos.py",
+        "scripts/jobos_profile_onboarding.py",
+        "docs/profile_onboarding.md"
+      ],
+      "summary": "Added the missing durable-execution schema for the worker: executing approval state with DB invariants, target/journal fields, and active idempotency enforcement. An opt-in disposable-PostgreSQL integration test covers approved → executing → journal verified → consumed. OpenClaw configuration setup can now explicitly install and verify its pinned private Node/OpenClaw runtime with --install-runtime. A local profile onboarding helper stages the private resume template and classified profile sources without DB/LLM writes, while the guide documents parse, ingest, review, project-registry, legal-profile, and manual-login boundaries."
     }
   ],
   "gemini_windows_log_audit": {
@@ -310,6 +321,7 @@
       ,"Pure immigration classification and deterministic autofill plan/verify smoke checks passed without a database, browser, LLM, or external call."
       ,"Deterministic session smoke check passed with a fake transport: a semantic sponsorship answer selected the explicit Yes option, a static field verified after a write, and an incomplete immigration profile could not reach HIGH. No browser command was invoked."
       ,"Python compilation passed for the pinned OpenClaw transport, rematching session, durable journal worker wiring, and approval artifact binding. The focused unit test exercises the exact fill --fields JSON payload and target id with a fake transport; no OpenClaw/browser/LLM invocation was used."
+      ,"Python compilation passed for the runtime installer, setup wrapper, profile onboarding helper, migration integration-test source, and worker. The OpenClaw setup dry run and profile-onboarding status command returned valid JSON; deterministic autofill tests passed (6). No runtime download, database integration, browser, or model run was started."
     ],
     "blocked_by_environment": [
       "The Chrome sidecar image kasmweb/chrome:1.16.0 is not present; Docker Desktop image pulls currently fail before download with Keychain Error (-67674).",
@@ -327,6 +339,8 @@
     "Repair Docker Desktop Keychain access or load kasmweb/chrome:1.16.0 through an approved registry path, then start the OpenClaw + browser overlay with an environment-only OPENCLAW_GATEWAY_TOKEN.",
     "Configure OpenClaw model names and re-run scripts/openclaw_bootstrap.py bootstrap --force after reviewing backups."
     ,"Apply migration 050, then use immigration_profile_v1.py set --confirm --apply only with candidate-verified values. Review JD flags and attach employer evidence with source URLs; do not treat E-Verify as a sponsorship guarantee."
+    ,"Before enabling deterministic form writes, apply migration 054 and run the disposable database test with JOBOS_TEST_DSN plus JOBOS_RUN_DB_INTEGRATION=1; then use a non-production ATS form for the first browser smoke test."
+    ,"On a clean clone, run setup_openclaw_jobos.py with --install-runtime before start_openclaw_jobos.py; use docs/profile_onboarding.md to stage private candidate inputs."
   ],
   "privacy_note": "This is a decision/progress report. It intentionally excludes private chain-of-thought and secrets."
 }

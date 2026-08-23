@@ -55,12 +55,13 @@ tokens in this repository.
 
 ### Current form-write policy
 
-`fill_application_form` is deliberately fail-closed. The historical path sent
-a real form and document text to an OpenClaw LLM agent; it is removed. The
-deterministic `autofill_agent_v1.py` remains useful for inspecting/planning
-fields, but `--apply` refuses to write until it can prove the focused page
-origin before every side effect, model checkbox/radio state, and verify every
-write afterwards. No agent can submit an application.
+`fill_application_form` never uses an OpenClaw LLM agent. Its deterministic
+path writes only an approval-bound value to an exact field, pins one browser
+target, rechecks allowed origin before/after every action, rematches refs after
+each UI change, and verifies the result. Sensitive fields require an exact
+user-confirmed semantic answer. The worker cannot submit an application; a
+crash or ambiguous partial write becomes `needs_reconciliation`, never an
+automatic replay.
 
 ## Non-interactive JobOS setup
 
@@ -79,7 +80,7 @@ the JSON template, Git, reports, or agent workspace.
 Native gateway under the dedicated OS user:
 
 ```bash
-python scripts/setup_openclaw_jobos.py --mode native --force --generate-gateway-token
+python scripts/setup_openclaw_jobos.py --mode native --install-runtime --force --generate-gateway-token
 # Private Node 24 + OpenClaw, not the system/global OpenClaw installation.
 python scripts/start_openclaw_jobos.py gateway
 ```
@@ -94,7 +95,11 @@ docker compose -f docker-compose.yml -f docker-compose.openclaw.yml up -d
 python services/orchestrator/pipeline_preflight_v1.py --check-browser
 ```
 
-Docker mode writes the config under `data/openclaw-runtime/.openclaw` and
+`setup_openclaw_jobos.py` renders configuration. It does not download a runtime
+unless `--install-runtime` is supplied; that explicit flag downloads and
+checksum-verifies the pinned Node distribution, installs the pinned OpenClaw
+package under ignored `data/openclaw-runtime/`, and verifies `node --version`
+and `openclaw --version` before configuration validation. Docker mode writes the config under `data/openclaw-runtime/.openclaw` and
 renders the remote CDP endpoint as `http://browser:9222`, the correct address
 inside the Compose network. Native mode renders `http://127.0.0.1:9222` for a
 locally exposed Chrome CDP listener. The host-side queue health check probes
