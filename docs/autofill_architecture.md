@@ -44,6 +44,31 @@ crash or ambiguous failure leaves the task in `needs_reconciliation`, never
 queued for an automatic browser replay. A completed or partial write consumes
 the capability once and preserves the journal for review.
 
+The approval is also page- and input-bound: it contains the exact canonical
+initial URL, an accessible-page fingerprint captured read-only before approval,
+and a hash of approved static values, legal answer confirmation versions,
+document hash, artifact hash, and page identity. A same-origin tab for another
+job, or any profile change after approval, is refused before the first write.
+Capture the identity without writing:
+
+```bash
+python services/autofill/autofill_agent_v1.py page-identity --url 'https://ats.example/apply/job-123'
+```
+
+Pass both returned values as `--expected-page-url` and
+`--expected-page-fingerprint` when creating the `autofill_form` approval.
+
+F-1/STEM prompts are classified separately. `CURRENT_STEM_OPT_STATUS`,
+`WILL_REQUIRE_STEM_EXTENSION`, and `I983_REQUIREMENT` remain paused unless
+the candidate has confirmed that exact meaning, for example:
+
+```bash
+python services/discovery/immigration_profile_v1.py set-exact-answer \
+  --question-class WILL_REQUIRE_STEM_EXTENSION --answer yes --confirm --apply
+```
+
+Employer E-Verify is never populated from candidate data and remains paused.
+
 Resume/cover-letter upload is limited to one QA-passed, user-approved artifact
 whose id, SHA-256, and filename are bound into the approval. Its bytes are
 rechecked, staged under OpenClaw's managed upload directory, and only then
@@ -58,7 +83,7 @@ remains a read-only snapshot/plan compatibility CLI.
 ## Database integration check
 
 Run this only against a disposable database after applying migrations through
-`054`; the test refuses to use an unspecified or non-test DSN and rolls back
+`055`; the test refuses to use an unspecified or non-test DSN and rolls back
 its fixture data.
 
 ```bash
@@ -70,3 +95,11 @@ pytest -q test_autofill_execution_db_integration.py
 It verifies the actual schema and state path `approved → executing → journal
 verified → consumed → task completed`. Pure form/matching tests remain in
 `test_autofill_pipeline.py`.
+
+For an interrupted session, first inspect the durable journal, then explicitly
+close the non-replayable capability only after inspecting the real page:
+
+```bash
+python services/autofill/autofill_reconcile_v1.py TASK_UUID
+python services/autofill/autofill_reconcile_v1.py TASK_UUID --close
+```

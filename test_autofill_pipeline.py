@@ -3,7 +3,7 @@ from pathlib import Path
 
 from services.autofill.autofill_planner_v1 import plan_autofill
 from services.autofill.autofill_executor_v1 import BrowserTarget, OpenClawTransport
-from services.autofill.autofill_session_v1 import AutofillSession, SnapshotState
+from services.autofill.autofill_session_v1 import AutofillSession, SessionError, SnapshotState
 from services.autofill.autofill_verifier_v1 import verify_actions
 from services.autofill.form_inspector_v1 import FormField, QuestionGroup, QuestionOption
 
@@ -48,6 +48,25 @@ def test_confirmed_semantic_answer_selects_only_the_matching_radio_option():
     assert actions[0].ref == "yes"
 
 
+def test_stem_question_requires_its_own_confirmed_semantic_answer():
+    group = QuestionGroup(
+        "Will you require a STEM OPT extension?", "radiogroup",
+        (QuestionOption("yes", "Yes", False), QuestionOption("no", "No", True)),
+    )
+    paused, _ = plan_autofill([], {}, question_groups=[group], approved_sensitive_answers={})
+    assert paused[0].action == "pause"
+    actions, _ = plan_autofill(
+        [], {}, question_groups=[group],
+        approved_sensitive_answers={
+            "WILL_REQUIRE_STEM_EXTENSION": {
+                "value": "Yes", "confirmed_at": "2026-08-23", "confirmation_version": 1,
+            },
+        },
+    )
+    assert actions[0].action == "check"
+    assert actions[0].ref == "yes"
+
+
 def test_session_pins_target_rematches_after_write_and_journals_it():
     class FakeTransport:
         def __init__(self):
@@ -68,7 +87,8 @@ def test_session_pins_target_rematches_after_write_and_journals_it():
     journal = []
     session = AutofillSession(
         transport=transport, expected_origin="https://jobs.example.com",
-        snapshot_state=lambda _target: SnapshotState((FormField("first", "First name", "textbox", transport.value),), ()),
+        expected_initial_url="https://jobs.example.com/apply", expected_page_fingerprint="fingerprint",
+        snapshot_state=lambda _target: SnapshotState((FormField("first", "First name", "textbox", transport.value),), (), "fingerprint"),
         origin_allowed=lambda _url: None,
         begin_execution=lambda target: journal.append(("begin", target)),
         before_action=lambda action, target: journal.append(("before", action.ref, target)) or "journal-1",
@@ -81,6 +101,51 @@ def test_session_pins_target_rematches_after_write_and_journals_it():
         ("begin", "tab-1"), ("before", "first", "tab-1"),
         ("verified", "first", "tab-1", "journal-1"),
     ]
+
+
+def test_session_verifies_re_rendered_ref_and_normalized_phone():
+    class FakeTransport:
+        def __init__(self): self.value = ""
+        def resolve_target(self): return BrowserTarget("tab-1", "https://jobs.example.com/apply")
+        def current_url(self, _target): return "https://jobs.example.com/apply"
+        def snapshot(self, _target): return {}
+        def execute(self, _target, command): self.value = command["value"]
+    transport = FakeTransport()
+    actions, _ = plan_autofill([FormField("old-ref", "Phone", "textbox")], {"personal": {"phone": "6095551234"}})
+    session = AutofillSession(
+        transport=transport, expected_origin="https://jobs.example.com", expected_initial_url="https://jobs.example.com/apply",
+        expected_page_fingerprint="fingerprint",
+        snapshot_state=lambda _target: SnapshotState((FormField("new-ref", "Phone", "textbox", "(609) 555-1234"),), (), "fingerprint"),
+        origin_allowed=lambda _url: None, begin_execution=lambda _target: None,
+        before_action=lambda _action, _target: "journal", after_verified=lambda *_args: None,
+        after_failed=lambda *_args: None,
+    )
+    assert session.execute(lambda _state: actions).status == "completed"
+
+
+def test_session_refuses_same_origin_but_different_approved_job_page():
+    class FakeTransport:
+        def resolve_target(self): return BrowserTarget("tab-1", "https://jobs.example.com/job-B/apply")
+        def current_url(self, _target): return "https://jobs.example.com/job-B/apply"
+        def snapshot(self, _target): return {}
+        def execute(self, _target, _command): raise AssertionError("must not write")
+    session = AutofillSession(
+        transport=FakeTransport(), expected_origin="https://jobs.example.com",
+        expected_initial_url="https://jobs.example.com/job-A/apply", expected_page_fingerprint="fingerprint",
+        snapshot_state=lambda _target: SnapshotState((), (), "fingerprint"), origin_allowed=lambda _url: None,
+        begin_execution=lambda _target: raise_error("must not begin"),
+        before_action=lambda *_args: raise_error("must not journal"),
+        after_verified=lambda *_args: None, after_failed=lambda *_args: None,
+    )
+    try:
+        session.execute(lambda _state: [])
+    except SessionError:
+        return
+    raise AssertionError("same-origin, different-job page was accepted")
+
+
+def raise_error(message):
+    raise AssertionError(message)
 
 
 def test_openclaw_fill_uses_documented_fields_payload_and_pinned_target():

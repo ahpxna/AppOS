@@ -20,7 +20,7 @@ systemd Ollama: [docs/ubuntu_gpu.md](docs/ubuntu_gpu.md).
 
 - WSL2 + Ubuntu (Windows) hoặc macOS/Linux, có Bash
 - Docker Desktop (bật WSL2 integration nếu dùng Windows)
-- Python 3.10+
+- Python 3.11+
 - Git
 - [Ollama](https://ollama.com/download) — chạy local LLM, cài trực tiếp trong
   WSL/máy, không qua Docker

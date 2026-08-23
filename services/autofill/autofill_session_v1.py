@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 from typing import Callable
 from urllib.parse import urlsplit
 
 from services.autofill.autofill_executor_v1 import AutofillTransport, BrowserTarget
 from services.autofill.autofill_planner_v1 import PlannedAction
 from services.autofill.form_inspector_v1 import FormField, QuestionGroup
+from services.common.autofill_identity import canonical_page_url
 
 
 class SessionError(RuntimeError):
@@ -18,6 +20,7 @@ class SessionError(RuntimeError):
 class SnapshotState:
     fields: tuple[FormField, ...]
     groups: tuple[QuestionGroup, ...]
+    page_fingerprint: str = ""
 
 
 @dataclass(frozen=True)
@@ -40,6 +43,26 @@ def _filename(value: str) -> str:
     return value.replace("\\", "/").rsplit("/", 1)[-1]
 
 
+def _normal_text(value: str) -> str:
+    return " ".join((value or "").casefold().split())
+
+
+def _equivalent_value(action: PlannedAction, observed: str, role: str) -> bool:
+    if action.value is None:
+        return False
+    if action.action == "upload":
+        return _filename(observed) == _filename(action.value)
+    if action.profile_key and action.profile_key.endswith("phone"):
+        return re.sub(r"\D", "", observed) == re.sub(r"\D", "", action.value)
+    # Select controls sometimes expose the state abbreviation as a value and
+    # the full state name as accessible text; accepting only exact text would
+    # be a safe but unnecessarily common false-negative. Preserve exactness
+    # for all other values.
+    aliases = {"nj": "new jersey", "ny": "new york", "ca": "california", "tx": "texas"}
+    actual, expected = _normal_text(observed), _normal_text(action.value)
+    return actual == expected or role in {"select", "combobox", "listbox"} and aliases.get(actual) == expected or aliases.get(expected) == actual
+
+
 def action_identity(action: PlannedAction) -> tuple[str, str | None, str | None, str | None]:
     return action.action, action.profile_key, action.question_label, action.value
 
@@ -47,12 +70,15 @@ def action_identity(action: PlannedAction) -> tuple[str, str | None, str | None,
 class AutofillSession:
     """Replans from a fresh snapshot; old refs never survive an action."""
     def __init__(self, *, transport: AutofillTransport, expected_origin: str,
+                 expected_initial_url: str, expected_page_fingerprint: str,
                  snapshot_state: Callable[[str], SnapshotState], origin_allowed: Callable[[str], None],
                  begin_execution: Callable[[str], None], before_action: Callable[[PlannedAction, str], str],
                  after_verified: Callable[[PlannedAction, str, str], None],
                  after_failed: Callable[[PlannedAction, str, str], None]):
         self.transport = transport
         self.expected_origin = _origin(expected_origin)
+        self.expected_initial_url = canonical_page_url(expected_initial_url)
+        self.expected_page_fingerprint = expected_page_fingerprint
         self.snapshot_state = snapshot_state
         self.origin_allowed = origin_allowed
         self.begin_execution, self.before_action = begin_execution, before_action
@@ -64,15 +90,33 @@ class AutofillSession:
         if _origin(current) != self.expected_origin:
             raise SessionError(f"Pinned browser target moved to {_origin(current)}; expected {self.expected_origin}.")
 
+    def _assert_initial_page(self, target: BrowserTarget, state: SnapshotState) -> None:
+        if canonical_page_url(self.transport.current_url(target.target_id)) != self.expected_initial_url:
+            raise SessionError("Pinned browser target is not the approval-bound application page.")
+        if not state.page_fingerprint or state.page_fingerprint != self.expected_page_fingerprint:
+            raise SessionError("Current application page fingerprint differs from the approved page; refusing writes.")
+
     @staticmethod
     def _verified(action: PlannedAction, state: SnapshotState) -> bool:
         if action.action in {"check", "verify"}:
-            return any(option.ref == action.ref and option.selected is True
-                       for group in state.groups for option in group.options)
+            # The option ref may change on an ATS rerender: recover by the
+            # question and desired option label, never by a stale old ref.
+            return any(
+                option.selected is True and (
+                    option.ref == action.ref or
+                    _normal_text(option.label) == _normal_text(action.value or "")
+                ) and (not action.question_label or _normal_text(group.label) == _normal_text(action.question_label))
+                for group in state.groups for option in group.options
+            )
         field = next((item for item in state.fields if item.ref == action.ref), None)
-        if field is None or action.value is None:
+        if field is None:
+            # React/Workday often replaces every accessibility ref. Recover
+            # the field semantically by its approved question label.
+            field = next((item for item in state.fields
+                          if action.question_label and _normal_text(item.label) == _normal_text(action.question_label)), None)
+        if field is None:
             return False
-        return _filename(field.value) == _filename(action.value) if action.action == "upload" else field.value == action.value
+        return _equivalent_value(action, field.value, field.role)
 
     def execute(self, plan: Callable[[SnapshotState], list[PlannedAction]]) -> SessionResult:
         target = self.transport.resolve_target()
@@ -80,6 +124,7 @@ class AutofillSession:
         # Do not consume a capability merely to inspect a form with no
         # deterministic write.  The preflight snapshot is read-only.
         state = self.snapshot_state(target.target_id)
+        self._assert_initial_page(target, state)
         initial_actions = plan(state)
         if not any(item.action in {"fill", "select", "check", "upload"} for item in initial_actions):
             pauses = any(item.action == "pause" for item in initial_actions)

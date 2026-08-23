@@ -49,7 +49,16 @@ python services/profile-ingestion/ingest_profile_sources_v2.py --apply
 
 Review the resulting profile assets before approving them. Approval is manual
 because it authorizes later resume/cover-letter claims; do not bulk approve
-for convenience. Once appropriate assets/capabilities are approved, run:
+for convenience. The first command is read-only; `approve` is dry-run unless
+you explicitly add `--apply`.
+
+```bash
+python scripts/jobos_profile_onboarding.py review
+python scripts/jobos_profile_onboarding.py approve <asset-id> --note "Checked against source PDF"
+python scripts/jobos_profile_onboarding.py approve <asset-id> --note "Checked against source PDF" --apply
+```
+
+Once appropriate assets/capabilities are approved, run:
 
 ```bash
 python services/profile-ingestion/prepare_profile_for_pipeline_v1.py status

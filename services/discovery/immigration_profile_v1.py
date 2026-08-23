@@ -28,17 +28,21 @@ from typing import Any
 
 import psycopg
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+from services.common.config import database_dsn
+from services.common.immigration_semantics import (
+    EXACT_CANDIDATE_ADDITIONAL_CLASSES,
+    ImmigrationQuestionClass,
+)
 from services.discovery.immigration_intelligence import (
     record_employer_evidence,
     record_jd_immigration_assessment,
 )
 
-DB_HOST = os.getenv("JOBOS_DB_HOST", "127.0.0.1")
-DB_PORT = int(os.getenv("JOBOS_DB_PORT", "5433"))
-DB_NAME = os.getenv("JOBOS_DB_NAME", "job_apply_os")
-DB_USER = os.getenv("JOBOS_DB_USER", "jobos")
-DB_PASSWORD = os.getenv("JOBOS_DB_PASSWORD", "jobos_local_dev_password_change_later")
-DSN = f"host={DB_HOST} port={DB_PORT} dbname={DB_NAME} user={DB_USER} password={DB_PASSWORD}"
+DSN = database_dsn()
+
+# These are candidate attestations. Employer E-Verify is deliberately absent:
+# it is employer evidence, not a candidate-provided legal profile field.
+EXACT_ADDITIONAL_QUESTION_CLASSES = EXACT_CANDIDATE_ADDITIONAL_CLASSES
 
 
 def parse_date(value: str | None) -> str | None:
@@ -223,6 +227,39 @@ def cmd_employer_evidence(conn, args) -> int:
     return 0
 
 
+def cmd_set_exact_answer(conn, args) -> int:
+    """Store one candidate-confirmed answer for one precise question class."""
+    question_class = ImmigrationQuestionClass(args.question_class)
+    if question_class not in EXACT_ADDITIONAL_QUESTION_CLASSES:
+        print("ERROR: this question class is not a candidate-only exact-answer field.")
+        return 1
+    if not args.confirm:
+        print("REFUSED: add --confirm only after you personally verified this exact meaning.")
+        return 1
+    field_name = f"immigration:{question_class.value}"
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO sensitive_answers
+              (field_name, answer, answer_kind, requires_review, approved_by_user, question_hints, notes)
+            VALUES (%s, %s, 'eligibility', false, true, '[]'::jsonb, %s)
+            ON CONFLICT (field_name) DO UPDATE
+            SET answer = EXCLUDED.answer, answer_kind = EXCLUDED.answer_kind,
+                requires_review = false, approved_by_user = true,
+                notes = EXCLUDED.notes, updated_at = now();
+            """,
+            (field_name, args.answer.title(),
+             (args.note or "Candidate-confirmed exact immigration question class.").strip()),
+        )
+    if args.apply:
+        conn.commit()
+        print(f"Saved candidate-confirmed answer for {question_class.value}.")
+    else:
+        conn.rollback()
+        print("DRY RUN: exact immigration answer not saved.")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="JobOS immigration profile and employer-evidence ledger.")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -252,6 +289,12 @@ def main() -> int:
     evidence.add_argument("--legal-entity-name")
     evidence.add_argument("--confidence", type=float, default=0.7)
     evidence.add_argument("--apply", action="store_true")
+    exact = sub.add_parser("set-exact-answer", help="Save one candidate-confirmed STEM/I-983 answer.")
+    exact.add_argument("--question-class", choices=[item.value for item in sorted(EXACT_ADDITIONAL_QUESTION_CLASSES, key=str)], required=True)
+    exact.add_argument("--answer", choices=("yes", "no"), required=True)
+    exact.add_argument("--note")
+    exact.add_argument("--confirm", action="store_true")
+    exact.add_argument("--apply", action="store_true")
     args = parser.parse_args()
     with psycopg.connect(DSN, autocommit=False) as conn:
         if args.command == "show":
@@ -259,7 +302,9 @@ def main() -> int:
                 return cmd_show(cur)
         if args.command == "set":
             return cmd_set(conn, args)
-        return cmd_employer_evidence(conn, args)
+        if args.command == "employer-evidence":
+            return cmd_employer_evidence(conn, args)
+        return cmd_set_exact_answer(conn, args)
 
 
 if __name__ == "__main__":

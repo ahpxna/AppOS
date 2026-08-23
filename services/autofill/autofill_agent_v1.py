@@ -54,6 +54,7 @@ import psycopg
 from services.common.immigration_semantics import legal_question_pause_reason
 from services.autofill.field_matcher_v1 import FieldClass, match_field as deterministic_match
 from services.autofill.form_inspector_v1 import FormField
+from services.common.autofill_identity import canonical_page_url, page_fingerprint
 
 DB_HOST = os.getenv("JOBOS_DB_HOST", "127.0.0.1")
 DB_PORT = int(os.getenv("JOBOS_DB_PORT", "5433"))
@@ -143,6 +144,17 @@ def cmd_probe(conn, args) -> int:
         proc = run_browser(sub, timeout=30)
         print((proc.stdout or proc.stderr or "").strip()[:2000])
         print()
+    return 0
+
+
+def cmd_page_identity(conn, args) -> int:
+    """Capture a read-only page binding before creating an autofill approval."""
+    with conn.cursor() as cur:
+        check_domain(cur, args.url)
+    run_browser(["open", args.url], timeout=90)
+    payload = browser_json(["snapshot", "--efficient"], timeout=150)
+    print(json.dumps({"canonical_page_url": canonical_page_url(args.url),
+                      "page_fingerprint": page_fingerprint(payload)}, indent=2))
     return 0
 
 
@@ -705,6 +717,8 @@ def main() -> int:
     sub = p.add_subparsers(dest="command", required=True)
 
     sub.add_parser("probe")
+    pid = sub.add_parser("page-identity")
+    pid.add_argument("--url", required=True, help="Read-only exact page identity for a later autofill approval.")
 
     pi = sub.add_parser("inspect")
     pi.add_argument("--url", required=True, help="Allowlisted URL to open before a read-only snapshot.")
@@ -727,7 +741,7 @@ def main() -> int:
     with psycopg.connect(DSN, autocommit=False) as conn:
         try:
             return {
-                "probe": cmd_probe, "inspect": cmd_inspect, "plan": cmd_plan,
+                "probe": cmd_probe, "page-identity": cmd_page_identity, "inspect": cmd_inspect, "plan": cmd_plan,
                 "fill": cmd_fill, "verify": cmd_verify,
             }[args.command](conn, args)
         except AutofillError as e:

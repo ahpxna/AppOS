@@ -81,7 +81,17 @@ def safe_extract(archive: Path, destination: Path) -> None:
             if candidate != root and root not in candidate.parents:
                 raise RuntimeInstallError("Refusing a Node archive with an unsafe member path.")
             if member.issym() or member.islnk():
-                raise RuntimeInstallError("Refusing a Node archive containing links.")
+                # Node distributions legitimately use internal npm/npx links.
+                # Accept only relative targets that resolve inside this archive.
+                if Path(member.linkname).is_absolute():
+                    raise RuntimeInstallError("Refusing a Node archive with an absolute link target.")
+                # Symlinks are relative to their containing directory; tar
+                # hardlinks name another archive member relative to the
+                # archive root.
+                link_base = candidate.parent if member.issym() else destination
+                link_target = (link_base / member.linkname).resolve()
+                if link_target != root and root not in link_target.parents:
+                    raise RuntimeInstallError("Refusing a Node archive link that escapes its extraction root.")
         tar.extractall(destination)
 
 

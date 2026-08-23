@@ -322,6 +322,8 @@
       ,"Deterministic session smoke check passed with a fake transport: a semantic sponsorship answer selected the explicit Yes option, a static field verified after a write, and an incomplete immigration profile could not reach HIGH. No browser command was invoked."
       ,"Python compilation passed for the pinned OpenClaw transport, rematching session, durable journal worker wiring, and approval artifact binding. The focused unit test exercises the exact fill --fields JSON payload and target id with a fake transport; no OpenClaw/browser/LLM invocation was used."
       ,"Python compilation passed for the runtime installer, setup wrapper, profile onboarding helper, migration integration-test source, and worker. The OpenClaw setup dry run and profile-onboarding status command returned valid JSON; deterministic autofill tests passed (6). No runtime download, database integration, browser, or model run was started."
+      ,"P0 autofill hardening compile and deterministic checks passed: exact initial-page URL/fingerprint binding, profile/input hash binding, re-rendered-ref recovery, normalized phone verification, separated STEM/I-983/E-Verify question classes, and the durable reconciliation CLI. No browser, model, DB integration, or runtime download was invoked."
+      ,"Follow-up hardening passed static compilation and 11 focused deterministic tests: same-origin/different-job page refusal, separate candidate-confirmed STEM/I-983 answers, safe Node archive internal-link extraction, automatic .env loading for the bootstrapped virtualenv, and manual profile-asset review/approval commands. No browser, LLM, network, Docker, or live database operation was invoked."
     ],
     "blocked_by_environment": [
       "The Chrome sidecar image kasmweb/chrome:1.16.0 is not present; Docker Desktop image pulls currently fail before download with Keychain Error (-67674).",
@@ -339,7 +341,7 @@
     "Repair Docker Desktop Keychain access or load kasmweb/chrome:1.16.0 through an approved registry path, then start the OpenClaw + browser overlay with an environment-only OPENCLAW_GATEWAY_TOKEN.",
     "Configure OpenClaw model names and re-run scripts/openclaw_bootstrap.py bootstrap --force after reviewing backups."
     ,"Apply migration 050, then use immigration_profile_v1.py set --confirm --apply only with candidate-verified values. Review JD flags and attach employer evidence with source URLs; do not treat E-Verify as a sponsorship guarantee."
-    ,"Before enabling deterministic form writes, apply migration 054 and run the disposable database test with JOBOS_TEST_DSN plus JOBOS_RUN_DB_INTEGRATION=1; then use a non-production ATS form for the first browser smoke test."
+    ,"Before enabling deterministic form writes, apply migrations 054 and 055 and run the disposable database test with JOBOS_TEST_DSN plus JOBOS_RUN_DB_INTEGRATION=1; then use a non-production ATS form for the first browser smoke test."
     ,"On a clean clone, run setup_openclaw_jobos.py with --install-runtime before start_openclaw_jobos.py; use docs/profile_onboarding.md to stage private candidate inputs."
   ],
   "privacy_note": "This is a decision/progress report. It intentionally excludes private chain-of-thought and secrets."

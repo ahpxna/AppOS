@@ -23,8 +23,21 @@ class ImmigrationQuestionClass(StrEnum):
     US_CITIZENSHIP = "US_CITIZENSHIP"
     US_PERSON = "US_PERSON"
     PERMANENT_WORK_AUTHORIZATION = "PERMANENT_WORK_AUTHORIZATION"
-    STEM_OPT_EMPLOYER_REQUIREMENT = "STEM_OPT_EMPLOYER_REQUIREMENT"
+    CURRENT_STEM_OPT_STATUS = "CURRENT_STEM_OPT_STATUS"
+    WILL_REQUIRE_STEM_EXTENSION = "WILL_REQUIRE_STEM_EXTENSION"
+    I983_REQUIREMENT = "I983_REQUIREMENT"
+    EMPLOYER_EVERIFY_REQUIREMENT = "EMPLOYER_EVERIFY_REQUIREMENT"
     UNKNOWN_IMMIGRATION_QUESTION = "UNKNOWN_IMMIGRATION_QUESTION"
+
+
+# These do not share a meaning with the general F-1 eligibility profile and
+# therefore need their own explicit candidate confirmation. Employer E-Verify
+# is intentionally excluded because it is employer evidence, not applicant data.
+EXACT_CANDIDATE_ADDITIONAL_CLASSES = frozenset((
+    ImmigrationQuestionClass.CURRENT_STEM_OPT_STATUS,
+    ImmigrationQuestionClass.WILL_REQUIRE_STEM_EXTENSION,
+    ImmigrationQuestionClass.I983_REQUIREMENT,
+))
 
 
 class RestrictionType(StrEnum):
@@ -77,8 +90,18 @@ def classify_immigration_question(question: str) -> ImmigrationQuestionClass | N
     text = _normalise(question)
     if not is_immigration_question(text):
         return None
-    if any(token in text for token in ("e-verify", "e verify", "i-983", "stem opt")):
-        return ImmigrationQuestionClass.STEM_OPT_EMPLOYER_REQUIREMENT
+    # These terms request different attestations. Employer E-Verify is never
+    # candidate data, so it remains paused unless employer evidence supplies it.
+    if "e-verify" in text or "e verify" in text:
+        return ImmigrationQuestionClass.EMPLOYER_EVERIFY_REQUIREMENT
+    if "i-983" in text or "i 983" in text:
+        return ImmigrationQuestionClass.I983_REQUIREMENT
+    if "stem opt" in text:
+        if any(token in text for token in ("currently", "current", "on stem opt")):
+            return ImmigrationQuestionClass.CURRENT_STEM_OPT_STATUS
+        if any(token in text for token in ("require", "need", "extension", "future")):
+            return ImmigrationQuestionClass.WILL_REQUIRE_STEM_EXTENSION
+        return ImmigrationQuestionClass.UNKNOWN_IMMIGRATION_QUESTION
     if "us person" in text or "u.s. person" in text:
         return ImmigrationQuestionClass.US_PERSON
     if any(token in text for token in ("citizen", "citizenship")):

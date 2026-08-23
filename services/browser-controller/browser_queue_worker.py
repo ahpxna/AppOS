@@ -56,6 +56,7 @@ from psycopg.types.json import Jsonb
 # PYTHONPATH already. Confirmed live 2026-08-01.
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from services.common.observability import emit_trace, make_trace_id
+from services.common.config import load_repo_env
 from services.discovery.linkedin_discovery_v1 import (
     LinkedInDiscoveryError,
     ingest_discovered_jobs,
@@ -66,6 +67,10 @@ from services.autofill.autofill_executor_v1 import OpenClawTransport, TransportE
 from services.autofill.autofill_planner_v1 import plan_autofill
 from services.autofill.autofill_session_v1 import AutofillSession, SessionError, SnapshotState
 from services.autofill.form_inspector_v1 import inspect_nodes, inspect_question_groups
+from services.common.autofill_identity import autofill_input_hash, canonical_page_url, page_fingerprint
+from services.common.immigration_semantics import EXACT_CANDIDATE_ADDITIONAL_CLASSES
+
+load_repo_env()
 
 # ---------------------------------------------------------------- config
 
@@ -305,7 +310,8 @@ def claim_next_task(cur) -> Optional[Dict[str, Any]]:
                   input_json, timeout_seconds, retry_count, max_retries,
                   approval_request_id::text, expected_origin,
                   generated_document_id::text, document_sha256,
-                  bound_artifact_id::text, artifact_sha256, artifact_filename;
+                  bound_artifact_id::text, artifact_sha256, artifact_filename,
+                  expected_initial_url, expected_page_fingerprint, autofill_input_hash;
         """,
         (WORKER_ID, LEASE_SECONDS),
     )
@@ -320,6 +326,7 @@ def claim_next_task(cur) -> Optional[Dict[str, Any]]:
         "approval_request_id": row[7], "expected_origin": row[8],
         "generated_document_id": row[9], "document_sha256": row[10],
         "bound_artifact_id": row[11], "artifact_sha256": row[12], "artifact_filename": row[13],
+        "expected_initial_url": row[14], "expected_page_fingerprint": row[15], "autofill_input_hash": row[16],
     }
 
 
@@ -434,7 +441,8 @@ def require_bound_approval(cur, task: Dict[str, Any]) -> Dict[str, Any]:
         """
         SELECT id::text, target_action, bound_document_id::text,
                bound_document_sha256, expected_origin, bound_artifact_id::text,
-               bound_artifact_sha256, bound_artifact_filename
+               bound_artifact_sha256, bound_artifact_filename, expected_initial_url,
+               expected_page_fingerprint, bound_autofill_input_hash
         FROM approval_requests
         WHERE id = %s
           AND application_id = %s
@@ -449,7 +457,7 @@ def require_bound_approval(cur, task: Dict[str, Any]) -> Dict[str, Any]:
         raise PermanentTaskError(
             "No valid unused approval exists for this exact application capability."
         )
-    approved_id, target_action, bound_doc, bound_hash, bound_origin, artifact_id, artifact_hash, artifact_filename = row
+    approved_id, target_action, bound_doc, bound_hash, bound_origin, artifact_id, artifact_hash, artifact_filename, page_url, page_fingerprint_sha, input_hash = row
     if target_action != "fill_application_form":
         raise PermanentTaskError(f"Approval {approved_id} is not for fill_application_form.")
     if bound_doc != document_id or bound_hash != document_sha256:
@@ -461,8 +469,19 @@ def require_bound_approval(cur, task: Dict[str, Any]) -> Dict[str, Any]:
         or artifact_filename != task.get("artifact_filename")
     ):
         raise PermanentTaskError("Approval artifact binding does not match this task.")
+    try:
+        page_matches = canonical_page_url(str(page_url)) == canonical_page_url(str(task.get("expected_initial_url") or ""))
+    except ValueError:
+        page_matches = False
+    if not all((page_url, page_fingerprint_sha, input_hash)) or not page_matches or (
+        page_fingerprint_sha != task.get("expected_page_fingerprint")
+        or input_hash != task.get("autofill_input_hash")
+    ):
+        raise PermanentTaskError("Approval page/input binding does not match this task.")
     return {"id": approved_id, "document_id": document_id, "expected_origin": origin,
-            "artifact_id": artifact_id, "artifact_sha256": artifact_hash, "artifact_filename": artifact_filename}
+            "artifact_id": artifact_id, "artifact_sha256": artifact_hash, "artifact_filename": artifact_filename,
+            "expected_initial_url": page_url, "expected_page_fingerprint": page_fingerprint_sha,
+            "autofill_input_hash": input_hash}
 
 
 def _durable_connection():
@@ -471,7 +490,9 @@ def _durable_connection():
     Browser writes cannot roll back.  These small state changes therefore
     deliberately survive a later rollback of the main queue transaction.
     """
-    return psycopg.connect(DSN, autocommit=True)
+    # A dedicated connection is durable relative to the queue worker's outer
+    # transaction, but its related statements must still commit atomically.
+    return psycopg.connect(DSN, autocommit=False)
 
 
 def durable_begin_execution(task: Dict[str, Any], binding: Dict[str, Any], target_id: str) -> None:
@@ -593,6 +614,27 @@ def durable_mark_reconciliation(task: Dict[str, Any], target_id: str | None, rea
         )
 
 
+def durable_close_unstarted_approval(task: Dict[str, Any], binding: Dict[str, Any], reason: str) -> None:
+    """Close a capability that produced no external browser write.
+
+    An approved capability must not remain live after its queue task reached a
+    no-write terminal state (for example, every proposed field needed review).
+    A later profile or form change must receive a fresh approval instead.
+    """
+    with _durable_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE approval_requests
+            SET status = 'expired', action_note = COALESCE(action_note, %s)
+            WHERE id = %s AND application_id = %s
+              AND status = 'approved' AND consumed_at IS NULL;
+            """,
+            (reason[:500], binding["id"], task["application_id"]),
+        )
+        if cur.rowcount != 1:
+            raise PermanentTaskError("Unstarted approval changed unexpectedly; do not reuse it.")
+
+
 def load_allowed_domains(cur) -> list:
     cur.execute("SELECT domain FROM allowed_domains WHERE enabled = true;")
     return [r[0].lower() for r in cur.fetchall()]
@@ -638,7 +680,8 @@ def load_autofill_profile(cur, application_id: str, artifact_binding: Dict[str, 
     """
     cur.execute("SELECT field_name, field_value FROM v_autofill_ready_values;")
     identity = {str(name): str(value) for name, value in cur.fetchall() if str(value).strip() and str(value) != "FILL_ME"}
-    profile: dict[str, Any] = {"personal": {}, "address": {}, "education": {}, "employment": {}, "documents": {}}
+    profile: dict[str, Any] = {"personal": {}, "address": {}, "education": {}, "employment": {}, "documents": {},
+                               "_approval_ready_values": identity}
     mapping = {
         "legal_first_name": ("personal", "first_name"), "legal_last_name": ("personal", "last_name"),
         "preferred_name": ("personal", "preferred_name"), "email": ("personal", "email"),
@@ -702,7 +745,6 @@ def load_autofill_profile(cur, application_id: str, artifact_binding: Dict[str, 
             "CURRENT_AUTHORIZATION": row[0], "SPONSORSHIP_TO_START": row[1],
             "SPONSORSHIP_NOW_OR_FUTURE": row[2], "US_CITIZENSHIP": row[3],
             "US_PERSON": row[4], "PERMANENT_WORK_AUTHORIZATION": row[5],
-            "STEM_OPT_EMPLOYER_REQUIREMENT": "yes" if row[6] is True else ("no" if row[6] is False else None),
         }
         for question_class, value in semantic_values.items():
             if str(value).casefold() in {"yes", "no"}:
@@ -710,12 +752,28 @@ def load_autofill_profile(cur, application_id: str, artifact_binding: Dict[str, 
                     "value": str(value).title(), "confirmed_at": confirmed_at,
                     "confirmation_version": int(row[8]),
                 }
+    exact_classes = tuple(item.value for item in EXACT_CANDIDATE_ADDITIONAL_CLASSES)
+    cur.execute(
+        """SELECT field_name, answer, updated_at
+           FROM sensitive_answers
+           WHERE approved_by_user = true
+             AND field_name = ANY(%s)""",
+        ([f"immigration:{item}" for item in exact_classes],),
+    )
+    for field_name, answer, updated_at in cur.fetchall():
+        question_class = str(field_name).removeprefix("immigration:")
+        if question_class in exact_classes and str(answer).casefold() in {"yes", "no"}:
+            answers[question_class] = {
+                "value": str(answer).title(), "confirmed_at": str(updated_at),
+                "confirmation_version": 1,
+            }
     return profile, answers
 
 
 def snapshot_state(transport: OpenClawTransport, target_id: str) -> SnapshotState:
-    nodes = parse_snapshot(transport.snapshot(target_id))
-    return SnapshotState(tuple(inspect_nodes(nodes)), tuple(inspect_question_groups(nodes)))
+    payload = transport.snapshot(target_id)
+    nodes = parse_snapshot(payload)
+    return SnapshotState(tuple(inspect_nodes(nodes)), tuple(inspect_question_groups(nodes)), page_fingerprint(payload))
 
 
 # ---------------------------------------------------------------- handlers
@@ -831,6 +889,13 @@ def handle_fill_application_form(cur, task) -> Dict[str, Any]:
         raise PermanentTaskError("Bound generated document content changed after approval; reissue approval.")
 
     profile, sensitive_answers = load_autofill_profile(cur, task["application_id"], binding)
+    current_input_hash = autofill_input_hash(
+        profile=profile, sensitive_answers=sensitive_answers, document_sha256=document_hash,
+        artifact_sha256=binding.get("artifact_sha256"), page_url=binding["expected_initial_url"],
+        page_fingerprint_sha256=binding["expected_page_fingerprint"],
+    )
+    if current_input_hash != binding["autofill_input_hash"]:
+        raise PermanentTaskError("Candidate profile or confirmed legal answer changed after approval; issue a new approval.")
     transport = OpenClawTransport(binary=OPENCLAW_BIN, profile=os.getenv("JOBOS_BROWSER_PROFILE", "remote"),
                                   timeout=min(int(task["timeout_seconds"]), 90), environment=openclaw_runtime_env())
     execution_started = False
@@ -853,6 +918,8 @@ def handle_fill_application_form(cur, task) -> Dict[str, Any]:
     try:
         session = AutofillSession(
             transport=transport, expected_origin=binding["expected_origin"],
+            expected_initial_url=binding["expected_initial_url"],
+            expected_page_fingerprint=binding["expected_page_fingerprint"],
             snapshot_state=lambda target_id: snapshot_state(transport, target_id),
             origin_allowed=lambda url: check_domain(cur, url),
             begin_execution=begin_execution,
@@ -863,6 +930,11 @@ def handle_fill_application_form(cur, task) -> Dict[str, Any]:
         result = session.execute(make_plan)
         if execution_started:
             durable_finish_execution(task, binding, result)
+        else:
+            durable_close_unstarted_approval(
+                task, binding,
+                "No deterministic browser write ran; issue a fresh approval after review or form changes.",
+            )
     except (SessionError, TransportError, PermanentTaskError) as exc:
         if execution_started:
             durable_mark_reconciliation(task, pinned_target_id, str(exc))
@@ -872,6 +944,10 @@ def handle_fill_application_form(cur, task) -> Dict[str, Any]:
             ) from exc
         if isinstance(exc, TransportError):
             raise TransientTaskError(str(exc)) from exc
+        # This task is terminal but never wrote to the browser.  Close its
+        # capability so an invalid page identity or changed form can be
+        # reviewed and approved afresh instead of leaving idempotency stuck.
+        durable_close_unstarted_approval(task, binding, f"Preflight refused: {exc}")
         raise PermanentTaskError(str(exc)) from exc
     return {
         "status": result.status, "verified_refs": list(result.verified_refs),
@@ -879,6 +955,7 @@ def handle_fill_application_form(cur, task) -> Dict[str, Any]:
         "pinned_target_id": result.target_id,
         "paused": [action.question_label or action.reason for action in latest_actions if action.action == "pause"],
         "approval_consumed": execution_started,
+        "approval_closed_without_write": not execution_started,
         "submitted": False,
     }
 

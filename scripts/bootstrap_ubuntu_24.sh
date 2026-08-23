@@ -25,7 +25,11 @@ EOF
   exit 0
 fi
 
-need_command python3 "Install Python 3.10+ and retry."
+need_command python3 "Install Python 3.11+ and retry."
+python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' || {
+  echo "ERROR: JobOS requires Python 3.11+ (it uses enum.StrEnum)." >&2
+  exit 1
+}
 need_command docker "Install Docker Engine/Desktop plus the Docker Compose plugin, then retry."
 docker compose version >/dev/null 2>&1 || {
   echo "ERROR: Docker Compose v2 plugin is required (the 'docker compose' command)." >&2
@@ -60,6 +64,13 @@ if [[ ! -x .venv/bin/python ]]; then
 fi
 .venv/bin/python -m pip install --upgrade pip
 .venv/bin/python -m pip install -r requirements.txt
+
+# Make the repository available during Python's startup so sitecustomize.py
+# loads the untracked .env for every service launched from this virtualenv.
+# This avoids requiring users to remember `source .env` (which would also
+# incorrectly treat the file as shell code).
+site_packages="$(.venv/bin/python -c 'import site; print(site.getsitepackages()[0])')"
+printf '%s\n' "$ROOT" > "$site_packages/jobos_repo_root.pth"
 
 compose_services=(postgres)
 if [[ "${1:-}" == "--with-n8n" ]]; then

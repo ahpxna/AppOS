@@ -11,9 +11,8 @@ Token handling:
   anyone approve anything, and a token pasted into a chat log can be revoked
   by expiring the request rather than by rotating a shared secret.
 
-  Redemption is single-use and constant-time compared. Wrong tokens increment
-  attempt_count; after max_attempts the request locks itself out, so a token
-  cannot be brute-forced even if the request id leaks.
+  Redemption is single-use and constant-time compared. An unmatched token does
+  not mutate unrelated approvals; local rate limits belong outside this table.
 
 Usage:
   python services/approval/approval_service_v1.py create \
@@ -33,11 +32,18 @@ import json
 import os
 import secrets
 import sys
+from pathlib import Path
 from urllib.parse import urlsplit
 from typing import Any, Dict, Optional
 
 import psycopg
 from psycopg.types.json import Jsonb
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from services.common.config import load_repo_env
+from services.common.autofill_identity import autofill_input_hash, canonical_page_url
+from services.common.immigration_semantics import EXACT_CANDIDATE_ADDITIONAL_CLASSES
+
+load_repo_env()
 
 DB_HOST = os.getenv("JOBOS_DB_HOST", "127.0.0.1")
 DB_PORT = int(os.getenv("JOBOS_DB_PORT", "5433"))
@@ -144,6 +150,46 @@ def fetch_artifact_binding(cur, application_id: str, document_id: str, artifact_
     if not row:
         raise RuntimeError("artifact must belong to the exact application and approved document.")
     return {"id": row[0], "sha256": row[1], "filename": row[2]}
+
+
+def current_autofill_input_hash(cur, *, document_sha256: str, artifact_sha256: str | None,
+                                page_url: str, page_fingerprint: str) -> str:
+    """Snapshot only values that the deterministic executor may later write."""
+    cur.execute("SELECT field_name, field_value FROM v_autofill_ready_values;")
+    ready_values = {str(name): str(value) for name, value in cur.fetchall()
+                    if str(value).strip() and str(value) != "FILL_ME"}
+    cur.execute(
+        """SELECT current_work_authorization, requires_sponsorship_to_start,
+                  requires_future_sponsorship, us_citizen, us_person,
+                  permanent_work_authorization, user_confirmed_at, confirmation_version
+           FROM immigration_profiles WHERE profile_key = 'primary';"""
+    )
+    row = cur.fetchone()
+    answers: dict[str, dict[str, object]] = {}
+    if row and row[6] and int(row[7] or 0) >= 1:
+        for key, value in zip(("CURRENT_AUTHORIZATION", "SPONSORSHIP_TO_START", "SPONSORSHIP_NOW_OR_FUTURE",
+                               "US_CITIZENSHIP", "US_PERSON", "PERMANENT_WORK_AUTHORIZATION"), row[:6]):
+            if str(value).casefold() in {"yes", "no"}:
+                answers[key] = {"value": str(value).title(), "confirmed_at": str(row[6]),
+                                "confirmation_version": int(row[7])}
+    exact_classes = tuple(item.value for item in EXACT_CANDIDATE_ADDITIONAL_CLASSES)
+    cur.execute(
+        """SELECT field_name, answer, updated_at
+           FROM sensitive_answers
+           WHERE approved_by_user = true
+             AND field_name = ANY(%s)""",
+        ([f"immigration:{item}" for item in exact_classes],),
+    )
+    for field_name, answer, updated_at in cur.fetchall():
+        question_class = str(field_name).removeprefix("immigration:")
+        if question_class in exact_classes and str(answer).casefold() in {"yes", "no"}:
+            answers[question_class] = {
+                "value": str(answer).title(), "confirmed_at": str(updated_at),
+                "confirmation_version": 1,
+            }
+    return autofill_input_hash(profile={"_approval_ready_values": ready_values}, sensitive_answers=answers,
+                               document_sha256=document_sha256, artifact_sha256=artifact_sha256,
+                               page_url=page_url, page_fingerprint_sha256=page_fingerprint)
 
 
 def normalise_origin(value: str) -> str:
@@ -280,14 +326,24 @@ def cmd_create(conn, args) -> int:
                 "content_hash": binding["content_hash"],
             })
         elif args.type == "autofill_form":
-            if not args.application_id or not args.document_id or not args.expected_origin:
-                print("ERROR: autofill_form requires --application-id, --document-id and --expected-origin.")
+            if not all((args.application_id, args.document_id, args.expected_origin,
+                        args.expected_page_url, args.expected_page_fingerprint)):
+                print("ERROR: autofill_form requires --application-id, --document-id, --expected-origin, --expected-page-url and --expected-page-fingerprint.")
                 return 1
             try:
                 binding = fetch_document_binding(cur, args.application_id, args.document_id)
                 expected_origin = normalise_origin(args.expected_origin)
+                expected_page_url = canonical_page_url(args.expected_page_url)
+                if normalise_origin(expected_page_url) != expected_origin:
+                    raise RuntimeError("--expected-page-url must belong to --expected-origin.")
+                if len(args.expected_page_fingerprint) != 64 or any(ch not in "0123456789abcdef" for ch in args.expected_page_fingerprint.casefold()):
+                    raise RuntimeError("--expected-page-fingerprint must be a SHA-256 hex value from the read-only page identity command.")
                 artifact = (fetch_artifact_binding(cur, args.application_id, args.document_id, args.artifact_id)
                             if args.artifact_id else None)
+                input_hash = current_autofill_input_hash(
+                    cur, document_sha256=binding["content_hash"], artifact_sha256=artifact["sha256"] if artifact else None,
+                    page_url=expected_page_url, page_fingerprint=args.expected_page_fingerprint.casefold(),
+                )
             except RuntimeError as exc:
                 print(f"ERROR: {exc}")
                 return 1
@@ -295,6 +351,9 @@ def cmd_create(conn, args) -> int:
                 "document_id": binding["id"],
                 "document_sha256": binding["content_hash"],
                 "expected_origin": expected_origin,
+                "expected_initial_url": expected_page_url,
+                "expected_page_fingerprint": args.expected_page_fingerprint.casefold(),
+                "autofill_input_hash": input_hash,
                 "artifact_id": artifact["id"] if artifact else None,
                 "artifact_sha256": artifact["sha256"] if artifact else None,
                 "artifact_filename": artifact["filename"] if artifact else None,
@@ -302,7 +361,9 @@ def cmd_create(conn, args) -> int:
             idempotency_key = hash_json({
                 "type": args.type, "application_id": args.application_id,
                 "document_id": binding["id"], "document_sha256": binding["content_hash"],
-                "expected_origin": expected_origin, "artifact_id": artifact["id"] if artifact else None,
+                "expected_origin": expected_origin, "expected_initial_url": expected_page_url,
+                "expected_page_fingerprint": args.expected_page_fingerprint.casefold(), "autofill_input_hash": input_hash,
+                "artifact_id": artifact["id"] if artifact else None,
                 "artifact_sha256": artifact["sha256"] if artifact else None,
             })
         elif args.type == "fit_review" and args.application_id:
@@ -345,10 +406,11 @@ def cmd_create(conn, args) -> int:
                approval_token_hash, token_expires_at, requested_by, summary_text,
                max_attempts, idempotency_key, target_action, bound_document_id,
                bound_document_sha256, expected_origin, bound_artifact_id,
-               bound_artifact_sha256, bound_artifact_filename, created_at)
+               bound_artifact_sha256, bound_artifact_filename, expected_initial_url,
+               expected_page_fingerprint, bound_autofill_input_hash, created_at)
             VALUES (%s, %s, %s, 'pending', %s, %s,
                     now() + make_interval(mins => %s), %s, %s, %s, %s,
-                    %s, %s, %s, %s, %s, %s, %s, now())
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
             RETURNING id::text, token_expires_at;
             """,
             (
@@ -358,6 +420,7 @@ def cmd_create(conn, args) -> int:
                 "fill_application_form" if args.type == "autofill_form" else None,
                 payload.get("document_id"), payload.get("document_sha256"), payload.get("expected_origin"),
                 payload.get("artifact_id"), payload.get("artifact_sha256"), payload.get("artifact_filename"),
+                payload.get("expected_initial_url"), payload.get("expected_page_fingerprint"), payload.get("autofill_input_hash"),
             ),
         )
         request_id, expires = cur.fetchone()
@@ -394,7 +457,7 @@ def redeem(conn, token: str, *, decision: str, note: str, actor: str) -> int:
             """
             UPDATE approval_requests
             SET status = 'expired'
-            WHERE status = 'pending' AND token_expires_at <= now();
+            WHERE status IN ('pending', 'approved') AND token_expires_at <= now();
             """
         )
 
@@ -420,13 +483,6 @@ def redeem(conn, token: str, *, decision: str, note: str, actor: str) -> int:
         if matched is None:
             # Do not say whether the token was wrong, expired, or already used.
             log_event(cur, None, "bad_token", actor, {"decision": decision})
-            cur.execute(
-                """
-                UPDATE approval_requests
-                SET attempt_count = attempt_count + 1
-                WHERE status = 'pending' AND token_expires_at > now();
-                """
-            )
             conn.commit()
             print("  No pending approval matches that token.")
             return 1
@@ -493,14 +549,16 @@ def redeem(conn, token: str, *, decision: str, note: str, actor: str) -> int:
                    input_json, approval_request_id, expected_origin,
                    generated_document_id, document_sha256, timeout_seconds,
                    bound_artifact_id, artifact_sha256, artifact_filename,
+                   expected_initial_url, expected_page_fingerprint, autofill_input_hash,
                    idempotency_key, created_at)
                 VALUES ('fill_application_form', %s, %s, 'queued', 'high',
-                        '{}'::jsonb, %s, %s, %s, %s, 300, %s, %s, %s, %s, now())
+                        '{}'::jsonb, %s, %s, %s, %s, 300, %s, %s, %s, %s, %s, %s, %s, now())
                 ON CONFLICT (approval_request_id) WHERE approval_request_id IS NOT NULL DO NOTHING;
                 """,
                 (actor, application_id, request_id, payload["expected_origin"],
                  payload["document_id"], payload["document_sha256"], payload.get("artifact_id"),
-                 payload.get("artifact_sha256"), payload.get("artifact_filename"), f"autofill:{request_id}"),
+                 payload.get("artifact_sha256"), payload.get("artifact_filename"), payload["expected_initial_url"],
+                 payload["expected_page_fingerprint"], payload["autofill_input_hash"], f"autofill:{request_id}"),
             )
             log_event(cur, request_id, "autofill_task_queued", actor, {
                 "expected_origin": payload["expected_origin"], "document_id": payload["document_id"],
@@ -514,8 +572,8 @@ def redeem(conn, token: str, *, decision: str, note: str, actor: str) -> int:
         print(f"  type:        {atype}")
         print(f"  summary:     {summary}")
         if application_id and new_status == "approved" and atype == "autofill_form":
-            print("\n  One document/origin-bound autofill capability is approved.")
-            print("  A deterministic one-time browser task was queued; it re-checks origin and")
+            print("\n  One document/page/input-bound autofill capability is approved.")
+            print("  A deterministic one-time browser task was queued; it re-checks page identity and")
             print("  verifies every write. It never submits the application.")
         return 0
 
@@ -568,7 +626,7 @@ def cmd_expire_stale(conn, args) -> int:
             """
             UPDATE approval_requests
             SET status = 'expired'
-            WHERE status = 'pending' AND token_expires_at <= now()
+            WHERE status IN ('pending', 'approved') AND token_expires_at <= now()
             RETURNING id::text;
             """
         )
@@ -601,6 +659,8 @@ def main() -> int:
     pc.add_argument("--document-id", help="Required for type=autofill_form.")
     pc.add_argument("--artifact-id", help="Optional exact resume/cover artifact to authorize for upload.")
     pc.add_argument("--expected-origin", help="Required for type=autofill_form, e.g. https://jobs.example.com")
+    pc.add_argument("--expected-page-url", help="Exact initial application URL for type=autofill_form.")
+    pc.add_argument("--expected-page-fingerprint", help="Read-only snapshot SHA-256 identity for type=autofill_form.")
     pc.add_argument("--apply", action="store_true")
 
     pa = sub.add_parser("approve")

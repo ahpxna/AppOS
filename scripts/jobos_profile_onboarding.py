@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Stage private profile files and a fixed resume template for a new JobOS machine.
+"""Stage private profile data and review explicitly generated profile assets.
 
-This local helper never uploads, parses into the database, calls an LLM, or
-approves evidence.  It makes the otherwise easy-to-miss private directories
-and then prints the next explicit review steps.
+Staging never uploads or calls an LLM.  Asset approval is an explicit, local,
+human-reviewed database operation rather than a hidden side effect of ingest.
 """
 from __future__ import annotations
 
@@ -15,6 +14,7 @@ import sys
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 SOURCE_ROOT = ROOT / "data" / "profile_sources_v2"
 TEMPLATE_DIR = ROOT / "data" / "resume-template"
 TEMPLATE_NAME = "VU PHAN AN NGUYEN-official_For_all.docx"
@@ -65,10 +65,73 @@ def status() -> dict[str, object]:
     }
 
 
+def review_assets(limit: int) -> list[dict[str, object]]:
+    """List the human-review queue without exposing a mutation shortcut."""
+    import psycopg
+    from services.common.config import database_dsn
+
+    with psycopg.connect(database_dsn()) as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id::text, asset_title, asset_type, status, confidence,
+                   coalesce(review_note, ''), left(canonical_narrative, 500)
+            FROM profile_assets
+            WHERE status IN ('draft', 'needs_review')
+            ORDER BY updated_at DESC
+            LIMIT %s;
+            """,
+            (limit,),
+        )
+        return [
+            {"id": row[0], "title": row[1], "type": row[2], "status": row[3],
+             "confidence": str(row[4]), "review_note": row[5], "preview": row[6]}
+            for row in cur.fetchall()
+        ]
+
+
+def approve_asset(asset_id: str, note: str, *, apply: bool) -> dict[str, object]:
+    """Approve exactly one reviewed asset; dry-run remains the default."""
+    import psycopg
+    from services.common.config import database_dsn
+
+    with psycopg.connect(database_dsn(), autocommit=False) as conn, conn.cursor() as cur:
+        cur.execute(
+            """SELECT asset_title, asset_type, status, left(canonical_narrative, 500)
+               FROM profile_assets WHERE id = %s""",
+            (asset_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            raise ValueError("Profile asset not found.")
+        if row[2] not in {"draft", "needs_review"}:
+            raise ValueError(f"Only draft/needs_review assets can be approved (current: {row[2]}).")
+        result = {"id": asset_id, "title": row[0], "type": row[1], "previous_status": row[2],
+                  "preview": row[3], "apply": apply}
+        if apply:
+            cur.execute(
+                """UPDATE profile_assets
+                   SET status = 'approved', review_note = %s, updated_at = now()
+                   WHERE id = %s""",
+                (note.strip() or "Approved manually through JobOS onboarding.", asset_id),
+            )
+            conn.commit()
+            result["status"] = "approved"
+        else:
+            conn.rollback()
+            result["status"] = "dry_run"
+        return result
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Stage private JobOS profile inputs on a new machine.")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("status")
+    review = sub.add_parser("review", help="List draft/needs_review profile assets for manual inspection.")
+    review.add_argument("--limit", type=int, default=20)
+    approve = sub.add_parser("approve", help="Approve one reviewed profile asset; dry-run by default.")
+    approve.add_argument("asset_id")
+    approve.add_argument("--note", default="")
+    approve.add_argument("--apply", action="store_true")
     stage = sub.add_parser("stage")
     stage.add_argument("--resume-template", type=Path, help="Your private immutable .docx resume template.")
     stage.add_argument("--source", type=Path, action="append", default=[], help="A resume, transcript, or project evidence file to copy.")
@@ -79,6 +142,14 @@ def main() -> int:
     try:
         if args.command == "status":
             print(json.dumps(status(), indent=2))
+            return 0
+        if args.command == "review":
+            if args.limit < 1 or args.limit > 100:
+                raise ValueError("--limit must be between 1 and 100.")
+            print(json.dumps({"assets": review_assets(args.limit)}, indent=2))
+            return 0
+        if args.command == "approve":
+            print(json.dumps(approve_asset(args.asset_id, args.note, apply=args.apply), indent=2))
             return 0
         staged: list[str] = []
         if args.resume_template:
