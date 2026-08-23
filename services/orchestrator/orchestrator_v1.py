@@ -40,6 +40,9 @@ from typing import Any, Dict, List, Optional
 import psycopg
 from psycopg.types.json import Jsonb
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+from services.discovery.immigration_intelligence import record_jd_immigration_assessment
+
 DB_HOST = os.getenv("JOBOS_DB_HOST", "127.0.0.1")
 DB_PORT = int(os.getenv("JOBOS_DB_PORT", "5433"))
 DB_NAME = os.getenv("JOBOS_DB_NAME", "job_apply_os")
@@ -144,6 +147,7 @@ def intake(cur, *, jd_text: str, company: str, job_title: str,
         (source, company, job_title, job_url, jd_text, jd_hash, channel),
     )
     app_id = cur.fetchone()[0]
+    immigration = record_jd_immigration_assessment(cur, app_id, jd_text)
 
     cur.execute(
         """
@@ -151,7 +155,8 @@ def intake(cur, *, jd_text: str, company: str, job_title: str,
           (application_id, from_step, to_step, actor, reason, detail_json)
         VALUES (%s, NULL, 'intake', 'orchestrator', 'Job captured.', %s);
         """,
-        (app_id, Jsonb({"channel": channel, "source": source, "jd_hash": jd_hash})),
+        (app_id, Jsonb({"channel": channel, "source": source, "jd_hash": jd_hash,
+                        "immigration_assessment": immigration})),
     )
     print(f"  intake: {app_id}  {company} / {job_title}")
     return app_id

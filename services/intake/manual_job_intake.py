@@ -16,6 +16,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from psycopg.types.json import Jsonb
+from services.discovery.immigration_intelligence import record_jd_immigration_assessment
 
 
 MIN_JD_CHARS = 200
@@ -109,9 +110,11 @@ def create_application(cur: Any, draft: JobDraft) -> tuple[str | None, JobDraft]
          clean.location, clean.work_mode, clean.seniority_level, clean.deadline, clean.salary_range),
     )
     application_id = cur.fetchone()[0]
+    immigration = record_jd_immigration_assessment(cur, application_id, clean.jd_text)
     event_detail = {
         "channel": "desktop_manual_form", "source": clean.source, "jd_hash": jd_hash,
         "notes": clean.notes, "browser_used": False,
+        "immigration_assessment": immigration,
     }
     cur.execute(
         """INSERT INTO pipeline_events

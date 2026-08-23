@@ -1,8 +1,8 @@
 # job-apply-os
 
 Pipeline cá nhân, chạy local, tự động hoá việc apply job: tìm job (ATS discovery),
-chấm điểm fit, sinh resume/cover letter có kiểm chứng bằng evidence, autofill form
-(chỉ điền, không tự bấm submit), và soạn nháp trả lời tin nhắn nhà tuyển dụng.
+chấm điểm fit, sinh resume/cover letter có kiểm chứng bằng evidence, tạo plan
+form để bạn review thủ công, và soạn nháp trả lời tin nhắn nhà tuyển dụng.
 LLM mặc định chạy local qua Ollama; mọi Python LLM/embedding stage cũng có thể
 đổi sang API tương thích OpenAI bằng token, theo global hoặc từng stage.
 
@@ -140,7 +140,7 @@ Không chạy A và B đồng thời: cả hai cùng dùng `127.0.0.1:11434`. Xe
 kiểm tra `ollama ps`, và dùng SSH tunnel an toàn từ Ubuntu client tới Windows
 GPU workstation.
 
-## 7. OpenClaw (tuỳ chọn — chỉ cần cho L3 browser runtime / L7 autofill)
+## 7. OpenClaw (tuỳ chọn — chỉ cần cho L3 browser runtime / discovery đọc JD)
 
 ```bash
 # tự tạo token private nếu chưa có, rồi render 4 agent/workspace
@@ -174,8 +174,10 @@ Entry point chính là `services/orchestrator/orchestrator_v1.py` — xem
 `--help` để biết các lệnh (`advance`, `approve`, `deny`, v.v). Toàn bộ các
 bước tốn tiền/nhạy cảm (fit-review khi điểm biên, gửi tin nhắn, generate
 research) đều dừng lại chờ approval qua `services/approval/approval_service_v1.py`
-trước khi tiếp tục — không có bước nào tự động submit đơn (L7 chỉ dừng ở
-draft, xem `VERIFICATION_REPORT.md`).
+trước khi tiếp tục — không có bước nào tự động submit đơn. Form write đang bị
+fail-closed: OpenClaw chỉ được dùng để discovery/read-only; deterministic
+autofill chỉ tạo plan để bạn review cho đến khi origin và checkbox/radio state
+được verify đầy đủ.
 
 Nếu preflight báo thiếu `base_fit_check_support`, không auto-approve dữ liệu.
 Review/approve evidence trước, rồi build các pack deterministic:
@@ -205,6 +207,33 @@ python scripts/jobos_intake_app.py
 Không chạy `launch_jobos_browser.py`, không cần Chrome, và không cần login LinkedIn
 cho workflow này.
 
+### Immigration / F-1 / OPT / STEM OPT (review-only)
+
+JobOS không tự trả lời câu hỏi work authorization, citizenship hay sponsorship.
+Migration mới reset các default legal answer cũ về `ASK_USER`, phân biệt câu hỏi
+“currently authorized”, “sponsorship to start”, và “now or in the future”, rồi
+dừng để bạn xác nhận wording thực tế. Mỗi JD mới được đánh giá trước filter/fit:
+policy trong JD, E-Verify evidence và H-1B history được lưu tách biệt; E-Verify
+không bao giờ được suy ra thành H-1B sponsorship.
+
+```bash
+# Chỉ lưu sau khi chính bạn đã kiểm tra thông tin và thêm --confirm.
+python services/discovery/immigration_profile_v1.py set \
+  --current-status F1 --current-work-authorization yes \
+  --requires-sponsorship-to-start no --requires-future-sponsorship yes \
+  --confirm --apply
+
+# Xem profile hoặc thêm một nguồn employer evidence có provenance.
+python services/discovery/immigration_profile_v1.py show
+python services/discovery/immigration_profile_v1.py employer-evidence \
+  --application-id APPLICATION_UUID --kind everify --status verified \
+  --source-url https://example.org/source --note "Exact employer name matched" --apply
+```
+
+Đây là ledger để review, không phải legal advice. Xác nhận OPT/STEM OPT dates,
+E-Verify/I-983 requirements và mọi attestation với DSO/immigration professional
+khi cần.
+
 ## 9.2 — Job search theo profile + LinkedIn user intake (tuỳ chọn)
 
 `services/discovery/profile_job_search_v1.py` chỉ dùng capability/tool/competency
@@ -217,6 +246,9 @@ python services/discovery/profile_job_search_v1.py terms
 python services/discovery/profile_job_search_v1.py queries --keyword "security engineer"
 python services/discovery/linkedin_intake_v1.py import --file data/linkedin_jobs.json --apply
 python services/discovery/profile_job_search_v1.py rank --keyword "security engineer"
+# Optional: hide only JDs whose explicit policy was classified BLOCKED;
+# UNKNOWN postings remain visible instead of being treated as sponsor-friendly.
+python services/discovery/profile_job_search_v1.py rank --exclude-immigration-blocked
 ```
 
 File import là JSON array (hoặc `{ "jobs": [...] }`) gồm `company`, `title`,

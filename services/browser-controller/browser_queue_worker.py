@@ -42,7 +42,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -92,7 +92,7 @@ BROWSER_CDP_URL = (
     or "http://127.0.0.1:9222"
 ).rstrip("/")
 
-WORKER_VERSION = "browser_queue_worker_v2_openclaw_cli_2026_07_28"
+WORKER_VERSION = "browser_queue_worker_v3_fail_closed_form_write_2026_08_23"
 WORKER_ID = f"{socket.gethostname()}:{os.getpid()}"
 LEASE_SECONDS = int(os.getenv("JOBOS_BROWSER_LEASE_SECONDS", "600"))
 
@@ -296,7 +296,9 @@ def claim_next_task(cur) -> Optional[Dict[str, Any]]:
           LIMIT 1
         )
         RETURNING id::text, task_type, application_id::text,
-                  input_json, timeout_seconds, retry_count, max_retries;
+                  input_json, timeout_seconds, retry_count, max_retries,
+                  approval_request_id::text, expected_origin,
+                  generated_document_id::text, document_sha256;
         """,
         (WORKER_ID, LEASE_SECONDS),
     )
@@ -308,6 +310,8 @@ def claim_next_task(cur) -> Optional[Dict[str, Any]]:
         "input_json": row[3] or {}, "timeout_seconds": row[4] or 300,
         "retry_count": row[5] or 0,
         "max_retries": row[6] if row[6] is not None else 2,
+        "approval_request_id": row[7], "expected_origin": row[8],
+        "generated_document_id": row[9], "document_sha256": row[10],
     }
 
 
@@ -354,19 +358,23 @@ def requeue_or_fail(cur, task: Dict[str, Any], error: str) -> str:
 
 # ---------------------------------------------------------------- guards
 
-def require_verified_document(cur, document_id: str) -> Dict[str, Any]:
+def require_verified_document(cur, document_id: str, application_id: Optional[str]) -> Dict[str, Any]:
     """The single chokepoint that keeps L3 from writing ungrounded text."""
+    if not application_id:
+        raise PermanentTaskError("A form-write document must have an application_id.")
     cur.execute(
         """
         SELECT id::text, doc_type, content, qa_status, approved
         FROM generated_documents
-        WHERE id = %s;
+        WHERE id = %s AND application_id = %s;
         """,
-        (document_id,),
+        (document_id, application_id),
     )
     row = cur.fetchone()
     if not row:
-        raise PermanentTaskError(f"generated_document not found: {document_id}")
+        raise PermanentTaskError(
+            f"generated_document {document_id} does not belong to application {application_id}."
+        )
 
     doc = {"id": row[0], "doc_type": row[1], "content": row[2],
            "qa_status": row[3], "approved": row[4]}
@@ -385,26 +393,83 @@ def require_verified_document(cur, document_id: str) -> Dict[str, Any]:
     return doc
 
 
-def require_approval(cur, application_id: Optional[str]) -> None:
+def _normalised_origin(url: str) -> str:
+    parsed = urlsplit(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise PermanentTaskError(f"Invalid expected origin: {url[:120]}")
+    return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}"
+
+
+def require_bound_approval(cur, task: Dict[str, Any]) -> Dict[str, Any]:
+    """Load exactly one unused capability bound to this task, app and document.
+
+    Looking up *any* approved request for an application was an authorization
+    bypass: a stale approval could authorize another URL/document.  Legacy
+    tasks have no complete binding and intentionally fail closed.
+    """
+    application_id = task.get("application_id")
+    approval_id = task.get("approval_request_id")
+    document_id = task.get("generated_document_id") or task.get("input_json", {}).get("generated_document_id")
+    expected_origin = task.get("expected_origin")
+    document_sha256 = task.get("document_sha256")
     if not application_id:
         raise PermanentTaskError(
             "Task touches a real application form but has no application_id."
         )
+    if not all((approval_id, document_id, expected_origin, document_sha256)):
+        raise PermanentTaskError(
+            "Form-write task lacks an exact approval_request_id, document id/hash, or expected origin. "
+            "Legacy approvals cannot authorize a form write."
+        )
+    origin = _normalised_origin(str(expected_origin))
     cur.execute(
         """
-        SELECT 1 FROM approval_requests
-        WHERE application_id = %s
+        SELECT id::text, target_action, bound_document_id::text,
+               bound_document_sha256, expected_origin
+        FROM approval_requests
+        WHERE id = %s
+          AND application_id = %s
           AND status = 'approved'
+          AND consumed_at IS NULL
           AND token_expires_at > now()
-        LIMIT 1;
         """,
-        (application_id,),
+        (approval_id, application_id),
+    )
+    row = cur.fetchone()
+    if row is None:
+        raise PermanentTaskError(
+            "No valid unused approval exists for this exact application capability."
+        )
+    approved_id, target_action, bound_doc, bound_hash, bound_origin = row
+    if target_action != "fill_application_form":
+        raise PermanentTaskError(f"Approval {approved_id} is not for fill_application_form.")
+    if bound_doc != document_id or bound_hash != document_sha256:
+        raise PermanentTaskError("Approval document binding does not match this task.")
+    if _normalised_origin(str(bound_origin or "")) != origin:
+        raise PermanentTaskError("Approval origin binding does not match this task.")
+    return {"id": approved_id, "document_id": document_id, "expected_origin": origin}
+
+
+def consume_bound_approval(cur, approval_id: str, task: Dict[str, Any]) -> None:
+    """Atomically consume one capability after a verified side effect.
+
+    This function is deliberately separate from token redemption.  No current
+    handler calls it because form writes are disabled below; a future
+    deterministic handler must call it in the same transaction as its final
+    post-write verification.
+    """
+    cur.execute(
+        """
+        UPDATE approval_requests
+        SET status = 'consumed', consumed_at = now(), consumed_by = %s
+        WHERE id = %s AND application_id = %s
+          AND status = 'approved' AND consumed_at IS NULL
+        RETURNING id;
+        """,
+        (WORKER_ID, approval_id, task["application_id"]),
     )
     if cur.fetchone() is None:
-        raise PermanentTaskError(
-            "No valid, unexpired approval_request for this application. "
-            "Human approval is required before touching a real form."
-        )
+        raise PermanentTaskError("Approval was already consumed or changed concurrently.")
 
 
 def load_allowed_domains(cur) -> list:
@@ -549,49 +614,16 @@ def handle_capture_page_snapshot(cur, task) -> Dict[str, Any]:
 
 
 def handle_fill_application_form(cur, task) -> Dict[str, Any]:
-    inp = task["input_json"]
-    url = require_url(cur, inp)
-    document_id = inp.get("generated_document_id")
-    if not document_id:
-        raise PermanentTaskError(
-            "fill_application_form requires input_json.generated_document_id. "
-            "Raw text is deliberately not accepted here."
-        )
-
-    doc = require_verified_document(cur, document_id)
-
-    agent = {
-        "resume": OPENCLAW_AGENT_RESUME,
-        "cover_letter": OPENCLAW_AGENT_COVER,
-    }.get(doc["doc_type"], OPENCLAW_AGENT_BROWSE)
-
-    msg = (
-        "Fill this application form using ONLY the text between the markers "
-        "below.\n"
-        f"URL: {url}\n\n"
-        "Rules:\n"
-        "1. Use the provided text as-is. Do not rewrite, expand, embellish, or "
-        "invent answers for fields the text does not cover.\n"
-        "2. Leave any field you cannot fill from the text EMPTY, and report it "
-        "as unfilled.\n"
-        "3. DO NOT CLICK SUBMIT. Stop once the fields are populated.\n"
-        "4. Take a screenshot of the filled form and return its path.\n\n"
-        f"--- BEGIN APPROVED {doc['doc_type'].upper()} ---\n"
-        f"{doc['content']}\n"
-        f"--- END APPROVED {doc['doc_type'].upper()} ---"
+    # This used to send an application page and applicant document to an LLM
+    # browser agent.  That contradicted the deterministic L7 architecture and
+    # made radio/checkbox correctness impossible to prove.  Do not re-enable
+    # it until a deterministic engine re-checks the current origin before each
+    # side effect, verifies the state of every control, and calls
+    # consume_bound_approval() only after post-write verification.
+    raise PermanentTaskError(
+        "LLM-driven form filling is disabled. Use the deterministic autofill plan "
+        "for review only; no browser worker may write a real application form yet."
     )
-
-    resp = openclaw_agent(
-        agent=agent, message=msg, timeout=task["timeout_seconds"], session_id=f"jobos-task-{task['id']}"
-    )
-    return {
-        "url": url,
-        "generated_document_id": document_id,
-        "doc_type": doc["doc_type"],
-        "submitted": False,
-        "note": "Fields populated. Final submit is a human action by design.",
-        "agent_response": resp,
-    }
 
 
 HANDLERS = {
@@ -640,7 +672,7 @@ def process_one(conn) -> bool:
                     f"Unsupported task_type: {task['task_type']}"
                 )
             if task["task_type"] in REQUIRES_APPROVAL:
-                require_approval(cur, task["application_id"])
+                require_bound_approval(cur, task)
 
             start = time.perf_counter()
             result = HANDLERS[task["task_type"]](cur, task)

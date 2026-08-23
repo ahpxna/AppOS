@@ -71,30 +71,27 @@ COMMENT ON COLUMN sensitive_answers.answer_kind IS
   'eligibility = factual and legally consequential, must be truthful. '
   'eeo = voluntary self-identification, declining is a normal choice.';
 
--- Eligibility answers. These are conditions of employment, not voluntary
--- disclosures. Leaving them blank usually auto-rejects an application, and
--- answering them untruthfully is a misrepresentation to the employer, so they
--- are declared once by the user and then reused verbatim.
+-- Eligibility answers are legally consequential.  They deliberately start as
+-- ASK_USER: a keyword such as "sponsorship" does not determine the legal
+-- meaning of a question (for example, "now or in the future" is different
+-- from current authorization).  Migration 050 adds the semantic profile used
+-- to model these separately.  Do not replace these placeholders with a
+-- generic Yes/No default.
 INSERT INTO sensitive_answers
   (field_name, answer, answer_kind, requires_review, approved_by_user, question_hints, notes)
 VALUES
-  ('work_authorization', 'Yes', 'eligibility', false, true,
+  ('work_authorization', 'ASK_USER', 'eligibility', true, false,
    '["legally authorized to work", "authorized to work in the", "work authorization"]'::jsonb,
-   'Declared by user.'),
+   'Must be confirmed for the exact question wording.'),
 
-  ('require_sponsorship', 'No', 'eligibility', false, true,
+  ('require_sponsorship', 'ASK_USER', 'eligibility', true, false,
    '["require sponsorship", "need visa sponsorship", "now or in the future require"]'::jsonb,
-   'Declared by user.'),
+   'Must be confirmed for the exact question wording.'),
 
-  ('age_18_or_older', 'Yes', 'eligibility', false, true,
+  ('age_18_or_older', 'ASK_USER', 'eligibility', true, false,
    '["18 years of age", "at least 18", "18 or older"]'::jsonb,
-   'Declared by user.')
-ON CONFLICT (field_name) DO UPDATE
-SET answer = EXCLUDED.answer,
-    answer_kind = EXCLUDED.answer_kind,
-    approved_by_user = EXCLUDED.approved_by_user,
-    question_hints = EXCLUDED.question_hints,
-    updated_at = now();
+   'Must be confirmed by the user.')
+ON CONFLICT (field_name) DO NOTHING;
 
 -- EEO answers. Voluntary under US federal contractor reporting rules; every
 -- such form offers a decline option, and choosing it carries no penalty.

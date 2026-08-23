@@ -63,7 +63,7 @@ DSN = (
     f"user={DB_USER} password={DB_PASSWORD}"
 )
 
-GENERATOR_VERSION = "document_generator_v1_asset_and_company_grounded_2026_08_20"
+GENERATOR_VERSION = "document_generator_v2_structural_cover_grounding_2026_08_23"
 DEFAULT_OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
 DEFAULT_MODEL = get_model("docgen")
 
@@ -456,10 +456,10 @@ Return ONLY valid JSON:
   "paragraphs": [
     {{
       "text": "one paragraph, 2-4 sentences",
-      "source_asset_id": "<uuid, or the string \\"none\\" for the opening/closing paragraph>",
-      "purpose": "opening | evidence | motivation | closing",
-      "jd_requirement_quote": "exact JD phrase for a candidate-evidence paragraph; empty only for purely structural opening/closing",
-      "candidate_evidence_quote": "exact phrase from cited ASSET; empty only when source_asset_id is none",
+      "source_asset_id": "<uuid copied exactly from an ASSET block>",
+      "purpose": "evidence | motivation",
+      "jd_requirement_quote": "exact JD phrase for this paragraph",
+      "candidate_evidence_quote": "exact phrase from cited ASSET",
       "uses_company_context": false,
       "company_source_urls": ["<exact URL from SOURCED COMPANY CONTEXT, or omit when unused>"],
       "company_insight": "specific source-backed company fact, empty when unused",
@@ -471,7 +471,10 @@ Return ONLY valid JSON:
   "self_check": "one sentence confirming no unsupported experience is implied"
 }}
 
-Four to five paragraphs total. Evidence paragraphs must cite a real asset id.
+Write only the substantive evidence/motivation paragraphs (two to four total).
+The renderer adds the deterministic greeting, application sentence, and closing;
+do not emit an opening or closing paragraph. Every paragraph must cite a real
+candidate asset id.
 Write a strong, specific application narrative, but never turn academic/project
 work into employment or manufacture a company insight. A less flashy letter
 with literal evidence is better than a polished false claim.
@@ -521,6 +524,8 @@ def validate_and_render(
     baseline_subtitles: Optional[Mapping[int, str]] = None,
     baseline_bullets: Optional[Mapping[int, str]] = None,
     jd_text: str = "",
+    company: str = "",
+    job_title: str = "",
 ) -> Tuple[str, List[str], Dict[str, Any], List[str]]:
     """Drop any claim citing an unknown asset. Returns
     (content, asset_ids_used, evidence_map, dropped)."""
@@ -653,7 +658,7 @@ def validate_and_render(
         company_specific_count = 0
         for p in parsed.get("paragraphs", []):
             text, src = (p.get("text") or "").strip(), p.get("source_asset_id")
-            if not text or not check(src, text, allow_none=True):
+            if not text:
                 continue
             requested_urls = p.get("company_source_urls") or []
             if not isinstance(requested_urls, list):
@@ -663,6 +668,8 @@ def validate_and_render(
             uses_company_context = bool(p.get("uses_company_context")) or bool(company_urls)
             if invalid_urls:
                 dropped.append(f"{text[:70]}... (cited unknown company URL)")
+                continue
+            if not check(src, text):
                 continue
             if uses_company_context and not company_urls:
                 dropped.append(f"{text[:70]}... (company claim has no source URL)")
@@ -705,6 +712,17 @@ def validate_and_render(
         if valid_company_urls and not company_specific_count:
             dropped.append("Cover letter has company research sources but no verified company-specific paragraph.")
             lines, used, evidence["claims"] = [], [], []
+        if lines and company.strip() and job_title.strip():
+            opening = f"I am applying for the {job_title.strip()} position at {company.strip()}."
+            closing = "Thank you for considering my application."
+            lines = [opening, *lines, closing]
+            evidence["claims"] = [
+                {"claim": opening, "source_asset_id": None,
+                 "kind": "cover_letter_structure", "purpose": "opening"},
+                *evidence["claims"],
+                {"claim": closing, "source_asset_id": None,
+                 "kind": "cover_letter_structure", "purpose": "closing"},
+            ]
 
     elif doc_type == "short_answers":
         for a in parsed.get("answers", []):
@@ -919,6 +937,8 @@ def main() -> int:
                 resume_subtitle_baselines if args.doc_type == "resume" else None,
                 resume_bullet_baselines if args.doc_type == "resume" else None,
                 app["jd_text"],
+                app["company"] if args.doc_type == "cover_letter" else "",
+                app["job_title"] if args.doc_type == "cover_letter" else "",
             )
 
             print("===== GENERATED =====")

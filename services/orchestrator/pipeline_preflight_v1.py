@@ -54,6 +54,8 @@ REQUIRED_RELATIONS = (
     "profile_context_packs",
     "pipeline_steps",
     "allowed_domains",
+    "immigration_profiles",
+    "application_immigration_assessments",
 )
 
 

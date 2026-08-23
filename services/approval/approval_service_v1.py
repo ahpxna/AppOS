@@ -33,6 +33,7 @@ import json
 import os
 import secrets
 import sys
+from urllib.parse import urlsplit
 from typing import Any, Dict, Optional
 
 import psycopg
@@ -49,14 +50,15 @@ DSN = (
     f"user={DB_USER} password={DB_PASSWORD}"
 )
 
-SERVICE_VERSION = "approval_service_v1_single_use_2026_07_29"
+SERVICE_VERSION = "approval_service_v2_capability_bound_2026_08_23"
 
 APPROVAL_TYPES = (
-    "submit_application",   # L7: fill a real application form
+    "submit_application",   # human attestation for a final submission; JobOS never submits
     "send_message",         # L8: send a reply to a recruiter
     "spend_over_budget",    # L1: exceed the daily cost budget
     "browser_login",        # L3: open a session on a site requiring login
     "fit_review",           # L5: borderline fit score (60-75), ask before spending on it
+    "autofill_form",        # one exact document/origin form-write capability
 )
 
 DEFAULT_TTL_MINUTES = 60
@@ -79,6 +81,7 @@ def fetch_submit_binding(cur, application_id: str) -> Dict[str, Any]:
         FROM generated_documents
         WHERE application_id = %s
           AND qa_status = 'pass'
+          AND approved = true
         ORDER BY doc_type, version, created_at;
         """,
         (application_id,),
@@ -104,6 +107,35 @@ def fetch_submit_binding(cur, application_id: str) -> Dict[str, Any]:
         "documents": documents,
         "content_hash": hash_json(documents),
     }
+
+
+def fetch_document_binding(cur, application_id: str, document_id: str) -> Dict[str, Any]:
+    """Return one QA-passed, user-approved document for one application."""
+    cur.execute(
+        """
+        SELECT id::text, doc_type, version, content
+        FROM generated_documents
+        WHERE id = %s AND application_id = %s
+          AND qa_status = 'pass' AND approved = true;
+        """,
+        (document_id, application_id),
+    )
+    row = cur.fetchone()
+    if not row:
+        raise RuntimeError(
+            "document must belong to this application and have passed QA and user approval."
+        )
+    return {
+        "id": row[0], "doc_type": row[1], "version": row[2],
+        "content_hash": hashlib.sha256((row[3] or "").encode("utf-8")).hexdigest(),
+    }
+
+
+def normalise_origin(value: str) -> str:
+    parsed = urlsplit((value or "").strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise RuntimeError("--expected-origin must be an http(s) origin, e.g. https://jobs.example.com")
+    return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}"
 
 
 def fetch_reply_binding(cur, reply_id: str) -> Dict[str, Any]:
@@ -166,6 +198,15 @@ def assert_binding_matches(cur, request_row: Dict[str, Any]) -> None:
                 "Reply approval no longer matches the drafted reply content. "
                 "Recreate the approval request."
             )
+    elif atype == "autofill_form":
+        if not application_id:
+            raise RuntimeError("Autofill approval request missing application_id.")
+        document_id = payload.get("document_id")
+        if not document_id:
+            raise RuntimeError("Autofill approval payload missing document_id.")
+        binding = fetch_document_binding(cur, application_id, document_id)
+        if payload.get("document_sha256") != binding["content_hash"]:
+            raise RuntimeError("Autofill approval no longer matches the exact approved document.")
 
 
 def log_event(cur, request_id: Optional[str], event: str,
@@ -218,6 +259,26 @@ def cmd_create(conn, args) -> int:
                 "application_id": args.application_id,
                 "content_hash": binding["content_hash"],
             })
+        elif args.type == "autofill_form":
+            if not args.application_id or not args.document_id or not args.expected_origin:
+                print("ERROR: autofill_form requires --application-id, --document-id and --expected-origin.")
+                return 1
+            try:
+                binding = fetch_document_binding(cur, args.application_id, args.document_id)
+                expected_origin = normalise_origin(args.expected_origin)
+            except RuntimeError as exc:
+                print(f"ERROR: {exc}")
+                return 1
+            payload.update({
+                "document_id": binding["id"],
+                "document_sha256": binding["content_hash"],
+                "expected_origin": expected_origin,
+            })
+            idempotency_key = hash_json({
+                "type": args.type, "application_id": args.application_id,
+                "document_id": binding["id"], "document_sha256": binding["content_hash"],
+                "expected_origin": expected_origin,
+            })
         elif args.type == "fit_review" and args.application_id:
             payload["content_hash"] = hash_json({
                 "application_id": args.application_id,
@@ -255,15 +316,19 @@ def cmd_create(conn, args) -> int:
             INSERT INTO approval_requests
               (type, application_id, payload_json, status, approval_channel,
                approval_token_hash, token_expires_at, requested_by, summary_text,
-               max_attempts, idempotency_key, created_at)
+               max_attempts, idempotency_key, target_action, bound_document_id,
+               bound_document_sha256, expected_origin, created_at)
             VALUES (%s, %s, %s, 'pending', %s, %s,
-                    now() + make_interval(mins => %s), %s, %s, %s, %s, now())
+                    now() + make_interval(mins => %s), %s, %s, %s, %s,
+                    %s, %s, %s, %s, now())
             RETURNING id::text, token_expires_at;
             """,
             (
                 args.type, args.application_id, Jsonb(payload),
                 args.channel, token_hash, args.ttl_minutes,
                 args.requested_by, summary, args.max_attempts, idempotency_key,
+                "fill_application_form" if args.type == "autofill_form" else None,
+                payload.get("document_id"), payload.get("document_sha256"), payload.get("expected_origin"),
             ),
         )
         request_id, expires = cur.fetchone()
@@ -378,12 +443,12 @@ def redeem(conn, token: str, *, decision: str, note: str, actor: str) -> int:
 
         cur.execute(
             """
-            UPDATE approval_requests
-            SET status = %s, action_taken = %s, action_note = %s,
-                responded_at = now(), consumed_at = now(), consumed_by = %s
-            WHERE id = %s AND status = 'pending';
-            """,
-            (new_status, decision, note, actor, request_id),
+        UPDATE approval_requests
+        SET status = %s, action_taken = %s, action_note = %s,
+                responded_at = now()
+        WHERE id = %s AND status = 'pending';
+        """,
+        (new_status, decision, note, request_id),
         )
         if cur.rowcount != 1:
             conn.rollback()
@@ -397,11 +462,10 @@ def redeem(conn, token: str, *, decision: str, note: str, actor: str) -> int:
         print(f"  request:     {request_id}")
         print(f"  type:        {atype}")
         print(f"  summary:     {summary}")
-        if application_id and new_status == "approved" and atype == "submit_application":
-            print("\n  L7 may now queue a fill_application_form task for "
-                  f"application {application_id}.")
-            print("  Note: filling a form is still not submitting it. "
-                  "The final submit remains a human action.")
+        if application_id and new_status == "approved" and atype == "autofill_form":
+            print("\n  One document/origin-bound autofill capability is approved.")
+            print("  Current JobOS policy still disables real browser writes until the deterministic")
+            print("  engine can re-check origin and selected state after every side effect.")
         return 0
 
 
@@ -483,6 +547,8 @@ def main() -> int:
     pc.add_argument("--max-attempts", type=int, default=5)
     pc.add_argument("--channel", default="cli")
     pc.add_argument("--requested-by", default="orchestrator")
+    pc.add_argument("--document-id", help="Required for type=autofill_form.")
+    pc.add_argument("--expected-origin", help="Required for type=autofill_form, e.g. https://jobs.example.com")
     pc.add_argument("--apply", action="store_true")
 
     pa = sub.add_parser("approve")

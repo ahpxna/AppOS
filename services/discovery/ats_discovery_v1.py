@@ -64,6 +64,7 @@ from typing import Any, Dict, List, Optional
 
 import psycopg
 from psycopg.types.json import Jsonb
+from services.discovery.immigration_intelligence import record_jd_immigration_assessment
 
 DB_HOST = os.getenv("JOBOS_DB_HOST", "127.0.0.1")
 DB_PORT = int(os.getenv("JOBOS_DB_PORT", "5433"))
@@ -413,13 +414,15 @@ def intake_job(cur, *, jd_text: str, company: str, job_title: str, job_url: str,
          ats_company_id, ats_external_id),
     )
     app_id = cur.fetchone()[0]
+    immigration = record_jd_immigration_assessment(cur, app_id, jd_text)
     cur.execute(
         """
         INSERT INTO pipeline_events
           (application_id, from_step, to_step, actor, reason, detail_json)
         VALUES (%s, NULL, 'intake', 'ats_discovery', 'Discovered via ATS API.', %s);
         """,
-        (app_id, Jsonb({"ats_type": ats_type, "ats_external_id": ats_external_id})),
+        (app_id, Jsonb({"ats_type": ats_type, "ats_external_id": ats_external_id,
+                        "immigration_assessment": immigration})),
     )
     return app_id
 

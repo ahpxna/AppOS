@@ -13,6 +13,7 @@ from typing import Any, Iterable
 from urllib.parse import urlparse
 
 from psycopg.types.json import Jsonb
+from services.discovery.immigration_intelligence import record_jd_immigration_assessment
 
 MAX_DISCOVERY_RESULTS = 5
 MIN_JD_CHARS = 200
@@ -123,6 +124,7 @@ def ingest_discovered_jobs(cur, browser_task_id: str, search_input: dict[str, An
              row["location"], row["work_mode"]),
         )
         application_id = cur.fetchone()[0]
+        immigration = record_jd_immigration_assessment(cur, application_id, row["jd_text"])
         cur.execute(
             """INSERT INTO pipeline_events
                  (application_id, from_step, to_step, actor, reason, detail_json)
@@ -130,7 +132,8 @@ def ingest_discovered_jobs(cur, browser_task_id: str, search_input: dict[str, An
                        'User-initiated bounded LinkedIn discovery capture.', %s);""",
             (application_id, Jsonb({"browser_task_id": browser_task_id,
                 "keywords": request["keywords"], "location": request["location"],
-                "max_results": request["max_results"], "job_url": row["url"]})),
+                "max_results": request["max_results"], "job_url": row["url"],
+                "immigration_assessment": immigration})),
         )
         created.append(application_id)
     return {"requested_max_results": request["max_results"], "returned_valid_jobs": len(rows),

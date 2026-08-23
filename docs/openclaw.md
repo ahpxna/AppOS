@@ -53,6 +53,15 @@ task uses an OpenClaw agent, select its model via `OPENCLAW_*_MODEL`; it may be
 an authenticated API provider rather than a local model. Do not put provider
 tokens in this repository.
 
+### Current form-write policy
+
+`fill_application_form` is deliberately fail-closed. The historical path sent
+a real form and document text to an OpenClaw LLM agent; it is removed. The
+deterministic `autofill_agent_v1.py` remains useful for inspecting/planning
+fields, but `--apply` refuses to write until it can prove the focused page
+origin before every side effect, model checkbox/radio state, and verify every
+write afterwards. No agent can submit an application.
+
 ## Non-interactive JobOS setup
 
 Use the JobOS setup script instead of the interactive `openclaw onboard` wizard.
@@ -97,8 +106,8 @@ The four workspaces have distinct roles:
 | Agent | Workspace | Autonomous safe work |
 |---|---|---|
 | `main` | `workspace-main` | User-initiated job/JD capture and public company research |
-| `resume` | `workspace-resume` | Evidence-grounded resume drafts |
-| `cover_letter` | `workspace-cover_letter` | Source-backed company-tailored letter drafts |
+| `resume` | `workspace-resume` | Reserved workspace; Python L6 now drafts resumes through the shared grounded gateway |
+| `cover_letter` | `workspace-cover_letter` | Reserved workspace; Python L6 now drafts cover letters through the shared grounded gateway |
 | `repo_coordinator` | `workspace-repo_coordinator` | Summarise isolated worker reports only |
 
 All four proceed without asking for confirmation for well-scoped, read-only
@@ -156,8 +165,8 @@ cover-letter-drafting agent don't share conversation context:
 | id | used by (env var) | called from |
 |---|---|---|
 | `main` | `OPENCLAW_AGENT_RESEARCH`, `OPENCLAW_AGENT_BROWSE` | `services/research/company_research_v1.py`, `services/browser-controller/browser_queue_worker.py` |
-| `resume` | `OPENCLAW_AGENT_RESUME` | `services/browser-controller/browser_queue_worker.py` (doc_type == "resume") |
-| `cover_letter` | `OPENCLAW_AGENT_COVER` | `services/browser-controller/browser_queue_worker.py` (doc_type == "cover_letter") |
+| `resume` | `OPENCLAW_AGENT_RESUME` | Reserved; never receives a real application form or document content |
+| `cover_letter` | `OPENCLAW_AGENT_COVER` | Reserved; never receives a real application form or document content |
 | `repo_coordinator` | `OPENCLAW_AGENT_REPO_COORDINATOR` | `services/repo-audit/repo_coordinator_v1.py` |
 
 `scripts/openclaw_bootstrap.py bootstrap` creates all four workspaces

@@ -15,7 +15,8 @@ Why no model:
 Three gates, in order:
   1. Domain gate    -- URL must be in allowed_domains.
   2. Sensitive gate -- fields matching always_pause_fields are left empty.
-  3. Submit gate    -- no code path clicks submit. The function does not exist.
+  3. Immigration gate -- legal question semantics always pause for the user.
+  4. Submit gate    -- no code path clicks submit. The function does not exist.
 
 Real-form findings this encodes (Oracle HCM, Odoo, w3schools):
   * The required marker is sometimes inline ("Country *") and sometimes a
@@ -33,7 +34,7 @@ Usage:
   python services/autofill/autofill_agent_v1.py probe
   python services/autofill/autofill_agent_v1.py inspect --url <url>
   python services/autofill/autofill_agent_v1.py plan --url <url>
-  python services/autofill/autofill_agent_v1.py fill --url <url> --apply
+  python services/autofill/autofill_agent_v1.py fill --url <url> --apply  # intentionally refuses writes
   python services/autofill/autofill_agent_v1.py verify
 """
 
@@ -49,7 +50,8 @@ import sys
 from typing import Any, Dict, List, Optional, Tuple
 
 import psycopg
-from psycopg.types.json import Jsonb
+
+from services.common.immigration_semantics import legal_question_pause_reason
 
 DB_HOST = os.getenv("JOBOS_DB_HOST", "127.0.0.1")
 DB_PORT = int(os.getenv("JOBOS_DB_PORT", "5433"))
@@ -67,7 +69,7 @@ OPENCLAW_BIN = os.getenv("OPENCLAW_BIN", "openclaw")
 # profile is always passed explicitly.
 BROWSER_PROFILE = os.getenv("JOBOS_BROWSER_PROFILE", "remote")
 
-AGENT_VERSION = "autofill_agent_v1_cli_direct_2026_07_29"
+AGENT_VERSION = "autofill_agent_v2_plan_only_2026_08_23"
 
 TEXT_ROLES = {"textbox", "searchbox", "spinbutton"}
 CHOICE_ROLES = {"combobox", "listbox", "select"}
@@ -351,6 +353,14 @@ def match_field(label: str, pause_patterns, hints, values) -> Dict[str, Any]:
     if not label:
         return {"decision": "skip", "reason": "no label"}
 
+    # This runs before the generic hints below.  A stored answer called
+    # `require_sponsorship` is not semantically sufficient for questions such
+    # as "now or in the future"; every immigration-related prompt is a human
+    # decision until a dedicated, state-aware engine exists.
+    immigration_pause = legal_question_pause_reason(label)
+    if immigration_pause:
+        return {"decision": "pause", "reason": immigration_pause}
+
     for pattern, reason in pause_patterns:
         try:
             if re.search(pattern, label):
@@ -452,7 +462,14 @@ def build_plan(cur, nodes: List[Dict[str, Any]]) -> Dict[str, Any]:
             if n["role"] in CHOICE_ROLES:
                 plan["selects"].append(entry)
             elif n["role"] in TOGGLE_ROLES:
-                plan["clicks"].append(entry)
+                # A checkbox/radio must be matched as an option in its question
+                # group and verified after clicking.  Snapshot metadata does not
+                # yet give this engine a reliable selected-state model, so it must
+                # remain a human-review item instead of a blind click target.
+                plan["pauses"].append({
+                    **entry, "decision": "pause",
+                    "reason": "Checkbox/radio state is not safely modelled; review this option yourself.",
+                })
             else:
                 plan["fills"].append(entry)
         elif decision["decision"] == "pause":
@@ -477,8 +494,8 @@ def print_plan(plan: Dict[str, Any], truncated: bool) -> None:
     if total == 0:
         print("\n  No form fields found on this page.")
         print("  Application forms usually sit behind a login and an Apply")
-        print("  click. Navigate to the real form in the browser first, then")
-        print("  run this without --url so it uses that tab.")
+        print("  click. Use a page URL only for a read-only plan; form writes")
+        print("  are intentionally disabled pending deterministic verification.")
         return
     if truncated:
         print("\n  WARNING: the snapshot was truncated. Fields below the cut")
@@ -498,8 +515,8 @@ def print_plan(plan: Dict[str, Any], truncated: bool) -> None:
         for u in plan["file_uploads"]:
             print(f"    - {u['label'][:66]}")
 
-    for key, title in (("fills", "WILL TYPE"), ("selects", "WILL SELECT"),
-                       ("clicks", "WILL CLICK")):
+    for key, title in (("fills", "PROPOSED TYPE"), ("selects", "PROPOSED SELECT"),
+                       ("clicks", "PROPOSED CLICK")):
         if plan[key]:
             print(f"\n  {title} ({len(plan[key])})")
             for f in plan[key]:
@@ -562,14 +579,17 @@ def act_click(ref: str) -> None:
 
 # ---------------------------------------------------------------- commands
 def resolve_target(cur, args) -> Optional[str]:
-    """Return a URL to open, or None to use the tab already focused.
+    """Require an explicit allowlisted URL for every browser interaction.
 
-    Real application forms sit behind a login and an Apply click, so reopening
-    the posting URL lands on the job description rather than the form. The
-    normal path is: navigate and sign in by hand, then run against that tab."""
+    The previous focused-tab mode had no way to verify the tab's origin.  It
+    is disabled rather than assuming a manually focused tab is still on an ATS
+    domain after redirects or a user tab switch.
+    """
     url = getattr(args, "url", None)
     if not url:
-        return None
+        raise AutofillError(
+            "An explicit --url is required. Focused-tab mode is disabled because its origin cannot be verified."
+        )
     check_domain(cur, url)
     return url
 
@@ -586,8 +606,7 @@ def cmd_inspect(conn, args) -> int:
         cur_val = f"  = {n['value'][:24]}" if n["value"] else ""
         print(f"  [{n['ref']:>7}] {n['role']:<10}{req} {n['label'][:52]}{cur_val}")
     if not inputs:
-        print("  No input fields on this page. Navigate to the actual form")
-        print("  in the browser, then run this without --url.")
+        print("  No input fields on this allowlisted page.")
     return 0
 
 
@@ -597,7 +616,7 @@ def cmd_plan(conn, args) -> int:
         nodes, truncated = take_snapshot(target)
         plan = build_plan(cur, nodes)
     print_plan(plan, truncated)
-    print("\n  Nothing was typed. Use 'fill --apply' to act on this plan.")
+    print("\n  Nothing was typed. Form writes remain disabled; use this as a review plan.")
     return 0
 
 
@@ -634,81 +653,14 @@ def cmd_fill(conn, args) -> int:
         print("\n  DRY RUN. Nothing typed.")
         return 0
 
-    done, failed = [], []
-
-    if plan["fills"]:
-        try:
-            act_fill(plan["fills"])
-            done.extend(plan["fills"])
-            for f in plan["fills"]:
-                print(f"    ok   {f['label'][:58]}")
-        except AutofillError as e:
-            # A batch failure is all-or-nothing, so retry individually to find
-            # which field the page rejected.
-            print(f"    batch fill failed ({e}); retrying one at a time")
-            for f in plan["fills"]:
-                try:
-                    act_fill([f])
-                    done.append(f)
-                    print(f"    ok   {f['label'][:58]}")
-                except AutofillError as e2:
-                    failed.append({**f, "error": str(e2)})
-                    print(f"    FAIL {f['label'][:58]}: {e2}")
-
-    for s in plan["selects"]:
-        try:
-            act_select(s["ref"], s["value"])
-            done.append(s)
-            print(f"    ok   {s['label'][:58]}")
-        except AutofillError as e:
-            failed.append({**s, "error": str(e)})
-            print(f"    FAIL {s['label'][:58]}: {e}")
-
-    for c in plan["clicks"]:
-        try:
-            act_click(c["ref"])
-            done.append(c)
-            print(f"    ok   {c['label'][:58]} -> {c['value'][:20]}")
-        except AutofillError as e:
-            failed.append({**c, "error": str(e)})
-            print(f"    FAIL {c['label'][:58]}: {e}")
-
-    result = {
-        "url": target or "(current tab)",
-        "agent_version": AGENT_VERSION,
-        "snapshot_truncated": truncated,
-        "done": [{"label": d["label"], "field_name": d.get("field_name")} for d in done],
-        "failed": [{"label": f["label"], "error": f["error"]} for f in failed],
-        "paused": [{"label": p["label"], "reason": p["reason"],
-                    "required": p["required"]} for p in plan["pauses"]],
-        "missing": [{"label": m["label"], "required": m["required"]}
-                    for m in plan["missing"]],
-        "unknown": [u["label"] for u in plan["unknown"]],
-        "resume_controls_ignored": [r["label"] for r in plan["resume_controls"]],
-        "file_uploads_needing_manual_attach": [u["label"] for u in plan["file_uploads"]],
-        "submitted": False,
-    }
-
-    if args.application_id:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO browser_tasks
-                  (task_type, requested_by, application_id, input_json,
-                   result_json, status, created_at, started_at, finished_at)
-                VALUES ('fill_application_form', %s, %s, %s, %s, 'completed',
-                        now(), now(), now());
-                """,
-                (AGENT_VERSION, args.application_id,
-                 Jsonb({"url": target}), Jsonb(result)),
-            )
-        conn.commit()
-
-    print(f"\n  done {len(done)}, failed {len(failed)}, "
-          f"paused {len(plan['pauses'])}, missing {len(plan['missing'])}")
-    print("\n  NOT SUBMITTED. Review every field in the browser, complete the")
-    print("  paused and missing ones yourself, then submit it yourself.")
-    return 0
+    # P0 hold: the historical implementation typed into a focused tab without
+    # verifying the active origin after navigation, clicked stateful controls
+    # without proving the selected option, and could report partial work as
+    # completed.  Keep this deterministic planner useful while forbidding real
+    # writes until its origin and post-write verification protocol is complete.
+    print("\n  REFUSED: real form writes are disabled pending origin re-check and state-aware control verification.")
+    print("  The plan above is read-only; complete the form yourself.")
+    return 1
 
 
 def cmd_verify(conn, args) -> int:
@@ -768,18 +720,18 @@ def main() -> int:
     sub.add_parser("probe")
 
     pi = sub.add_parser("inspect")
-    pi.add_argument("--url", help="Omit to use the current tab.")
+    pi.add_argument("--url", required=True, help="Allowlisted URL to open before a read-only snapshot.")
 
     pp = sub.add_parser("plan")
-    pp.add_argument("--url", help="Omit to use the current tab.")
+    pp.add_argument("--url", required=True, help="Allowlisted URL to open before a read-only plan.")
 
     pf = sub.add_parser("fill")
-    pf.add_argument("--url", help="Omit to use the current tab.")
+    pf.add_argument("--url", required=True, help="Allowlisted URL; writes currently refuse by policy.")
     pf.add_argument("--application-id")
     pf.add_argument("--apply", action="store_true")
 
     pv = sub.add_parser("verify")
-    pv.add_argument("--url", help="Omit to snapshot the current tab.")
+    pv.add_argument("--url", required=True, help="Allowlisted URL to snapshot.")
 
     args = p.parse_args()
     print(f"===== AUTOFILL AGENT ({AGENT_VERSION}) =====")

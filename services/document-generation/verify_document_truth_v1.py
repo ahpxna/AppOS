@@ -69,7 +69,7 @@ DSN = (
     f"user={DB_USER} password={DB_PASSWORD}"
 )
 
-VERIFIER_VERSION = "truth_quality_checker_v1_per_claim_2026_07_28"
+VERIFIER_VERSION = "truth_quality_checker_v2_structured_and_company_grounded_2026_08_23"
 DEFAULT_OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
 DEFAULT_MODEL = get_model("verifier")
 
@@ -186,6 +186,21 @@ def fetch_application_jd(cur, application_id: str) -> str:
     return str(row[0] or "") if row else ""
 
 
+def fetch_application_identity(cur, application_id: str) -> tuple[str, str]:
+    cur.execute("SELECT company, job_title FROM applications WHERE id = %s;", (application_id,))
+    row = cur.fetchone()
+    return (str(row[0] or ""), str(row[1] or "")) if row else ("", "")
+
+
+def deterministic_cover_structure(company: str, job_title: str) -> set[str]:
+    if not company.strip() or not job_title.strip():
+        return set()
+    return {
+        f"I am applying for the {job_title.strip()} position at {company.strip()}.",
+        "Thank you for considering my application.",
+    }
+
+
 def fetch_company_research_text(cur, application_id: str) -> str:
     """Return the cached, URL-backed company context for literal-quote audit."""
     cur.execute(
@@ -253,6 +268,28 @@ Return ONLY valid JSON:
 """
 
 
+def build_company_claim_prompt(paragraph: str, company_insight: str, evidence_quote: str) -> str:
+    """Check company-claim entailment separately from candidate grounding."""
+    return f"""You are JobOS Company-Context Checker V1.
+
+Determine whether the company-specific statement is supported by the exact
+source excerpt. Do not use outside knowledge. A real URL is not proof that an
+interpretation is true.
+
+PARAGRAPH:
+{paragraph!r}
+
+COMPANY-SPECIFIC STATEMENT TO VERIFY:
+{company_insight!r}
+
+ONLY SOURCE EXCERPT:
+{evidence_quote!r}
+
+Return ONLY valid JSON:
+{{"verdict":"supported | unsupported", "reason":"one concise reason"}}
+"""
+
+
 def verify_claims(
     cur, claims: List[Dict[str, Any]], *, model: str, ollama_url: str,
     timeout: int, temperature: float, num_ctx: int, verbose: bool,
@@ -260,6 +297,7 @@ def verify_claims(
     jd_text: str = "", baseline_subtitles: Optional[Dict[int, str]] = None,
     baseline_bullets: Optional[Dict[int, str]] = None,
     company_context_text: str = "",
+    structural_cover_texts: Optional[set[str]] = None,
 ) -> List[Dict[str, Any]]:
     results = []
     tokens_in = tokens_out = 0
@@ -298,10 +336,19 @@ def verify_claims(
             continue
 
         if not asset_id or asset_id == "none":
+            is_valid_structure = (
+                c.get("kind") == "cover_letter_structure"
+                and claim_text in (structural_cover_texts or set())
+                and not uses_company_context
+            )
             results.append({
                 "claim": claim_text, "source_asset_id": None,
-                "verdict": "supported",
-                "reason": "Structural text with no factual claim.",
+                "verdict": "supported" if is_valid_structure else "rule_violation",
+                "reason": (
+                    "Deterministic cover-letter structure with no factual claim."
+                    if is_valid_structure else
+                    "Uncited text is not an approved deterministic structural cover-letter sentence."
+                ),
                 "safe_rewrite": "",
                 **company_evidence,
             })
@@ -359,6 +406,32 @@ def verify_claims(
                     "cover_evidence_audit": {"passed": False, "problems": cover_problems}, **company_evidence,
                 })
                 continue
+            if uses_company_context:
+                company_prompt = build_company_claim_prompt(
+                    claim_text,
+                    str(c.get("company_insight") or ""),
+                    str(c.get("company_evidence_quote") or ""),
+                )
+                company_raw = ollama_generate(
+                    model=model, prompt=company_prompt, ollama_url=ollama_url,
+                    timeout=timeout, temperature=0.0, num_ctx=num_ctx,
+                )
+                tokens_in += estimate_tokens(company_prompt)
+                tokens_out += estimate_tokens(company_raw)
+                try:
+                    company_verdict = extract_json_object(company_raw).get("verdict")
+                except (ValueError, json.JSONDecodeError):
+                    company_verdict = "unsupported"
+                if company_verdict != "supported":
+                    results.append({
+                        "claim": claim_text, "source_asset_id": asset_id, "asset_title": asset["title"],
+                        "kind": "cover_letter_evidence", "verdict": "rule_violation",
+                        "reason": "Company-specific claim is not entailed by its cited source excerpt.",
+                        "safe_rewrite": "",
+                        "cover_evidence_audit": {"passed": False, "company_entailment": False},
+                        **company_evidence,
+                    })
+                    continue
             prompt = build_claim_prompt(claim_text, asset)
         else:
             prompt = build_claim_prompt(claim_text, asset)
@@ -536,10 +609,18 @@ def process_document(
         jd_text=fetch_application_jd(cur, doc["application_id"]), baseline_subtitles=baseline_subtitles,
         baseline_bullets=baseline_bullets,
         company_context_text=fetch_company_research_text(cur, doc["application_id"]),
+        structural_cover_texts=deterministic_cover_structure(
+            *fetch_application_identity(cur, doc["application_id"])
+        ),
     )
     elapsed = time.time() - start
 
     qa_status = decide_qa_status(results)
+    if doc["doc_type"] == "resume" and qa_status == "revise":
+        # The generic revision builder flattens resume evidence into markdown
+        # and loses immutable template slots/subtitle audits.  Regenerate the
+        # structured resume instead of persisting a lossy child revision.
+        qa_status = "fail"
     counts = {v: sum(1 for r in results if r["verdict"] == v)
               for v in ("supported", "overclaimed", "unsupported", "rule_violation")}
 

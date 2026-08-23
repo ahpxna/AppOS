@@ -64,11 +64,18 @@ def cmd_rank(cur, args) -> int:
     terms = approved_terms(cur)
     cur.execute(
         """
-        SELECT id::text, source, company, job_title, job_url, jd_text,
-               current_step, status, location, work_mode
-        FROM applications
+        SELECT a.id::text, a.source, a.company, a.job_title, a.job_url, a.jd_text,
+               a.current_step, a.status, a.location, a.work_mode,
+               COALESCE(ia.status, 'UNKNOWN'),
+               COALESCE(ia.jd_policy_result, 'unknown'),
+               COALESCE(ia.jd_policy_evidence, '[]'::jsonb),
+               COALESCE(ia.everify_status, 'unknown'),
+               COALESCE(ia.h1b_history_status, 'unknown'),
+               ia.final_reason
+        FROM applications a
+        LEFT JOIN application_immigration_assessments ia ON ia.application_id = a.id
         WHERE (%s OR status = 'active')
-        ORDER BY created_at DESC;
+        ORDER BY a.created_at DESC;
         """,
         (args.include_inactive,),
     )
@@ -78,12 +85,23 @@ def cmd_rank(cur, args) -> int:
                          profile_terms=terms, user_keywords=args.keyword)
         if match["discovery_score"] < args.min_score:
             continue
+        immigration = {
+            "status": row[10], "jd_policy": row[11], "jd_policy_evidence": row[12] or [],
+            "everify": row[13], "h1b_history": row[14], "reason": row[15] or "",
+        }
+        if args.exclude_immigration_blocked and immigration["status"] == "BLOCKED":
+            continue
         results.append({
             "application_id": row[0], "source": row[1], "company": row[2],
             "job_title": row[3], "job_url": row[4], "current_step": row[6],
-            "status": row[7], "location": row[8], "work_mode": row[9], **match,
+            "status": row[7], "location": row[8], "work_mode": row[9],
+            "immigration_fit": immigration, **match,
         })
-    results.sort(key=lambda item: (-item["discovery_score"], item["company"] or "", item["job_title"] or ""))
+    immigration_order = {"HIGH": 0, "POSSIBLE": 1, "UNKNOWN": 2, "LOW": 3, "BLOCKED": 4}
+    results.sort(key=lambda item: (
+        immigration_order.get(item["immigration_fit"]["status"], 5),
+        -item["discovery_score"], item["company"] or "", item["job_title"] or "",
+    ))
     print(json.dumps({"profile_term_count": len(terms), "matches": results[:args.limit]}, indent=2))
     return 0
 
@@ -99,6 +117,8 @@ def main() -> int:
         sub.add_argument("--limit", type=int, default=25)
     rank.add_argument("--min-score", type=int, default=1)
     rank.add_argument("--include-inactive", action="store_true")
+    rank.add_argument("--exclude-immigration-blocked", action="store_true",
+                      help="Hide only JDs with an explicit incompatible immigration policy; unknown remains visible.")
     args = parser.parse_args()
     with psycopg.connect(DSN, autocommit=True) as conn:
         with conn.cursor() as cur:
