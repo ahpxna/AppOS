@@ -31,6 +31,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -42,12 +43,13 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 from pathlib import Path
 from typing import Any, Dict, Optional
 import threading
 import requests
 from services.autofill.parallel_bypass import _fake_mouse_routine
+
 import psycopg
 from psycopg.types.json import Jsonb
 
@@ -57,32 +59,41 @@ from psycopg.types.json import Jsonb
 # PYTHONPATH already. Confirmed live 2026-08-01.
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from services.common.observability import emit_trace, make_trace_id
+from services.common.config import database_dsn, load_repo_env
 from services.discovery.linkedin_discovery_v1 import (
     LinkedInDiscoveryError,
     ingest_discovered_jobs,
+    validate_job_url,
     validate_search_request,
 )
+from services.autofill.autofill_agent_v1 import parse_snapshot
+from services.autofill.autofill_executor_v1 import OpenClawTransport, TransportError
+from services.autofill.autofill_planner_v1 import plan_autofill
+from services.autofill.autofill_session_v1 import AutofillSession, SessionError, SnapshotState
+from services.autofill.form_inspector_v1 import inspect_nodes, inspect_question_groups
+from services.common.autofill_identity import canonical_page_url, page_fingerprint
+from services.autofill.autofill_context_v1 import AutofillContextError, load_autofill_context
+from services.common.openclaw_runtime import resolve_openclaw_binary
+from services.common.immigration_semantics import classify_immigration_question
+from services.common.question_memory import normalize_question
+
+
+load_repo_env()
 
 # ---------------------------------------------------------------- config
 
-DB_HOST = os.getenv("JOBOS_DB_HOST", "127.0.0.1")
-DB_PORT = int(os.getenv("JOBOS_DB_PORT", "5433"))
-DB_NAME = os.getenv("JOBOS_DB_NAME", "job_apply_os")
-DB_USER = os.getenv("JOBOS_DB_USER", "jobos")
-DB_PASSWORD = os.getenv("JOBOS_DB_PASSWORD", "jobos_local_dev_password_change_later")
-
-DSN = (
-    f"host={DB_HOST} port={DB_PORT} dbname={DB_NAME} "
-    f"user={DB_USER} password={DB_PASSWORD}"
-)
+DSN = database_dsn()
 
 # Prefer the pinned JobOS runtime when setup installed it.  A global OpenClaw
 # can otherwise inherit an unsupported Node version or a different plugin set.
 REPO_ROOT = Path(__file__).resolve().parents[2]
-PRIVATE_OPENCLAW_BIN = REPO_ROOT / "data" / "openclaw-runtime" / "node" / "node_modules" / ".bin" / "openclaw"
-OPENCLAW_BIN = os.getenv("OPENCLAW_BIN") or (str(PRIVATE_OPENCLAW_BIN) if PRIVATE_OPENCLAW_BIN.is_file() else "openclaw")
+OPENCLAW_BIN = resolve_openclaw_binary()
 # Agent ids as defined in ~/.openclaw/openclaw.json -> agents.list
 OPENCLAW_AGENT_BROWSE = os.getenv("OPENCLAW_AGENT_BROWSE", "main")
+OPENCLAW_AGENT_LINKEDIN_DISCOVERY = (
+    os.getenv("OPENCLAW_AGENT_LINKEDIN_DISCOVERY", "linkedin_discovery").strip()
+    or "linkedin_discovery"
+)
 OPENCLAW_AGENT_RESUME = os.getenv("OPENCLAW_AGENT_RESUME", "resume")
 OPENCLAW_AGENT_COVER = os.getenv("OPENCLAW_AGENT_COVER", "cover_letter")
 # This is a host-side probe. For the Docker overlay, OpenClaw itself is
@@ -94,7 +105,7 @@ BROWSER_CDP_URL = (
     or "http://127.0.0.1:9222"
 ).rstrip("/")
 
-WORKER_VERSION = "browser_queue_worker_v2_openclaw_cli_2026_07_28"
+WORKER_VERSION = "browser_queue_worker_v4_deterministic_form_session_2026_08_23"
 WORKER_ID = f"{socket.gethostname()}:{os.getpid()}"
 LEASE_SECONDS = int(os.getenv("JOBOS_BROWSER_LEASE_SECONDS", "600"))
 
@@ -105,6 +116,14 @@ SUPPORTED_TASKS = {
     "fill_application_form",
 }
 REQUIRES_APPROVAL = {"fill_application_form"}
+
+
+def feature_enabled(name: str, default: bool = True) -> bool:
+    """Read a deliberately explicit local feature switch without guessing."""
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().casefold() in {"1", "true", "yes", "on"}
 
 
 class PermanentTaskError(Exception):
@@ -234,6 +253,56 @@ def browser_cdp_health() -> tuple[bool, str]:
 # ---------------------------------------------------------------- queue
 
 def reap_expired_leases(cur) -> int:
+    # A crash before an action is journaled is provably pre-I/O. Release that
+    # exact capability/task pair for a safe retry. Once a journal row exists,
+    # an external write may have happened and the task must be reconciled.
+    cur.execute(
+        """
+        WITH safe AS (
+          SELECT b.id AS task_id, b.approval_request_id
+          FROM browser_tasks b
+          JOIN approval_requests a ON a.id = b.approval_request_id
+          WHERE b.status = 'running'
+            AND b.lease_expires_at < now()
+            AND b.execution_state = 'executing'
+            AND a.status = 'executing'
+            AND a.executing_task_id = b.id
+            AND NOT EXISTS (
+              SELECT 1 FROM autofill_action_journal j WHERE j.browser_task_id = b.id
+            )
+          FOR UPDATE
+        ), released AS (
+          UPDATE approval_requests a
+          SET status = 'approved', executing_task_id = NULL
+          FROM safe s
+          WHERE a.id = s.approval_request_id
+          RETURNING s.task_id
+        )
+        UPDATE browser_tasks b
+        SET status = 'queued', execution_state = 'not_started', locked_by = NULL,
+            lease_expires_at = NULL, retry_count = retry_count + 1
+        FROM released r
+        WHERE b.id = r.task_id
+        RETURNING b.id;
+        """
+    )
+    pre_io = len(cur.fetchall())
+    # Once deterministic execution started, the browser may already contain a
+    # side effect. Never place such a task back on the queue after a worker
+    # crash: retain it for explicit reconciliation instead.
+    cur.execute(
+        """
+        UPDATE browser_tasks
+        SET status = 'failed', execution_state = 'needs_reconciliation',
+            locked_by = NULL, lease_expires_at = NULL, finished_at = now(),
+            error_message = COALESCE(error_message, 'Worker lease expired during browser execution; reconcile before retrying.')
+        WHERE status = 'running'
+          AND lease_expires_at < now()
+          AND execution_state IN ('executing', 'partial')
+        RETURNING id;
+        """
+    )
+    unsafe = len(cur.fetchall())
     cur.execute(
         """
         UPDATE browser_tasks
@@ -241,11 +310,12 @@ def reap_expired_leases(cur) -> int:
             retry_count = retry_count + 1
         WHERE status = 'running'
           AND lease_expires_at < now()
+          AND execution_state = 'not_started'
           AND retry_count < max_retries
         RETURNING id;
         """
     )
-    return len(cur.fetchall())
+    return pre_io + unsafe + len(cur.fetchall())
 
 
 def dead_letter_exhausted(cur) -> int:
@@ -264,6 +334,7 @@ def dead_letter_exhausted(cur) -> int:
               error_message = COALESCE(error_message, 'Max retries exceeded')
           WHERE status = 'running'
             AND lease_expires_at < now()
+            AND execution_state = 'not_started'
             AND retry_count >= max_retries
           RETURNING id, task_type, application_id, input_json,
                     error_message, retry_count, screenshot_url
@@ -298,7 +369,12 @@ def claim_next_task(cur) -> Optional[Dict[str, Any]]:
           LIMIT 1
         )
         RETURNING id::text, task_type, application_id::text,
-                  input_json, timeout_seconds, retry_count, max_retries;
+                  input_json, timeout_seconds, retry_count, max_retries,
+                  approval_request_id::text, expected_origin,
+                  generated_document_id::text, document_sha256,
+                  bound_artifact_id::text, artifact_sha256, artifact_filename,
+                  expected_initial_url, expected_page_fingerprint, autofill_input_hash,
+                  autofill_action_scope;
         """,
         (WORKER_ID, LEASE_SECONDS),
     )
@@ -310,6 +386,11 @@ def claim_next_task(cur) -> Optional[Dict[str, Any]]:
         "input_json": row[3] or {}, "timeout_seconds": row[4] or 300,
         "retry_count": row[5] or 0,
         "max_retries": row[6] if row[6] is not None else 2,
+        "approval_request_id": row[7], "expected_origin": row[8],
+        "generated_document_id": row[9], "document_sha256": row[10],
+        "bound_artifact_id": row[11], "artifact_sha256": row[12], "artifact_filename": row[13],
+        "expected_initial_url": row[14], "expected_page_fingerprint": row[15], "autofill_input_hash": row[16],
+        "autofill_action_scope": row[17] or {},
     }
 
 
@@ -356,19 +437,23 @@ def requeue_or_fail(cur, task: Dict[str, Any], error: str) -> str:
 
 # ---------------------------------------------------------------- guards
 
-def require_verified_document(cur, document_id: str) -> Dict[str, Any]:
+def require_verified_document(cur, document_id: str, application_id: Optional[str]) -> Dict[str, Any]:
     """The single chokepoint that keeps L3 from writing ungrounded text."""
+    if not application_id:
+        raise PermanentTaskError("A form-write document must have an application_id.")
     cur.execute(
         """
         SELECT id::text, doc_type, content, qa_status, approved
         FROM generated_documents
-        WHERE id = %s;
+        WHERE id = %s AND application_id = %s;
         """,
-        (document_id,),
+        (document_id, application_id),
     )
     row = cur.fetchone()
     if not row:
-        raise PermanentTaskError(f"generated_document not found: {document_id}")
+        raise PermanentTaskError(
+            f"generated_document {document_id} does not belong to application {application_id}."
+        )
 
     doc = {"id": row[0], "doc_type": row[1], "content": row[2],
            "qa_status": row[3], "approved": row[4]}
@@ -387,26 +472,277 @@ def require_verified_document(cur, document_id: str) -> Dict[str, Any]:
     return doc
 
 
-def require_approval(cur, application_id: Optional[str]) -> None:
+def _normalised_origin(url: str) -> str:
+    parsed = urlsplit(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise PermanentTaskError(f"Invalid expected origin: {url[:120]}")
+    return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}"
+
+
+def require_bound_approval(cur, task: Dict[str, Any]) -> Dict[str, Any]:
+    """Load exactly one unused capability bound to this task, app and document.
+
+    Looking up *any* approved request for an application was an authorization
+    bypass: a stale approval could authorize another URL/document.  Legacy
+    tasks have no complete binding and intentionally fail closed.
+    """
+    application_id = task.get("application_id")
+    approval_id = task.get("approval_request_id")
+    document_id = task.get("generated_document_id") or task.get("input_json", {}).get("generated_document_id")
+    expected_origin = task.get("expected_origin")
+    document_sha256 = task.get("document_sha256")
     if not application_id:
         raise PermanentTaskError(
             "Task touches a real application form but has no application_id."
         )
+    if not all((approval_id, document_id, expected_origin, document_sha256)):
+        raise PermanentTaskError(
+            "Form-write task lacks an exact approval_request_id, document id/hash, or expected origin. "
+            "Legacy approvals cannot authorize a form write."
+        )
+    origin = _normalised_origin(str(expected_origin))
     cur.execute(
         """
-        SELECT 1 FROM approval_requests
-        WHERE application_id = %s
+        SELECT id::text, target_action, bound_document_id::text,
+               bound_document_sha256, expected_origin, bound_artifact_id::text,
+               bound_artifact_sha256, bound_artifact_filename, expected_initial_url,
+               expected_page_fingerprint, bound_autofill_input_hash, bound_autofill_action_scope
+        FROM approval_requests
+        WHERE id = %s
+          AND application_id = %s
           AND status = 'approved'
+          AND consumed_at IS NULL
           AND token_expires_at > now()
-        LIMIT 1;
         """,
-        (application_id,),
+        (approval_id, application_id),
     )
-    if cur.fetchone() is None:
+    row = cur.fetchone()
+    if row is None:
         raise PermanentTaskError(
-            "No valid, unexpired approval_request for this application. "
-            "Human approval is required before touching a real form."
+            "No valid unused approval exists for this exact application capability."
         )
+    approved_id, target_action, bound_doc, bound_hash, bound_origin, artifact_id, artifact_hash, artifact_filename, page_url, page_fingerprint_sha, input_hash, action_scope = row
+    if target_action != "fill_application_form":
+        raise PermanentTaskError(f"Approval {approved_id} is not for fill_application_form.")
+    if bound_doc != document_id or bound_hash != document_sha256:
+        raise PermanentTaskError("Approval document binding does not match this task.")
+    if _normalised_origin(str(bound_origin or "")) != origin:
+        raise PermanentTaskError("Approval origin binding does not match this task.")
+    if (artifact_id or task.get("bound_artifact_id")) and (
+        artifact_id != task.get("bound_artifact_id") or artifact_hash != task.get("artifact_sha256")
+        or artifact_filename != task.get("artifact_filename")
+    ):
+        raise PermanentTaskError("Approval artifact binding does not match this task.")
+    try:
+        page_matches = canonical_page_url(str(page_url)) == canonical_page_url(str(task.get("expected_initial_url") or ""))
+    except ValueError:
+        page_matches = False
+    if not all((page_url, page_fingerprint_sha, input_hash)) or not page_matches or (
+        page_fingerprint_sha != task.get("expected_page_fingerprint")
+        or input_hash != task.get("autofill_input_hash")
+        or (action_scope or {}) != (task.get("autofill_action_scope") or {})
+    ):
+        raise PermanentTaskError("Approval page/input binding does not match this task.")
+    return {"id": approved_id, "document_id": document_id, "expected_origin": origin,
+            "artifact_id": artifact_id, "artifact_sha256": artifact_hash, "artifact_filename": artifact_filename,
+            "expected_initial_url": page_url, "expected_page_fingerprint": page_fingerprint_sha,
+            "autofill_input_hash": input_hash, "autofill_action_scope": action_scope or {}}
+
+
+def require_current_input_hash(binding: Dict[str, Any], current_hash: str) -> None:
+    """Reject a capability when profile/legal/document inputs changed post-approval."""
+    if str(binding.get("autofill_input_hash") or "") != str(current_hash or ""):
+        raise PermanentTaskError(
+            "Candidate profile or confirmed legal answer changed after approval; issue a new approval."
+        )
+
+
+def action_is_in_approved_scope(action, scope: Dict[str, Any]) -> bool:
+    """Do not let a dynamic ATS reveal an unreviewed extra write."""
+    if action.action not in {"fill", "select", "check", "upload"}:
+        return True
+    key = action.profile_key or ""
+    if key.startswith("documents."):
+        return key.removeprefix("documents.") in set(scope.get("document_types") or [])
+    if key:
+        return key in set(scope.get("profile_keys") or [])
+    question = action.question_label or ""
+    semantic = classify_immigration_question(question)
+    if semantic is not None:
+        return semantic.value in set(scope.get("sensitive_classes") or [])
+    return normalize_question(question) in set(scope.get("remembered_questions") or [])
+
+
+def _durable_connection():
+    """A commit independent of the worker's task transaction.
+
+    Browser writes cannot roll back.  These small state changes therefore
+    deliberately survive a later rollback of the main queue transaction.
+    """
+    # A dedicated connection is durable relative to the queue worker's outer
+    # transaction, but its related statements must still commit atomically.
+    return psycopg.connect(DSN, autocommit=False)
+
+
+def durable_begin_execution(task: Dict[str, Any], binding: Dict[str, Any], target_id: str) -> None:
+    """Move the capability to executing before the first browser write."""
+    with _durable_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE approval_requests
+            SET status = 'executing', executing_task_id = %s
+            WHERE id = %s AND application_id = %s
+              AND status = 'approved' AND consumed_at IS NULL
+              AND token_expires_at > now()
+            RETURNING id;
+            """,
+            (task["id"], binding["id"], task["application_id"]),
+        )
+        if cur.fetchone() is None:
+            raise PermanentTaskError("Approval changed before execution; create a new approval instead of replaying.")
+        cur.execute(
+            """
+            UPDATE browser_tasks
+            SET execution_state = 'executing', pinned_target_id = %s
+            WHERE id = %s AND status = 'running';
+            """,
+            (target_id, task["id"]),
+        )
+        if cur.rowcount != 1:
+            raise PermanentTaskError("Browser task is no longer running; refusing a browser write.")
+        cur.execute(
+            """INSERT INTO application_attempts
+                  (application_id, browser_task_id, attempt_kind, status, detail_json)
+               VALUES (%s, %s, 'deterministic_autofill', 'started', %s);""",
+            (task["application_id"], task["id"], Jsonb({"pinned_target_id": target_id})),
+        )
+
+
+def durable_journal_start(task: Dict[str, Any], binding: Dict[str, Any], action, target_id: str) -> str:
+    """Persist a pending external action before invoking OpenClaw."""
+    value_hash = hashlib.sha256((action.value or "").encode("utf-8")).hexdigest()
+    with _durable_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO autofill_action_journal
+              (browser_task_id, approval_request_id, sequence_no, target_id,
+               action_kind, target_ref, expected_value_sha256, status)
+            SELECT %s, %s, COALESCE(MAX(sequence_no), 0) + 1, %s,
+                   %s, %s, %s, 'started'
+            FROM autofill_action_journal
+            WHERE browser_task_id = %s
+            RETURNING id::text;
+            """,
+            (task["id"], binding["id"], target_id, action.action, action.ref, value_hash, task["id"]),
+        )
+        return cur.fetchone()[0]
+
+
+def durable_journal_verified(action, target_id: str, journal_id: str) -> None:
+    with _durable_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE autofill_action_journal
+            SET status = 'verified', verified_at = now(),
+                observed_json = %s
+            WHERE id = %s AND status = 'started';
+            """,
+            (Jsonb({"target_id": target_id, "ref": action.ref, "action": action.action}), journal_id),
+        )
+        if cur.rowcount != 1:
+            raise PermanentTaskError("Autofill action journal changed unexpectedly; manual reconciliation is required.")
+
+
+def durable_journal_failed(action, target_id: str, journal_id: str) -> None:
+    with _durable_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE autofill_action_journal
+            SET status = 'failed', observed_json = %s
+            WHERE id = %s AND status = 'started';
+            """,
+            (Jsonb({"target_id": target_id, "ref": action.ref, "action": action.action}), journal_id),
+        )
+
+
+def durable_finish_execution(task: Dict[str, Any], binding: Dict[str, Any], result) -> None:
+    """Consume once only after the session finishes, including partial writes.
+
+    A partially written form must never be retried under the same capability.
+    The journal is the recovery record for the user/reviewer.
+    """
+    execution_state = "completed" if result.status == "completed" else "partial"
+    with _durable_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE approval_requests
+            SET status = 'consumed', consumed_at = now(), consumed_by = %s
+            WHERE id = %s AND application_id = %s
+              AND status = 'executing' AND executing_task_id = %s
+            RETURNING id;
+            """,
+            (WORKER_ID, binding["id"], task["application_id"], task["id"]),
+        )
+        if cur.fetchone() is None:
+            raise PermanentTaskError("Executing approval changed unexpectedly; manual reconciliation is required.")
+        cur.execute(
+            """
+            UPDATE browser_tasks
+            SET execution_state = %s, pinned_target_id = %s
+            WHERE id = %s;
+            """,
+            (execution_state, result.target_id, task["id"]),
+        )
+        cur.execute(
+            """UPDATE application_attempts
+                   SET status = %s, finished_at = now(),
+                       detail_json = detail_json || %s
+                 WHERE browser_task_id = %s AND status = 'started';""",
+            (execution_state, Jsonb({"verified_refs": list(result.verified_refs),
+                                     "failed_refs": list(result.failed_refs)}), task["id"]),
+        )
+
+
+def durable_mark_reconciliation(task: Dict[str, Any], target_id: str | None, reason: str) -> None:
+    """Leave an executing capability non-replayable after an uncertain write."""
+    with _durable_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE browser_tasks
+            SET execution_state = 'needs_reconciliation', pinned_target_id = COALESCE(%s, pinned_target_id),
+                error_message = %s
+            WHERE id = %s;
+            """,
+            (target_id, reason[:2000], task["id"]),
+        )
+        cur.execute(
+            """UPDATE application_attempts
+                   SET status = 'needs_review', finished_at = now(),
+                       detail_json = detail_json || %s
+                 WHERE browser_task_id = %s AND status = 'started';""",
+            (Jsonb({"reason": reason[:500]}), task["id"]),
+        )
+
+
+def durable_close_unstarted_approval(task: Dict[str, Any], binding: Dict[str, Any], reason: str) -> None:
+    """Close a capability that produced no external browser write.
+
+    An approved capability must not remain live after its queue task reached a
+    no-write terminal state (for example, every proposed field needed review).
+    A later profile or form change must receive a fresh approval instead.
+    """
+    with _durable_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE approval_requests
+            SET status = 'expired', action_note = COALESCE(action_note, %s)
+            WHERE id = %s AND application_id = %s
+              AND status = 'approved' AND consumed_at IS NULL;
+            """,
+            (reason[:500], binding["id"], task["application_id"]),
+        )
+        if cur.rowcount != 1:
+            raise PermanentTaskError("Unstarted approval changed unexpectedly; do not reuse it.")
 
 
 def load_allowed_domains(cur) -> list:
@@ -445,10 +781,67 @@ def require_url(cur, input_json: Dict[str, Any]) -> str:
     return url
 
 
+def require_ats_autofill_capability(cur, application_id: str) -> dict[str, bool]:
+    """Fail closed when an ATS has not been explicitly proven for this mode."""
+    cur.execute("SELECT coalesce(ats_type, 'unknown') FROM applications WHERE id = %s;", (application_id,))
+    row = cur.fetchone()
+    ats_type = str(row[0]) if row else "unknown"
+    cur.execute("""SELECT autofill_mode, supports_static_text, supports_radio,
+                          supports_select, supports_upload
+                   FROM ats_capabilities WHERE ats_type = %s;""", (ats_type,))
+    capability = cur.fetchone()
+    if not capability or capability[0] == "review_only":
+        raise PermanentTaskError(
+            f"ATS '{ats_type}' is review-only or unregistered. Add a proven single-page capability before browser writes."
+        )
+    return {"fill": bool(capability[1]), "check": bool(capability[2]),
+            "select": bool(capability[3]), "upload": bool(capability[4])}
+
+
+def snapshot_state(transport: OpenClawTransport, target_id: str) -> SnapshotState:
+    payload = transport.snapshot(target_id)
+    nodes = parse_snapshot(payload)
+    return SnapshotState(
+        tuple(inspect_nodes(nodes)), tuple(inspect_question_groups(nodes)),
+        page_fingerprint(payload, page_url=transport.current_url(target_id)), bool(payload.get("truncated")),
+    )
+
+
 # ---------------------------------------------------------------- handlers
 
 def handle_fetch_job_description(cur, task) -> Dict[str, Any]:
     url = require_url(cur, task["input_json"])
+    # The third LinkedIn intake mode is intentionally deterministic: the user
+    # opens one already-authenticated job page, then JobOS reads the exact
+    # pinned tab without giving an LLM a browser handle.
+    if task["input_json"].get("source") == "linkedin" and task["input_json"].get("deterministic_read_only"):
+        if not feature_enabled("JOBOS_LINKEDIN_READONLY_CAPTURE_ENABLED"):
+            raise PermanentTaskError("LinkedIn deterministic read-only capture is disabled by configuration.")
+        transport = OpenClawTransport(
+            binary=OPENCLAW_BIN, profile=os.getenv("JOBOS_BROWSER_PROFILE", "remote"),
+            timeout=min(int(task["timeout_seconds"]), 90), environment=openclaw_runtime_env(),
+        )
+        target = transport.resolve_target()
+        current = transport.current_url(target.target_id)
+        try:
+            exact_current, exact_requested = validate_job_url(current), validate_job_url(url)
+        except LinkedInDiscoveryError as exc:
+            raise PermanentTaskError(f"Pinned page is not a canonical LinkedIn job detail: {exc}") from exc
+        if exact_current != exact_requested:
+            raise PermanentTaskError(
+                "Pinned browser tab is not the user-approved LinkedIn job URL; open that exact job page and retry."
+            )
+        payload = transport.snapshot(target.target_id)
+        if payload.get("truncated"):
+            raise PermanentTaskError("LinkedIn snapshot is truncated; refusing partial JD capture.")
+        text = str(payload.get("snapshot") or "").strip()
+        if not text:
+            raise PermanentTaskError("Pinned LinkedIn job page produced no readable snapshot.")
+        return {
+            "url": current, "mode": "linkedin_deterministic_read_only",
+            "pinned_target_id": target.target_id, "agent_response": {"text": text},
+            "submitted": False,
+        }
     msg = (
         "Open this URL and return the full job description text.\n"
         f"URL: {url}\n\n"
@@ -474,13 +867,20 @@ def handle_discover_linkedin_jobs(cur, task) -> Dict[str, Any]:
     message anyone, alter preferences, or apply; it merely reads at most the
     requested number of result detail pages and returns their JDs as JSON.
     """
+    if not feature_enabled("JOBOS_LINKEDIN_AGENT_DISCOVERY_ENABLED"):
+        raise PermanentTaskError(
+            "LinkedIn autonomous discovery is disabled. Enable "
+            "JOBOS_LINKEDIN_AGENT_DISCOVERY_ENABLED only for a dedicated, manually logged-in JobOS browser."
+        )
     inp = task["input_json"]
     if inp.get("user_initiated") is not True:
         raise PermanentTaskError("LinkedIn discovery requires explicit user_initiated=true.")
     try:
         request = validate_search_request(
-            str(inp.get("keywords") or ""), str(inp.get("location") or ""),
-            inp.get("max_results"),
+            str(inp.get("keywords") or ""), str(inp.get("location") or ""), inp.get("max_results"),
+            date_posted=inp.get("date_posted"), experience_levels=inp.get("experience_levels"),
+            employment_types=inp.get("employment_types"), work_modes=inp.get("work_modes"),
+            companies=inp.get("companies"), sort_by=inp.get("sort_by"),
         )
     except LinkedInDiscoveryError as exc:
         raise PermanentTaskError(str(exc)) from exc
@@ -495,7 +895,10 @@ def handle_discover_linkedin_jobs(cur, task) -> Dict[str, Any]:
         "Search the URL below. "
         "This is a bounded, read-only user-requested discovery task.\n"
         f"Search URL: {search_url}\n"
-        f"Read no more than {request['max_results']} result detail pages.\n\n"
+        f"Read no more than {request['max_results']} result detail pages. Apply only these requested filters when LinkedIn exposes them: "
+        f"date_posted={request['date_posted'] or 'any'}, experience_levels={request['experience_levels'] or ['any']}, "
+        f"employment_types={request['employment_types'] or ['any']}, work_modes={request['work_modes'] or ['any']}, "
+        f"companies={request['companies'] or ['any']}, sort={request['sort_by']}.\n\n"
         "First list/focus tabs for profile `remote`. If a LinkedIn jobs-search tab "
         "already has these keywords and location, snapshot it and do not navigate again. "
         "If navigation reports a timeout, immediately list tabs and snapshot the current "
@@ -505,8 +908,8 @@ def handle_discover_linkedin_jobs(cur, task) -> Dict[str, Any]:
         "create alerts, save jobs, message anyone, upload, fill fields, click Easy Apply, "
         "or submit anything. If the existing browser session is not signed in or a "
         "CAPTCHA appears, stop and report that exact blocker.\n\n"
-        "Open only the first eligible result detail if its details are not already visible. "
-        "Snapshot the detail pane and copy the complete visible `About the job` text. "
+        "Open at most the requested number of eligible result details. Snapshot each detail pane "
+        "and copy its complete visible `About the job` text. "
         "Use a canonical URL exactly like https://www.linkedin.com/jobs/view/<numeric-id>/; "
         "discard tracking query parameters.\n\n"
         "For each read result return ONLY one JSON object in this exact form:\n"
@@ -545,7 +948,7 @@ def handle_discover_linkedin_jobs(cur, task) -> Dict[str, Any]:
 
     try:
         agent_response = openclaw_agent(
-            agent=OPENCLAW_AGENT_BROWSE, message=msg, timeout=task["timeout_seconds"],
+            agent=OPENCLAW_AGENT_LINKEDIN_DISCOVERY, message=msg, timeout=task["timeout_seconds"],
             session_id=f"jobos-task-{task['id']}",
         )
     finally:
@@ -595,49 +998,91 @@ def handle_capture_page_snapshot(cur, task) -> Dict[str, Any]:
 
 
 def handle_fill_application_form(cur, task) -> Dict[str, Any]:
-    inp = task["input_json"]
-    url = require_url(cur, inp)
-    document_id = inp.get("generated_document_id")
-    if not document_id:
-        raise PermanentTaskError(
-            "fill_application_form requires input_json.generated_document_id. "
-            "Raw text is deliberately not accepted here."
+    action_capabilities = require_ats_autofill_capability(cur, task["application_id"])
+    binding = require_bound_approval(cur, task)
+    document = require_verified_document(cur, binding["document_id"], task["application_id"])
+    document_hash = hashlib.sha256((document["content"] or "").encode("utf-8")).hexdigest()
+    if document_hash != task["document_sha256"]:
+        raise PermanentTaskError("Bound generated document content changed after approval; reissue approval.")
+
+    try:
+        context = load_autofill_context(
+            cur, application_id=task["application_id"], artifact_binding=binding,
+            document_sha256=document_hash, page_url=binding["expected_initial_url"],
+            page_fingerprint_sha256=binding["expected_page_fingerprint"], data_root=REPO_ROOT / "data",
         )
+    except AutofillContextError as exc:
+        raise PermanentTaskError(str(exc)) from exc
+    require_current_input_hash(binding, context.input_hash)
+    transport = OpenClawTransport(binary=OPENCLAW_BIN, profile=os.getenv("JOBOS_BROWSER_PROFILE", "remote"),
+                                  timeout=min(int(task["timeout_seconds"]), 90), environment=openclaw_runtime_env())
+    execution_started = False
+    pinned_target_id: str | None = None
+    latest_actions = []
 
-    doc = require_verified_document(cur, document_id)
+    def make_plan(state: SnapshotState):
+        nonlocal latest_actions
+        latest_actions, _ = plan_autofill(
+            list(state.fields), context.profile, question_groups=list(state.groups),
+            approved_sensitive_answers=context.sensitive_answers,
+            remembered_answers=context.remembered_answers,
+        )
+        latest_actions = [
+            action if action_is_in_approved_scope(action, binding["autofill_action_scope"]) and
+                      (action.action not in action_capabilities or action_capabilities[action.action])
+            else type(action)("pause", action.ref, None, action.profile_key,
+                              "Action is outside the approved scope or unsupported by this ATS.", action.question_label)
+            for action in latest_actions
+        ]
+        return latest_actions
 
-    agent = {
-        "resume": OPENCLAW_AGENT_RESUME,
-        "cover_letter": OPENCLAW_AGENT_COVER,
-    }.get(doc["doc_type"], OPENCLAW_AGENT_BROWSE)
+    def begin_execution(target_id: str) -> None:
+        nonlocal execution_started, pinned_target_id
+        durable_begin_execution(task, binding, target_id)
+        execution_started, pinned_target_id = True, target_id
 
-    msg = (
-        "Fill this application form using ONLY the text between the markers "
-        "below.\n"
-        f"URL: {url}\n\n"
-        "Rules:\n"
-        "1. Use the provided text as-is. Do not rewrite, expand, embellish, or "
-        "invent answers for fields the text does not cover.\n"
-        "2. Leave any field you cannot fill from the text EMPTY, and report it "
-        "as unfilled.\n"
-        "3. DO NOT CLICK SUBMIT. Stop once the fields are populated.\n"
-        "4. Take a screenshot of the filled form and return its path.\n\n"
-        f"--- BEGIN APPROVED {doc['doc_type'].upper()} ---\n"
-        f"{doc['content']}\n"
-        f"--- END APPROVED {doc['doc_type'].upper()} ---"
-    )
-
-    resp = openclaw_agent(
-        agent=agent, message=msg, timeout=task["timeout_seconds"], session_id=f"jobos-task-{task['id']}"
-    )
+    try:
+        session = AutofillSession(
+            transport=transport, expected_origin=binding["expected_origin"],
+            expected_initial_url=binding["expected_initial_url"],
+            expected_page_fingerprint=binding["expected_page_fingerprint"],
+            snapshot_state=lambda target_id: snapshot_state(transport, target_id),
+            origin_allowed=lambda url: check_domain(cur, url),
+            begin_execution=begin_execution,
+            before_action=lambda action, target_id: durable_journal_start(task, binding, action, target_id),
+            after_verified=durable_journal_verified,
+            after_failed=durable_journal_failed,
+        )
+        result = session.execute(make_plan)
+        if execution_started:
+            durable_finish_execution(task, binding, result)
+        else:
+            durable_close_unstarted_approval(
+                task, binding,
+                "No deterministic browser write ran; issue a fresh approval after review or form changes.",
+            )
+    except (SessionError, TransportError, PermanentTaskError) as exc:
+        if execution_started:
+            durable_mark_reconciliation(task, pinned_target_id, str(exc))
+            raise PermanentTaskError(
+                "Browser execution entered an uncertain state after a write; "
+                "it will not retry automatically. Review the autofill action journal."
+            ) from exc
+        if isinstance(exc, TransportError):
+            raise TransientTaskError(str(exc)) from exc
+        # This task is terminal but never wrote to the browser.  Close its
+        # capability so an invalid page identity or changed form can be
+        # reviewed and approved afresh instead of leaving idempotency stuck.
+        durable_close_unstarted_approval(task, binding, f"Preflight refused: {exc}")
+        raise PermanentTaskError(str(exc)) from exc
     return {
-        "url": url,
-        "generated_document_id": document_id,
-        "doc_type": doc["doc_type"],
-        "submitted": False,
-        "note": "Fields populated. Final submit is a human action by design.",
-        "agent_response": resp,
-    }
+        "status": result.status, "verified_refs": list(result.verified_refs),
+        "failed_refs": list(result.failed_refs), "executed_refs": list(result.executed_refs),
+        "pinned_target_id": result.target_id,
+        "paused": [action.question_label or action.reason for action in latest_actions if action.action == "pause"],
+        "approval_consumed": execution_started,
+        "approval_closed_without_write": not execution_started,
+        "submitted": False, }
 
 
 HANDLERS = {
@@ -686,7 +1131,7 @@ def process_one(conn) -> bool:
                     f"Unsupported task_type: {task['task_type']}"
                 )
             if task["task_type"] in REQUIRES_APPROVAL:
-                require_approval(cur, task["application_id"])
+                require_bound_approval(cur, task)
 
             start = time.perf_counter()
             result = HANDLERS[task["task_type"]](cur, task)

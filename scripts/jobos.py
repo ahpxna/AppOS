@@ -201,11 +201,34 @@ def autofill_prepare(application_id: str, *, create: bool, yes: bool) -> int:
             print("No approval created.")
             return 0
         command = [
-            sys.executable, str(ROOT / "services" / "approval" / "approval_service_v1.py"), "create",
-            "--type", "autofill_form", "--application-id", application_id,
-            "--document-id", document[0], "--expected-origin", _origin(canonical_url),
-            "--expected-page-url", canonical_url, "--expected-page-fingerprint", fingerprint,
-            "--autofill-action-scope-json", json.dumps(action_scope, separators=(",", ":")),
+            sys.executable,
+            str(ROOT / "services" / "approval" / "approval_service_v1.py"),
+            "create",
+
+            "--type",
+            "autofill_form",
+
+            "--application-id",
+            application_id,
+
+            "--document-id",
+            document[0],
+
+            "--expected-origin",
+            _origin(canonical_url),
+
+            "--expected-page-url",
+            canonical_url,
+
+            "--expected-page-fingerprint",
+            fingerprint,
+
+            "--expected-autofill-input-hash",
+            context.input_hash,
+
+            "--autofill-action-scope-json",
+            json.dumps(action_scope, separators=(",", ":")),
+
             "--apply",
         ]
         if document[2]:

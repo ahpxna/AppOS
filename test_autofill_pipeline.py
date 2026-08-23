@@ -6,8 +6,46 @@ from services.autofill.autofill_executor_v1 import BrowserTarget, OpenClawTransp
 from services.autofill.autofill_session_v1 import AutofillSession, SessionError, SnapshotState
 from services.autofill.autofill_verifier_v1 import verify_actions
 from services.autofill.form_inspector_v1 import FormField, QuestionGroup, QuestionOption
-from services.common.autofill_identity import canonical_page_url
+from services.common.autofill_identity import (
+    canonical_page_url,
+    autofill_input_hash,
+)
 
+def test_autofill_input_hash_binds_remembered_answers():
+    common = dict(
+        profile={
+            "personal": {
+                "first_name": "An",
+            },
+        },
+        sensitive_answers={},
+        document_sha256="a" * 64,
+        artifact_sha256=None,
+        page_url="https://jobs.example.com/apply?job=123",
+        page_fingerprint_sha256="b" * 64,
+    )
+
+    blue = autofill_input_hash(
+        remembered_answers={
+            "favorite color": {
+                "value": "Blue",
+                "answer_kind": "text",
+            },
+        },
+        **common,
+    )
+
+    red = autofill_input_hash(
+        remembered_answers={
+            "favorite color": {
+                "value": "Red",
+                "answer_kind": "text",
+            },
+        },
+        **common,
+    )
+
+    assert blue != red
 
 def test_static_identity_is_narrow_and_verifiable():
     actions, _ = plan_autofill(

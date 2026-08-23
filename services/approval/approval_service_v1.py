@@ -289,8 +289,8 @@ def cmd_create(conn, args) -> int:
             })
         elif args.type == "autofill_form":
             if not all((args.application_id, args.document_id, args.expected_origin,
-                        args.expected_page_url, args.expected_page_fingerprint)):
-                print("ERROR: autofill_form requires --application-id, --document-id, --expected-origin, --expected-page-url and --expected-page-fingerprint.")
+                        args.expected_page_url, args.expected_page_fingerprint, args.expected_autofill_input_hash,)):
+                print("ERROR: autofill_form requires --application-id, --document-id, --expected-origin, --expected-page-url, --expected-page-fingerprint and --expected-autofill-input-hash.")
                 return 1
             try:
                 binding = fetch_document_binding(cur, args.application_id, args.document_id)
@@ -306,11 +306,36 @@ def cmd_create(conn, args) -> int:
                 if not isinstance(action_scope, dict) or not isinstance(action_scope.get("profile_keys"), list):
                     raise RuntimeError("--autofill-action-scope-json must contain profile_keys from jobos autofill prepare.")
                 input_hash = current_autofill_input_hash(
-                    cur, application_id=args.application_id,
-                    artifact_binding={"artifact_id": artifact["id"], "artifact_sha256": artifact["sha256"], "artifact_filename": artifact["filename"]} if artifact else {},
+                    cur,
+                    application_id=args.application_id,
+                    artifact_binding={
+                        "artifact_id": artifact["id"],
+                        "artifact_sha256": artifact["sha256"],
+                        "artifact_filename": artifact["filename"],
+                    } if artifact else {},
                     document_sha256=binding["content_hash"],
-                    page_url=expected_page_url, page_fingerprint=args.expected_page_fingerprint.casefold(),
+                    page_url=expected_page_url,
+                    page_fingerprint=args.expected_page_fingerprint.casefold(),
                 )
+                expected_input_hash = args.expected_autofill_input_hash.casefold()
+
+                if (
+                    len(expected_input_hash) != 64
+                    or any(
+                        ch not in "0123456789abcdef"
+                        for ch in expected_input_hash
+                    )
+                ):
+                    raise RuntimeError(
+                        "--expected-autofill-input-hash must be a SHA-256 "
+                        "hex value emitted by jobos autofill prepare."
+                    )
+
+                if input_hash != expected_input_hash:
+                    raise RuntimeError(
+                        "Autofill inputs changed after preview; "
+                        "run jobos autofill prepare again."
+                    )
             except (RuntimeError, json.JSONDecodeError) as exc:
                 print(f"ERROR: {exc}")
                 return 1
@@ -632,7 +657,13 @@ def main() -> int:
     pc.add_argument("--artifact-id", help="Optional exact resume/cover artifact to authorize for upload.")
     pc.add_argument("--expected-origin", help="Required for type=autofill_form, e.g. https://jobs.example.com")
     pc.add_argument("--expected-page-url", help="Exact initial application URL for type=autofill_form.")
-    pc.add_argument("--expected-page-fingerprint", help="Read-only snapshot SHA-256 identity for type=autofill_form.")
+    pc.add_argument(
+        "--expected-autofill-input-hash",
+        help=(
+            "Exact input SHA-256 emitted by jobos autofill prepare; "
+            "creation fails if inputs changed."
+        ),
+    )
     pc.add_argument("--autofill-action-scope-json", help="Exact action-scope JSON emitted by jobos autofill prepare.")
     pc.add_argument("--apply", action="store_true")
 

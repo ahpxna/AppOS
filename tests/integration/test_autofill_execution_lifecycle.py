@@ -9,9 +9,11 @@ from __future__ import annotations
 import argparse
 import hashlib
 import importlib.util
+import json
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -65,14 +67,14 @@ def db():
     original = apply_migrations.connection_string
     apply_migrations.connection_string = lambda: TEST_DSN
     try:
-        assert apply_migrations.apply(argparse.Namespace(dry_run=False, adopt_existing=False, through=50)) == 0
+        assert apply_migrations.apply(argparse.Namespace(dry_run=False, adopt_existing=False, through=58)) == 0
     finally:
         apply_migrations.connection_string = original
     return psycopg
 
 
 def _record(db, *, approval_status: str = "approved", expires: str = "now() + interval '5 minutes'",
-            idempotency_key: str | None = None):
+            idempotency_key: str | None = None, task_status: str = "running"):
     """Create the exact synthetic application/document/artifact/capability graph."""
     with db.connect(TEST_DSN) as conn, conn.cursor() as cur:
         cur.execute("INSERT INTO applications (company, job_title) VALUES ('Fixture Co', 'Fixture Role') RETURNING id")
@@ -94,17 +96,22 @@ def _record(db, *, approval_status: str = "approved", expires: str = "now() + in
         )
         artifact_id = cur.fetchone()[0]
         page_url, fingerprint, input_hash = "https://jobs.example.test/apply?job=123", "b" * 64, "c" * 64
+        action_scope = {
+            "profile_keys": ["personal.first_name", "personal.email", "personal.phone"],
+            "document_types": [], "sensitive_classes": [], "remembered_questions": [],
+        }
         cur.execute(
             f"""INSERT INTO approval_requests
                 (type, application_id, payload_json, status, approval_token_hash, token_expires_at,
                  target_action, bound_document_id, bound_document_sha256, expected_origin,
                  bound_artifact_id, bound_artifact_sha256, bound_artifact_filename,
-                 expected_initial_url, expected_page_fingerprint, bound_autofill_input_hash, idempotency_key)
+                 expected_initial_url, expected_page_fingerprint, bound_autofill_input_hash,
+                 bound_autofill_action_scope, idempotency_key)
                VALUES ('autofill_form', %s, '{{}}'::jsonb, %s, 'fixture-token', {expires},
                        'fill_application_form', %s, %s, 'https://jobs.example.test', %s, %s, 'fixture-resume.docx',
-                       %s, %s, %s, %s) RETURNING id""",
+                       %s, %s, %s, %s::jsonb, %s) RETURNING id""",
             (application_id, approval_status, document_id, content_hash, artifact_id, artifact_hash,
-             page_url, fingerprint, input_hash, idempotency_key),
+             page_url, fingerprint, input_hash, json.dumps(action_scope), idempotency_key),
         )
         approval_id = cur.fetchone()[0]
         cur.execute(
@@ -112,12 +119,12 @@ def _record(db, *, approval_status: str = "approved", expires: str = "now() + in
                (task_type, requested_by, application_id, status, approval_request_id,
                 generated_document_id, document_sha256, expected_origin, bound_artifact_id,
                 artifact_sha256, artifact_filename, expected_initial_url, expected_page_fingerprint,
-                autofill_input_hash, lease_expires_at)
-               VALUES ('fill_application_form', 'fixture', %s, 'running', %s, %s, %s,
+                autofill_input_hash, autofill_action_scope, lease_expires_at)
+               VALUES ('fill_application_form', 'fixture', %s, %s, %s, %s, %s,
                        'https://jobs.example.test', %s, %s, 'fixture-resume.docx', %s, %s, %s,
-                       now() + interval '5 minutes') RETURNING id""",
-            (application_id, approval_id, document_id, content_hash, artifact_id, artifact_hash,
-             page_url, fingerprint, input_hash),
+                       %s::jsonb, now() + interval '5 minutes') RETURNING id""",
+            (application_id, task_status, approval_id, document_id, content_hash, artifact_id, artifact_hash,
+             page_url, fingerprint, input_hash, json.dumps(action_scope)),
         )
         task_id = cur.fetchone()[0]
     return {
@@ -126,7 +133,8 @@ def _record(db, *, approval_status: str = "approved", expires: str = "now() + in
         "bound_artifact_id": str(artifact_id), "artifact_sha256": artifact_hash,
         "artifact_filename": "fixture-resume.docx", "expected_origin": "https://jobs.example.test",
         "expected_initial_url": page_url, "expected_page_fingerprint": fingerprint,
-        "autofill_input_hash": input_hash, "input_json": {}, "timeout_seconds": 30,
+        "autofill_input_hash": input_hash, "autofill_action_scope": action_scope,
+        "input_json": {}, "timeout_seconds": 30,
         "retry_count": 0, "max_retries": 2,
     }
 
@@ -147,6 +155,28 @@ class FakeTransport:
 
     def state(self):
         return SnapshotState((FormField("name-ref", "First name", "textbox", self.value),), (), self.fingerprint)
+
+
+class MultiFieldFakeTransport:
+    def __init__(self, *, url: str, fingerprint: str):
+        self.url, self.fingerprint = url, fingerprint
+        self.values = {"first": "", "email": "", "phone": ""}
+        self.write_refs: list[str] = []
+
+    def resolve_target(self): return BrowserTarget("fixture-tab", self.url)
+    def current_url(self, _target): return self.url
+    def snapshot(self, _target): return {}
+    def execute(self, _target, command):
+        self.write_refs.append(command["target"])
+        self.values[command["target"]] = command["value"]
+
+    def state(self):
+        return SnapshotState(
+            (FormField("first", "First name", "textbox", self.values["first"]),
+             FormField("email", "Email", "textbox", self.values["email"]),
+             FormField("phone", "Phone", "textbox", self.values["phone"])),
+            (), self.fingerprint,
+        )
 
 
 def _binding(worker, db, task):
@@ -254,3 +284,65 @@ def test_lease_reaper_retries_only_provably_pre_io_execution(db):
         assert cur.fetchone() == ("queued", "not_started")
         cur.execute("SELECT status FROM approval_requests WHERE id = %s", (task["approval_request_id"],))
         assert cur.fetchone() == ("approved",)
+
+
+def _patch_multifield_worker(worker, monkeypatch, seeded, transport):
+    monkeypatch.setattr(worker, "OpenClawTransport", lambda **_kwargs: transport)
+    monkeypatch.setattr(worker, "snapshot_state", lambda actual_transport, _target: actual_transport.state())
+    monkeypatch.setattr(worker, "check_domain", lambda _cur, _url: None)
+    monkeypatch.setattr(worker, "require_ats_autofill_capability", lambda _cur, _application_id: {
+        "fill": True, "check": True, "select": True, "upload": True,
+    })
+    monkeypatch.setattr(worker, "load_autofill_context", lambda *_args, **_kwargs: SimpleNamespace(
+        profile={"personal": {"first_name": "Ada", "email": "ada@example.test", "phone": "6095551234"}},
+        sensitive_answers={}, remembered_answers={}, input_hash=seeded["autofill_input_hash"],
+    ))
+    monkeypatch.setattr(worker, "emit_trace", lambda *_args, **_kwargs: None)
+
+
+def test_production_worker_path_claims_exact_approval_journals_each_write_and_completes(db, monkeypatch):
+    worker = _load_worker()
+    seeded = _record(db, task_status="queued")
+    transport = MultiFieldFakeTransport(
+        url=seeded["expected_initial_url"], fingerprint=seeded["expected_page_fingerprint"],
+    )
+    _patch_multifield_worker(worker, monkeypatch, seeded, transport)
+
+    with db.connect(TEST_DSN) as conn:
+        assert worker.process_one(conn) is True
+
+    assert transport.write_refs == ["first", "email", "phone"]
+    with db.connect(TEST_DSN) as conn, conn.cursor() as cur:
+        cur.execute("SELECT status, execution_state FROM browser_tasks WHERE id = %s", (seeded["id"],))
+        assert cur.fetchone() == ("completed", "completed")
+        cur.execute("SELECT status, consumed_at IS NOT NULL FROM approval_requests WHERE id = %s", (seeded["approval_request_id"],))
+        assert cur.fetchone() == ("consumed", True)
+        cur.execute("SELECT action_ref, status FROM autofill_action_journal WHERE browser_task_id = %s", (seeded["id"],))
+        journal = cur.fetchall()
+        assert {row[0] for row in journal} == {"first", "email", "phone"}
+        assert len(journal) == 3
+        assert all(row[1] == "verified" for row in journal)
+
+
+def test_production_fill_handler_never_calls_openclaw_agent(db, monkeypatch):
+    worker = _load_worker()
+    task = _record(db)
+    transport = MultiFieldFakeTransport(
+        url=task["expected_initial_url"], fingerprint=task["expected_page_fingerprint"],
+    )
+    _patch_multifield_worker(worker, monkeypatch, task, transport)
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("fill_application_form must not call openclaw_agent")
+
+    monkeypatch.setattr(worker, "openclaw_agent", fail_if_called)
+    with db.connect(TEST_DSN) as conn, conn.cursor() as cur:
+        result = worker.handle_fill_application_form(cur, task)
+
+    assert result["status"] == "completed"
+    assert transport.write_refs == ["first", "email", "phone"]
+
+
+def test_fill_handler_is_deterministic_handler():
+    worker = _load_worker()
+    assert worker.HANDLERS["fill_application_form"] is worker.handle_fill_application_form

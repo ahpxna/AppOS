@@ -123,9 +123,18 @@ def load_autofill_context(
             sensitive[question_class] = {"value": str(answer).title(), "confirmed_at": str(updated_at),
                                          "confirmation_version": 1}
     remembered = _load_remembered_answers(cur, application_id)
+
     return AutofillContext(
-        profile, sensitive, remembered,
-        autofill_input_hash(profile=profile, sensitive_answers=sensitive, document_sha256=document_sha256,
-                            artifact_sha256=artifact.get("artifact_sha256"), page_url=page_url,
-                            page_fingerprint_sha256=page_fingerprint_sha256),
+        profile,
+        sensitive,
+        remembered,
+        autofill_input_hash(
+            profile=profile,
+            sensitive_answers=sensitive,
+            remembered_answers=remembered,
+            document_sha256=document_sha256,
+            artifact_sha256=artifact.get("artifact_sha256"),
+            page_url=page_url,
+            page_fingerprint_sha256=page_fingerprint_sha256,
+        ),
     )
