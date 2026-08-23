@@ -1,36 +1,47 @@
-"""Narrow OpenClaw browser transport; it never receives a profile or prompt."""
+"""Pinned-tab OpenClaw transport; no prompts and no arbitrary local uploads."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
-from services.autofill.autofill_planner_v1 import PlannedAction
-
 
 class AutofillTransport(Protocol):
-    def current_url(self) -> str: ...
-    def snapshot(self) -> dict[str, Any]: ...
-    def execute(self, command: dict[str, str]) -> None: ...
+    def resolve_target(self) -> "BrowserTarget": ...
+    def current_url(self, target_id: str) -> str: ...
+    def snapshot(self, target_id: str) -> dict[str, Any]: ...
+    def execute(self, target_id: str, command: dict[str, str]) -> None: ...
 
 
 class TransportError(RuntimeError):
     pass
 
 
+@dataclass(frozen=True)
+class BrowserTarget:
+    target_id: str
+    url: str
+
+
 class OpenClawTransport:
-    """Direct adapter for one attached OpenClaw browser profile only."""
+    """Use only documented OpenClaw browser primitives on one stable tab."""
     def __init__(self, *, binary: str = "openclaw", profile: str = "remote", timeout: int = 60,
-                 environment: dict[str, str] | None = None):
+                 environment: dict[str, str] | None = None, uploads_dir: Path | None = None):
         self.binary, self.profile, self.timeout = binary, profile, timeout
         self.environment = environment or dict(os.environ)
+        self.uploads_dir = uploads_dir or Path(os.getenv("JOBOS_OPENCLAW_UPLOADS_DIR", "/tmp/openclaw/uploads"))
 
     def _run(self, args: list[str], *, json_output: bool = False) -> str:
         if shutil.which(self.binary) is None:
             raise TransportError(f"OpenClaw binary not found: {self.binary}")
+        # Keep ``--browser-profile`` adjacent to its value.  OpenClaw's CLI
+        # examples put ``--json`` after the browser subcommand, which also
+        # works across the pinned CLI versions.
         command = [self.binary, "browser", "--browser-profile", self.profile, *args]
         if json_output:
             command.append("--json")
@@ -47,66 +58,76 @@ class OpenClawTransport:
         starts = [index for index in (output.find("{"), output.find("[")) if index >= 0]
         if not starts:
             raise TransportError("OpenClaw browser command did not return JSON.")
-        first = min(starts)
-        last = max(output.rfind("}"), output.rfind("]"))
-        if last <= first:
-            raise TransportError("OpenClaw browser JSON was incomplete.")
+        first, last = min(starts), max(output.rfind("}"), output.rfind("]"))
         try:
-            data = json.loads(output[first:last + 1])
-        except json.JSONDecodeError as exc:
+            return json.loads(output[first:last + 1])
+        except (json.JSONDecodeError, ValueError) as exc:
             raise TransportError("OpenClaw browser returned malformed JSON.") from exc
-        return data
 
-    def snapshot(self) -> dict[str, Any]:
-        data = self._json(self._run(["snapshot", "--efficient"], json_output=True))
+    def _tabs(self) -> list[dict[str, Any]]:
+        data = self._json(self._run(["tabs"], json_output=True))
+        nested = data.get("data") if isinstance(data, dict) else None
+        tabs = data if isinstance(data, list) else (data.get("tabs") or data.get("pages") or
+               (nested.get("tabs") if isinstance(nested, dict) else []) or [])
+        if not isinstance(tabs, list):
+            raise TransportError("OpenClaw did not provide a tab list.")
+        return [item for item in tabs if isinstance(item, dict)]
+
+    @staticmethod
+    def _stable_id(tab: dict[str, Any]) -> str:
+        return str(tab.get("suggestedTargetId") or tab.get("tabId") or "")
+
+    def resolve_target(self) -> BrowserTarget:
+        tabs = self._tabs()
+        active = [tab for tab in tabs if any(tab.get(key) is True for key in ("active", "focused", "selected"))]
+        candidates = active or (tabs if len(tabs) == 1 else [])
+        if len(candidates) != 1:
+            raise TransportError("Cannot identify exactly one focused browser tab to pin.")
+        tab = candidates[0]
+        target_id, url = self._stable_id(tab), str(tab.get("url") or "")
+        if not target_id or not url.startswith(("https://", "http://")):
+            raise TransportError("Focused OpenClaw tab has no stable target id or HTTP(S) URL.")
+        return BrowserTarget(target_id, url)
+
+    def current_url(self, target_id: str) -> str:
+        for tab in self._tabs():
+            if target_id in {self._stable_id(tab), str(tab.get("targetId") or "")}:
+                url = str(tab.get("url") or "")
+                if url.startswith(("https://", "http://")):
+                    return url
+        raise TransportError("Pinned browser tab disappeared or cannot be resolved.")
+
+    def snapshot(self, target_id: str) -> dict[str, Any]:
+        data = self._json(self._run(["snapshot", "--efficient", "--target-id", target_id], json_output=True))
         if not isinstance(data, dict):
             raise TransportError("OpenClaw snapshot JSON is not an object.")
         return data
 
-    def current_url(self) -> str:
-        data = self._json(self._run(["tabs"], json_output=True))
-        nested = data.get("data") if isinstance(data, dict) else None
-        tabs = data if isinstance(data, list) else (
-            data.get("tabs") or data.get("pages") or
-            (nested.get("tabs") if isinstance(nested, dict) else []) or []
-        )
-        if not isinstance(tabs, list):
-            raise TransportError("OpenClaw did not provide a tab list.")
-        active = [
-            tab for tab in tabs if isinstance(tab, dict)
-            and any(tab.get(key) is True for key in ("active", "focused", "selected"))
-        ]
-        candidates = active or (tabs if len(tabs) == 1 else [])
-        if len(candidates) != 1 or not isinstance(candidates[0], dict):
-            raise TransportError("Cannot identify exactly one focused browser tab.")
-        url = str(candidates[0].get("url") or "")
-        if not url.startswith(("https://", "http://")):
-            raise TransportError("Focused tab has no HTTP(S) URL.")
-        return url
+    def _stage_upload(self, value: str) -> str:
+        source = Path(value).expanduser().resolve()
+        if not source.is_file():
+            raise TransportError(f"Approved upload artifact is missing: {source}")
+        digest = hashlib.sha256(source.read_bytes()).hexdigest()
+        self.uploads_dir.mkdir(parents=True, exist_ok=True)
+        staged = self.uploads_dir / f"{digest[:16]}-{source.name}"
+        if not staged.exists() or hashlib.sha256(staged.read_bytes()).hexdigest() != digest:
+            shutil.copyfile(source, staged)
+            staged.chmod(0o600)
+        return str(staged)
 
-    def execute(self, command: dict[str, str]) -> None:
-        action, target, value = command.get("action"), command.get("target"), command.get("value")
-        if not action or not target or value is None:
+    def execute(self, target_id: str, command: dict[str, str]) -> None:
+        action, ref, value = command.get("action"), command.get("target"), command.get("value")
+        if not action or not ref or value is None:
             raise TransportError("Malformed deterministic browser command.")
+        scope = ["--target-id", target_id]
         if action == "fill":
-            self._run(["fill", target, value])
+            payload = json.dumps([{"ref": ref, "value": value}], separators=(",", ":"))
+            self._run(["fill", "--fields", payload, *scope])
         elif action == "select":
-            self._run(["select", target, value])
+            self._run(["select", ref, value, *scope])
         elif action == "check":
-            self._run(["click", target])
+            self._run(["click", ref, *scope])
         elif action == "upload":
-            path = Path(value).expanduser().resolve()
-            if not path.is_file():
-                raise TransportError(f"Approved upload artifact is missing: {path}")
-            self._run(["upload", target, str(path)])
+            self._run(["upload", self._stage_upload(value), "--ref", ref, *scope])
         else:
             raise TransportError(f"Unsupported deterministic browser action: {action}")
-
-
-def _narrow_commands(actions: list[PlannedAction]) -> list[dict[str, str]]:
-    """Internal helper; execution is only authorized through AutofillSession."""
-    return [
-        {"action": item.action, "target": item.ref, "value": item.value}
-        for item in actions
-        if item.action in {"fill", "select", "check", "upload"} and item.value is not None
-    ]

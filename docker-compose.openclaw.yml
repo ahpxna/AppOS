@@ -33,6 +33,9 @@ services:
       OPENCLAW_BROWSER_ALLOW_EVAL: "false"
     volumes:
       - ./data/openclaw-runtime/.openclaw:/root/.openclaw
+      # Host worker stages verified artifacts here; OpenClaw accepts uploads
+      # only from this managed temp root, never arbitrary repository paths.
+      - /tmp/openclaw/uploads:/tmp/openclaw/uploads
     depends_on:
       - browser
     networks:

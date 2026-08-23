@@ -160,6 +160,17 @@
         "db/migrations/052_autofill_execution_artifacts.sql"
       ],
       "summary": "Wired the production autofill task to a concrete OpenClaw browser transport, not an LLM agent. Approval redemption queues one exact task. The session rechecks focused-tab origin and allowlist before and after each action, executes one narrow action, snapshots to verify it, and consumes the capability after the first verified write. Radio/checkbox work requires an explicit QuestionGroup/Option state model. Immigration answers are available only through exact semantic classes with a candidate confirmation timestamp and version. Resume upload accepts only a registered QA-passed artifact, validates SHA-256 before upload, and verifies the attached filename rather than an absolute browser fakepath."
+    },
+    {
+      "files": [
+        "services/autofill/autofill_executor_v1.py",
+        "services/autofill/autofill_session_v1.py",
+        "services/browser-controller/browser_queue_worker.py",
+        "services/approval/approval_service_v1.py",
+        "db/migrations/054_autofill_execution_journal.sql",
+        "docker-compose.openclaw.yml"
+      ],
+      "summary": "Corrected the concrete OpenClaw command contracts: textbox values use fill --fields JSON and uploads stage a checksum-verified artifact into OpenClaw's managed upload directory before upload --ref. A session pins one stable tab id, passes it to every command, re-snapshots and rematches after every browser side effect, and never reuses stale refs. Approval binds the exact artifact id/SHA/filename. Before the first write a separate committed transaction moves the capability to executing; each action is journaled before execution. Any ambiguous failure becomes needs_reconciliation rather than retrying a partially changed form."
     }
   ],
   "gemini_windows_log_audit": {
@@ -203,6 +214,12 @@
       "decision": "Use only approved capability names, tool tags, competency tags, and role families to generate terms and rank captured jobs.",
       "reason": "Avoids treating draft profile data as candidate evidence.",
       "status": "implemented"
+    },
+    {
+      "topic": "OpenClaw autofill execution",
+      "decision": "Pin a stable OpenClaw tab target for the entire session; stage only approval-bound artifacts; durably journal each narrow browser write before it occurs; never automatically retry an executing capability.",
+      "reason": "A browser side effect cannot be rolled back by PostgreSQL, and modern ATS pages can invalidate accessibility refs after every interaction.",
+      "status": "implemented_pending_database_migration_and_operator_smoke_test"
     },
     {
       "topic": "Pointer dynamics",
@@ -292,6 +309,7 @@
       ,"Python syntax compilation and whitespace checks passed for the Ubuntu bootstrap, migration ledger, immigration synthesis, approval reissue change, and deterministic autofill contracts."
       ,"Pure immigration classification and deterministic autofill plan/verify smoke checks passed without a database, browser, LLM, or external call."
       ,"Deterministic session smoke check passed with a fake transport: a semantic sponsorship answer selected the explicit Yes option, a static field verified after a write, and an incomplete immigration profile could not reach HIGH. No browser command was invoked."
+      ,"Python compilation passed for the pinned OpenClaw transport, rematching session, durable journal worker wiring, and approval artifact binding. The focused unit test exercises the exact fill --fields JSON payload and target id with a fake transport; no OpenClaw/browser/LLM invocation was used."
     ],
     "blocked_by_environment": [
       "The Chrome sidecar image kasmweb/chrome:1.16.0 is not present; Docker Desktop image pulls currently fail before download with Keychain Error (-67674).",

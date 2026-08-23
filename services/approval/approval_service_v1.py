@@ -131,6 +131,21 @@ def fetch_document_binding(cur, application_id: str, document_id: str) -> Dict[s
     }
 
 
+def fetch_artifact_binding(cur, application_id: str, document_id: str, artifact_id: str) -> Dict[str, Any]:
+    cur.execute(
+        """
+        SELECT id::text, sha256, filename
+        FROM generated_document_artifacts
+        WHERE id = %s AND application_id = %s AND generated_document_id = %s;
+        """,
+        (artifact_id, application_id, document_id),
+    )
+    row = cur.fetchone()
+    if not row:
+        raise RuntimeError("artifact must belong to the exact application and approved document.")
+    return {"id": row[0], "sha256": row[1], "filename": row[2]}
+
+
 def normalise_origin(value: str) -> str:
     parsed = urlsplit((value or "").strip())
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
@@ -207,6 +222,11 @@ def assert_binding_matches(cur, request_row: Dict[str, Any]) -> None:
         binding = fetch_document_binding(cur, application_id, document_id)
         if payload.get("document_sha256") != binding["content_hash"]:
             raise RuntimeError("Autofill approval no longer matches the exact approved document.")
+        artifact_id = payload.get("artifact_id")
+        if artifact_id:
+            artifact = fetch_artifact_binding(cur, application_id, document_id, str(artifact_id))
+            if artifact["sha256"] != payload.get("artifact_sha256") or artifact["filename"] != payload.get("artifact_filename"):
+                raise RuntimeError("Autofill approval no longer matches the exact upload artifact.")
 
 
 def log_event(cur, request_id: Optional[str], event: str,
@@ -266,6 +286,8 @@ def cmd_create(conn, args) -> int:
             try:
                 binding = fetch_document_binding(cur, args.application_id, args.document_id)
                 expected_origin = normalise_origin(args.expected_origin)
+                artifact = (fetch_artifact_binding(cur, args.application_id, args.document_id, args.artifact_id)
+                            if args.artifact_id else None)
             except RuntimeError as exc:
                 print(f"ERROR: {exc}")
                 return 1
@@ -273,11 +295,15 @@ def cmd_create(conn, args) -> int:
                 "document_id": binding["id"],
                 "document_sha256": binding["content_hash"],
                 "expected_origin": expected_origin,
+                "artifact_id": artifact["id"] if artifact else None,
+                "artifact_sha256": artifact["sha256"] if artifact else None,
+                "artifact_filename": artifact["filename"] if artifact else None,
             })
             idempotency_key = hash_json({
                 "type": args.type, "application_id": args.application_id,
                 "document_id": binding["id"], "document_sha256": binding["content_hash"],
-                "expected_origin": expected_origin,
+                "expected_origin": expected_origin, "artifact_id": artifact["id"] if artifact else None,
+                "artifact_sha256": artifact["sha256"] if artifact else None,
             })
         elif args.type == "fit_review" and args.application_id:
             payload["content_hash"] = hash_json({
@@ -299,7 +325,7 @@ def cmd_create(conn, args) -> int:
                 SELECT id::text, status, summary_text
                 FROM approval_requests
                 WHERE idempotency_key = %s
-                  AND status IN ('pending', 'approved')
+                  AND status IN ('pending', 'approved', 'executing')
                 ORDER BY created_at DESC
                 LIMIT 1;
                 """,
@@ -318,10 +344,11 @@ def cmd_create(conn, args) -> int:
               (type, application_id, payload_json, status, approval_channel,
                approval_token_hash, token_expires_at, requested_by, summary_text,
                max_attempts, idempotency_key, target_action, bound_document_id,
-               bound_document_sha256, expected_origin, created_at)
+               bound_document_sha256, expected_origin, bound_artifact_id,
+               bound_artifact_sha256, bound_artifact_filename, created_at)
             VALUES (%s, %s, %s, 'pending', %s, %s,
                     now() + make_interval(mins => %s), %s, %s, %s, %s,
-                    %s, %s, %s, %s, now())
+                    %s, %s, %s, %s, %s, %s, %s, now())
             RETURNING id::text, token_expires_at;
             """,
             (
@@ -330,6 +357,7 @@ def cmd_create(conn, args) -> int:
                 args.requested_by, summary, args.max_attempts, idempotency_key,
                 "fill_application_form" if args.type == "autofill_form" else None,
                 payload.get("document_id"), payload.get("document_sha256"), payload.get("expected_origin"),
+                payload.get("artifact_id"), payload.get("artifact_sha256"), payload.get("artifact_filename"),
             ),
         )
         request_id, expires = cur.fetchone()
@@ -464,13 +492,15 @@ def redeem(conn, token: str, *, decision: str, note: str, actor: str) -> int:
                   (task_type, requested_by, application_id, status, priority,
                    input_json, approval_request_id, expected_origin,
                    generated_document_id, document_sha256, timeout_seconds,
+                   bound_artifact_id, artifact_sha256, artifact_filename,
                    idempotency_key, created_at)
                 VALUES ('fill_application_form', %s, %s, 'queued', 'high',
-                        '{}'::jsonb, %s, %s, %s, %s, 300, %s, now())
+                        '{}'::jsonb, %s, %s, %s, %s, 300, %s, %s, %s, %s, now())
                 ON CONFLICT (approval_request_id) WHERE approval_request_id IS NOT NULL DO NOTHING;
                 """,
                 (actor, application_id, request_id, payload["expected_origin"],
-                 payload["document_id"], payload["document_sha256"], f"autofill:{request_id}"),
+                 payload["document_id"], payload["document_sha256"], payload.get("artifact_id"),
+                 payload.get("artifact_sha256"), payload.get("artifact_filename"), f"autofill:{request_id}"),
             )
             log_event(cur, request_id, "autofill_task_queued", actor, {
                 "expected_origin": payload["expected_origin"], "document_id": payload["document_id"],
@@ -569,6 +599,7 @@ def main() -> int:
     pc.add_argument("--channel", default="cli")
     pc.add_argument("--requested-by", default="orchestrator")
     pc.add_argument("--document-id", help="Required for type=autofill_form.")
+    pc.add_argument("--artifact-id", help="Optional exact resume/cover artifact to authorize for upload.")
     pc.add_argument("--expected-origin", help="Required for type=autofill_form, e.g. https://jobs.example.com")
     pc.add_argument("--apply", action="store_true")
 

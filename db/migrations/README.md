@@ -16,7 +16,7 @@ you spend time on a real install. It's not a full SQL engine (see its own docstr
 limits) but it's what found and confirmed the fixes below, and it's self-tested against
 synthetic bad input (4/4 cases) so a clean run means something. It exits non-zero and prints
 every issue with a file reference if it finds anything; exit 0 and "No issues found" means
-none of these three bug classes exist anywhere in the current 58 files.
+none of these three bug classes exist anywhere in the current 59 files.
 
 ## Known duplicate/lettered numbers (historical, left as-is)
 
@@ -147,7 +147,7 @@ these two tables had the problem, both confined to `025`, both fixed above.
 
 ## If you add a new migration
 
-Use the next integer after the highest number present (currently `053`). Don't reuse a
+Use the next integer after the highest number present (currently `054`). Don't reuse a
 letter suffix pattern (`041a`, `041b`) unless you are patching a migration that has
 *already shipped and been applied by someone* and you specifically do not want to touch
 the original file's already-executed statements. Otherwise just take the next number.

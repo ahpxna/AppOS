@@ -304,7 +304,8 @@ def claim_next_task(cur) -> Optional[Dict[str, Any]]:
         RETURNING id::text, task_type, application_id::text,
                   input_json, timeout_seconds, retry_count, max_retries,
                   approval_request_id::text, expected_origin,
-                  generated_document_id::text, document_sha256;
+                  generated_document_id::text, document_sha256,
+                  bound_artifact_id::text, artifact_sha256, artifact_filename;
         """,
         (WORKER_ID, LEASE_SECONDS),
     )
@@ -318,6 +319,7 @@ def claim_next_task(cur) -> Optional[Dict[str, Any]]:
         "max_retries": row[6] if row[6] is not None else 2,
         "approval_request_id": row[7], "expected_origin": row[8],
         "generated_document_id": row[9], "document_sha256": row[10],
+        "bound_artifact_id": row[11], "artifact_sha256": row[12], "artifact_filename": row[13],
     }
 
 
@@ -431,7 +433,8 @@ def require_bound_approval(cur, task: Dict[str, Any]) -> Dict[str, Any]:
     cur.execute(
         """
         SELECT id::text, target_action, bound_document_id::text,
-               bound_document_sha256, expected_origin
+               bound_document_sha256, expected_origin, bound_artifact_id::text,
+               bound_artifact_sha256, bound_artifact_filename
         FROM approval_requests
         WHERE id = %s
           AND application_id = %s
@@ -446,36 +449,148 @@ def require_bound_approval(cur, task: Dict[str, Any]) -> Dict[str, Any]:
         raise PermanentTaskError(
             "No valid unused approval exists for this exact application capability."
         )
-    approved_id, target_action, bound_doc, bound_hash, bound_origin = row
+    approved_id, target_action, bound_doc, bound_hash, bound_origin, artifact_id, artifact_hash, artifact_filename = row
     if target_action != "fill_application_form":
         raise PermanentTaskError(f"Approval {approved_id} is not for fill_application_form.")
     if bound_doc != document_id or bound_hash != document_sha256:
         raise PermanentTaskError("Approval document binding does not match this task.")
     if _normalised_origin(str(bound_origin or "")) != origin:
         raise PermanentTaskError("Approval origin binding does not match this task.")
-    return {"id": approved_id, "document_id": document_id, "expected_origin": origin}
+    if (artifact_id or task.get("bound_artifact_id")) and (
+        artifact_id != task.get("bound_artifact_id") or artifact_hash != task.get("artifact_sha256")
+        or artifact_filename != task.get("artifact_filename")
+    ):
+        raise PermanentTaskError("Approval artifact binding does not match this task.")
+    return {"id": approved_id, "document_id": document_id, "expected_origin": origin,
+            "artifact_id": artifact_id, "artifact_sha256": artifact_hash, "artifact_filename": artifact_filename}
 
 
-def consume_bound_approval(cur, approval_id: str, task: Dict[str, Any]) -> None:
-    """Atomically consume one capability after a verified side effect.
+def _durable_connection():
+    """A commit independent of the worker's task transaction.
 
-    This function is deliberately separate from token redemption.  No current
-    handler calls it because form writes are disabled below; a future
-    deterministic handler must call it in the same transaction as its final
-    post-write verification.
+    Browser writes cannot roll back.  These small state changes therefore
+    deliberately survive a later rollback of the main queue transaction.
     """
-    cur.execute(
-        """
-        UPDATE approval_requests
-        SET status = 'consumed', consumed_at = now(), consumed_by = %s
-        WHERE id = %s AND application_id = %s
-          AND status = 'approved' AND consumed_at IS NULL
-        RETURNING id;
-        """,
-        (WORKER_ID, approval_id, task["application_id"]),
-    )
-    if cur.fetchone() is None:
-        raise PermanentTaskError("Approval was already consumed or changed concurrently.")
+    return psycopg.connect(DSN, autocommit=True)
+
+
+def durable_begin_execution(task: Dict[str, Any], binding: Dict[str, Any], target_id: str) -> None:
+    """Move the capability to executing before the first browser write."""
+    with _durable_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE approval_requests
+            SET status = 'executing', executing_task_id = %s
+            WHERE id = %s AND application_id = %s
+              AND status = 'approved' AND consumed_at IS NULL
+              AND token_expires_at > now()
+            RETURNING id;
+            """,
+            (task["id"], binding["id"], task["application_id"]),
+        )
+        if cur.fetchone() is None:
+            raise PermanentTaskError("Approval changed before execution; create a new approval instead of replaying.")
+        cur.execute(
+            """
+            UPDATE browser_tasks
+            SET execution_state = 'executing', pinned_target_id = %s
+            WHERE id = %s AND status = 'running';
+            """,
+            (target_id, task["id"]),
+        )
+        if cur.rowcount != 1:
+            raise PermanentTaskError("Browser task is no longer running; refusing a browser write.")
+
+
+def durable_journal_start(task: Dict[str, Any], binding: Dict[str, Any], action, target_id: str) -> str:
+    """Persist a pending external action before invoking OpenClaw."""
+    value_hash = hashlib.sha256((action.value or "").encode("utf-8")).hexdigest()
+    with _durable_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO autofill_action_journal
+              (browser_task_id, approval_request_id, sequence_no, target_id,
+               action_kind, target_ref, expected_value_sha256, status)
+            SELECT %s, %s, COALESCE(MAX(sequence_no), 0) + 1, %s,
+                   %s, %s, %s, 'started'
+            FROM autofill_action_journal
+            WHERE browser_task_id = %s
+            RETURNING id::text;
+            """,
+            (task["id"], binding["id"], target_id, action.action, action.ref, value_hash, task["id"]),
+        )
+        return cur.fetchone()[0]
+
+
+def durable_journal_verified(action, target_id: str, journal_id: str) -> None:
+    with _durable_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE autofill_action_journal
+            SET status = 'verified', verified_at = now(),
+                observed_json = %s
+            WHERE id = %s AND status = 'started';
+            """,
+            (Jsonb({"target_id": target_id, "ref": action.ref, "action": action.action}), journal_id),
+        )
+        if cur.rowcount != 1:
+            raise PermanentTaskError("Autofill action journal changed unexpectedly; manual reconciliation is required.")
+
+
+def durable_journal_failed(action, target_id: str, journal_id: str) -> None:
+    with _durable_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE autofill_action_journal
+            SET status = 'failed', observed_json = %s
+            WHERE id = %s AND status = 'started';
+            """,
+            (Jsonb({"target_id": target_id, "ref": action.ref, "action": action.action}), journal_id),
+        )
+
+
+def durable_finish_execution(task: Dict[str, Any], binding: Dict[str, Any], result) -> None:
+    """Consume once only after the session finishes, including partial writes.
+
+    A partially written form must never be retried under the same capability.
+    The journal is the recovery record for the user/reviewer.
+    """
+    execution_state = "completed" if result.status == "completed" else "partial"
+    with _durable_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE approval_requests
+            SET status = 'consumed', consumed_at = now(), consumed_by = %s
+            WHERE id = %s AND application_id = %s
+              AND status = 'executing' AND executing_task_id = %s
+            RETURNING id;
+            """,
+            (WORKER_ID, binding["id"], task["application_id"], task["id"]),
+        )
+        if cur.fetchone() is None:
+            raise PermanentTaskError("Executing approval changed unexpectedly; manual reconciliation is required.")
+        cur.execute(
+            """
+            UPDATE browser_tasks
+            SET execution_state = %s, pinned_target_id = %s
+            WHERE id = %s;
+            """,
+            (execution_state, result.target_id, task["id"]),
+        )
+
+
+def durable_mark_reconciliation(task: Dict[str, Any], target_id: str | None, reason: str) -> None:
+    """Leave an executing capability non-replayable after an uncertain write."""
+    with _durable_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE browser_tasks
+            SET execution_state = 'needs_reconciliation', pinned_target_id = COALESCE(%s, pinned_target_id),
+                error_message = %s
+            WHERE id = %s;
+            """,
+            (target_id, reason[:2000], task["id"]),
+        )
 
 
 def load_allowed_domains(cur) -> list:
@@ -514,7 +629,7 @@ def require_url(cur, input_json: Dict[str, Any]) -> str:
     return url
 
 
-def load_autofill_profile(cur, application_id: str, document_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
+def load_autofill_profile(cur, application_id: str, artifact_binding: Dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
     """Load only approved values needed by the deterministic planner.
 
     This is intentionally a structured DB read, not a prompt.  Immigration
@@ -541,25 +656,34 @@ def load_autofill_profile(cur, application_id: str, document_id: str) -> tuple[d
     if profile["personal"].get("first_name") and profile["personal"].get("last_name"):
         profile["personal"]["full_name"] = f"{profile['personal']['first_name']} {profile['personal']['last_name']}"
 
-    cur.execute(
-        """
-        SELECT gd.doc_type, gda.file_path, gda.filename, gda.sha256
-        FROM generated_document_artifacts gda
-        JOIN generated_documents gd ON gd.id = gda.generated_document_id
-        WHERE gda.generated_document_id = %s AND gda.application_id = %s
-          AND gd.application_id = %s AND gd.qa_status = 'pass' AND gd.approved = true;
-        """,
-        (document_id, application_id, application_id),
-    )
-    for doc_type, file_path, filename, digest in cur.fetchall():
+    # Uploads are opt-in and capability-bound.  Never select the newest (or
+    # any other) artifact merely because it belongs to the same document.
+    if artifact_binding.get("artifact_id"):
+        cur.execute(
+            """
+            SELECT gd.doc_type, gda.file_path, gda.filename, gda.sha256
+            FROM generated_document_artifacts gda
+            JOIN generated_documents gd ON gd.id = gda.generated_document_id
+            WHERE gda.id = %s AND gda.application_id = %s
+              AND gd.application_id = %s AND gd.qa_status = 'pass' AND gd.approved = true;
+            """,
+            (artifact_binding["artifact_id"], application_id, application_id),
+        )
+        row = cur.fetchone()
+        if not row:
+            raise PermanentTaskError("The approved upload artifact no longer belongs to this verified application document.")
+        doc_type, file_path, filename, digest = row
+        if str(digest) != str(artifact_binding.get("artifact_sha256")) or str(filename) != str(artifact_binding.get("artifact_filename")):
+            raise PermanentTaskError("The upload artifact changed after approval; issue a new approval.")
         path = Path(str(file_path)).expanduser().resolve()
         allowed_root = (REPO_ROOT / "data").resolve()
         if not path.is_file() or allowed_root not in path.parents:
-            continue
+            raise PermanentTaskError("Approved upload artifact is outside the managed JobOS data directory.")
         if hashlib.sha256(path.read_bytes()).hexdigest() != str(digest):
-            continue
-        if str(doc_type) in {"resume", "cover_letter"} and path.name == str(filename):
-            profile["documents"][str(doc_type)] = str(path)
+            raise PermanentTaskError("Approved upload artifact bytes changed after approval.")
+        if str(doc_type) not in {"resume", "cover_letter"} or path.name != str(filename):
+            raise PermanentTaskError("Approved upload artifact has an unsupported document type or filename.")
+        profile["documents"][str(doc_type)] = str(path)
 
     cur.execute(
         """
@@ -589,8 +713,8 @@ def load_autofill_profile(cur, application_id: str, document_id: str) -> tuple[d
     return profile, answers
 
 
-def snapshot_state(transport: OpenClawTransport) -> SnapshotState:
-    nodes = parse_snapshot(transport.snapshot())
+def snapshot_state(transport: OpenClawTransport, target_id: str) -> SnapshotState:
+    nodes = parse_snapshot(transport.snapshot(target_id))
     return SnapshotState(tuple(inspect_nodes(nodes)), tuple(inspect_question_groups(nodes)))
 
 
@@ -706,36 +830,55 @@ def handle_fill_application_form(cur, task) -> Dict[str, Any]:
     if document_hash != task["document_sha256"]:
         raise PermanentTaskError("Bound generated document content changed after approval; reissue approval.")
 
-    profile, sensitive_answers = load_autofill_profile(cur, task["application_id"], binding["document_id"])
+    profile, sensitive_answers = load_autofill_profile(cur, task["application_id"], binding)
     transport = OpenClawTransport(binary=OPENCLAW_BIN, profile=os.getenv("JOBOS_BROWSER_PROFILE", "remote"),
                                   timeout=min(int(task["timeout_seconds"]), 90), environment=openclaw_runtime_env())
-    try:
-        initial = snapshot_state(transport)
-        actions, _ = plan_autofill(
-            list(initial.fields), profile, question_groups=list(initial.groups),
+    execution_started = False
+    pinned_target_id: str | None = None
+    latest_actions = []
+
+    def make_plan(state: SnapshotState):
+        nonlocal latest_actions
+        latest_actions, _ = plan_autofill(
+            list(state.fields), profile, question_groups=list(state.groups),
             approved_sensitive_answers=sensitive_answers,
         )
-        executable = [action for action in actions if action.action in {"fill", "select", "check", "upload"}]
-        if not executable:
-            return {
-                "status": "needs_review", "reason": "No exact, verified-safe form actions were available.",
-                "paused": [action.question_label or action.reason for action in actions if action.action == "pause"],
-                "approval_consumed": False,
-            }
+        return latest_actions
+
+    def begin_execution(target_id: str) -> None:
+        nonlocal execution_started, pinned_target_id
+        durable_begin_execution(task, binding, target_id)
+        execution_started, pinned_target_id = True, target_id
+
+    try:
         session = AutofillSession(
             transport=transport, expected_origin=binding["expected_origin"],
-            snapshot_state=lambda: snapshot_state(transport), origin_allowed=lambda url: check_domain(cur, url),
+            snapshot_state=lambda target_id: snapshot_state(transport, target_id),
+            origin_allowed=lambda url: check_domain(cur, url),
+            begin_execution=begin_execution,
+            before_action=lambda action, target_id: durable_journal_start(task, binding, action, target_id),
+            after_verified=durable_journal_verified,
+            after_failed=durable_journal_failed,
         )
-        result = session.execute(actions, on_first_verified_write=lambda: consume_bound_approval(cur, binding["id"], task))
-    except SessionError as exc:
+        result = session.execute(make_plan)
+        if execution_started:
+            durable_finish_execution(task, binding, result)
+    except (SessionError, TransportError, PermanentTaskError) as exc:
+        if execution_started:
+            durable_mark_reconciliation(task, pinned_target_id, str(exc))
+            raise PermanentTaskError(
+                "Browser execution entered an uncertain state after a write; "
+                "it will not retry automatically. Review the autofill action journal."
+            ) from exc
+        if isinstance(exc, TransportError):
+            raise TransientTaskError(str(exc)) from exc
         raise PermanentTaskError(str(exc)) from exc
-    except TransportError as exc:
-        raise TransientTaskError(str(exc)) from exc
     return {
         "status": result.status, "verified_refs": list(result.verified_refs),
         "failed_refs": list(result.failed_refs), "executed_refs": list(result.executed_refs),
-        "paused": [action.question_label or action.reason for action in actions if action.action == "pause"],
-        "approval_consumed": bool(result.verified_refs),
+        "pinned_target_id": result.target_id,
+        "paused": [action.question_label or action.reason for action in latest_actions if action.action == "pause"],
+        "approval_consumed": execution_started,
         "submitted": False,
     }
 
