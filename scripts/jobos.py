@@ -138,10 +138,14 @@ def autofill_prepare(application_id: str, *, create: bool, yes: bool) -> int:
     load_repo_env()
     import psycopg
     with psycopg.connect(database_dsn(), autocommit=False) as conn, conn.cursor() as cur:
-        cur.execute("SELECT company, job_title FROM applications WHERE id = %s;", (application_id,))
+        cur.execute("SELECT company, job_title, coalesce(ats_type, 'unknown') FROM applications WHERE id = %s;", (application_id,))
         application = cur.fetchone()
         if not application:
             raise RuntimeError("Application was not found.")
+        cur.execute("SELECT autofill_mode FROM ats_capabilities WHERE ats_type = %s;", (application[2],))
+        capability = cur.fetchone()
+        if not capability or capability[0] == "review_only":
+            raise RuntimeError(f"ATS '{application[2]}' is review-only or unregistered for deterministic autofill.")
         cur.execute(
             """SELECT gd.id::text, gda.id::text, gda.filename
                  FROM generated_documents gd
@@ -209,6 +213,29 @@ def autofill_prepare(application_id: str, *, create: bool, yes: bool) -> int:
     return subprocess.call(command, cwd=ROOT)
 
 
+def status() -> int:
+    """Print the product-level pipeline state without invoking a worker or model."""
+    import psycopg
+    load_repo_env()
+    with psycopg.connect(database_dsn(), autocommit=True) as conn, conn.cursor() as cur:
+        cur.execute("SELECT coalesce(status, 'unknown'), count(*) FROM applications GROUP BY 1 ORDER BY 1;")
+        applications = {str(status): count for status, count in cur.fetchall()}
+        cur.execute("SELECT coalesce(source, 'unknown'), count(*) FROM applications GROUP BY 1 ORDER BY 2 DESC;")
+        sources = {str(source): count for source, count in cur.fetchall()}
+        cur.execute("SELECT status, count(*) FROM browser_tasks GROUP BY 1 ORDER BY 1;")
+        browser_tasks = {str(task_status): count for task_status, count in cur.fetchall()}
+        cur.execute("SELECT count(*) FROM browser_tasks WHERE execution_state = 'needs_reconciliation';")
+        reconciliation = int(cur.fetchone()[0])
+        cur.execute("SELECT coalesce(status, 'unknown'), count(*) FROM application_attempts GROUP BY 1 ORDER BY 1;")
+        attempts = {str(attempt_status): count for attempt_status, count in cur.fetchall()}
+    print(json.dumps({
+        "applications_by_status": applications, "applications_by_source": sources,
+        "browser_tasks": browser_tasks, "attempts": attempts,
+        "needs_reconciliation": reconciliation, "submit": "human_only",
+    }, indent=2))
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="JobOS operator commands.")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -220,9 +247,12 @@ def main() -> int:
     prepare_parser.add_argument("--application-id", required=True)
     prepare_parser.add_argument("--create", action="store_true", help="After showing the plan, prompt to create a one-time approval.")
     prepare_parser.add_argument("--yes", action="store_true", help="Create without an interactive confirmation; use only after reviewing the printed plan.")
+    commands.add_parser("status", help="Read-only product status: applications, browser tasks, and attempts.")
     args = parser.parse_args()
     if args.command == "doctor":
         return doctor(check_browser=args.check_browser)
+    if args.command == "status":
+        return status()
     return autofill_prepare(args.application_id, create=args.create, yes=args.yes)
 
 

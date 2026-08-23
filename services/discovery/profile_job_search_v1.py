@@ -19,6 +19,7 @@ import psycopg
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from services.common.profile_job_matching import rank_job, unique_terms
+from services.common.search_preferences import preference_reason
 from services.common.config import database_dsn
 
 DSN = database_dsn()
@@ -58,10 +59,13 @@ def cmd_queries(cur, args) -> int:
 def cmd_rank(cur, args) -> int:
     """Rank already-intaked jobs with transparent profile-term overlap."""
     terms = approved_terms(cur)
+    cur.execute("SELECT * FROM job_search_preferences WHERE profile_key = 'primary';")
+    preference_row = cur.fetchone()
+    preferences = dict(zip([column.name for column in cur.description], preference_row or ()))
     cur.execute(
         """
         SELECT a.id::text, a.source, a.company, a.job_title, a.job_url, a.jd_text,
-               a.current_step, a.status, a.location, a.work_mode,
+               a.current_step, a.status, a.location, a.work_mode, a.stale_at,
                COALESCE(ia.status, 'UNKNOWN'),
                COALESCE(ia.restriction_type, 'UNKNOWN'),
                COALESCE(ia.jd_policy_result, 'unknown'),
@@ -71,28 +75,31 @@ def cmd_rank(cur, args) -> int:
                ia.final_reason
         FROM applications a
         LEFT JOIN application_immigration_assessments ia ON ia.application_id = a.id
-        WHERE (%s OR status = 'active')
+        WHERE (%s OR status = 'active' OR (%s AND status = 'stale'))
         ORDER BY a.created_at DESC;
         """,
-        (args.include_inactive,),
+        (args.include_inactive, args.include_stale),
     )
     results = []
     for row in cur.fetchall():
         match = rank_job(title=row[3] or "", jd_text=row[5] or "",
                          profile_terms=terms, user_keywords=args.keyword)
-        if match["discovery_score"] < args.min_score:
+        excluded_by = preference_reason(company=row[2] or "", title=row[3] or "",
+                                        location=row[8] or "", work_mode=row[9] or "",
+                                        preferences=preferences)
+        if excluded_by or match["discovery_score"] < args.min_score or (row[10] and not args.include_stale):
             continue
         immigration = {
-            "status": row[10], "restriction_type": row[11], "jd_policy": row[12],
-            "jd_policy_evidence": row[13] or [], "everify": row[14],
-            "h1b_history": row[15], "reason": row[16] or "",
+            "status": row[11], "restriction_type": row[12], "jd_policy": row[13],
+            "jd_policy_evidence": row[14] or [], "everify": row[15],
+            "h1b_history": row[16], "reason": row[17] or "",
         }
         if args.exclude_immigration_blocked and immigration["status"] == "BLOCKED":
             continue
         results.append({
             "application_id": row[0], "source": row[1], "company": row[2],
             "job_title": row[3], "job_url": row[4], "current_step": row[6],
-            "status": row[7], "location": row[8], "work_mode": row[9],
+            "status": row[7], "location": row[8], "work_mode": row[9], "stale_at": row[10],
             "immigration_fit": immigration, **match,
         })
     immigration_order = {"HIGH": 0, "POSSIBLE": 1, "UNKNOWN": 2, "LOW": 3, "BLOCKED": 4}
@@ -115,6 +122,7 @@ def main() -> int:
         sub.add_argument("--limit", type=int, default=25)
     rank.add_argument("--min-score", type=int, default=1)
     rank.add_argument("--include-inactive", action="store_true")
+    rank.add_argument("--include-stale", action="store_true")
     rank.add_argument("--exclude-immigration-blocked", action="store_true",
                       help="Hide only JDs with an explicit incompatible immigration policy; unknown remains visible.")
     args = parser.parse_args()

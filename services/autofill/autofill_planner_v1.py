@@ -8,6 +8,7 @@ from typing import Any, Mapping
 from services.autofill.field_matcher_v1 import FieldClass, FieldMatch, match_field
 from services.autofill.form_inspector_v1 import FormField, QuestionGroup
 from services.common.immigration_semantics import classify_immigration_question
+from services.common.question_memory import normalize_question
 
 
 @dataclass(frozen=True)
@@ -63,6 +64,7 @@ def plan_autofill(
     fields: list[FormField], profile: Mapping[str, Any], *,
     question_groups: list[QuestionGroup] | None = None,
     approved_sensitive_answers: Mapping[str, Any] | None = None,
+    remembered_answers: Mapping[str, Any] | None = None,
 ) -> tuple[list[PlannedAction], list[FieldMatch]]:
     """Plan only exact mappings with a provably safe verification path."""
     actions: list[PlannedAction] = []
@@ -70,12 +72,13 @@ def plan_autofill(
     used_option_refs: set[str] = set()
     used_profile_keys: set[str] = set()
     answers = approved_sensitive_answers or {}
+    remembered = remembered_answers or {}
     for group in question_groups or []:
         pseudo = FormField(group.options[0].ref, group.label, group.role, required=group.required)
         match = match_field(pseudo)
         matches.append(match)
         value = _answer_for_question(group.label, answers) if match.field_class is FieldClass.SENSITIVE else (
-            _lookup(profile, match.profile_key) if match.profile_key else None
+            _lookup(profile, match.profile_key) if match.profile_key else remembered.get(normalize_question(group.label))
         )
         option = _option_for_value(group, value) if value not in (None, "") else None
         if option is None:
@@ -93,6 +96,11 @@ def plan_autofill(
         matches.append(match)
         if match.field_class is FieldClass.SENSITIVE:
             actions.append(PlannedAction("pause", field.ref, None, None, match.reason, field.label))
+            continue
+        remembered_value = remembered.get(normalize_question(field.label))
+        if match.field_class is FieldClass.UNKNOWN and remembered_value not in (None, ""):
+            actions.append(PlannedAction("fill", field.ref, str(remembered_value), None,
+                                         "Exact human-confirmed question-memory match.", field.label))
             continue
         if match.field_class is FieldClass.UNKNOWN or match.profile_key is None:
             actions.append(PlannedAction("pause", field.ref, None, None, match.reason, field.label))

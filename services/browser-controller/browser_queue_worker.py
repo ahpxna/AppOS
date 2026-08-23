@@ -72,6 +72,7 @@ from services.common.autofill_identity import autofill_input_hash, canonical_pag
 from services.common.immigration_semantics import EXACT_CANDIDATE_ADDITIONAL_CLASSES
 from services.common.openclaw_runtime import resolve_openclaw_binary
 from services.common.autofill_field_registry import AUTOFILL_FIELD_REGISTRY
+from services.common.question_memory import normalize_question
 
 load_repo_env()
 
@@ -586,6 +587,12 @@ def durable_begin_execution(task: Dict[str, Any], binding: Dict[str, Any], targe
         )
         if cur.rowcount != 1:
             raise PermanentTaskError("Browser task is no longer running; refusing a browser write.")
+        cur.execute(
+            """INSERT INTO application_attempts
+                  (application_id, browser_task_id, attempt_kind, status, detail_json)
+               VALUES (%s, %s, 'deterministic_autofill', 'started', %s);""",
+            (task["application_id"], task["id"], Jsonb({"pinned_target_id": target_id})),
+        )
 
 
 def durable_journal_start(task: Dict[str, Any], binding: Dict[str, Any], action, target_id: str) -> str:
@@ -663,6 +670,14 @@ def durable_finish_execution(task: Dict[str, Any], binding: Dict[str, Any], resu
             """,
             (execution_state, result.target_id, task["id"]),
         )
+        cur.execute(
+            """UPDATE application_attempts
+                   SET status = %s, finished_at = now(),
+                       detail_json = detail_json || %s
+                 WHERE browser_task_id = %s AND status = 'started';""",
+            (execution_state, Jsonb({"verified_refs": list(result.verified_refs),
+                                     "failed_refs": list(result.failed_refs)}), task["id"]),
+        )
 
 
 def durable_mark_reconciliation(task: Dict[str, Any], target_id: str | None, reason: str) -> None:
@@ -676,6 +691,13 @@ def durable_mark_reconciliation(task: Dict[str, Any], target_id: str | None, rea
             WHERE id = %s;
             """,
             (target_id, reason[:2000], task["id"]),
+        )
+        cur.execute(
+            """UPDATE application_attempts
+                   SET status = 'needs_review', finished_at = now(),
+                       detail_json = detail_json || %s
+                 WHERE browser_task_id = %s AND status = 'started';""",
+            (Jsonb({"reason": reason[:500]}), task["id"]),
         )
 
 
@@ -822,6 +844,42 @@ def load_autofill_profile(cur, application_id: str, artifact_binding: Dict[str, 
                 "confirmation_version": 1,
             }
     return profile, answers
+
+
+def load_question_memory(cur, application_id: str) -> dict[str, str]:
+    """Resolve only exact, user-confirmed non-legal answers by safe scope."""
+    cur.execute("SELECT lower(coalesce(company, '')), coalesce(ats_type, '') FROM applications WHERE id = %s;", (application_id,))
+    row = cur.fetchone()
+    if not row:
+        return {}
+    company, ats_type = row
+    cur.execute(
+        """SELECT question_normalized, answer_text
+             FROM application_question_memory
+            WHERE (scope = 'global')
+               OR (scope = 'ats' AND ats_type = %s)
+               OR (scope = 'company' AND company_normalized = %s)
+            ORDER BY CASE scope WHEN 'company' THEN 3 WHEN 'ats' THEN 2 ELSE 1 END DESC,
+                     updated_at DESC;""",
+        (ats_type, normalize_question(company)),
+    )
+    result: dict[str, str] = {}
+    for question, answer in cur.fetchall():
+        result.setdefault(str(question), str(answer))
+    return result
+
+
+def require_ats_autofill_capability(cur, application_id: str) -> None:
+    """Fail closed when an ATS has not been explicitly proven for this mode."""
+    cur.execute("SELECT coalesce(ats_type, 'unknown') FROM applications WHERE id = %s;", (application_id,))
+    row = cur.fetchone()
+    ats_type = str(row[0]) if row else "unknown"
+    cur.execute("SELECT autofill_mode FROM ats_capabilities WHERE ats_type = %s;", (ats_type,))
+    capability = cur.fetchone()
+    if not capability or capability[0] == "review_only":
+        raise PermanentTaskError(
+            f"ATS '{ats_type}' is review-only or unregistered. Add a proven single-page capability before browser writes."
+        )
 
 
 def snapshot_state(transport: OpenClawTransport, target_id: str) -> SnapshotState:
@@ -975,6 +1033,7 @@ def handle_capture_page_snapshot(cur, task) -> Dict[str, Any]:
 
 
 def handle_fill_application_form(cur, task) -> Dict[str, Any]:
+    require_ats_autofill_capability(cur, task["application_id"])
     binding = require_bound_approval(cur, task)
     document = require_verified_document(cur, binding["document_id"], task["application_id"])
     document_hash = hashlib.sha256((document["content"] or "").encode("utf-8")).hexdigest()
@@ -982,6 +1041,7 @@ def handle_fill_application_form(cur, task) -> Dict[str, Any]:
         raise PermanentTaskError("Bound generated document content changed after approval; reissue approval.")
 
     profile, sensitive_answers = load_autofill_profile(cur, task["application_id"], binding)
+    remembered_answers = load_question_memory(cur, task["application_id"])
     current_input_hash = autofill_input_hash(
         profile=profile, sensitive_answers=sensitive_answers, document_sha256=document_hash,
         artifact_sha256=binding.get("artifact_sha256"), page_url=binding["expected_initial_url"],
@@ -999,6 +1059,7 @@ def handle_fill_application_form(cur, task) -> Dict[str, Any]:
         latest_actions, _ = plan_autofill(
             list(state.fields), profile, question_groups=list(state.groups),
             approved_sensitive_answers=sensitive_answers,
+            remembered_answers=remembered_answers,
         )
         return latest_actions
 

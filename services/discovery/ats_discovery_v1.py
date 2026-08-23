@@ -379,14 +379,29 @@ def fetch_jobs(platform: str, slug: str, *, with_details: bool = False) -> List[
 def intake_job(cur, *, jd_text: str, company: str, job_title: str, job_url: str,
                location: str, work_mode: str, ats_type: str,
                ats_company_id: str, ats_external_id: str) -> Optional[str]:
-    """Same dedupe contract as orchestrator_v1.py's intake(): unique on
-    jd_hash. Kept as a local copy rather than a cross-module import, matching
-    this codebase's existing convention of each service script being
-    self-contained (see: every script re-declaring its own DB connection
-    constants)."""
+    """Create or refresh one source-stable discovered posting."""
     jd_text = jd_text.strip()
     jd_hash = hashlib.sha256(jd_text.encode("utf-8")).hexdigest()
 
+    cur.execute(
+        """SELECT id::text, jd_hash FROM applications
+           WHERE source = %s AND ats_company_id = %s AND source_job_id = %s;""",
+        (ats_type, ats_company_id, ats_external_id),
+    )
+    existing = cur.fetchone()
+    if existing:
+        changed = existing[1] != jd_hash
+        cur.execute(
+            """UPDATE applications
+               SET job_title = %s, job_url = %s, jd_text = %s, jd_hash = %s,
+                   location = %s, work_mode = %s, last_seen_at = now(),
+                   last_content_change_at = CASE WHEN %s THEN now() ELSE last_content_change_at END,
+                   stale_at = NULL, closed_at = NULL, updated_at = now()
+             WHERE id = %s;""",
+            (job_title, job_url, jd_text, jd_hash, location,
+             ("remote" if work_mode else None), changed, existing[0]),
+        )
+        return None
     cur.execute("SELECT id::text FROM applications WHERE jd_hash = %s;", (jd_hash,))
     if cur.fetchone():
         return None
@@ -396,14 +411,15 @@ def intake_job(cur, *, jd_text: str, company: str, job_title: str, job_url: str,
         INSERT INTO applications
           (source, company, job_title, job_url, jd_text, jd_hash,
            current_step, status, intake_channel, ats_type, location, work_mode,
-           ats_company_id, ats_external_id, created_at, updated_at)
+           ats_company_id, ats_external_id, source_job_id,
+           first_seen_at, last_seen_at, created_at, updated_at)
         VALUES (%s, %s, %s, %s, %s, %s, 'intake', 'active', 'ats_discovery',
-                %s, %s, %s, %s, %s, now(), now())
+                %s, %s, %s, %s, %s, now(), now(), now(), now())
         RETURNING id::text;
         """,
         (ats_type, company, job_title, job_url, jd_text, jd_hash,
          ats_type, location, ("remote" if work_mode else None),
-         ats_company_id, ats_external_id),
+         ats_company_id, ats_external_id, ats_external_id),
     )
     app_id = cur.fetchone()[0]
     immigration = record_jd_immigration_assessment(cur, app_id, jd_text)
@@ -551,6 +567,16 @@ def poll_company(conn, cid, name, platform, slug, *, apply: bool, with_details: 
                 """,
                 (ok, seen, ok, cid),
             )
+            if ok:
+                cur.execute(
+                    """UPDATE applications
+                       SET stale_at = now(), status = 'stale', updated_at = now()
+                     WHERE ats_company_id = %s AND source = %s
+                       AND intake_channel = 'ats_discovery' AND current_step = 'intake'
+                       AND status = 'active'
+                       AND last_seen_at < (SELECT started_at FROM ats_discovery_runs WHERE id = %s);""",
+                    (cid, platform, run_id),
+                )
     conn.commit()
     return ok, seen, new, dup, err
 
