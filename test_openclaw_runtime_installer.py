@@ -1,8 +1,10 @@
 import io
+import os
 import tarfile
 import tempfile
 from pathlib import Path
 
+import services.common.openclaw_runtime as runtime
 from scripts.install_openclaw_runtime import RuntimeInstallError, safe_extract
 
 
@@ -43,3 +45,21 @@ def test_safe_extract_rejects_symlink_escape():
         except RuntimeInstallError:
             return
         raise AssertionError("unsafe archive link was accepted")
+
+
+def test_empty_openclaw_bin_prefers_private_runtime():
+    with tempfile.TemporaryDirectory() as tmp:
+        binary = Path(tmp) / "openclaw"
+        binary.write_text("#!/bin/sh\n", encoding="utf-8")
+        original = runtime.PRIVATE_OPENCLAW_BIN
+        old_env = os.environ.get("OPENCLAW_BIN")
+        try:
+            runtime.PRIVATE_OPENCLAW_BIN = binary
+            os.environ["OPENCLAW_BIN"] = ""
+            assert runtime.resolve_openclaw_binary() == str(binary)
+        finally:
+            runtime.PRIVATE_OPENCLAW_BIN = original
+            if old_env is None:
+                os.environ.pop("OPENCLAW_BIN", None)
+            else:
+                os.environ["OPENCLAW_BIN"] = old_env

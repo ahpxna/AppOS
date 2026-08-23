@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 from typing import Any, Mapping
 
 from services.autofill.field_matcher_v1 import FieldClass, FieldMatch, match_field
@@ -44,6 +45,20 @@ def _option_for_value(group: QuestionGroup, value: Any):
     return next((item for item in group.options if item.label.casefold() == wanted), None)
 
 
+def _already_matches(field: FormField, value: Any) -> bool:
+    """Skip a redundant write when an ATS already holds the approved value."""
+    actual, expected = str(field.value or "").strip(), str(value or "").strip()
+    if not actual or not expected:
+        return False
+    if field.role in {"combobox", "listbox", "select"}:
+        aliases = {"nj": "new jersey", "ny": "new york", "ca": "california", "tx": "texas"}
+        a, e = actual.casefold(), expected.casefold()
+        return a == e or aliases.get(a) == e or aliases.get(e) == a
+    if "phone" in field.label.casefold():
+        return re.sub(r"\D", "", actual) == re.sub(r"\D", "", expected)
+    return " ".join(actual.casefold().split()) == " ".join(expected.casefold().split())
+
+
 def plan_autofill(
     fields: list[FormField], profile: Mapping[str, Any], *,
     question_groups: list[QuestionGroup] | None = None,
@@ -84,6 +99,9 @@ def plan_autofill(
         value = _lookup(profile, match.profile_key)
         if value in (None, ""):
             actions.append(PlannedAction("pause", field.ref, None, match.profile_key, "No approved profile value exists.", field.label))
+        elif _already_matches(field, value):
+            actions.append(PlannedAction("verify", field.ref, str(value), match.profile_key,
+                                         "Existing value already matches the approved profile.", field.label))
         elif match.field_class is FieldClass.DERIVED:
             actions.append(PlannedAction("pause", field.ref, None, match.profile_key, "Derived answer requires evidence review.", field.label))
         elif match.profile_key.startswith("documents."):

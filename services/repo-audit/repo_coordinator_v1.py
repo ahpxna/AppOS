@@ -9,7 +9,9 @@ import shutil
 import subprocess
 from pathlib import Path
 
-OPENCLAW_BIN = os.getenv("OPENCLAW_BIN", "openclaw")
+from services.common.openclaw_runtime import resolve_openclaw_binary
+
+OPENCLAW_BIN = resolve_openclaw_binary()
 OPENCLAW_AGENT = os.getenv("OPENCLAW_AGENT_REPO_COORDINATOR", "repo_coordinator")
 
 

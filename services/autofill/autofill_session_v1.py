@@ -21,6 +21,7 @@ class SnapshotState:
     fields: tuple[FormField, ...]
     groups: tuple[QuestionGroup, ...]
     page_fingerprint: str = ""
+    truncated: bool = False
 
 
 @dataclass(frozen=True)
@@ -91,6 +92,8 @@ class AutofillSession:
             raise SessionError(f"Pinned browser target moved to {_origin(current)}; expected {self.expected_origin}.")
 
     def _assert_initial_page(self, target: BrowserTarget, state: SnapshotState) -> None:
+        if state.truncated:
+            raise SessionError("Browser snapshot is truncated; refusing to authorize an incomplete form view.")
         if canonical_page_url(self.transport.current_url(target.target_id)) != self.expected_initial_url:
             raise SessionError("Pinned browser target is not the approval-bound application page.")
         if not state.page_fingerprint or state.page_fingerprint != self.expected_page_fingerprint:
@@ -135,6 +138,9 @@ class AutofillSession:
         executed: list[str] = []
         while True:
             self._assert_origin(target)
+            # V1 is intentionally single-page. A new wizard step needs its
+            # own approval rather than silently continuing on same-origin URL.
+            self._assert_initial_page(target, state)
             actions = plan(state)
             candidate = next((item for item in actions if item.action in {"fill", "select", "check", "upload", "verify"}
                               and action_identity(item) not in completed), None)
@@ -153,6 +159,7 @@ class AutofillSession:
             executed.append(candidate.ref)
             self._assert_origin(target)
             fresh = self.snapshot_state(target.target_id)
+            self._assert_initial_page(target, fresh)
             if not self._verified(candidate, fresh):
                 self.after_failed(candidate, target.target_id, journal_id)
                 return SessionResult("partial", tuple(verified), (candidate.ref,), tuple(executed), target.target_id)

@@ -6,6 +6,7 @@ from services.autofill.autofill_executor_v1 import BrowserTarget, OpenClawTransp
 from services.autofill.autofill_session_v1 import AutofillSession, SessionError, SnapshotState
 from services.autofill.autofill_verifier_v1 import verify_actions
 from services.autofill.form_inspector_v1 import FormField, QuestionGroup, QuestionOption
+from services.common.autofill_identity import canonical_page_url
 
 
 def test_static_identity_is_narrow_and_verifiable():
@@ -16,6 +17,14 @@ def test_static_identity_is_narrow_and_verifiable():
     assert [action.action for action in actions] == ["fill", "fill"]
     result = verify_actions(actions, {"first": "An", "email": "an@example.com"})
     assert result.status == "completed"
+
+
+def test_already_correct_static_value_is_verified_without_a_browser_write():
+    actions, _ = plan_autofill(
+        [FormField("phone", "Phone", "textbox", "(609) 555-1234")],
+        {"personal": {"phone": "6095551234"}},
+    )
+    assert actions[0].action == "verify"
 
 
 def test_immigration_and_unknown_fields_pause():
@@ -142,6 +151,34 @@ def test_session_refuses_same_origin_but_different_approved_job_page():
     except SessionError:
         return
     raise AssertionError("same-origin, different-job page was accepted")
+
+
+def test_page_identity_preserves_job_query_parameters_but_ignores_fragment():
+    assert canonical_page_url("https://jobs.example.com/apply?job=123#section") == \
+           canonical_page_url("https://jobs.example.com/apply?job=123#other")
+    assert canonical_page_url("https://jobs.example.com/apply?job=123") != \
+           canonical_page_url("https://jobs.example.com/apply?job=456")
+
+
+def test_truncated_initial_snapshot_never_begins_execution():
+    class FakeTransport:
+        def resolve_target(self): return BrowserTarget("tab-1", "https://jobs.example.com/apply")
+        def current_url(self, _target): return "https://jobs.example.com/apply"
+        def snapshot(self, _target): return {}
+        def execute(self, _target, _command): raise AssertionError("must not write")
+    session = AutofillSession(
+        transport=FakeTransport(), expected_origin="https://jobs.example.com",
+        expected_initial_url="https://jobs.example.com/apply", expected_page_fingerprint="fingerprint",
+        snapshot_state=lambda _target: SnapshotState((), (), "fingerprint", True),
+        origin_allowed=lambda _url: None, begin_execution=lambda _target: raise_error("must not begin"),
+        before_action=lambda *_args: raise_error("must not journal"),
+        after_verified=lambda *_args: None, after_failed=lambda *_args: None,
+    )
+    try:
+        session.execute(lambda _state: [])
+    except SessionError:
+        return
+    raise AssertionError("truncated snapshot was accepted")
 
 
 def raise_error(message):

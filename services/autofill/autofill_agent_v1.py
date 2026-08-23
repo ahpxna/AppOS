@@ -55,6 +55,7 @@ from services.common.immigration_semantics import legal_question_pause_reason
 from services.autofill.field_matcher_v1 import FieldClass, match_field as deterministic_match
 from services.autofill.form_inspector_v1 import FormField
 from services.common.autofill_identity import canonical_page_url, page_fingerprint
+from services.common.openclaw_runtime import resolve_openclaw_binary
 
 DB_HOST = os.getenv("JOBOS_DB_HOST", "127.0.0.1")
 DB_PORT = int(os.getenv("JOBOS_DB_PORT", "5433"))
@@ -67,7 +68,7 @@ DSN = (
     f"user={DB_USER} password={DB_PASSWORD}"
 )
 
-OPENCLAW_BIN = os.getenv("OPENCLAW_BIN", "openclaw")
+OPENCLAW_BIN = resolve_openclaw_binary()
 # browser.defaultProfile does not propagate into tool/CLI calls, so the
 # profile is always passed explicitly.
 BROWSER_PROFILE = os.getenv("JOBOS_BROWSER_PROFILE", "remote")

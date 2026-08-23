@@ -42,6 +42,16 @@ dependencies (bao gồm `psycopg`), bật PostgreSQL và chạy migration có ch
 Nó **không** kéo Ollama model, bật OpenClaw hay worker dùng token. Hướng dẫn
 chi tiết/upgrade DB cũ: [docs/ubuntu_bootstrap.md](docs/ubuntu_bootstrap.md).
 
+Sau khi stage profile riêng và OpenClaw (nếu cần browser), chạy readiness check
+không dùng model/browser page:
+
+```bash
+source .venv/bin/activate
+python scripts/jobos.py doctor
+# chỉ probe gateway + CDP, vẫn không mở tab hoặc điền form
+python scripts/jobos.py doctor --check-browser
+```
+
 ## 2. Clone & cấu hình môi trường thủ công
 
 ```bash

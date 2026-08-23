@@ -69,6 +69,7 @@ from services.autofill.autofill_session_v1 import AutofillSession, SessionError,
 from services.autofill.form_inspector_v1 import inspect_nodes, inspect_question_groups
 from services.common.autofill_identity import autofill_input_hash, canonical_page_url, page_fingerprint
 from services.common.immigration_semantics import EXACT_CANDIDATE_ADDITIONAL_CLASSES
+from services.common.openclaw_runtime import resolve_openclaw_binary
 
 load_repo_env()
 
@@ -88,8 +89,7 @@ DSN = (
 # Prefer the pinned JobOS runtime when setup installed it.  A global OpenClaw
 # can otherwise inherit an unsupported Node version or a different plugin set.
 REPO_ROOT = Path(__file__).resolve().parents[2]
-PRIVATE_OPENCLAW_BIN = REPO_ROOT / "data" / "openclaw-runtime" / "node" / "node_modules" / ".bin" / "openclaw"
-OPENCLAW_BIN = os.getenv("OPENCLAW_BIN") or (str(PRIVATE_OPENCLAW_BIN) if PRIVATE_OPENCLAW_BIN.is_file() else "openclaw")
+OPENCLAW_BIN = resolve_openclaw_binary()
 # Agent ids as defined in ~/.openclaw/openclaw.json -> agents.list
 OPENCLAW_AGENT_BROWSE = os.getenv("OPENCLAW_AGENT_BROWSE", "main")
 OPENCLAW_AGENT_RESUME = os.getenv("OPENCLAW_AGENT_RESUME", "resume")
@@ -243,6 +243,56 @@ def browser_cdp_health() -> tuple[bool, str]:
 # ---------------------------------------------------------------- queue
 
 def reap_expired_leases(cur) -> int:
+    # A crash before an action is journaled is provably pre-I/O. Release that
+    # exact capability/task pair for a safe retry. Once a journal row exists,
+    # an external write may have happened and the task must be reconciled.
+    cur.execute(
+        """
+        WITH safe AS (
+          SELECT b.id AS task_id, b.approval_request_id
+          FROM browser_tasks b
+          JOIN approval_requests a ON a.id = b.approval_request_id
+          WHERE b.status = 'running'
+            AND b.lease_expires_at < now()
+            AND b.execution_state = 'executing'
+            AND a.status = 'executing'
+            AND a.executing_task_id = b.id
+            AND NOT EXISTS (
+              SELECT 1 FROM autofill_action_journal j WHERE j.browser_task_id = b.id
+            )
+          FOR UPDATE
+        ), released AS (
+          UPDATE approval_requests a
+          SET status = 'approved', executing_task_id = NULL
+          FROM safe s
+          WHERE a.id = s.approval_request_id
+          RETURNING s.task_id
+        )
+        UPDATE browser_tasks b
+        SET status = 'queued', execution_state = 'not_started', locked_by = NULL,
+            lease_expires_at = NULL, retry_count = retry_count + 1
+        FROM released r
+        WHERE b.id = r.task_id
+        RETURNING b.id;
+        """
+    )
+    pre_io = len(cur.fetchall())
+    # Once deterministic execution started, the browser may already contain a
+    # side effect. Never place such a task back on the queue after a worker
+    # crash: retain it for explicit reconciliation instead.
+    cur.execute(
+        """
+        UPDATE browser_tasks
+        SET status = 'failed', execution_state = 'needs_reconciliation',
+            locked_by = NULL, lease_expires_at = NULL, finished_at = now(),
+            error_message = COALESCE(error_message, 'Worker lease expired during browser execution; reconcile before retrying.')
+        WHERE status = 'running'
+          AND lease_expires_at < now()
+          AND execution_state IN ('executing', 'partial')
+        RETURNING id;
+        """
+    )
+    unsafe = len(cur.fetchall())
     cur.execute(
         """
         UPDATE browser_tasks
@@ -250,11 +300,12 @@ def reap_expired_leases(cur) -> int:
             retry_count = retry_count + 1
         WHERE status = 'running'
           AND lease_expires_at < now()
+          AND execution_state = 'not_started'
           AND retry_count < max_retries
         RETURNING id;
         """
     )
-    return len(cur.fetchall())
+    return pre_io + unsafe + len(cur.fetchall())
 
 
 def dead_letter_exhausted(cur) -> int:
@@ -273,6 +324,7 @@ def dead_letter_exhausted(cur) -> int:
               error_message = COALESCE(error_message, 'Max retries exceeded')
           WHERE status = 'running'
             AND lease_expires_at < now()
+            AND execution_state = 'not_started'
             AND retry_count >= max_retries
           RETURNING id, task_type, application_id, input_json,
                     error_message, retry_count, screenshot_url
@@ -482,6 +534,14 @@ def require_bound_approval(cur, task: Dict[str, Any]) -> Dict[str, Any]:
             "artifact_id": artifact_id, "artifact_sha256": artifact_hash, "artifact_filename": artifact_filename,
             "expected_initial_url": page_url, "expected_page_fingerprint": page_fingerprint_sha,
             "autofill_input_hash": input_hash}
+
+
+def require_current_input_hash(binding: Dict[str, Any], current_hash: str) -> None:
+    """Reject a capability when profile/legal/document inputs changed post-approval."""
+    if str(binding.get("autofill_input_hash") or "") != str(current_hash or ""):
+        raise PermanentTaskError(
+            "Candidate profile or confirmed legal answer changed after approval; issue a new approval."
+        )
 
 
 def _durable_connection():
@@ -773,7 +833,10 @@ def load_autofill_profile(cur, application_id: str, artifact_binding: Dict[str, 
 def snapshot_state(transport: OpenClawTransport, target_id: str) -> SnapshotState:
     payload = transport.snapshot(target_id)
     nodes = parse_snapshot(payload)
-    return SnapshotState(tuple(inspect_nodes(nodes)), tuple(inspect_question_groups(nodes)), page_fingerprint(payload))
+    return SnapshotState(
+        tuple(inspect_nodes(nodes)), tuple(inspect_question_groups(nodes)),
+        page_fingerprint(payload), bool(payload.get("truncated")),
+    )
 
 
 # ---------------------------------------------------------------- handlers
@@ -894,8 +957,7 @@ def handle_fill_application_form(cur, task) -> Dict[str, Any]:
         artifact_sha256=binding.get("artifact_sha256"), page_url=binding["expected_initial_url"],
         page_fingerprint_sha256=binding["expected_page_fingerprint"],
     )
-    if current_input_hash != binding["autofill_input_hash"]:
-        raise PermanentTaskError("Candidate profile or confirmed legal answer changed after approval; issue a new approval.")
+    require_current_input_hash(binding, current_input_hash)
     transport = OpenClawTransport(binary=OPENCLAW_BIN, profile=os.getenv("JOBOS_BROWSER_PROFILE", "remote"),
                                   timeout=min(int(task["timeout_seconds"]), 90), environment=openclaw_runtime_env())
     execution_started = False

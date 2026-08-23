@@ -50,3 +50,29 @@ def test_high_requires_confirmed_profile_and_two_distinct_employer_signals():
     assert status == "HIGH"
     status, _ = synthesize_immigration_fit({}, policy, everify_status="verified", h1b_history_status="positive")
     assert status == "POSSIBLE"
+
+
+def test_legal_question_classifier_is_exact_and_unknown_fails_closed():
+    cases = {
+        "Are you currently authorized to work in the United States?": ImmigrationQuestionClass.CURRENT_AUTHORIZATION,
+        "Are you legally authorized to work in the US?": ImmigrationQuestionClass.CURRENT_AUTHORIZATION,
+        "Will you now or in the future require sponsorship?": ImmigrationQuestionClass.SPONSORSHIP_NOW_OR_FUTURE,
+        "Do you need visa sponsorship now or in the future?": ImmigrationQuestionClass.SPONSORSHIP_NOW_OR_FUTURE,
+        "Will you require sponsorship to begin employment?": ImmigrationQuestionClass.SPONSORSHIP_TO_START,
+        "Will you need visa sponsorship upon start?": ImmigrationQuestionClass.SPONSORSHIP_TO_START,
+        "Are you currently on STEM OPT?": ImmigrationQuestionClass.CURRENT_STEM_OPT_STATUS,
+        "Do you currently hold STEM OPT authorization?": ImmigrationQuestionClass.CURRENT_STEM_OPT_STATUS,
+        "Will you require a STEM OPT extension?": ImmigrationQuestionClass.WILL_REQUIRE_STEM_EXTENSION,
+        "Do you need STEM OPT in the future?": ImmigrationQuestionClass.WILL_REQUIRE_STEM_EXTENSION,
+        "Will you require your employer to complete Form I-983?": ImmigrationQuestionClass.I983_REQUIREMENT,
+        "Do you need an I 983 from the employer?": ImmigrationQuestionClass.I983_REQUIREMENT,
+        "Is this employer enrolled in E-Verify?": ImmigrationQuestionClass.EMPLOYER_EVERIFY_REQUIREMENT,
+        "Is the company E verify registered?": ImmigrationQuestionClass.EMPLOYER_EVERIFY_REQUIREMENT,
+        "Are you a U.S. citizen?": ImmigrationQuestionClass.US_CITIZENSHIP,
+        "Are you a US person?": ImmigrationQuestionClass.US_PERSON,
+        "Do you have permanent work authorization?": ImmigrationQuestionClass.PERMANENT_WORK_AUTHORIZATION,
+        "Please indicate your preferred employment category.": None,
+        "Will you require visa sponsorship?": ImmigrationQuestionClass.UNKNOWN_IMMIGRATION_QUESTION,
+    }
+    for question, expected in cases.items():
+        assert classify_immigration_question(question) is expected

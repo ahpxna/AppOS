@@ -1,0 +1,18 @@
+<!doctype html><meta charset="utf-8"><title>JobOS Fake ATS — Dynamic</title>
+<form aria-label="Application for Job 123"><div id="fields"></div></form>
+<script>
+let generation = 0, values = { phone: "", first_name: "" };
+function render() {
+  generation += 1;
+  const box = document.querySelector('#fields');
+  box.innerHTML = `<p>Render generation ${generation}</p>
+    <label>First name <input id="first-${generation}" aria-label="First name" value="${values.first_name}"></label>
+    <label>Phone <input id="phone-${generation}" aria-label="Phone" value="${values.phone}"></label>`;
+  for (const input of box.querySelectorAll('input')) input.addEventListener('input', event => {
+    values[event.target.ariaLabel === 'Phone' ? 'phone' : 'first_name'] = event.target.value;
+    if (event.target.ariaLabel === 'Phone') values.phone = values.phone.replace(/(\d{3})(\d{3})(\d{0,4})/, '($1) $2-$3').replace(/-$/, '');
+    render();
+  });
+}
+render();
+</script>

@@ -76,7 +76,7 @@ def is_immigration_question(question: str) -> bool:
     return any(token in text for token in (
         "sponsor", "visa", "work authorization", "authorized to work",
         "citizen", "citizenship", "us person", "u.s. person", "opt",
-        "e-verify", "e verify", "i-983", "permanent work authorization",
+        "e-verify", "e verify", "i-983", "i 983", "permanent work authorization",
     ))
 
 

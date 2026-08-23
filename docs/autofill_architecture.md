@@ -96,6 +96,21 @@ It verifies the actual schema and state path `approved → executing → journal
 verified → consumed → task completed`. Pure form/matching tests remain in
 `test_autofill_pipeline.py`.
 
+The release gate is the fuller fresh-schema suite below. It drops and rebuilds
+only the explicitly named disposable database, applies every migration through
+`055`, and uses a `FakeTransport`—not OpenClaw or a real browser.
+
+```bash
+JOBOS_TEST_DSN='host=127.0.0.1 port=5433 dbname=jobos_test user=jobos password=...' \
+JOBOS_RUN_DB_INTEGRATION=1 \
+pytest -q tests/integration/test_autofill_execution_lifecycle.py
+```
+
+Only after this passes may an operator start a local fake ATS fixture. The
+fixtures are in `tests/browser_fixtures/`; they include same-origin wrong-job,
+rerendering, legal-question, and upload cases. They do not contain applicant
+data or contact real ATS providers.
+
 For an interrupted session, first inspect the durable journal, then explicitly
 close the non-replayable capability only after inspecting the real page:
 

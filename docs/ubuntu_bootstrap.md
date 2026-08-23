@@ -65,3 +65,7 @@ Core JD intake, ranking, evidence storage, resume rendering, and tests do not
 need a model. Configure either Ollama or an OpenAI-compatible API later in
 `.env`; see `.env.example` and [ubuntu_gpu.md](ubuntu_gpu.md). OpenClaw is only
 a browser-execution adapter and remains opt-in; see [openclaw.md](openclaw.md).
+
+Before any browser pilot, run the disposable database lifecycle gate documented
+in [autofill_architecture.md](autofill_architecture.md). Start only the local
+fixtures next; never use a real ATS as the first execution target.

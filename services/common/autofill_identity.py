@@ -3,15 +3,21 @@ from __future__ import annotations
 
 import hashlib
 import json
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from typing import Any, Mapping
 
 
 def canonical_page_url(value: str) -> str:
+    """Canonicalize a page without discarding job-identifying query values."""
     parsed = urlsplit((value or "").strip())
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise ValueError("Expected page URL must be an absolute HTTP(S) URL.")
-    return urlunsplit((parsed.scheme.casefold(), parsed.netloc.casefold(), parsed.path.rstrip("/") or "/", "", ""))
+    # Query parameters routinely carry an ATS requisition/job identifier.
+    # Preserve all of them (but normalize ordering/encoding); stripping only
+    # the fragment avoids treating job=123 and job=456 as the same capability.
+    query = urlencode(sorted(parse_qsl(parsed.query, keep_blank_values=True)), doseq=True)
+    return urlunsplit((parsed.scheme.casefold(), parsed.netloc.casefold(),
+                       parsed.path.rstrip("/") or "/", query, ""))
 
 
 def page_fingerprint(snapshot_payload: Mapping[str, Any]) -> str:
