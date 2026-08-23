@@ -21,9 +21,22 @@ class ImmigrationQuestionClass(StrEnum):
     SPONSORSHIP_TO_START = "SPONSORSHIP_TO_START"
     SPONSORSHIP_NOW_OR_FUTURE = "SPONSORSHIP_NOW_OR_FUTURE"
     US_CITIZENSHIP = "US_CITIZENSHIP"
+    US_PERSON = "US_PERSON"
     PERMANENT_WORK_AUTHORIZATION = "PERMANENT_WORK_AUTHORIZATION"
     STEM_OPT_EMPLOYER_REQUIREMENT = "STEM_OPT_EMPLOYER_REQUIREMENT"
     UNKNOWN_IMMIGRATION_QUESTION = "UNKNOWN_IMMIGRATION_QUESTION"
+
+
+class RestrictionType(StrEnum):
+    """The legal meaning expressed by a job post, separate from its rank."""
+
+    NO_SPONSORSHIP = "NO_SPONSORSHIP"
+    PERMANENT_AUTHORIZATION = "PERMANENT_AUTHORIZATION"
+    US_CITIZENSHIP = "US_CITIZENSHIP"
+    US_PERSON = "US_PERSON"
+    OPT_COMPATIBLE = "OPT_COMPATIBLE"
+    STEM_OPT_COMPATIBLE = "STEM_OPT_COMPATIBLE"
+    UNKNOWN = "UNKNOWN"
 
 
 @dataclass(frozen=True)
@@ -38,6 +51,7 @@ class ImmigrationAssessment:
     jd_policy_result: str
     evidence: tuple[str, ...]
     final_reason: str
+    restriction_type: RestrictionType = RestrictionType.UNKNOWN
 
 
 def _normalise(text: str) -> str:
@@ -65,7 +79,9 @@ def classify_immigration_question(question: str) -> ImmigrationQuestionClass | N
         return None
     if any(token in text for token in ("e-verify", "e verify", "i-983", "stem opt")):
         return ImmigrationQuestionClass.STEM_OPT_EMPLOYER_REQUIREMENT
-    if any(token in text for token in ("citizen", "citizenship", "us person", "u.s. person")):
+    if "us person" in text or "u.s. person" in text:
+        return ImmigrationQuestionClass.US_PERSON
+    if any(token in text for token in ("citizen", "citizenship")):
         return ImmigrationQuestionClass.US_CITIZENSHIP
     if "permanent" in text or "indefinitely" in text:
         return ImmigrationQuestionClass.PERMANENT_WORK_AUTHORIZATION
@@ -91,15 +107,28 @@ def legal_question_pause_reason(question: str) -> str | None:
     )
 
 
-_BLOCKED_PATTERNS = (
+_NO_SPONSORSHIP_PATTERNS = (
     r"(?:no|unable to|cannot|can not|will not|does not)\s+(?:provide|offer|sponsor).{0,80}(?:visa|sponsorship)",
     r"(?:must not|cannot|may not).{0,80}(?:require|need).{0,80}(?:sponsorship|visa)",
     r"(?:authorized to work).{0,80}(?:without|no).{0,80}(?:sponsorship|visa)",
-    r"(?:citizenship required|u\.?s\.? citizen(?:ship)? required|u\.?s\.? person required)",
 )
-_COMPATIBLE_PATTERNS = (
-    r"(?:opt candidates?|f-?1 candidates?|stem opt).{0,80}(?:welcome|eligible|accepted|considered)",
-    r"(?:welcome|eligible|accepted|consider).{0,80}(?:opt candidates?|f-?1 candidates?|stem opt)",
+_PERMANENT_AUTHORIZATION_PATTERNS = (
+    r"(?:permanent|unrestricted|indefinite).{0,100}(?:work authorization|authorization|right to work)",
+    r"(?:must be|only).{0,80}(?:authorized|eligible).{0,80}(?:indefinitely|permanently)",
+)
+_US_CITIZENSHIP_PATTERNS = (
+    r"(?:u\.?s\.? citizenship required|u\.?s\.? citizen(?:ship)? required|must be a u\.?s\.? citizen)",
+)
+_US_PERSON_PATTERNS = (
+    r"(?:u\.?s\.? person required|must be a u\.?s\.? person)",
+)
+_STEM_OPT_PATTERNS = (
+    r"(?:stem opt).{0,80}(?:welcome|eligible|accepted|considered|supported)",
+    r"(?:welcome|eligible|accepted|consider).{0,80}(?:stem opt)",
+)
+_OPT_PATTERNS = (
+    r"(?:opt candidates?|f-?1 candidates?).{0,80}(?:welcome|eligible|accepted|considered|supported)",
+    r"(?:welcome|eligible|accepted|consider).{0,80}(?:opt candidates?|f-?1 candidates?)",
 )
 
 
@@ -115,20 +144,37 @@ def _matching_phrases(text: str, patterns: Iterable[str]) -> tuple[str, ...]:
 
 
 def assess_jd_immigration_policy(jd_text: str) -> ImmigrationAssessment:
-    """Classify explicit JD wording only; absence is UNKNOWN, never a pass."""
-    blocked = _matching_phrases(jd_text or "", _BLOCKED_PATTERNS)
-    if blocked:
+    """Classify explicit JD wording only; absence is UNKNOWN, never a pass.
+
+    Citizenship and US-person requirements are intentionally classified before
+    sponsorship: they have different legal semantics and candidate evidence.
+    """
+    text = jd_text or ""
+    rules = (
+        (RestrictionType.US_CITIZENSHIP, _US_CITIZENSHIP_PATTERNS, "incompatible"),
+        (RestrictionType.US_PERSON, _US_PERSON_PATTERNS, "incompatible"),
+        (RestrictionType.PERMANENT_AUTHORIZATION, _PERMANENT_AUTHORIZATION_PATTERNS, "incompatible"),
+        (RestrictionType.NO_SPONSORSHIP, _NO_SPONSORSHIP_PATTERNS, "incompatible"),
+        (RestrictionType.STEM_OPT_COMPATIBLE, _STEM_OPT_PATTERNS, "compatible"),
+        (RestrictionType.OPT_COMPATIBLE, _OPT_PATTERNS, "compatible"),
+    )
+    for restriction_type, patterns, result in rules:
+        matches = _matching_phrases(text, patterns)
+        if not matches:
+            continue
+        if result == "incompatible":
+            return ImmigrationAssessment(
+                status="BLOCKED", jd_policy_result=result, evidence=matches,
+                final_reason=f"The JD explicitly states a {restriction_type.value} restriction.",
+                restriction_type=restriction_type,
+            )
         return ImmigrationAssessment(
-            status="BLOCKED", jd_policy_result="incompatible", evidence=blocked,
-            final_reason="The job description explicitly states an incompatible authorization or sponsorship policy.",
-        )
-    compatible = _matching_phrases(jd_text or "", _COMPATIBLE_PATTERNS)
-    if compatible:
-        return ImmigrationAssessment(
-            status="POSSIBLE", jd_policy_result="compatible", evidence=compatible,
-            final_reason="The JD explicitly mentions OPT/F-1 compatibility; future sponsorship still requires confirmation.",
+            status="POSSIBLE", jd_policy_result=result, evidence=matches,
+            final_reason=f"The JD explicitly mentions {restriction_type.value} compatibility; future sponsorship still requires confirmation.",
+            restriction_type=restriction_type,
         )
     return ImmigrationAssessment(
         status="UNKNOWN", jd_policy_result="unknown", evidence=(),
         final_reason="The JD contains no explicit immigration policy evidence; do not infer sponsorship from its absence.",
+        restriction_type=RestrictionType.UNKNOWN,
     )

@@ -27,10 +27,11 @@ from datetime import date
 from typing import Any
 
 import psycopg
-from psycopg.types.json import Jsonb
-
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-from services.discovery.immigration_intelligence import record_jd_immigration_assessment
+from services.discovery.immigration_intelligence import (
+    record_employer_evidence,
+    record_jd_immigration_assessment,
+)
 
 DB_HOST = os.getenv("JOBOS_DB_HOST", "127.0.0.1")
 DB_PORT = int(os.getenv("JOBOS_DB_PORT", "5433"))
@@ -56,6 +57,7 @@ def cmd_show(cur) -> int:
                opt_eligible, opt_start_date, opt_end_date,
                stem_extension_eligible, stem_cip_code,
                requires_sponsorship_to_start, requires_future_sponsorship,
+               us_citizen, us_person, permanent_work_authorization,
                user_confirmed_at, confirmation_note
         FROM immigration_profiles WHERE profile_key = 'primary';
         """
@@ -69,7 +71,9 @@ def cmd_show(cur) -> int:
             "stem_extension_eligible": row[6], "stem_cip_code": row[7],
             "requires_sponsorship_to_start": row[8],
             "requires_future_sponsorship": row[9],
-            "user_confirmed_at": str(row[10] or ""), "confirmation_note": row[11],
+            "us_citizen": row[10], "us_person": row[11],
+            "permanent_work_authorization": row[12],
+            "user_confirmed_at": str(row[13] or ""), "confirmation_note": row[14],
         },
         "warning": "This profile does not answer employer questions automatically.",
     }, indent=2))
@@ -98,6 +102,9 @@ def cmd_set(conn, args) -> int:
         "stem_cip_code": (args.stem_cip_code or "").strip() or None,
         "requires_sponsorship_to_start": args.requires_sponsorship_to_start,
         "requires_future_sponsorship": args.requires_future_sponsorship,
+        "us_citizen": args.us_citizen,
+        "us_person": args.us_person,
+        "permanent_work_authorization": args.permanent_work_authorization,
         "confirmation_note": (args.confirmation_note or "").strip() or None,
     }
     with conn.cursor() as cur:
@@ -107,10 +114,12 @@ def cmd_set(conn, args) -> int:
               (profile_key, current_status, current_work_authorization, opt_eligible,
                opt_start_date, opt_end_date, stem_extension_eligible, stem_cip_code,
                requires_sponsorship_to_start, requires_future_sponsorship,
+               us_citizen, us_person, permanent_work_authorization,
                user_confirmed_at, confirmation_note)
             VALUES ('primary', %(current_status)s, %(current_work_authorization)s, %(opt_eligible)s,
                     %(opt_start_date)s, %(opt_end_date)s, %(stem_extension_eligible)s, %(stem_cip_code)s,
                     %(requires_sponsorship_to_start)s, %(requires_future_sponsorship)s,
+                    %(us_citizen)s, %(us_person)s, %(permanent_work_authorization)s,
                     now(), %(confirmation_note)s)
             ON CONFLICT (profile_key) DO UPDATE
             SET current_status = EXCLUDED.current_status,
@@ -122,6 +131,8 @@ def cmd_set(conn, args) -> int:
                 stem_cip_code = EXCLUDED.stem_cip_code,
                 requires_sponsorship_to_start = EXCLUDED.requires_sponsorship_to_start,
                 requires_future_sponsorship = EXCLUDED.requires_future_sponsorship,
+                us_citizen = EXCLUDED.us_citizen, us_person = EXCLUDED.us_person,
+                permanent_work_authorization = EXCLUDED.permanent_work_authorization,
                 user_confirmed_at = now(), confirmation_note = EXCLUDED.confirmation_note;
             """,
             values,
@@ -149,29 +160,29 @@ def cmd_employer_evidence(conn, args) -> int:
     if not args.source_url.startswith(("https://", "http://")):
         print("ERROR: --source-url must be an http(s) URL.")
         return 1
-    column = "everify" if args.kind == "everify" else "h1b_history"
     allowed = {"everify": {"verified", "not_found", "unknown"},
                "h1b_history": {"positive", "none_found", "unknown"}}
     if args.status not in allowed[args.kind]:
         print(f"ERROR: invalid --status for {args.kind}.")
         return 1
-    evidence: dict[str, Any] = {"source_url": args.source_url, "note": args.note or "", "recorded_by": "user"}
+    if not 0 <= args.confidence <= 1:
+        print("ERROR: --confidence must be between 0 and 1.")
+        return 1
     with conn.cursor() as cur:
-        cur.execute(
-            """
-            UPDATE application_immigration_assessments
-            SET %s_status = %%s, %s_evidence = %%s, updated_at = now()
-            WHERE application_id = %%s;
-            """ % (column, column),
-            (args.status, Jsonb(evidence), args.application_id),
-        )
-        if cur.rowcount != 1:
-            print("ERROR: application assessment not found; capture/assess the JD first.")
+        try:
+            reassessed = record_employer_evidence(
+                cur, application_id=args.application_id, kind=args.kind, status=args.status,
+                source_url=args.source_url, source_name=args.source_name,
+                note=args.note or "", confidence=args.confidence,
+                legal_entity_name=(args.legal_entity_name or "").strip() or None,
+            )
+        except ValueError as exc:
+            print(f"ERROR: {exc}")
             conn.rollback()
             return 1
     if args.apply:
         conn.commit()
-        print("Employer evidence saved. It remains separate from JD policy and is not a sponsorship guarantee.")
+        print(f"Employer evidence saved and {reassessed} matching JD(s) re-assessed. It is not a sponsorship guarantee.")
     else:
         conn.rollback()
         print("DRY RUN: employer evidence not saved.")
@@ -184,7 +195,10 @@ def main() -> int:
     sub.add_parser("show")
     set_parser = sub.add_parser("set")
     set_parser.add_argument("--current-status", default="unconfirmed")
-    for name in ("current-work-authorization", "requires-sponsorship-to-start", "requires-future-sponsorship"):
+    for name in (
+        "current-work-authorization", "requires-sponsorship-to-start", "requires-future-sponsorship",
+        "us-citizen", "us-person", "permanent-work-authorization",
+    ):
         set_parser.add_argument(f"--{name}", choices=("yes", "no", "unconfirmed"), default="unconfirmed")
     set_parser.add_argument("--opt-eligible", action=argparse.BooleanOptionalAction, default=None)
     set_parser.add_argument("--opt-start-date")
@@ -199,7 +213,10 @@ def main() -> int:
     evidence.add_argument("--kind", choices=("everify", "h1b_history"), required=True)
     evidence.add_argument("--status", required=True)
     evidence.add_argument("--source-url", required=True)
+    evidence.add_argument("--source-name", default="user supplied source")
     evidence.add_argument("--note")
+    evidence.add_argument("--legal-entity-name")
+    evidence.add_argument("--confidence", type=float, default=0.7)
     evidence.add_argument("--apply", action="store_true")
     args = parser.parse_args()
     with psycopg.connect(DSN, autocommit=False) as conn:

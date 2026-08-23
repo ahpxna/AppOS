@@ -67,6 +67,7 @@ def cmd_rank(cur, args) -> int:
         SELECT a.id::text, a.source, a.company, a.job_title, a.job_url, a.jd_text,
                a.current_step, a.status, a.location, a.work_mode,
                COALESCE(ia.status, 'UNKNOWN'),
+               COALESCE(ia.restriction_type, 'UNKNOWN'),
                COALESCE(ia.jd_policy_result, 'unknown'),
                COALESCE(ia.jd_policy_evidence, '[]'::jsonb),
                COALESCE(ia.everify_status, 'unknown'),
@@ -86,8 +87,9 @@ def cmd_rank(cur, args) -> int:
         if match["discovery_score"] < args.min_score:
             continue
         immigration = {
-            "status": row[10], "jd_policy": row[11], "jd_policy_evidence": row[12] or [],
-            "everify": row[13], "h1b_history": row[14], "reason": row[15] or "",
+            "status": row[10], "restriction_type": row[11], "jd_policy": row[12],
+            "jd_policy_evidence": row[13] or [], "everify": row[14],
+            "h1b_history": row[15], "reason": row[16] or "",
         }
         if args.exclude_immigration_blocked and immigration["status"] == "BLOCKED":
             continue

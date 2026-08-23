@@ -130,6 +130,26 @@
         "services/document-generation/verify_document_truth_v1.py"
       ],
       "summary": "Disabled the LLM-driven real-form write path. New approval data binds one application, document hash, target action, and origin for a future deterministic engine, while legacy unbound approvals fail closed. The direct planner refuses writes until active-origin and state-aware radio/checkbox verification exist. Cover-letter structure is deterministic; all substantive paragraphs require candidate evidence, company claims require source-quote entailment verification, and a partially failing resume is regenerated instead of flattened into a template-breaking revision."
+    },
+    {
+      "files": [
+        "scripts/bootstrap_ubuntu_24.sh",
+        "scripts/apply_migrations.py",
+        "db/migrations/051_immigration_employer_evidence_and_migration_ledger.sql",
+        "docs/ubuntu_bootstrap.md",
+        "docs/autofill_architecture.md"
+      ],
+      "summary": "Added a one-command Ubuntu 24 bootstrap that creates an untracked local environment, installs root requirements including psycopg, starts only PostgreSQL, waits for readiness, and applies checksum-tracked migrations without starting models, OpenClaw, or paid workers. Employer evidence is append-only and shared across a company's applications. Immigration synthesis now emits HIGH only for a confirmed profile plus verified E-Verify and positive H-1B history; citizenship, US-person, permanent-authorization, and sponsorship restrictions remain semantically separate."
+    },
+    {
+      "files": [
+        "services/autofill/form_inspector_v1.py",
+        "services/autofill/field_matcher_v1.py",
+        "services/autofill/autofill_planner_v1.py",
+        "services/autofill/autofill_executor_v1.py",
+        "services/autofill/autofill_verifier_v1.py"
+      ],
+      "summary": "Added transport-neutral deterministic autofill contracts: inspect fields, map exact static values, pause derived/sensitive/unknown values, emit least-privilege per-field commands, and require post-write verification before completed status. OpenClaw, Playwright, and CDP are adapter choices; no adapter receives a full candidate profile or authority to decide form answers."
     }
   ],
   "gemini_windows_log_audit": {
@@ -221,6 +241,12 @@
       "decision": "Treat immigration questions as semantic, user-confirmed decisions; preserve explicit JD/employer evidence separately; disable LLM browser form writes until deterministic origin and control-state verification is complete.",
       "reason": "A generic sponsorship answer can be legally misleading, and a free-form browser agent cannot prove that it selected the correct field or retained the intended origin.",
       "status": "implemented_pending_migration_and_operator_confirmation"
+    },
+    {
+      "topic": "New-machine setup and migrations",
+      "decision": "Provide one Ubuntu bootstrap for dependencies, local secrets, PostgreSQL, and migrations; record migration checksums instead of replaying historical SQL.",
+      "reason": "A clean clone must install psycopg automatically, while a database containing applicant data must not be reset by rerunning seed/update migrations.",
+      "status": "implemented"
     }
   ],
   "verification": {
@@ -253,10 +279,13 @@
       ,"Dedicated Chrome CDP session verified on the LinkedIn Jobs page after manual user login; OpenClaw browser doctor, status, tab listing, and snapshot checks passed"
       ,"Live LinkedIn discovery completed through the JobOS OpenClaw executor using the attach-only remote CDP profile: one IBM posting was validated, canonicalized, and stored with a 4,578-character JD; its market-requirement extraction run was automatically queued"
       ,"Targeted regression suite for immigration semantics, document grounding, and fixed-template resume rules passed (14 tests); Python compilation passed for the changed safety modules. No browser or LLM invocation was used."
+      ,"Python syntax compilation and whitespace checks passed for the Ubuntu bootstrap, migration ledger, immigration synthesis, approval reissue change, and deterministic autofill contracts."
+      ,"Pure immigration classification and deterministic autofill plan/verify smoke checks passed without a database, browser, LLM, or external call."
     ],
     "blocked_by_environment": [
       "The Chrome sidecar image kasmweb/chrome:1.16.0 is not present; Docker Desktop image pulls currently fail before download with Keychain Error (-67674).",
-      "OpenAI API authentication is recognized but currently returns insufficient_quota; the configured OpenRouter paid model key hit its daily limit, so the successful browser smoke run used the API-only openrouter/free route."
+      "OpenAI API authentication is recognized but currently returns insufficient_quota; the configured OpenRouter paid model key hit its daily limit, so the successful browser smoke run used the API-only openrouter/free route.",
+      "The current development host lacks pglast and pytest, so this revision did not rerun the static migration linter or pytest suite here. The new Ubuntu bootstrap installs both in .venv before migrations/tests; no browser, Docker, or model run was started for this revision."
     ]
   },
   "next_operator_actions": [

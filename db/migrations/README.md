@@ -1,7 +1,9 @@
 # Migration numbering — read this before adding a new file
 
-Apply order is plain filename sort. `for f in db/migrations/*.sql; do psql ... -f "$f"; done`
-in that order, every time, including on a brand-new database.
+Apply order is plain filename sort, but use `python scripts/apply_migrations.py`
+rather than a shell loop. It records each applied filename and SHA-256 in
+`schema_migrations`; a normal re-run verifies that ledger and never replays an
+old seed/update migration.
 
 ## Before running against a real database
 
@@ -14,7 +16,7 @@ you spend time on a real install. It's not a full SQL engine (see its own docstr
 limits) but it's what found and confirmed the fixes below, and it's self-tested against
 synthetic bad input (4/4 cases) so a clean run means something. It exits non-zero and prints
 every issue with a file reference if it finds anything; exit 0 and "No issues found" means
-none of these three bug classes exist anywhere in the current 55 files.
+none of these three bug classes exist anywhere in the current 56 files.
 
 ## Known duplicate/lettered numbers (historical, left as-is)
 
@@ -24,10 +26,10 @@ A few numbers exist more than once: `007` / `007_seed_mock_profile_fixed` / `007
 `031_profile_capability_builder_tables` / `031b`.
 
 These were not renamed, on purpose: renaming an already-applied migration file doesn't
-undo what it already did to anyone's existing database, and there is no migration-tracking
-table in this project (no `schema_migrations` row per file) — reordering filenames only
-changes fresh-install behavior, and could make people believe a rename fixed something on
-a database it never touched. Each of these was checked individually:
+undo what it already did to anyone's existing database. The migration ledger introduced
+with 051 now rejects edited applied files by checksum; reordering filenames only changes
+fresh-install behavior, and could make people believe a rename fixed something on a
+database it never touched. Each of these was checked individually:
 
 - `007_seed_mock_profile.sql` vs `007_seed_mock_profile_fixed.sql` vs `007a_fix_conflict_indexes.sql`,
   `024` vs `024a`, `025` vs `025a` vs `025b` — sibling "fix the previous file" patches for
@@ -145,7 +147,7 @@ these two tables had the problem, both confined to `025`, both fixed above.
 
 ## If you add a new migration
 
-Use the next integer after the highest number present (currently `050`). Don't reuse a
+Use the next integer after the highest number present (currently `051`). Don't reuse a
 letter suffix pattern (`041a`, `041b`) unless you are patching a migration that has
 *already shipped and been applied by someone* and you specifically do not want to touch
 the original file's already-executed statements. Otherwise just take the next number.

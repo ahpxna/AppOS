@@ -299,6 +299,7 @@ def cmd_create(conn, args) -> int:
                 SELECT id::text, status, summary_text
                 FROM approval_requests
                 WHERE idempotency_key = %s
+                  AND status IN ('pending', 'approved')
                 ORDER BY created_at DESC
                 LIMIT 1;
                 """,

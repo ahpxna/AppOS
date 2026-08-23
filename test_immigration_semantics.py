@@ -1,21 +1,11 @@
 from services.common.immigration_semantics import (
     ImmigrationQuestionClass,
+    RestrictionType,
     assess_jd_immigration_policy,
     classify_immigration_question,
     legal_question_pause_reason,
 )
-from services.discovery.immigration_intelligence import candidate_fit_status
-
-
-class _Cursor:
-    def __init__(self, row):
-        self.row = row
-
-    def execute(self, *_args, **_kwargs):
-        pass
-
-    def fetchone(self):
-        return self.row
+from services.discovery.immigration_intelligence import synthesize_immigration_fit
 
 
 def test_sponsorship_now_or_future_is_not_collapsed_into_current_authorization():
@@ -42,7 +32,19 @@ def test_jd_policy_is_explicit_and_never_uses_absence_as_compatibility():
     assert unknown.jd_policy_result == "unknown"
 
 
-def test_explicit_no_sponsorship_only_blocks_after_candidate_confirmation():
-    assert candidate_fit_status(_Cursor(None), "BLOCKED")[0] == "LOW"
-    assert candidate_fit_status(_Cursor(("no", "yes", "2026-08-23")), "BLOCKED")[0] == "BLOCKED"
-    assert candidate_fit_status(_Cursor(("no", "yes", "2026-08-23")), "UNKNOWN")[0] == "UNKNOWN"
+def test_citizenship_is_not_conflated_with_sponsorship():
+    policy = assess_jd_immigration_policy("U.S. citizenship required for this role.")
+    assert policy.restriction_type is RestrictionType.US_CITIZENSHIP
+    status, _ = synthesize_immigration_fit({"user_confirmed_at": "today", "us_citizen": "no"}, policy)
+    assert status == "BLOCKED"
+
+
+def test_high_requires_confirmed_profile_and_two_distinct_employer_signals():
+    policy = assess_jd_immigration_policy("Build distributed services in Python.")
+    status, _ = synthesize_immigration_fit(
+        {"user_confirmed_at": "today", "current_status": "F1"}, policy,
+        everify_status="verified", h1b_history_status="positive",
+    )
+    assert status == "HIGH"
+    status, _ = synthesize_immigration_fit({}, policy, everify_status="verified", h1b_history_status="positive")
+    assert status == "POSSIBLE"

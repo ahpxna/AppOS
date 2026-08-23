@@ -27,7 +27,22 @@ systemd Ollama: [docs/ubuntu_gpu.md](docs/ubuntu_gpu.md).
 - (Tuỳ chọn) [OpenClaw](https://github.com/khal3d/openclaw) nếu muốn dùng lớp
   browser automation (L3/L7) — xem `docs/openclaw.md`
 
-## 2. Clone & cấu hình môi trường
+## Cài nhanh Ubuntu 24 (khuyến nghị)
+
+Trên máy Ubuntu mới, sau khi cài Git và Docker Compose v2, chỉ cần:
+
+```bash
+git clone https://github.com/your-account/job-apply-os.git job-apply-os
+cd job-apply-os
+bash scripts/bootstrap_ubuntu_24.sh
+```
+
+Lệnh này tự tạo `.env` local với secret mới, `.venv`, cài toàn bộ Python
+dependencies (bao gồm `psycopg`), bật PostgreSQL và chạy migration có checksum.
+Nó **không** kéo Ollama model, bật OpenClaw hay worker dùng token. Hướng dẫn
+chi tiết/upgrade DB cũ: [docs/ubuntu_bootstrap.md](docs/ubuntu_bootstrap.md).
+
+## 2. Clone & cấu hình môi trường thủ công
 
 ```bash
 git clone https://github.com/your-account/job-apply-os.git job-apply-os
@@ -53,14 +68,13 @@ Postgres expose ở `127.0.0.1:${POSTGRES_HOST_PORT}` (mặc định `5433`), n8
 
 ```bash
 python scripts/migration_lint.py   # kiểm tra tĩnh, không cần DB — xem db/migrations/README.md
-chmod +x scripts/apply_migrations.sh
-./scripts/apply_migrations.sh
+python scripts/apply_migrations.py
 ```
 
-Script này chạy toàn bộ `db/migrations/*.sql` theo thứ tự tên file (không có
-bảng theo dõi migration — xem `db/migrations/README.md` để hiểu vì sao số thứ
-tự có vài chỗ trùng/lặp có chủ đích). Cần `psql` trong PATH; trên WSL/Ubuntu:
-`sudo apt install postgresql-client`.
+Migration runner lưu filename + SHA-256 vào `schema_migrations`, nên re-run chỉ
+kiểm tra checksum; nó không chạy lại SQL seed/update. Không cần `psql` trong
+PATH. DB cũ tạo trước migration ledger phải được adopt có chủ đích, xem
+[docs/ubuntu_bootstrap.md](docs/ubuntu_bootstrap.md).
 
 ## 5. Cài Python dependencies
 
@@ -212,22 +226,27 @@ cho workflow này.
 JobOS không tự trả lời câu hỏi work authorization, citizenship hay sponsorship.
 Migration mới reset các default legal answer cũ về `ASK_USER`, phân biệt câu hỏi
 “currently authorized”, “sponsorship to start”, và “now or in the future”, rồi
-dừng để bạn xác nhận wording thực tế. Mỗi JD mới được đánh giá trước filter/fit:
-policy trong JD, E-Verify evidence và H-1B history được lưu tách biệt; E-Verify
-không bao giờ được suy ra thành H-1B sponsorship.
+dừng để bạn xác nhận wording thực tế. Mỗi JD mới được đánh giá trước filter/fit.
+`US citizenship`, `US person`, permanent authorization và no-sponsorship là
+restriction type riêng; policy của JD, E-Verify evidence và H-1B history được
+lưu tách biệt theo employer. E-Verify không bao giờ được suy ra thành H-1B
+sponsorship. `HIGH` chỉ là evidence rank (profile đã confirm + E-Verify
+verified + H-1B history positive), không phải lời hứa employer sẽ sponsor.
 
 ```bash
 # Chỉ lưu sau khi chính bạn đã kiểm tra thông tin và thêm --confirm.
 python services/discovery/immigration_profile_v1.py set \
   --current-status F1 --current-work-authorization yes \
   --requires-sponsorship-to-start no --requires-future-sponsorship yes \
+  --us-citizen no --us-person no --permanent-work-authorization no \
   --confirm --apply
 
 # Xem profile hoặc thêm một nguồn employer evidence có provenance.
 python services/discovery/immigration_profile_v1.py show
 python services/discovery/immigration_profile_v1.py employer-evidence \
   --application-id APPLICATION_UUID --kind everify --status verified \
-  --source-url https://example.org/source --note "Exact employer name matched" --apply
+  --source-url https://example.org/source --source-name "E-Verify Employer Search" \
+  --note "Exact employer name matched" --apply
 ```
 
 Đây là ledger để review, không phải legal advice. Xác nhận OPT/STEM OPT dates,
