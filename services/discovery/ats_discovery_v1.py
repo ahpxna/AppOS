@@ -61,6 +61,8 @@ import urllib.error
 import urllib.request
 from html.parser import HTMLParser
 from typing import Any, Dict, List, Optional
+from services.discovery.captcha_detector import analyze_captcha_risk
+import logging
 
 import psycopg
 from psycopg.types.json import Jsonb
@@ -85,6 +87,8 @@ class DiscoveryError(Exception):
 
 # ---------------------------------------------------------------- http
 
+from services.discovery.captcha_detector import analyze_captcha_risk
+
 def http_get_json(url: str) -> Any:
     req = urllib.request.Request(
         url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
@@ -99,6 +103,10 @@ def http_get_json(url: str) -> Any:
     try:
         return json.loads(body)
     except json.JSONDecodeError as e:
+        # [THÊM MỚI] Check CAPTCHA nếu API trả về HTML thay vì JSON
+        is_blocked, reason = analyze_captcha_risk(body, url)
+        if is_blocked:
+            raise DiscoveryError(f"Bị chặn bởi Anti-Bot/CAPTCHA: {reason}")
         raise DiscoveryError(f"Non-JSON response from {url}: {body[:200]!r}") from e
 
 
@@ -128,6 +136,7 @@ class _TextExtractor(HTMLParser):
 
     def text(self) -> str:
         return re.sub(r"\n{3,}", "\n\n", " ".join(self._parts)).strip()
+
 
 
 def html_to_text(raw: Optional[str]) -> str:
