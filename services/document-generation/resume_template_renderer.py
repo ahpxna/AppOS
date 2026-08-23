@@ -144,6 +144,18 @@ def protected_snapshot(document) -> dict[str, Any]:
     }
 
 
+def validate_template_contract(template: Path) -> dict[str, int]:
+    """Validate the exact immutable slot contract before onboarding accepts it."""
+    if not template.is_file():
+        raise ResumeTemplateError(f"Resume template not found: {template}")
+    document = Document(template)
+    bullets, skills = _slot_indices(document.paragraphs)
+    headers = _header_indices(document.paragraphs)
+    # Exercise all format-sensitive invariants without writing a copy.
+    protected_snapshot(document)
+    return {"project_bullet_slots": len(bullets), "skill_slots": len(skills), "project_headers": len(headers)}
+
+
 def render_docx(*, template: Path, output: Path, project_bullets: list[dict[str, Any]],
                 skill_lines: list[dict[str, str]], project_subtitles: list[dict[str, Any]] | None = None) -> None:
     """Copy the template and alter only fixed bullet/skill slots in place."""

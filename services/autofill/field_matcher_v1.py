@@ -46,7 +46,9 @@ _STATIC = (
     (r"\b(zip|postal)\b", "address.postal"),
     (r"\bcounty\b", "address.county"),
     (r"\bcountry\b", "address.country"),
-    (r"\b(university|college|school)\b", "education.university"),
+    # A generic "School" label is ambiguous in repeated ATS education rows.
+    # Only labels that explicitly say university/college are safe to fill.
+    (r"\b(university|college)\b", "education.university"),
     (r"\bmajor|field of study\b", "education.major"),
     (r"\bgraduation\s*(date|year)?\b", "education.graduation_date"),
     (r"\bcurrent\s+(employer|company)\b", "employment.current_employer"),
@@ -66,6 +68,12 @@ _SENSITIVE = (r"\b(race|ethnicity|gender|disability|veteran|export control)\b",)
 
 def match_field(field: FormField) -> FieldMatch:
     label = field.label.casefold()
+    if re.search(r"\b(high\s*school|secondary\s*(school|education)|ged)\b", label):
+        return FieldMatch(field, None, FieldClass.UNKNOWN, 1.0,
+                          "High-school/secondary education is not the approved university field.")
+    if re.fullmatch(r"\s*(school|institution|education)\s*", label):
+        return FieldMatch(field, None, FieldClass.UNKNOWN, 0.0,
+                          "Ambiguous education-row label; select the correct education entry manually.")
     immigration_reason = legal_question_pause_reason(field.label)
     if immigration_reason:
         return FieldMatch(field, None, FieldClass.SENSITIVE, 1.0, immigration_reason)

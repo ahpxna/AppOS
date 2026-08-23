@@ -15,13 +15,8 @@ import requests
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from services.common.model_config import get_model  # noqa: E402
 from services.common.llm_gateway import chat_text, resolve_config  # noqa: E402
+from services.common.config import database_dsn  # noqa: E402
 
-
-DB_HOST = os.getenv("JOBOS_DB_HOST", "127.0.0.1")
-DB_PORT = int(os.getenv("JOBOS_DB_PORT", "5433"))
-DB_NAME = os.getenv("JOBOS_DB_NAME", "job_apply_os")
-DB_USER = os.getenv("JOBOS_DB_USER", "jobos")
-DB_PASSWORD = os.getenv("JOBOS_DB_PASSWORD", "jobos_local_dev_password_change_later")
 
 LOCAL_LLM_BASE_URL = os.getenv("LOCAL_LLM_BASE_URL", "http://127.0.0.1:11434")
 LOCAL_LLM_MODEL = get_model("legacy_local_llm")
@@ -33,10 +28,7 @@ DEFAULT_LIMIT = int(os.getenv("JOBOS_FACT_EXTRACT_LIMIT", "3"))
 MIN_TOKEN_COUNT = int(os.getenv("JOBOS_FACT_MIN_TOKENS", "40"))
 SLEEP_SECONDS = float(os.getenv("JOBOS_FACT_SLEEP_SECONDS", "0.3"))
 
-DSN = (
-    f"host={DB_HOST} port={DB_PORT} dbname={DB_NAME} "
-    f"user={DB_USER} password={DB_PASSWORD}"
-)
+DSN = database_dsn()
 
 
 FACT_SCHEMA = {

@@ -20,16 +20,28 @@ def canonical_page_url(value: str) -> str:
                        parsed.path.rstrip("/") or "/", query, ""))
 
 
-def page_fingerprint(snapshot_payload: Mapping[str, Any]) -> str:
-    """Hash accessible structure without retaining refs or entered values."""
-    lines = []
+def page_fingerprint(snapshot_payload: Mapping[str, Any], *, page_url: str = "") -> str:
+    """Hash stable application anchors, not dynamic form controls.
+
+    A React form may reveal conditional controls after a legitimate write. The
+    exact canonical URL remains the primary identity binding; this fingerprint
+    adds only stable form/heading anchors and intentionally excludes inputs,
+    radios, selects, and their values.
+    """
+    anchors = []
     for line in str(snapshot_payload.get("snapshot") or "").splitlines():
         stable = line.split("[ref=", 1)[0].strip()
-        if stable:
-            lines.append(" ".join(stable.split()))
-    if not lines:
-        raise ValueError("Cannot bind an approval to an empty browser snapshot.")
-    return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
+        role = stable.removeprefix("-").strip().split(" ", 1)[0].casefold()
+        if role in {"heading", "main", "form", "article", "dialog", "banner"}:
+            anchors.append(" ".join(stable.split()))
+    # Some ATS snapshots omit semantic container roles. The exact URL still
+    # provides a secure identity; an empty structure must not force a false
+    # reconciliation after an otherwise valid conditional form update.
+    if not anchors and page_url:
+        anchors.append(f"url:{canonical_page_url(page_url)}")
+    if not anchors:
+        raise ValueError("Cannot bind an approval to an empty browser page identity.")
+    return hashlib.sha256("\n".join(anchors).encode("utf-8")).hexdigest()
 
 
 def autofill_input_hash(*, profile: Mapping[str, Any], sensitive_answers: Mapping[str, Any],

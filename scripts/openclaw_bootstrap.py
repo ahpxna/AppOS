@@ -42,6 +42,7 @@ MODEL_DEFAULTS: Dict[str, str] = {
     "RESUME_MODEL": "openrouter/auto",
     "COVER_MODEL": "openrouter/auto",
     "REPO_COORDINATOR_MODEL": "openrouter/auto",
+    "LINKEDIN_DISCOVERY_MODEL": "openrouter/auto",
     "HOOKS_MODEL": "openrouter/meta-llama/llama-3.3-70b-instruct:free",
     "GMAIL_MODEL": "openrouter/meta-llama/llama-3.3-70b-instruct:free",
 }
@@ -293,7 +294,8 @@ def bootstrap(target_home: Path, template_path: Path, values: Dict[str, Any], al
 
     ensure_dir(openclaw_home)
     for name in ("agents", "skills", "logs", "memory", "state", "subagents", "tmp", "workspace-main",
-                 "workspace-resume", "workspace-cover_letter", "workspace-repo_coordinator", "workspace"):
+                 "workspace-resume", "workspace-cover_letter", "workspace-repo_coordinator",
+                 "workspace-linkedin_discovery", "workspace"):
         ensure_dir(openclaw_home / name)
     # The "resume" and "cover_letter" agent profiles in openclaw.template.json
     # declare an explicit agentDir (~/.openclaw/agents/<id>/agent). Without
@@ -301,7 +303,7 @@ def bootstrap(target_home: Path, template_path: Path, values: Dict[str, Any], al
     # the config JSON itself renders fine -- create them up front so
     # `openclaw agent --agent resume` / `--agent cover_letter` have
     # somewhere to write their agent-specific state.
-    for agent_id in ("resume", "cover_letter", "repo_coordinator"):
+    for agent_id in ("resume", "cover_letter", "repo_coordinator", "linkedin_discovery"):
         ensure_dir(openclaw_home / "agents" / agent_id / "agent")
 
     config = render_template(template_path, values, allow_missing=allow_missing)
@@ -316,6 +318,7 @@ def bootstrap(target_home: Path, template_path: Path, values: Dict[str, Any], al
         "workspace-resume": workspace_seed,
         "workspace-cover_letter": workspace_seed,
         "workspace-repo_coordinator": workspace_seed,
+        "workspace-linkedin_discovery": workspace_seed,
     }
     for target_name, source_dir in workspace_targets.items():
         target_dir = openclaw_home / target_name

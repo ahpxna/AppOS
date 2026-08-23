@@ -22,14 +22,9 @@ import psycopg
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
 from services.common.llm_gateway import LLMGatewayError, chat_text, resolve_config
+from services.common.config import database_dsn
 
-DSN = (
-    f"host={os.getenv('JOBOS_DB_HOST', '127.0.0.1')} "
-    f"port={os.getenv('JOBOS_DB_PORT', '5433')} "
-    f"dbname={os.getenv('JOBOS_DB_NAME', 'job_apply_os')} "
-    f"user={os.getenv('JOBOS_DB_USER', 'jobos')} "
-    f"password={os.getenv('JOBOS_DB_PASSWORD', 'jobos_local_dev_password_change_later')}"
-)
+DSN = database_dsn()
 EXTRACTOR_VERSION = "market_requirement_llm_v2_2026_08_20"
 MAX_CHUNK_CHARS, CHUNK_OVERLAP_CHARS = 9000, 650
 ALLOWED_CATEGORIES = {

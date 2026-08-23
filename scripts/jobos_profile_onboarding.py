@@ -7,6 +7,7 @@ human-reviewed database operation rather than a hidden side effect of ingest.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 from pathlib import Path
 import shutil
@@ -29,15 +30,18 @@ def validate_template(path: Path) -> list[str]:
     if path.suffix.casefold() != ".docx":
         raise ValueError("Resume template must be a .docx file.")
     try:
-        from docx import Document
+        renderer_path = ROOT / "services" / "document-generation" / "resume_template_renderer.py"
+        spec = importlib.util.spec_from_file_location("jobos_onboarding_resume_renderer", renderer_path)
+        if spec is None or spec.loader is None:
+            raise ValueError("Resume renderer is unavailable.")
+        renderer = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(renderer)
+        result = renderer.validate_template_contract(path)
     except ImportError as exc:
         raise ValueError("Install Python requirements before validating the Word template.") from exc
-    document = Document(path)
-    headings = {paragraph.text.strip().upper() for paragraph in document.paragraphs}
-    missing = {"PROJECTS", "CERTIFICATIONS", "SKILLS"} - headings
-    if missing:
-        raise ValueError(f"Template is missing required fixed headings: {', '.join(sorted(missing))}.")
-    return sorted(headings & {"PROJECTS", "CERTIFICATIONS", "SKILLS"})
+    except Exception as exc:
+        raise ValueError(f"Template does not satisfy the fixed renderer contract: {exc}") from exc
+    return [f"{key}={value}" for key, value in sorted(result.items())]
 
 
 def copy_private(source: Path, destination: Path, *, replace: bool) -> None:

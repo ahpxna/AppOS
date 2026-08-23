@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """One-command, non-interactive OpenClaw setup for the JobOS architecture.
 
-This script creates the isolated OpenClaw home, four agent workspaces, the
+This script creates the isolated OpenClaw home, five agent workspaces, the
 browser/CDP profile, and the least-privilege tool policy from tracked files.
 It reads an untracked ``.env`` and optional secrets file without printing their
 contents. It does not start a gateway, invoke an LLM, log in to a site, or
@@ -30,7 +30,7 @@ from typing import Any, Iterator
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BOOTSTRAP_PATH = REPO_ROOT / "scripts" / "openclaw_bootstrap.py"
 RUNTIME_INSTALLER = REPO_ROOT / "scripts" / "install_openclaw_runtime.py"
-REQUIRED_AGENTS = {"main", "resume", "cover_letter", "repo_coordinator"}
+REQUIRED_AGENTS = {"main", "resume", "cover_letter", "repo_coordinator", "linkedin_discovery"}
 REQUIRED_DENIES = {"exec", "process", "write", "edit", "apply_patch", "file_write"}
 RUNTIME_PROVIDER_KEYS = ("DEEPSEEK_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY")
 
@@ -113,7 +113,7 @@ def inspect_rendered_config(config_path: Path) -> list[dict[str, str]]:
     checks = [
         {"name": "gateway_token_configured", "status": "pass" if config.get("gateway", {}).get("auth", {}).get("token") else "fail"},
         {"name": "remote_cdp_profile", "status": "pass" if cdp_url.startswith(("http://", "https://")) else "fail"},
-        {"name": "four_isolated_agents", "status": "pass" if REQUIRED_AGENTS <= agents else "fail"},
+        {"name": "isolated_agents", "status": "pass" if REQUIRED_AGENTS <= agents else "fail"},
         {"name": "tool_side_effect_denies", "status": "pass" if REQUIRED_DENIES <= denied else "fail"},
         {"name": "browser_plugin_enabled", "status": "pass" if config.get("plugins", {}).get("entries", {}).get("browser", {}).get("enabled") else "fail"},
     ]

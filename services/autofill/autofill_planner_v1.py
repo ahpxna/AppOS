@@ -68,6 +68,7 @@ def plan_autofill(
     actions: list[PlannedAction] = []
     matches: list[FieldMatch] = []
     used_option_refs: set[str] = set()
+    used_profile_keys: set[str] = set()
     answers = approved_sensitive_answers or {}
     for group in question_groups or []:
         pseudo = FormField(group.options[0].ref, group.label, group.role, required=group.required)
@@ -96,6 +97,12 @@ def plan_autofill(
         if match.field_class is FieldClass.UNKNOWN or match.profile_key is None:
             actions.append(PlannedAction("pause", field.ref, None, None, match.reason, field.label))
             continue
+        if match.profile_key in used_profile_keys:
+            actions.append(PlannedAction(
+                "pause", field.ref, None, match.profile_key,
+                "Repeated profile field/education row is ambiguous; choose the correct row manually.", field.label,
+            ))
+            continue
         value = _lookup(profile, match.profile_key)
         if value in (None, ""):
             actions.append(PlannedAction("pause", field.ref, None, match.profile_key, "No approved profile value exists.", field.label))
@@ -112,4 +119,5 @@ def plan_autofill(
             actions.append(PlannedAction("pause", field.ref, None, match.profile_key, "Control is missing an explicit question-group model.", field.label))
         else:
             actions.append(PlannedAction("fill", field.ref, str(value), match.profile_key, match.reason, field.label))
+        used_profile_keys.add(match.profile_key)
     return actions, matches

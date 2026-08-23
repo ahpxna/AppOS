@@ -14,9 +14,9 @@ Python requirement (including `psycopg[binary]`), starts PostgreSQL, waits for
 it, then runs checksum-tracked migrations. Add `--with-n8n` only when the n8n
 UI is wanted.
 
-It also installs a repository-local Python startup hook in `.venv`, so every
-JobOS Python service automatically reads the untracked `.env`. Do **not** run
-`source .env`; activating `.venv` is the only shell step required.
+Every JobOS executable explicitly loads the untracked `.env` through the
+shared configuration module. Do **not** run `source .env`; activating `.venv`
+is the only shell step required.
 
 It deliberately does **not** pull an Ollama model, start OpenClaw, start a
 market-intelligence worker, or use a paid token API. Those are separate,

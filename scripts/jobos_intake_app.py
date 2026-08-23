@@ -27,6 +27,7 @@ import psycopg
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 from services.intake.manual_job_intake import JobDraft, ManualIntakeError, create_application
+from services.common.config import database_dsn, load_repo_env
 
 
 def load_project_env() -> None:
@@ -36,30 +37,11 @@ def load_project_env() -> None:
     and LLM configuration agrees with the CLI without requiring ``source .env``
     (which would be unsafe for a general dotenv file).
     """
-    env_file = REPO_ROOT / ".env"
-    if not env_file.is_file():
-        return
-    for raw in env_file.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = key.strip()
-        if key.replace("_", "").isalnum() and key not in os.environ:
-            value = value.strip()
-            if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
-                value = value[1:-1]
-            os.environ[key] = value
+    load_repo_env()
 
 
 def dsn() -> str:
-    return (
-        f"host={os.getenv('JOBOS_DB_HOST', '127.0.0.1')} "
-        f"port={os.getenv('JOBOS_DB_PORT', '5433')} "
-        f"dbname={os.getenv('JOBOS_DB_NAME', 'job_apply_os')} "
-        f"user={os.getenv('JOBOS_DB_USER', 'jobos')} "
-        f"password={os.getenv('JOBOS_DB_PASSWORD', 'jobos_local_dev_password_change_later')}"
-    )
+    return database_dsn()
 
 
 class IntakeApp(ttk.Frame):

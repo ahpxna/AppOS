@@ -4,6 +4,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -11,11 +12,8 @@ import psycopg
 from psycopg.types.json import Jsonb
 
 
-DB_HOST = os.getenv("JOBOS_DB_HOST", "127.0.0.1")
-DB_PORT = int(os.getenv("JOBOS_DB_PORT", "5433"))
-DB_NAME = os.getenv("JOBOS_DB_NAME", "job_apply_os")
-DB_USER = os.getenv("JOBOS_DB_USER", "jobos")
-DB_PASSWORD = os.getenv("JOBOS_DB_PASSWORD", "jobos_local_dev_password_change_later")
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from services.common.config import database_dsn
 
 PROJECT_ROOT = Path(os.getenv("JOBOS_PROJECT_ROOT", Path.cwd())).resolve()
 OCR_DIR = Path(os.getenv("JOBOS_PROFILE_OCR_DIR", PROJECT_ROOT / "data" / "profile_ocr")).resolve()
@@ -26,10 +24,7 @@ TASK_TYPE_OCR = "run_ocr"
 
 ENGINE = "tesseract_cli_plus_poppler"
 
-DSN = (
-    f"host={DB_HOST} port={DB_PORT} dbname={DB_NAME} "
-    f"user={DB_USER} password={DB_PASSWORD}"
-)
+DSN = database_dsn()
 
 
 def require_binary(name: str) -> None:

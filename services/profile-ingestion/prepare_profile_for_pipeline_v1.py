@@ -19,6 +19,9 @@ import psycopg
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+import sys
+sys.path.insert(0, str(REPO_ROOT))
+from services.common.config import database_dsn
 BRIEFS_SQL = REPO_ROOT / "services" / "profile-ingestion" / "generate_profile_briefs_v1.sql"
 PACKS_SQL = REPO_ROOT / "services" / "profile-ingestion" / "build_profile_context_packs_v1.sql"
 BASE_PACK_PURPOSES = (
@@ -30,12 +33,7 @@ BASE_PACK_PURPOSES = (
     "base_message_reply",
 )
 
-DB_HOST = os.getenv("JOBOS_DB_HOST", "127.0.0.1")
-DB_PORT = int(os.getenv("JOBOS_DB_PORT", "5433"))
-DB_NAME = os.getenv("JOBOS_DB_NAME", "job_apply_os")
-DB_USER = os.getenv("JOBOS_DB_USER", "jobos")
-DB_PASSWORD = os.getenv("JOBOS_DB_PASSWORD", "jobos_local_dev_password_change_later")
-DSN = f"host={DB_HOST} port={DB_PORT} dbname={DB_NAME} user={DB_USER} password={DB_PASSWORD}"
+DSN = database_dsn()
 
 
 def profile_state(cur) -> dict[str, Any]:

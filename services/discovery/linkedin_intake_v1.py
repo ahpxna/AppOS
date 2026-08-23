@@ -23,19 +23,21 @@ from psycopg.types.json import Jsonb
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from services.discovery.linkedin_discovery_v1 import (
     LinkedInDiscoveryError,
+    validate_job_url,
     validate_search_request,
 )
+from services.common.config import database_dsn
 
-DB_HOST = os.getenv("JOBOS_DB_HOST", "127.0.0.1")
-DB_PORT = int(os.getenv("JOBOS_DB_PORT", "5433"))
-DB_NAME = os.getenv("JOBOS_DB_NAME", "job_apply_os")
-DB_USER = os.getenv("JOBOS_DB_USER", "jobos")
-DB_PASSWORD = os.getenv("JOBOS_DB_PASSWORD", "jobos_local_dev_password_change_later")
-DSN = f"host={DB_HOST} port={DB_PORT} dbname={DB_NAME} user={DB_USER} password={DB_PASSWORD}"
+DSN = database_dsn()
 
 
 class IntakeError(ValueError):
     pass
+
+
+def feature_enabled(name: str, default: bool = True) -> bool:
+    value = os.getenv(name)
+    return default if value is None else value.strip().casefold() in {"1", "true", "yes", "on"}
 
 
 def validate_linkedin_url(url: str) -> str:
@@ -44,12 +46,10 @@ def validate_linkedin_url(url: str) -> str:
     This is the intake boundary: search pages, profile pages, and arbitrary
     domains cannot be turned into browser work by this command.
     """
-    parsed = urlparse((url or "").strip())
-    if parsed.scheme != "https" or not (parsed.hostname or "").lower().endswith("linkedin.com"):
-        raise IntakeError("URL must be an https LinkedIn URL.")
-    if not parsed.path.startswith("/jobs/"):
-        raise IntakeError("URL must point to an individual LinkedIn job page under /jobs/.")
-    return parsed.geturl()
+    try:
+        return validate_job_url(url)
+    except LinkedInDiscoveryError as exc:
+        raise IntakeError(str(exc)) from exc
 
 
 def extract_text(value: Any) -> str:
@@ -110,13 +110,16 @@ def intake(cur, *, company: str, title: str, url: str, jd_text: str,
 
 def cmd_queue(cur, args) -> int:
     """Queue a read-only capture for one validated user-pasted job URL."""
+    if not feature_enabled("JOBOS_LINKEDIN_READONLY_CAPTURE_ENABLED"):
+        raise IntakeError("LinkedIn deterministic read-only capture is disabled by configuration.")
     url = validate_linkedin_url(args.url)
     cur.execute(
         """INSERT INTO browser_tasks
               (task_type, requested_by, status, priority, input_json, timeout_seconds)
            VALUES ('fetch_job_description', 'linkedin_intake_v1', 'queued', 'normal', %s, %s)
            RETURNING id::text;""",
-        (Jsonb({"url": url, "user_initiated": True, "source": "linkedin"}), args.timeout),
+        (Jsonb({"url": url, "user_initiated": True, "source": "linkedin",
+                "deterministic_read_only": True}), args.timeout),
     )
     print(json.dumps({"browser_task_id": cur.fetchone()[0], "url": url,
                       "next": "Run browser_queue_worker, then linkedin_intake_v1.py ingest-task."}, indent=2))
@@ -125,6 +128,8 @@ def cmd_queue(cur, args) -> int:
 
 def cmd_queue_discovery(cur, args) -> int:
     """Queue a bounded, user-requested search for the JobOS browser executor."""
+    if not feature_enabled("JOBOS_LINKEDIN_AGENT_DISCOVERY_ENABLED"):
+        raise IntakeError("LinkedIn autonomous discovery is disabled by configuration.")
     request = validate_search_request(args.keywords, args.location, args.max_results)
     cur.execute(
         """INSERT INTO browser_tasks
@@ -164,6 +169,8 @@ def cmd_ingest_task(cur, args) -> int:
 
 def cmd_import(cur, args) -> int:
     """Preview or commit a user-reviewed LinkedIn JSON export."""
+    if not feature_enabled("JOBOS_LINKEDIN_MANUAL_INTAKE_ENABLED"):
+        raise IntakeError("LinkedIn manual/search-assisted intake is disabled by configuration.")
     raw = json.loads(Path(args.file).read_text(encoding="utf-8"))
     records = raw if isinstance(raw, list) else raw.get("jobs", [])
     if not isinstance(records, list):

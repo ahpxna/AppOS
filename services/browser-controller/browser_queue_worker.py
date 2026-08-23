@@ -56,10 +56,11 @@ from psycopg.types.json import Jsonb
 # PYTHONPATH already. Confirmed live 2026-08-01.
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from services.common.observability import emit_trace, make_trace_id
-from services.common.config import load_repo_env
+from services.common.config import database_dsn, load_repo_env
 from services.discovery.linkedin_discovery_v1 import (
     LinkedInDiscoveryError,
     ingest_discovered_jobs,
+    validate_job_url,
     validate_search_request,
 )
 from services.autofill.autofill_agent_v1 import parse_snapshot
@@ -70,21 +71,13 @@ from services.autofill.form_inspector_v1 import inspect_nodes, inspect_question_
 from services.common.autofill_identity import autofill_input_hash, canonical_page_url, page_fingerprint
 from services.common.immigration_semantics import EXACT_CANDIDATE_ADDITIONAL_CLASSES
 from services.common.openclaw_runtime import resolve_openclaw_binary
+from services.common.autofill_field_registry import AUTOFILL_FIELD_REGISTRY
 
 load_repo_env()
 
 # ---------------------------------------------------------------- config
 
-DB_HOST = os.getenv("JOBOS_DB_HOST", "127.0.0.1")
-DB_PORT = int(os.getenv("JOBOS_DB_PORT", "5433"))
-DB_NAME = os.getenv("JOBOS_DB_NAME", "job_apply_os")
-DB_USER = os.getenv("JOBOS_DB_USER", "jobos")
-DB_PASSWORD = os.getenv("JOBOS_DB_PASSWORD", "jobos_local_dev_password_change_later")
-
-DSN = (
-    f"host={DB_HOST} port={DB_PORT} dbname={DB_NAME} "
-    f"user={DB_USER} password={DB_PASSWORD}"
-)
+DSN = database_dsn()
 
 # Prefer the pinned JobOS runtime when setup installed it.  A global OpenClaw
 # can otherwise inherit an unsupported Node version or a different plugin set.
@@ -92,6 +85,10 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 OPENCLAW_BIN = resolve_openclaw_binary()
 # Agent ids as defined in ~/.openclaw/openclaw.json -> agents.list
 OPENCLAW_AGENT_BROWSE = os.getenv("OPENCLAW_AGENT_BROWSE", "main")
+OPENCLAW_AGENT_LINKEDIN_DISCOVERY = (
+    os.getenv("OPENCLAW_AGENT_LINKEDIN_DISCOVERY", "linkedin_discovery").strip()
+    or "linkedin_discovery"
+)
 OPENCLAW_AGENT_RESUME = os.getenv("OPENCLAW_AGENT_RESUME", "resume")
 OPENCLAW_AGENT_COVER = os.getenv("OPENCLAW_AGENT_COVER", "cover_letter")
 # This is a host-side probe. For the Docker overlay, OpenClaw itself is
@@ -114,6 +111,14 @@ SUPPORTED_TASKS = {
     "fill_application_form",
 }
 REQUIRES_APPROVAL = {"fill_application_form"}
+
+
+def feature_enabled(name: str, default: bool = True) -> bool:
+    """Read a deliberately explicit local feature switch without guessing."""
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().casefold() in {"1", "true", "yes", "on"}
 
 
 class PermanentTaskError(Exception):
@@ -740,20 +745,9 @@ def load_autofill_profile(cur, application_id: str, artifact_binding: Dict[str, 
     """
     cur.execute("SELECT field_name, field_value FROM v_autofill_ready_values;")
     identity = {str(name): str(value) for name, value in cur.fetchall() if str(value).strip() and str(value) != "FILL_ME"}
-    profile: dict[str, Any] = {"personal": {}, "address": {}, "education": {}, "employment": {}, "documents": {},
+    profile: dict[str, Any] = {"personal": {}, "address": {}, "education": {}, "employment": {}, "preferences": {}, "documents": {},
                                "_approval_ready_values": identity}
-    mapping = {
-        "legal_first_name": ("personal", "first_name"), "legal_last_name": ("personal", "last_name"),
-        "preferred_name": ("personal", "preferred_name"), "email": ("personal", "email"),
-        "phone": ("personal", "phone"), "linkedin_url": ("personal", "linkedin"),
-        "github_url": ("personal", "github"), "portfolio_url": ("personal", "portfolio"),
-        "address_line1": ("address", "line1"), "address_line2": ("address", "line2"),
-        "address_city": ("address", "city"), "address_state": ("address", "state"),
-        "address_postal": ("address", "postal"), "address_country": ("address", "country"),
-        "university_name": ("education", "university"), "major": ("education", "major"),
-        "graduation_date": ("education", "graduation_date"), "degree": ("education", "degree"),
-    }
-    for source, target in mapping.items():
+    for source, target in AUTOFILL_FIELD_REGISTRY.items():
         if source in identity:
             profile[target[0]][target[1]] = identity[source]
     if profile["personal"].get("first_name") and profile["personal"].get("last_name"):
@@ -835,7 +829,7 @@ def snapshot_state(transport: OpenClawTransport, target_id: str) -> SnapshotStat
     nodes = parse_snapshot(payload)
     return SnapshotState(
         tuple(inspect_nodes(nodes)), tuple(inspect_question_groups(nodes)),
-        page_fingerprint(payload), bool(payload.get("truncated")),
+        page_fingerprint(payload, page_url=transport.current_url(target_id)), bool(payload.get("truncated")),
     )
 
 
@@ -843,6 +837,37 @@ def snapshot_state(transport: OpenClawTransport, target_id: str) -> SnapshotStat
 
 def handle_fetch_job_description(cur, task) -> Dict[str, Any]:
     url = require_url(cur, task["input_json"])
+    # The third LinkedIn intake mode is intentionally deterministic: the user
+    # opens one already-authenticated job page, then JobOS reads the exact
+    # pinned tab without giving an LLM a browser handle.
+    if task["input_json"].get("source") == "linkedin" and task["input_json"].get("deterministic_read_only"):
+        if not feature_enabled("JOBOS_LINKEDIN_READONLY_CAPTURE_ENABLED"):
+            raise PermanentTaskError("LinkedIn deterministic read-only capture is disabled by configuration.")
+        transport = OpenClawTransport(
+            binary=OPENCLAW_BIN, profile=os.getenv("JOBOS_BROWSER_PROFILE", "remote"),
+            timeout=min(int(task["timeout_seconds"]), 90), environment=openclaw_runtime_env(),
+        )
+        target = transport.resolve_target()
+        current = transport.current_url(target.target_id)
+        try:
+            exact_current, exact_requested = validate_job_url(current), validate_job_url(url)
+        except LinkedInDiscoveryError as exc:
+            raise PermanentTaskError(f"Pinned page is not a canonical LinkedIn job detail: {exc}") from exc
+        if exact_current != exact_requested:
+            raise PermanentTaskError(
+                "Pinned browser tab is not the user-approved LinkedIn job URL; open that exact job page and retry."
+            )
+        payload = transport.snapshot(target.target_id)
+        if payload.get("truncated"):
+            raise PermanentTaskError("LinkedIn snapshot is truncated; refusing partial JD capture.")
+        text = str(payload.get("snapshot") or "").strip()
+        if not text:
+            raise PermanentTaskError("Pinned LinkedIn job page produced no readable snapshot.")
+        return {
+            "url": current, "mode": "linkedin_deterministic_read_only",
+            "pinned_target_id": target.target_id, "agent_response": {"text": text},
+            "submitted": False,
+        }
     msg = (
         "Open this URL and return the full job description text.\n"
         f"URL: {url}\n\n"
@@ -868,6 +893,11 @@ def handle_discover_linkedin_jobs(cur, task) -> Dict[str, Any]:
     message anyone, alter preferences, or apply; it merely reads at most the
     requested number of result detail pages and returns their JDs as JSON.
     """
+    if not feature_enabled("JOBOS_LINKEDIN_AGENT_DISCOVERY_ENABLED"):
+        raise PermanentTaskError(
+            "LinkedIn autonomous discovery is disabled. Enable "
+            "JOBOS_LINKEDIN_AGENT_DISCOVERY_ENABLED only for a dedicated, manually logged-in JobOS browser."
+        )
     inp = task["input_json"]
     if inp.get("user_initiated") is not True:
         raise PermanentTaskError("LinkedIn discovery requires explicit user_initiated=true.")
@@ -899,8 +929,8 @@ def handle_discover_linkedin_jobs(cur, task) -> Dict[str, Any]:
         "create alerts, save jobs, message anyone, upload, fill fields, click Easy Apply, "
         "or submit anything. If the existing browser session is not signed in or a "
         "CAPTCHA appears, stop and report that exact blocker.\n\n"
-        "Open only the first eligible result detail if its details are not already visible. "
-        "Snapshot the detail pane and copy the complete visible `About the job` text. "
+        "Open at most the requested number of eligible result details. Snapshot each detail pane "
+        "and copy its complete visible `About the job` text. "
         "Use a canonical URL exactly like https://www.linkedin.com/jobs/view/<numeric-id>/; "
         "discard tracking query parameters.\n\n"
         "For each read result return ONLY one JSON object in this exact form:\n"
@@ -912,7 +942,7 @@ def handle_discover_linkedin_jobs(cur, task) -> Dict[str, Any]:
         "cannot be grounded in the snapshot, return {\"jobs\":[]} rather than guessing."
     )
     agent_response = openclaw_agent(
-        agent=OPENCLAW_AGENT_BROWSE, message=msg, timeout=task["timeout_seconds"],
+        agent=OPENCLAW_AGENT_LINKEDIN_DISCOVERY, message=msg, timeout=task["timeout_seconds"],
         session_id=f"jobos-task-{task['id']}",
     )
     try:

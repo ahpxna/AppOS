@@ -38,9 +38,11 @@ def validate_search_request(keywords: str, location: str, max_results: int) -> d
 def validate_job_url(url: str) -> str:
     parsed = urlparse((url or "").strip())
     if (parsed.scheme != "https" or not (parsed.hostname or "").lower().endswith("linkedin.com")
-            or not parsed.path.startswith("/jobs/")):
-        raise LinkedInDiscoveryError("result URL must be an https LinkedIn /jobs/ page.")
-    return parsed.geturl()
+            or not re.fullmatch(r"/jobs/view/\d+/?", parsed.path)):
+        raise LinkedInDiscoveryError("result URL must be an https canonical LinkedIn /jobs/view/<id>/ page.")
+    # Tracking parameters are neither evidence nor a stable identity.  Intake
+    # keeps one canonical job URL for deduplication and later human review.
+    return f"https://{parsed.hostname.lower()}{parsed.path.rstrip('/')}/"
 
 
 def json_candidates(value: Any) -> Iterable[Any]:

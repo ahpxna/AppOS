@@ -115,6 +115,18 @@
             "__MODEL_FALLBACK__"
           ]
         }
+      },
+      {
+        "id": "linkedin_discovery",
+        "name": "linkedin_discovery",
+        "workspace": "~/.openclaw/workspace-linkedin_discovery",
+        "agentDir": "~/.openclaw/agents/linkedin_discovery/agent",
+        "model": {
+          "primary": "__LINKEDIN_DISCOVERY_MODEL__",
+          "fallbacks": [
+            "__MODEL_FALLBACK__"
+          ]
+        }
       }
     ]
   },

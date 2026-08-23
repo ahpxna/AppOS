@@ -65,13 +65,6 @@ fi
 .venv/bin/python -m pip install --upgrade pip
 .venv/bin/python -m pip install -r requirements.txt
 
-# Make the repository available during Python's startup so sitecustomize.py
-# loads the untracked .env for every service launched from this virtualenv.
-# This avoids requiring users to remember `source .env` (which would also
-# incorrectly treat the file as shell code).
-site_packages="$(.venv/bin/python -c 'import site; print(site.getsitepackages()[0])')"
-printf '%s\n' "$ROOT" > "$site_packages/jobos_repo_root.pth"
-
 compose_services=(postgres)
 if [[ "${1:-}" == "--with-n8n" ]]; then
   compose_services+=(n8n)

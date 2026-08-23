@@ -1,20 +1,16 @@
 import os
 import socket
 import uuid
+import sys
+from pathlib import Path
 import psycopg
 
-DB_HOST = os.getenv("JOBOS_DB_HOST", "127.0.0.1")
-DB_PORT = int(os.getenv("JOBOS_DB_PORT", "5433"))
-DB_NAME = os.getenv("JOBOS_DB_NAME", "job_apply_os")
-DB_USER = os.getenv("JOBOS_DB_USER", "jobos")
-DB_PASSWORD = os.getenv("JOBOS_DB_PASSWORD", "jobos_local_dev_password_change_later")
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from services.common.config import database_dsn
 
 WATCHDOG_ID = f"watchdog-{socket.gethostname()}-{uuid.uuid4().hex[:8]}"
 
-DSN = (
-    f"host={DB_HOST} port={DB_PORT} dbname={DB_NAME} "
-    f"user={DB_USER} password={DB_PASSWORD}"
-)
+DSN = database_dsn()
 
 def requeue_expired_tasks(conn):
     with conn.cursor() as cur:
@@ -32,6 +28,7 @@ def requeue_expired_tasks(conn):
               AND lease_expires_at IS NOT NULL
               AND lease_expires_at < now()
               AND retry_count < max_retries
+              AND COALESCE(execution_state, 'not_started') <> 'executing'
             RETURNING id, task_type, retry_count, max_retries;
             """
         )
@@ -49,6 +46,7 @@ def dead_letter_expired_tasks(conn):
                 AND lease_expires_at IS NOT NULL
                 AND lease_expires_at < now()
                 AND retry_count >= max_retries
+                AND COALESCE(execution_state, 'not_started') <> 'executing'
               FOR UPDATE SKIP LOCKED
             ),
             inserted AS (

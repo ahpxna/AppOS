@@ -39,22 +39,13 @@ from typing import Any, Dict, Optional
 import psycopg
 from psycopg.types.json import Jsonb
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from services.common.config import load_repo_env
+from services.common.config import database_dsn, load_repo_env
 from services.common.autofill_identity import autofill_input_hash, canonical_page_url
 from services.common.immigration_semantics import EXACT_CANDIDATE_ADDITIONAL_CLASSES
 
 load_repo_env()
 
-DB_HOST = os.getenv("JOBOS_DB_HOST", "127.0.0.1")
-DB_PORT = int(os.getenv("JOBOS_DB_PORT", "5433"))
-DB_NAME = os.getenv("JOBOS_DB_NAME", "job_apply_os")
-DB_USER = os.getenv("JOBOS_DB_USER", "jobos")
-DB_PASSWORD = os.getenv("JOBOS_DB_PASSWORD", "jobos_local_dev_password_change_later")
-
-DSN = (
-    f"host={DB_HOST} port={DB_PORT} dbname={DB_NAME} "
-    f"user={DB_USER} password={DB_PASSWORD}"
-)
+DSN = database_dsn()
 
 SERVICE_VERSION = "approval_service_v2_capability_bound_2026_08_23"
 

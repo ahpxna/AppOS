@@ -2,20 +2,16 @@ import os
 import socket
 import time
 import uuid
+import sys
+from pathlib import Path
 import psycopg
 
-DB_HOST = os.getenv("JOBOS_DB_HOST", "127.0.0.1")
-DB_PORT = int(os.getenv("JOBOS_DB_PORT", "5433"))
-DB_NAME = os.getenv("JOBOS_DB_NAME", "job_apply_os")
-DB_USER = os.getenv("JOBOS_DB_USER", "jobos")
-DB_PASSWORD = os.getenv("JOBOS_DB_PASSWORD", "jobos_local_dev_password_change_later")
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from services.common.config import database_dsn
 
 WORKER_ID = f"fake-worker-{socket.gethostname()}-{uuid.uuid4().hex[:8]}"
 
-DSN = (
-    f"host={DB_HOST} port={DB_PORT} dbname={DB_NAME} "
-    f"user={DB_USER} password={DB_PASSWORD}"
-)
+DSN = database_dsn()
 
 def claim_one_task(conn):
     with conn.cursor() as cur:
@@ -75,6 +71,11 @@ def main():
             return
 
         task_id, task_type, input_json, timeout_seconds = task
+        if task_type in {"fill_application_form", "discover_linkedin_jobs"}:
+            raise RuntimeError(
+                "fake_worker is a queue-development fixture and cannot process autofill or LinkedIn discovery tasks. "
+                "Use browser_queue_worker.py for the real bounded execution path."
+            )
         conn.commit()
 
         print(f"Claimed task: {task_id}")

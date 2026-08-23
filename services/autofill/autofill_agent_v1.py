@@ -54,19 +54,11 @@ import psycopg
 from services.common.immigration_semantics import legal_question_pause_reason
 from services.autofill.field_matcher_v1 import FieldClass, match_field as deterministic_match
 from services.autofill.form_inspector_v1 import FormField
-from services.common.autofill_identity import canonical_page_url, page_fingerprint
 from services.common.openclaw_runtime import resolve_openclaw_binary
+from services.common.config import database_dsn
+from services.common.autofill_field_registry import PROFILE_PATH_TO_FIELD
 
-DB_HOST = os.getenv("JOBOS_DB_HOST", "127.0.0.1")
-DB_PORT = int(os.getenv("JOBOS_DB_PORT", "5433"))
-DB_NAME = os.getenv("JOBOS_DB_NAME", "job_apply_os")
-DB_USER = os.getenv("JOBOS_DB_USER", "jobos")
-DB_PASSWORD = os.getenv("JOBOS_DB_PASSWORD", "jobos_local_dev_password_change_later")
-
-DSN = (
-    f"host={DB_HOST} port={DB_PORT} dbname={DB_NAME} "
-    f"user={DB_USER} password={DB_PASSWORD}"
-)
+DSN = database_dsn()
 
 OPENCLAW_BIN = resolve_openclaw_binary()
 # browser.defaultProfile does not propagate into tool/CLI calls, so the
@@ -145,17 +137,6 @@ def cmd_probe(conn, args) -> int:
         proc = run_browser(sub, timeout=30)
         print((proc.stdout or proc.stderr or "").strip()[:2000])
         print()
-    return 0
-
-
-def cmd_page_identity(conn, args) -> int:
-    """Capture a read-only page binding before creating an autofill approval."""
-    with conn.cursor() as cur:
-        check_domain(cur, args.url)
-    run_browser(["open", args.url], timeout=90)
-    payload = browser_json(["snapshot", "--efficient"], timeout=150)
-    print(json.dumps({"canonical_page_url": canonical_page_url(args.url),
-                      "page_fingerprint": page_fingerprint(payload)}, indent=2))
     return 0
 
 
@@ -358,24 +339,7 @@ def match_field(label: str, pause_patterns, hints, values) -> Dict[str, Any]:
     matched = deterministic_match(FormField(ref="legacy", label=label, role="textbox"))
     if matched.field_class is FieldClass.SENSITIVE:
         return {"decision": "pause", "reason": matched.reason}
-    legacy_keys = {
-        "personal.full_name": "full_name", "personal.first_name": "legal_first_name",
-        "personal.last_name": "legal_last_name", "personal.middle_name": "middle_name",
-        "personal.preferred_name": "preferred_name", "personal.pronouns": "pronouns",
-        "personal.email": "email", "personal.phone": "phone", "personal.linkedin": "linkedin_url",
-        "personal.phone_country_code": "phone_country_code", "personal.github": "github_url",
-        "personal.portfolio": "portfolio_url", "personal.twitter": "twitter_url", "personal.other_url": "other_url",
-        "address.line1": "address_line1", "address.line2": "address_line2",
-        "address.city": "address_city", "address.state": "address_state",
-        "address.postal": "address_postal", "address.postal_extension": "address_postal_ext",
-        "address.county": "address_county", "address.country": "address_country",
-        "education.university": "university_name", "education.degree": "degree",
-        "education.major": "major", "education.graduation_date": "graduation_date",
-        "employment.current_employer": "current_employer", "employment.current_title": "current_title",
-        "employment.desired_title": "desired_title", "preferences.referral_source": "referral_source",
-        "derived.years_experience": "years_experience",
-    }
-    field_name = legacy_keys.get(matched.profile_key or "")
+    field_name = PROFILE_PATH_TO_FIELD.get(matched.profile_key or "")
     if field_name:
         if field_name in values:
             return {"decision": "value", "field_name": field_name,
@@ -718,9 +682,6 @@ def main() -> int:
     sub = p.add_subparsers(dest="command", required=True)
 
     sub.add_parser("probe")
-    pid = sub.add_parser("page-identity")
-    pid.add_argument("--url", required=True, help="Read-only exact page identity for a later autofill approval.")
-
     pi = sub.add_parser("inspect")
     pi.add_argument("--url", required=True, help="Allowlisted URL to open before a read-only snapshot.")
 
@@ -742,7 +703,7 @@ def main() -> int:
     with psycopg.connect(DSN, autocommit=False) as conn:
         try:
             return {
-                "probe": cmd_probe, "page-identity": cmd_page_identity, "inspect": cmd_inspect, "plan": cmd_plan,
+                "probe": cmd_probe, "inspect": cmd_inspect, "plan": cmd_plan,
                 "fill": cmd_fill, "verify": cmd_verify,
             }[args.command](conn, args)
         except AutofillError as e:

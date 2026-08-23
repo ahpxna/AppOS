@@ -21,12 +21,9 @@ renderer = importlib.util.module_from_spec(RENDERER_SPEC)
 RENDERER_SPEC.loader.exec_module(renderer)
 render_docx = renderer.render_docx
 ResumeTemplateError = renderer.ResumeTemplateError
+from services.common.config import database_dsn
 
-DSN = " ".join((
-    f"host={os.getenv('JOBOS_DB_HOST', '127.0.0.1')}", f"port={os.getenv('JOBOS_DB_PORT', '5433')}",
-    f"dbname={os.getenv('JOBOS_DB_NAME', 'job_apply_os')}", f"user={os.getenv('JOBOS_DB_USER', 'jobos')}",
-    f"password={os.getenv('JOBOS_DB_PASSWORD', 'jobos_local_dev_password_change_later')}",
-))
+DSN = database_dsn()
 TEMPLATE = Path(os.getenv("JOBOS_RESUME_TEMPLATE_PATH", ROOT / "data/resume-template/VU PHAN AN NGUYEN-official_For_all.docx"))
 OUTPUT_ROOT = Path(os.getenv("JOBOS_RESUME_OUTPUT_DIR", ROOT / "data/generated-resumes"))
 
