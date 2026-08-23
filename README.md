@@ -6,9 +6,15 @@ chấm điểm fit, sinh resume/cover letter có kiểm chứng bằng evidence,
 LLM mặc định chạy local qua Ollama; mọi Python LLM/embedding stage cũng có thể
 đổi sang API tương thích OpenAI bằng token, theo global hoặc từng stage.
 
-Giả định: bạn chạy trên **WSL2 (Ubuntu)** nếu là máy Windows. Toàn bộ hướng dẫn dưới
-đây chạy trong shell Bash (WSL/macOS/Linux). Không hỗ trợ chạy trực tiếp trên
-PowerShell/CMD.
+Giả định: bạn chạy trên **WSL2 (Ubuntu)** nếu là máy Windows, hoặc native
+Ubuntu/Linux nếu đó là máy chạy JobOS. Toàn bộ hướng dẫn dưới đây chạy trong
+shell Bash (WSL/macOS/Linux). Không hỗ trợ chạy trực tiếp trên PowerShell/CMD.
+
+### Chọn máy chạy đúng vai trò
+
+JobOS có thể chạy toàn bộ trên Ubuntu GPU host, dùng token API, hoặc dùng tunnel
+SSH tới Ollama trên máy khác. Runbook đầy đủ cho `/dev/nvidia`, Docker GPU và
+systemd Ollama: [docs/ubuntu_gpu.md](docs/ubuntu_gpu.md).
 
 ## 1. Yêu cầu
 
@@ -24,7 +30,7 @@ PowerShell/CMD.
 ## 2. Clone & cấu hình môi trường
 
 ```bash
-git clone <repo-url> job-apply-os
+git clone https://github.com/your-account/job-apply-os.git job-apply-os
 cd job-apply-os
 cp .env.example .env
 ```
@@ -106,6 +112,34 @@ Xem danh sách tên role và ví dụ đầy đủ trong `.env.example`. Dùng
 DeepSeek cho analysis/coordinator và một provider khác cho CV, verification,
 và embeddings mà không sửa code.
 
+### Ubuntu NVIDIA/Ollama GPU doctor
+
+Trước khi chạy Ollama trên GPU Ubuntu, dùng doctor chỉ-đọc này. Nó không đọc
+`.env`, browser profile hay API key; output có thể đưa Gemini để phân loại đúng
+lỗi host driver, Docker runtime hoặc Ollama service:
+
+```bash
+bash scripts/ubuntu_ollama_gpu_doctor.sh
+# chỉ khi chấp nhận pull CUDA image public để test Docker GPU:
+bash scripts/ubuntu_ollama_gpu_doctor.sh --docker-smoke
+```
+
+Hai lựa chọn loại trừ nhau:
+
+```bash
+# A. Khuyến nghị: Ollama native systemd trên Ubuntu GPU host.
+sudo systemctl restart ollama
+
+# B. Ollama container GPU: yêu cầu host nvidia-smi và Docker smoke test pass.
+docker compose -f docker-compose.yml -f docker-compose.ollama-gpu.yml up -d ollama
+docker exec -it jobos-ollama ollama pull qwen3:8b
+```
+
+Không chạy A và B đồng thời: cả hai cùng dùng `127.0.0.1:11434`. Xem
+`docs/ubuntu_gpu.md` để cài NVIDIA Container Toolkit, xử lý Secure Boot/DKMS,
+kiểm tra `ollama ps`, và dùng SSH tunnel an toàn từ Ubuntu client tới Windows
+GPU workstation.
+
 ## 7. OpenClaw (tuỳ chọn — chỉ cần cho L3 browser runtime / L7 autofill)
 
 ```bash
@@ -131,7 +165,7 @@ python services/orchestrator/pipeline_preflight_v1.py --json
 
 # test có phụ thuộc DB thật — chạy sau bước 3+4
 python services/orchestrator/orchestrator_v1.py --help
-python services/discovery/ats_discovery_v1.py test --platform greenhouse --slug <slug-công-ty-thật>
+python services/discovery/ats_discovery_v1.py test --platform greenhouse --slug example-company
 ```
 
 ## 9. Chạy pipeline
@@ -152,7 +186,26 @@ python services/profile-ingestion/prepare_profile_for_pipeline_v1.py build --app
 python services/orchestrator/pipeline_preflight_v1.py --json
 ```
 
-## 9.1 — Job search theo profile + LinkedIn user intake
+## 9.1 — Cửa sổ dán JD (khuyến nghị, không cần browser)
+
+Nếu bạn tự tìm job, đây là đường nhanh và không phụ thuộc LinkedIn/CDP/OpenClaw.
+Form desktop nhận công ty, chức danh, URL, nguồn, địa điểm, seniority, deadline,
+salary range, ghi chú và toàn bộ JD. Nó lưu vào `applications` chuẩn, dedupe theo
+hash JD, chạy screen miễn phí nếu chọn, rồi database tự queue market-demand cho cả
+job bị loại lẫn job phù hợp. Nút analysis là opt-in vì có thể dùng API/LLM; nó chỉ
+chạy đến cổng duyệt của bạn và không submit đơn.
+
+```bash
+# Ubuntu desktop only; cài một lần nếu Python thiếu Tk.
+sudo apt install python3-tk
+source .venv/bin/activate
+python scripts/jobos_intake_app.py
+```
+
+Không chạy `launch_jobos_browser.py`, không cần Chrome, và không cần login LinkedIn
+cho workflow này.
+
+## 9.2 — Job search theo profile + LinkedIn user intake (tuỳ chọn)
 
 `services/discovery/profile_job_search_v1.py` chỉ dùng capability/tool/competency
 đã `approved` trong database. Nó sinh link tìm kiếm LinkedIn để **bạn tự mở**
@@ -172,7 +225,7 @@ tự dán cũng có thể đi qua browser queue ở chế độ chỉ đọc (`q
 `ingest-task`). Tất cả đều vào bảng `applications` hiện có, nên vẫn đi qua fit,
 company research, document evidence và approval như mọi nguồn khác.
 
-### LinkedIn browser executor (profile riêng)
+### LinkedIn browser executor (profile riêng, tuỳ chọn)
 
 Để JobOS tự tìm một số JD và lưu thử, mở Chrome profile riêng của JobOS. Bạn
 đăng nhập LinkedIn bằng tay một lần trong cửa sổ đó; JobOS không sao chép
@@ -205,6 +258,65 @@ fills forms, or applies.
 Cover letter lấy company context từ `company_research_cache` chỉ khi cache còn
 hiệu lực và có URL nguồn. Mỗi đoạn dùng context đó phải lưu URL trong evidence
 map; URL lạ hoặc claim company không có nguồn bị loại trước khi lưu document.
+
+### Resume Word từ template local
+
+Sau khi truth checker pass, pipeline copy Word template riêng, chỉ tailor 12
+project-bullet slots, 5 skill-category rows, và subtitle nằm giữa project name
+với GitHub link. Education, experience, certifications, project name, dates,
+GitHub links, font và spacing được preserve; không tự shrink font để nhét
+trang. Template và output là local/ignored:
+
+```bash
+python services/document-generation/render_verified_resume_v1.py \
+  --application-id APPLICATION_UUID
+```
+
+Mở DOCX này trong Word và dùng Print/Save as PDF sau khi review. JobOS không tự
+in PDF từ LibreOffice, vì cùng một DOCX có thể paginate khác Word/macOS. Xem
+`docs/resume_template_contract.md`.
+
+Resume rules are enforced, not just prompted: only the six pre-approved project
+blocks already present in the template can be selected; their title, dates, and
+GitHub links cannot change. A primary bullet (slots 1, 3, …) is limited to 200
+characters and its optional secondary bullet to 105 characters; the secondary
+cannot exist on its own. Each block can cite only that same project's approved
+profile asset, and skills are capped at five evidence-backed ranked rows. A new
+project requires a deliberately prepared block in the Word template and an
+approved asset-title alias before it can be used.
+
+The editable header subtitle (for example, `CAROECT-D — [subtitle] | GitHub`)
+is separately audited. A proposed subtitle must provide the exact previous
+subtitle, a literal JD quote, a literal quote from its project asset, a reason
+the change is more accurate/relevant, and a before/after rationale covering
+every substantive changed term. The verifier checks both quotes and rejects the
+whole document if the change is not supported. See
+`docs/resume_template_contract.md`.
+
+Project bullets receive the same JD/profile audit: they need an exact old
+bullet, literal JD and profile-asset quotes, and a term-by-term rationale.
+Unsupported tools or invented experience are blocked. Cover letters are the
+more context-rich artifact: the generator combines fit requirements and gaps,
+approved evidence, and sourced company context. When company research exists,
+it requires at least one candidate-asset-backed, URL-backed company-specific
+paragraph with a literal company-research quote; it may be persuasive, but
+cannot invent a company fact or professional experience.
+
+### Project profile form (source of truth)
+
+Before tailoring, record the verified facts for the six approved projects in a
+private local registry. The form captures immutable template identity plus
+aliases, skills, tools, JD keywords, allowed facts, boundaries, and evidence
+locations. It later maps parsed profile/repository data conservatively; unclear
+records stay unmapped rather than contaminating a project.
+
+```bash
+source .venv/bin/activate
+python scripts/jobos_project_profile_app.py
+```
+
+The JSON is local/ignored at `data/project-registry/project_profiles.json`.
+See `docs/project_profile_registry.md` for the mapping contract.
 
 ### Market-demand intelligence → project backlog
 
@@ -311,7 +423,7 @@ chạy `message_reply_v1.py`:
 python services/interview-prep/interview_prep_v1.py --list-only
 
 # sinh prep package cho 1 interview cụ thể và ghi vào DB
-python services/interview-prep/interview_prep_v1.py --interview-id <uuid> --apply
+python services/interview-prep/interview_prep_v1.py --interview-id APPLICATION_UUID --apply
 
 # không có --interview-id: xử lý toàn bộ hàng đợi
 python services/interview-prep/interview_prep_v1.py --apply

@@ -28,7 +28,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import psycopg
 from psycopg.types.json import Jsonb
@@ -42,6 +42,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from services.common.observability import emit_trace, make_trace_id
 from services.common.llm_gateway import generate_text
 from services.common.model_config import get_model
+from services.common.project_registry import ProjectRegistryError, project_asset_terms_by_slot
+from services.common.resume_project_bullet_audit import (
+    ResumeBulletAuditError, load_template_bullet_baselines, normalize as normalize_bullet,
+    validate_bullet_change,
+)
+from services.common.resume_project_header_audit import (
+    ResumeHeaderAuditError, load_template_subtitle_baselines, normalize as normalize_subtitle,
+    validate_subtitle_change,
+)
 
 DB_HOST = os.getenv("JOBOS_DB_HOST", "127.0.0.1")
 DB_PORT = int(os.getenv("JOBOS_DB_PORT", "5433"))
@@ -59,6 +68,20 @@ DEFAULT_OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
 DEFAULT_MODEL = get_model("docgen")
 
 DOC_TYPES = ("resume", "cover_letter", "short_answers")
+FIXED_RESUME_PROJECTS = (
+    "1-2 CAROECT-D", "3-4 CIG-AMF", "5-6 PKI Sentinel", "7-8 ApplyOps",
+    "9-10 Enterprise NetSec IaC", "11-12 Optimixer",
+)
+# Fallback only. The user-owned project registry is the normal source for these
+# aliases; this map keeps historical installs safe before the first form save.
+FIXED_RESUME_PROJECT_ASSET_TERMS = {
+    1: ("caroect",),
+    3: ("cig-amf", "cig amf"),
+    5: ("pki sentinel", "pki-sentinel"),
+    7: ("applyops", "apply ops"),
+    9: ("enterprise netsec", "netsec iac", "network security iac"),
+    11: ("optimixer",),
+}
 
 COMPONENT_BY_DOC_TYPE = {
     "resume": "resume_agent",
@@ -234,6 +257,39 @@ def render_asset_catalog(assets: List[Dict[str, Any]], *, field: str) -> str:
     return "\n".join(blocks)
 
 
+def fixed_project_asset_ids(assets: List[Dict[str, Any]]) -> Dict[int, set[str]]:
+    """Map each resume block's primary slot to its own approved profile assets.
+
+    This prevents an otherwise approved asset for one project being written
+    under another project's immutable title.  Asset titles intentionally act as
+    the approval binding so unknown naming fails closed rather than guessing.
+    """
+    try:
+        terms_by_slot = project_asset_terms_by_slot()
+    except ProjectRegistryError as exc:
+        # A bad local registry must not cause an unsafe guessed mapping. Keep
+        # the known six aliases only, which still fails closed for new names.
+        print(f"WARNING: invalid project registry ignored: {exc}", file=sys.stderr)
+        terms_by_slot = FIXED_RESUME_PROJECT_ASSET_TERMS
+    result: Dict[int, set[str]] = {slot: set() for slot in FIXED_RESUME_PROJECT_ASSET_TERMS}
+    for asset in assets:
+        title = " ".join(str(asset.get("asset_title") or "").casefold().split())
+        for slot, terms in terms_by_slot.items():
+            if any(term in title for term in terms):
+                result[slot].add(asset["profile_asset_id"])
+    return result
+
+
+def render_fixed_project_asset_rules(project_assets: Mapping[int, set[str]]) -> str:
+    """Expose the strict slot-to-asset binding to the resume model."""
+    lines = []
+    for slot, label in zip(sorted(project_assets), FIXED_RESUME_PROJECTS):
+        allowed = sorted(project_assets[slot])
+        cited = ", ".join(allowed) if allowed else "NONE — do not use this block"
+        lines.append(f"- slots {slot}-{slot + 1} ({label.split(' ', 1)[1]}): {cited}")
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------- prompts
 
 GROUNDING_RULES = """
@@ -252,7 +308,12 @@ Grounding rules (violating any of these makes the output unusable):
 """
 
 
-def build_resume_prompt(app: Dict[str, Any], catalog: str, max_bullets: int) -> str:
+def build_resume_prompt(
+    app: Dict[str, Any], catalog: str, max_bullets: int,
+    project_assets: Optional[Mapping[int, set[str]]] = None,
+    baseline_subtitles: Optional[Mapping[int, str]] = None,
+    baseline_bullets: Optional[Mapping[int, str]] = None,
+) -> str:
     return f"""You are JobOS Resume Agent V1.
 
 Write resume bullets for this specific job, using ONLY the approved assets below.
@@ -274,19 +335,76 @@ APPROVED ASSETS:
 
 Return ONLY valid JSON, no markdown, no commentary:
 {{
-  "bullets": [
+  "project_updates": [
     {{
-      "text": "one resume bullet, max 30 words, starts with a past-tense verb",
+      "slot": "integer 1..12 from the fixed slot map below",
+      "text": "one project resume bullet, max 30 words, starts with a past-tense verb",
       "source_asset_id": "<uuid copied exactly from an ASSET block>",
-      "supports_requirement": "which JD requirement this addresses",
+      "previous_bullet": "exact current template bullet text for this slot, copied from BULLET BASELINE below",
+      "jd_requirement_quote": "exact verbatim phrase from the JD that this bullet addresses",
+      "project_evidence_quote": "exact verbatim phrase from the cited ASSET that supports the new wording",
+      "word_change_rationale": [
+        {{"before": "old/removed word or phrase", "after": "replacement word or phrase", "why": "specific JD + project-evidence reason"}}
+      ],
+      "why_better": "specific reason this bullet is more accurate and more relevant than previous_bullet",
       "evidence_boundary": "academic project | coursework | research | lab exercise"
+    }}
+  ],
+  "skill_lines_ranked": [
+    {{
+      "category": "one existing resume skill category, max 45 characters",
+      "items": "comma-separated skills, max 220 characters, all backed by the cited asset",
+      "source_asset_id": "<uuid copied exactly from an ASSET block>"
+    }}
+  ],
+  "project_subtitle_updates": [
+    {{
+      "slot": "one of 1, 3, 5, 7, 9, 11; identifies the header that contains this project name",
+      "text": "replacement subtitle only: text between the fixed project name and the fixed GitHub link, max 88 chars",
+      "source_asset_id": "<uuid copied exactly from the matching project ASSET>",
+      "previous_subtitle": "exact template subtitle copied from BASELINE below",
+      "jd_requirement_quote": "exact verbatim phrase from the JD that this subtitle addresses",
+      "project_evidence_quote": "exact verbatim phrase from the cited ASSET that supports the subtitle",
+      "word_change_rationale": [
+        {{"before": "old/removed word or phrase", "after": "replacement word or phrase", "why": "specific JD + project-evidence reason"}}
+      ],
+      "why_better": "specific reason this subtitle is more accurate and more relevant than previous_subtitle"
     }}
   ],
   "not_supported": ["JD requirements no asset can back"],
   "self_check": "one sentence: confirm no bullet claims professional experience"
 }}
 
-Produce at most {max_bullets} bullets. Fewer strong grounded bullets beats more weak ones.
+Fixed project slots (title/date/link are immutable): {', '.join(FIXED_RESUME_PROJECTS)}.
+CURRENT FIXED-TEMPLATE SUBTITLE BASELINE (these are the only permitted `previous_subtitle` values):
+{json.dumps(dict(baseline_subtitles or {}), indent=2, ensure_ascii=False)}
+CURRENT FIXED-TEMPLATE BULLET BASELINE (these are the only permitted `previous_bullet` values):
+{json.dumps(dict(baseline_bullets or {}), indent=2, ensure_ascii=False)}
+Allowed source asset IDs for each immutable project block (cite only the IDs
+listed for the slot you update; `NONE` means that block is unavailable):
+{render_fixed_project_asset_rules(project_assets or {slot: set() for slot in FIXED_RESUME_PROJECT_ASSET_TERMS})}
+Select only tightly JD-relevant project slots backed by their asset. Do not
+invent a new project or reuse a weakly related one. For each selected project,
+use at most its two slots: odd primary slots are max 200 characters (target two
+visual lines); even secondary slots are max 105 characters (target one visual
+line). Do not output a secondary slot without its matching primary slot.
+Use full lines when backed by evidence, but rewrite if the final wrapped line
+would contain only a few words. Rank skills by explicit JD relevance first,
+then profile evidence, while retaining diverse categories; omit weak/unproven
+skills. Do not write education, employment, certification, contact,
+company-motivation, project name, project date, GitHub URL/link, or generic
+summary text: those fields are preserved verbatim from the template and this
+model has no control over them.
+Only `project_subtitle_updates.text` may change the words between the project
+name and GitHub link. Every changed substantive subtitle word must appear in
+`word_change_rationale`; no cosmetic or generic keyword edits.
+Every project bullet rewrite has the same evidence requirement: cite one exact
+JD phrase, one exact phrase from the matching project asset, and explain each
+substantive changed word. If the project does not genuinely match the JD, do
+not output a bullet for it. Never introduce a tool, result, responsibility, or
+experience that is not in the approved profile asset.
+Produce at most {min(max_bullets, 12)} project bullets. Fewer strong grounded
+bullets are better than weak filler; any unselected template bullet is cleared.
 """
 
 
@@ -300,6 +418,12 @@ sourced company context below.
 TARGET ROLE: {app['job_title']} at {app['company']}
 FIT SCORE: {app['fit_score']} ({app['fit_decision']})
 
+MATCHED JD REQUIREMENTS:
+{json.dumps(app.get('matched_requirements', []), indent=2, ensure_ascii=False)}
+
+KNOWN GAPS (do not hide these with invented experience):
+{json.dumps(app.get('missing_or_weak_requirements', []), indent=2, ensure_ascii=False)}
+
 RISK FLAGS RAISED BY THE FIT ANALYSIS (address honestly or stay silent, never contradict):
 {json.dumps(app['risk_flags'], indent=2, ensure_ascii=False)}
 
@@ -312,6 +436,14 @@ RISK FLAGS RAISED BY THE FIT ANALYSIS (address honestly or stay silent, never co
 11. Company facts are not candidate evidence: they never replace a real
     source_asset_id for a paragraph about the candidate.
 12. If the company context is empty, do not claim familiarity beyond the JD.
+13. Spend effort on relevance, not invention: for every candidate-evidence
+    paragraph cite one exact JD phrase and one exact phrase from its asset.
+14. When company context is present, include at least one genuinely
+    company-specific paragraph with a cited source URL, a concrete sourced
+    insight, and an honest explanation of how an approved candidate asset
+    connects to it. That paragraph must cite a real candidate asset. Do not
+    invent a company initiative, culture, product, or experience merely to
+    sound tailored.
 
 SOURCED COMPANY CONTEXT (may be empty):
 {json.dumps(company_context, indent=2, ensure_ascii=False)}
@@ -326,8 +458,13 @@ Return ONLY valid JSON:
       "text": "one paragraph, 2-4 sentences",
       "source_asset_id": "<uuid, or the string \\"none\\" for the opening/closing paragraph>",
       "purpose": "opening | evidence | motivation | closing",
+      "jd_requirement_quote": "exact JD phrase for a candidate-evidence paragraph; empty only for purely structural opening/closing",
+      "candidate_evidence_quote": "exact phrase from cited ASSET; empty only when source_asset_id is none",
       "uses_company_context": false,
-      "company_source_urls": ["<exact URL from SOURCED COMPANY CONTEXT, or omit when unused>"]
+      "company_source_urls": ["<exact URL from SOURCED COMPANY CONTEXT, or omit when unused>"],
+      "company_insight": "specific source-backed company fact, empty when unused",
+      "company_evidence_quote": "exact phrase from SOURCED COMPANY CONTEXT supporting company_insight, empty when unused",
+      "why_company_fit": "honest explanation linking company insight, JD and one approved candidate asset, empty when unused"
     }}
   ],
   "not_supported": ["claims deliberately left out"],
@@ -335,6 +472,9 @@ Return ONLY valid JSON:
 }}
 
 Four to five paragraphs total. Evidence paragraphs must cite a real asset id.
+Write a strong, specific application narrative, but never turn academic/project
+work into employment or manufacture a company insight. A less flashy letter
+with literal evidence is better than a polished false claim.
 """
 
 
@@ -376,6 +516,11 @@ Return ONLY valid JSON:
 def validate_and_render(
     doc_type: str, parsed: Dict[str, Any], valid_asset_ids: set,
     valid_company_urls: Optional[set] = None,
+    fixed_project_assets: Optional[Mapping[int, set[str]]] = None,
+    max_resume_bullets: int = 12,
+    baseline_subtitles: Optional[Mapping[int, str]] = None,
+    baseline_bullets: Optional[Mapping[int, str]] = None,
+    jd_text: str = "",
 ) -> Tuple[str, List[str], Dict[str, Any], List[str]]:
     """Drop any claim citing an unknown asset. Returns
     (content, asset_ids_used, evidence_map, dropped)."""
@@ -394,20 +539,118 @@ def validate_and_render(
         return True
 
     if doc_type == "resume":
-        for b in parsed.get("bullets", []):
+        project_bullets, skill_lines, project_subtitles = [], [], []
+        raw_bullets = parsed.get("project_updates", parsed.get("project_bullets", parsed.get("bullets", [])))
+        seen_project_slots: set[int] = set()
+        for position, b in enumerate(raw_bullets[:12], start=1):
+            if len(project_bullets) >= max(0, min(max_resume_bullets, 12)):
+                break
+            try:
+                slot = int(b.get("slot", position))
+            except (TypeError, ValueError):
+                continue
+            if not 1 <= slot <= 12 or slot in seen_project_slots:
+                continue
+            if slot % 2 == 0 and slot - 1 not in seen_project_slots:
+                continue
             text, src = (b.get("text") or "").strip(), b.get("source_asset_id")
-            if not text or not check(src, text):
+            block_slot = slot if slot % 2 else slot - 1
+            if fixed_project_assets is not None and src not in fixed_project_assets.get(block_slot, set()):
+                dropped.append(
+                    f"{text[:70]}... (asset {src} is not approved for fixed project slot {block_slot}-{block_slot + 1})"
+                )
+                continue
+            limit = 200 if slot % 2 else 105
+            if not text or len(text) > limit or not check(src, text):
+                continue
+            change = {
+                "slot": slot, "claim": text, "previous_bullet": b.get("previous_bullet", ""),
+                "jd_requirement_quote": b.get("jd_requirement_quote", ""),
+                "project_evidence_quote": b.get("project_evidence_quote", ""),
+                "word_change_rationale": b.get("word_change_rationale"),
+                "why_better": b.get("why_better", ""),
+            }
+            audit_problems = validate_bullet_change(
+                change, baseline_bullets=baseline_bullets or {}, jd_text=jd_text,
+            )
+            if audit_problems:
+                dropped.append(f"{text[:70]}... (project bullet audit: {'; '.join(audit_problems)})")
+                continue
+            seen_project_slots.add(slot)
+            lines.append(f"- {text}")
+            used.append(src)
+            claim = {
+                "claim": text,
+                "source_asset_id": src,
+                "kind": "resume_project_bullet_change", "slot": slot,
+                "previous_bullet": normalize_bullet(b.get("previous_bullet")),
+                "jd_requirement_quote": normalize_bullet(b.get("jd_requirement_quote")),
+                "project_evidence_quote": normalize_bullet(b.get("project_evidence_quote")),
+                "word_change_rationale": b.get("word_change_rationale"),
+                "why_better": normalize_bullet(b.get("why_better")),
+                "evidence_boundary": b.get("evidence_boundary", ""),
+            }
+            evidence["claims"].append(claim)
+            project_bullets.append({"slot": slot, "text": text, **claim})
+        for item in parsed.get("skill_lines_ranked", parsed.get("skill_lines", []))[:5]:
+            category, values = (item.get("category") or "").strip(), (item.get("items") or "").strip()
+            src = item.get("source_asset_id")
+            text = f"{category}: {values}"
+            if not category or not values or not check(src, text):
                 continue
             lines.append(f"- {text}")
             used.append(src)
-            evidence["claims"].append({
-                "claim": text,
-                "source_asset_id": src,
-                "supports_requirement": b.get("supports_requirement", ""),
-                "evidence_boundary": b.get("evidence_boundary", ""),
-            })
+            claim = {"claim": text, "source_asset_id": src, "kind": "skill_line"}
+            evidence["claims"].append(claim)
+            skill_lines.append({"category": category, "items": values, "source_asset_id": src})
+        seen_subtitle_slots: set[int] = set()
+        for item in parsed.get("project_subtitle_updates", [])[:6]:
+            try:
+                slot = int(item.get("slot"))
+            except (TypeError, ValueError):
+                continue
+            text, src = (item.get("text") or "").strip(), item.get("source_asset_id")
+            block_slot = slot
+            if slot not in {1, 3, 5, 7, 9, 11} or slot in seen_subtitle_slots:
+                continue
+            if fixed_project_assets is not None and src not in fixed_project_assets.get(block_slot, set()):
+                dropped.append(f"{text[:70]}... (asset {src} is not approved for project header slot {slot})")
+                continue
+            if not text or len(text) > 88 or not check(src, text):
+                continue
+            change = {
+                "slot": slot, "claim": text, "previous_subtitle": item.get("previous_subtitle", ""),
+                "jd_requirement_quote": item.get("jd_requirement_quote", ""),
+                "project_evidence_quote": item.get("project_evidence_quote", ""),
+                "word_change_rationale": item.get("word_change_rationale"),
+                "why_better": item.get("why_better", ""),
+            }
+            audit_problems = validate_subtitle_change(
+                change, baseline_subtitles=baseline_subtitles or {}, jd_text=jd_text,
+            )
+            if audit_problems:
+                dropped.append(f"{text[:70]}... (project subtitle audit: {'; '.join(audit_problems)})")
+                continue
+            seen_subtitle_slots.add(slot)
+            used.append(src)
+            lines.append(f"- [Project subtitle slot {slot}] {text}")
+            claim = {
+                "claim": text, "source_asset_id": src, "kind": "resume_project_subtitle_change", "slot": slot,
+                "previous_subtitle": normalize_subtitle(item.get("previous_subtitle")),
+                "jd_requirement_quote": normalize_subtitle(item.get("jd_requirement_quote")),
+                "project_evidence_quote": normalize_subtitle(item.get("project_evidence_quote")),
+                "word_change_rationale": item.get("word_change_rationale"),
+                "why_better": normalize_subtitle(item.get("why_better")),
+            }
+            evidence["claims"].append(claim)
+            project_subtitles.append({"slot": slot, "text": text, **claim})
+        evidence["resume_template"] = {
+            "project_bullets": project_bullets, "skill_lines": skill_lines,
+            "project_subtitles": project_subtitles,
+        }
 
     elif doc_type == "cover_letter":
+        company_specific_count = 0
         for p in parsed.get("paragraphs", []):
             text, src = (p.get("text") or "").strip(), p.get("source_asset_id")
             if not text or not check(src, text, allow_none=True):
@@ -424,16 +667,44 @@ def validate_and_render(
             if uses_company_context and not company_urls:
                 dropped.append(f"{text[:70]}... (company claim has no source URL)")
                 continue
+            if uses_company_context and src not in valid_asset_ids:
+                dropped.append(f"{text[:70]}... (company-specific paragraph must cite a candidate asset)")
+                continue
+            jd_quote = (p.get("jd_requirement_quote") or "").strip()
+            evidence_quote = (p.get("candidate_evidence_quote") or "").strip()
+            if src in valid_asset_ids and (len(jd_quote) < 8 or jd_quote.casefold() not in jd_text.casefold()):
+                dropped.append(f"{text[:70]}... (candidate paragraph lacks an exact JD requirement quote)")
+                continue
+            if src in valid_asset_ids and len(evidence_quote) < 8:
+                dropped.append(f"{text[:70]}... (candidate paragraph lacks an exact asset evidence quote)")
+                continue
+            company_insight = (p.get("company_insight") or "").strip()
+            company_evidence_quote = (p.get("company_evidence_quote") or "").strip()
+            why_company_fit = (p.get("why_company_fit") or "").strip()
+            if uses_company_context and (len(company_insight) < 12 or len(company_evidence_quote) < 8 or len(why_company_fit) < 24):
+                dropped.append(f"{text[:70]}... (company-specific paragraph needs source quote, insight and fit reason)")
+                continue
             lines.append(text)
             if src in valid_asset_ids:
                 used.append(src)
+            if uses_company_context:
+                company_specific_count += 1
             evidence["claims"].append({
                 "claim": text,
                 "source_asset_id": src,
+                "kind": "cover_letter_evidence" if src in valid_asset_ids else "cover_letter_structure",
                 "purpose": p.get("purpose", ""),
+                "jd_requirement_quote": jd_quote,
+                "candidate_evidence_quote": evidence_quote,
                 "uses_company_context": uses_company_context,
                 "company_source_urls": company_urls,
+                "company_insight": company_insight,
+                "company_evidence_quote": company_evidence_quote,
+                "why_company_fit": why_company_fit,
             })
+        if valid_company_urls and not company_specific_count:
+            dropped.append("Cover letter has company research sources but no verified company-specific paragraph.")
+            lines, used, evidence["claims"] = [], [], []
 
     elif doc_type == "short_answers":
         for a in parsed.get("answers", []):
@@ -583,6 +854,16 @@ def main() -> int:
                 return 1
 
             valid_ids = {a["profile_asset_id"] for a in assets}
+            resume_project_assets = fixed_project_asset_ids(assets)
+            resume_subtitle_baselines: dict[int, str] = {}
+            resume_bullet_baselines: dict[int, str] = {}
+            if args.doc_type == "resume":
+                try:
+                    resume_subtitle_baselines = load_template_subtitle_baselines()
+                    resume_bullet_baselines = load_template_bullet_baselines()
+                except (ResumeHeaderAuditError, ResumeBulletAuditError) as exc:
+                    print(f"ERROR: resume auditing needs the fixed Word template: {exc}")
+                    return 1
             valid_company_urls = set((app.get("company_context") or {}).get("sources") or [])
 
             field = {
@@ -593,7 +874,10 @@ def main() -> int:
             catalog = render_asset_catalog(assets, field=field)
 
             if args.doc_type == "resume":
-                prompt = build_resume_prompt(app, catalog, args.max_bullets)
+                prompt = build_resume_prompt(
+                    app, catalog, args.max_bullets, resume_project_assets, resume_subtitle_baselines,
+                    resume_bullet_baselines,
+                )
             elif args.doc_type == "cover_letter":
                 prompt = build_cover_letter_prompt(app, catalog)
             else:
@@ -629,7 +913,12 @@ def main() -> int:
 
             parsed = extract_json_object(raw)
             content, used, evidence, dropped = validate_and_render(
-                args.doc_type, parsed, valid_ids, valid_company_urls
+                args.doc_type, parsed, valid_ids, valid_company_urls,
+                resume_project_assets if args.doc_type == "resume" else None,
+                args.max_bullets if args.doc_type == "resume" else 12,
+                resume_subtitle_baselines if args.doc_type == "resume" else None,
+                resume_bullet_baselines if args.doc_type == "resume" else None,
+                app["jd_text"],
             )
 
             print("===== GENERATED =====")

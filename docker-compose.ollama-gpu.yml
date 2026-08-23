@@ -1,0 +1,27 @@
+# Optional Ubuntu/Linux overlay: GPU-enabled Ollama in Docker.
+#
+# Use this OR a native systemd Ollama service, never both on host port 11434.
+# Prerequisite: host `nvidia-smi` and the Docker GPU smoke test must both pass.
+# Start with:
+#   docker compose -f docker-compose.yml -f docker-compose.ollama-gpu.yml up -d ollama
+services:
+  ollama:
+    image: ${JOBOS_OLLAMA_IMAGE:-ollama/ollama:latest}
+    container_name: jobos-ollama
+    restart: unless-stopped
+    ports:
+      # Python services on the host use OLLAMA_URL=127.0.0.1:11434.
+      # Loopback binding prevents other LAN devices from calling the model.
+      - "127.0.0.1:11434:11434"
+    volumes:
+      - jobos_ollama_models:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  jobos_ollama_models:

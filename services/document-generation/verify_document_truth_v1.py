@@ -49,6 +49,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from services.common.observability import emit_trace, make_trace_id
 from services.common.llm_gateway import generate_text
 from services.common.model_config import get_model
+from services.common.resume_project_bullet_audit import (
+    ResumeBulletAuditError, build_bullet_audit_prompt, load_template_bullet_baselines,
+    validate_bullet_change,
+)
+from services.common.resume_project_header_audit import (
+    ResumeHeaderAuditError, build_subtitle_audit_prompt, load_template_subtitle_baselines,
+    validate_subtitle_change,
+)
 
 DB_HOST = os.getenv("JOBOS_DB_HOST", "127.0.0.1")
 DB_PORT = int(os.getenv("JOBOS_DB_PORT", "5433"))
@@ -171,6 +179,32 @@ def fetch_company_source_urls(cur, application_id: str) -> set[str]:
     }
 
 
+def fetch_application_jd(cur, application_id: str) -> str:
+    """Load the original JD for exact-quote checking in subtitle audits."""
+    cur.execute("SELECT jd_text FROM applications WHERE id = %s;", (application_id,))
+    row = cur.fetchone()
+    return str(row[0] or "") if row else ""
+
+
+def fetch_company_research_text(cur, application_id: str) -> str:
+    """Return the cached, URL-backed company context for literal-quote audit."""
+    cur.execute(
+        """
+        SELECT crc.summary, crc.mission, crc.products, crc.recent_news
+        FROM applications a
+        JOIN company_research_cache crc ON lower(crc.company_name) = lower(a.company)
+        WHERE a.id = %s
+        ORDER BY crc.last_refreshed_at DESC NULLS LAST, crc.created_at DESC
+        LIMIT 1;
+        """,
+        (application_id,),
+    )
+    row = cur.fetchone()
+    if not row:
+        return ""
+    return "\n".join(str(value or "") for value in row)
+
+
 # ---------------------------------------------------------------- verification
 
 def build_claim_prompt(claim: str, asset: Dict[str, Any]) -> str:
@@ -223,6 +257,9 @@ def verify_claims(
     cur, claims: List[Dict[str, Any]], *, model: str, ollama_url: str,
     timeout: int, temperature: float, num_ctx: int, verbose: bool,
     valid_company_source_urls: set[str],
+    jd_text: str = "", baseline_subtitles: Optional[Dict[int, str]] = None,
+    baseline_bullets: Optional[Dict[int, str]] = None,
+    company_context_text: str = "",
 ) -> List[Dict[str, Any]]:
     results = []
     tokens_in = tokens_out = 0
@@ -281,7 +318,50 @@ def verify_claims(
             })
             continue
 
-        prompt = build_claim_prompt(claim_text, asset)
+        is_subtitle_change = c.get("kind") == "resume_project_subtitle_change"
+        is_bullet_change = c.get("kind") == "resume_project_bullet_change"
+        is_cover_evidence = c.get("kind") == "cover_letter_evidence"
+        if is_subtitle_change or is_bullet_change:
+            asset_source = "\n\n".join(str(asset.get(key) or "") for key in ("summary", "bullets", "positioning"))
+            audit_problems = (
+                validate_subtitle_change(c, baseline_subtitles=baseline_subtitles or {}, jd_text=jd_text, asset_source=asset_source)
+                if is_subtitle_change else
+                validate_bullet_change(c, baseline_bullets=baseline_bullets or {}, jd_text=jd_text, asset_source=asset_source)
+            )
+            if audit_problems:
+                results.append({
+                    "claim": claim_text, "source_asset_id": asset_id, "asset_title": asset["title"],
+                    "kind": c.get("kind"), "verdict": "rule_violation",
+                    "reason": "; ".join(audit_problems), "safe_rewrite": "",
+                    "resume_change_audit": {"passed": False, "problems": audit_problems}, **company_evidence,
+                })
+                continue
+            prompt = build_subtitle_audit_prompt(c, asset, jd_text) if is_subtitle_change else build_bullet_audit_prompt(c, asset, jd_text)
+        elif is_cover_evidence:
+            asset_source = "\n\n".join(str(asset.get(key) or "") for key in ("summary", "bullets", "positioning"))
+            jd_quote = str(c.get("jd_requirement_quote") or "").strip()
+            evidence_quote = str(c.get("candidate_evidence_quote") or "").strip()
+            cover_problems = []
+            if len(jd_quote) < 8 or jd_quote.casefold() not in jd_text.casefold():
+                cover_problems.append("JD requirement quote is absent from the original job description.")
+            if len(evidence_quote) < 8 or evidence_quote.casefold() not in asset_source.casefold():
+                cover_problems.append("Candidate evidence quote is absent from the cited approved asset.")
+            if c.get("uses_company_context") and (
+                len(str(c.get("company_evidence_quote") or "").strip()) < 8
+                or str(c.get("company_evidence_quote") or "").casefold() not in company_context_text.casefold()
+            ):
+                cover_problems.append("Company evidence quote is absent from sourced company research context.")
+            if cover_problems:
+                results.append({
+                    "claim": claim_text, "source_asset_id": asset_id, "asset_title": asset["title"],
+                    "kind": "cover_letter_evidence", "verdict": "rule_violation",
+                    "reason": "; ".join(cover_problems), "safe_rewrite": "",
+                    "cover_evidence_audit": {"passed": False, "problems": cover_problems}, **company_evidence,
+                })
+                continue
+            prompt = build_claim_prompt(claim_text, asset)
+        else:
+            prompt = build_claim_prompt(claim_text, asset)
         raw = ollama_generate(
             model=model, prompt=prompt, ollama_url=ollama_url,
             timeout=timeout, temperature=temperature, num_ctx=num_ctx,
@@ -297,12 +377,31 @@ def verify_claims(
             verdict = "unsupported"
             parsed = {"reason": "Verifier output unparseable; failing closed.",
                       "safe_rewrite": ""}
+        if (is_subtitle_change or is_bullet_change or is_cover_evidence) and verdict != "supported":
+            # Resume template changes cannot take the lossy revision path:
+            # they must remain attached to their fixed slot and full audit.
+            verdict = "rule_violation"
 
         results.append({
             "claim": claim_text, "source_asset_id": asset_id,
-            "asset_title": asset["title"], "verdict": verdict,
+            "asset_title": asset["title"], "kind": c.get("kind", "claim"), "verdict": verdict,
             "reason": parsed.get("reason", ""),
             "safe_rewrite": parsed.get("safe_rewrite", ""),
+            **({"resume_change_audit": {
+                "passed": verdict == "supported", "slot": c.get("slot"),
+                "previous_text": c.get("previous_subtitle") if is_subtitle_change else c.get("previous_bullet"),
+                "jd_requirement_quote": c.get("jd_requirement_quote"),
+                "project_evidence_quote": c.get("project_evidence_quote"),
+                "word_change_rationale": c.get("word_change_rationale"),
+                "why_better": c.get("why_better"),
+            }} if (is_subtitle_change or is_bullet_change) else {}),
+            **({"cover_evidence_audit": {
+                "passed": verdict == "supported", "jd_requirement_quote": c.get("jd_requirement_quote"),
+                "candidate_evidence_quote": c.get("candidate_evidence_quote"),
+                "company_insight": c.get("company_insight"),
+                "company_evidence_quote": c.get("company_evidence_quote"),
+                "why_company_fit": c.get("why_company_fit"),
+            }} if is_cover_evidence else {}),
             **company_evidence,
         })
 
@@ -422,11 +521,21 @@ def process_document(
         return {"qa_status": "fail", "results": []}
 
     start = time.time()
+    try:
+        baseline_subtitles = load_template_subtitle_baselines() if doc["doc_type"] == "resume" else None
+        baseline_bullets = load_template_bullet_baselines() if doc["doc_type"] == "resume" else None
+    except (ResumeHeaderAuditError, ResumeBulletAuditError) as exc:
+        save_qa(cur, document_id=document_id, qa_status="fail",
+                report={"verifier_version": VERIFIER_VERSION, "error": str(exc)})
+        return {"qa_status": "fail", "results": []}
     results = verify_claims(
         cur, claims, model=args.model, ollama_url=args.ollama_url,
         timeout=args.timeout, temperature=args.temperature,
         num_ctx=args.ctx, verbose=verbose,
         valid_company_source_urls=fetch_company_source_urls(cur, doc["application_id"]),
+        jd_text=fetch_application_jd(cur, doc["application_id"]), baseline_subtitles=baseline_subtitles,
+        baseline_bullets=baseline_bullets,
+        company_context_text=fetch_company_research_text(cur, doc["application_id"]),
     )
     elapsed = time.time() - start
 

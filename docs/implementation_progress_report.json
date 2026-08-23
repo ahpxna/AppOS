@@ -1,7 +1,22 @@
 {
   "report_type": "jobos_implementation_progress",
-  "last_updated": "2026-08-21",
+  "last_updated": "2026-08-22",
   "scope": "Job discovery, user-owned LinkedIn intake, profile matching, market-demand intelligence, pointer telemetry, repository evidence and isolated auditing, and interchangeable local/API LLM transport.",
+  "desktop_manual_intake": {
+    "status": "implemented",
+    "summary": "Added a Tk desktop form for user-pasted job descriptions. It creates normal applications with source metadata, queues market-demand extraction through the existing trigger, supports free screening, and offers explicit opt-in progression through LLM/document stages. It has no browser, CDP, LinkedIn login, cursor injection, or application-submission capability.",
+    "files": ["scripts/jobos_intake_app.py", "services/intake/manual_job_intake.py", "test_manual_job_intake.py"]
+  },
+  "project_profile_registry": {
+    "status": "implemented",
+    "summary": "Added a private local Python/Tk project-profile form and JSON source of truth for the six existing Word resume blocks. It records template identity, aliases, skills, technologies, JD keywords, evidence locations, allowed facts, and do-not-overclaim boundaries. Parsed/aggregated records map only through user-confirmed aliases; ties and unknown records remain unmapped. Resume generation now reads those aliases to bind an approved profile asset to its correct immutable project block.",
+    "files": ["scripts/jobos_project_profile_app.py", "services/common/project_registry.py", "docs/project_profile_registry.md", "test_project_registry.py"]
+  },
+  "resume_template_pdf": {
+    "status": "implemented_docx_review_before_pdf",
+    "summary": "A template-preserving renderer limits tailoring to the existing 12 project bullet slots, five skill rows, and six audited header subtitles of the supplied one-page Word resume. It hard-enforces six fixed project blocks, immutable project name/date/GitHub fields, per-slot two-line/one-line character budgets, primary-before-secondary pairing, evidence-backed ranked skill rows, a project-slot-to-approved-asset binding, and literal JD/project-evidence change logs for both project bullets and subtitles. The verifier independently rejects unsupported resume changes before DOCX export. Cover-letter prompting and validation now require literal candidate/JD evidence and, where research exists, a candidate-asset-backed, URL-backed company-specific paragraph with a literal quote from the sourced company context rather than generic company praise. It runs only after claim QA passes and writes a local DOCX for Word-based review/Print to PDF; JobOS intentionally does not use LibreOffice to make the final PDF because that engine paginated the source template differently.",
+    "files": ["services/document-generation/resume_template_renderer.py", "services/document-generation/render_verified_resume_v1.py", "docs/resume_template_contract.md"]
+  },
   "code_change_notes": [
     {
       "files": [
@@ -82,6 +97,16 @@
         "docs/openclaw.md"
       ],
       "summary": "Added non-interactive OpenClaw setup for native or Docker mode. It generates a private gateway token when missing, renders four isolated agent workspaces, correct CDP network endpoints, optional-provider gating, and a deny policy for process/filesystem mutation. The private launcher pins JobOS to its tested Node 24/OpenClaw runtime instead of a global Homebrew installation. Provider keys are staged only in the untracked runtime .env when the operator supplies them."
+    },
+    {
+      "files": [
+        "README.md",
+        "docs/ubuntu_gpu.md",
+        "scripts/ubuntu_ollama_gpu_doctor.sh",
+        "docker-compose.ollama-gpu.yml",
+        ".env.example"
+      ],
+      "summary": "Added an Ubuntu NVIDIA/Ollama runbook, a non-mutating GPU doctor, and an optional Docker GPU overlay. The documentation distinguishes an Ubuntu GPU compute host from a non-GPU ThinkPad capture/client and documents an SSH-tunnel path to a separate Windows/Linux GPU workstation, so unauthenticated Ollama is never exposed directly to a LAN or Internet address."
     }
   ],
   "gemini_windows_log_audit": {

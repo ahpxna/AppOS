@@ -58,6 +58,7 @@ PYTHON = sys.executable
 FIT_SCRIPT = os.path.join(REPO_ROOT, "services", "job-analysis", "analyze_job_fit_v1.py")
 DOCGEN_SCRIPT = os.path.join(REPO_ROOT, "services", "document-generation", "generate_documents_v1.py")
 VERIFY_SCRIPT = os.path.join(REPO_ROOT, "services", "document-generation", "verify_document_truth_v1.py")
+RESUME_EXPORT_SCRIPT = os.path.join(REPO_ROOT, "services", "document-generation", "render_verified_resume_v1.py")
 COST_SCRIPT = os.path.join(REPO_ROOT, "services", "cost", "cost_controller_v1.py")
 RESEARCH_SCRIPT = os.path.join(REPO_ROOT, "services", "research", "company_research_v1.py")
 MARKET_INTELLIGENCE_SCRIPT = os.path.join(
@@ -536,6 +537,22 @@ def advance_one(cur, application_id: str, *, apply: bool) -> None:
         doc_id, qa, rround = (r[0], r[1], r[2]) if r else (None, None, 0)
 
         if qa == "pass":
+            # The export step only reads the QA-passed evidence map and patches
+            # the fixed local Word template's project/skill slots. The user
+            # reviews the DOCX and chooses Print/Save as PDF in their editor.
+            eok, eout, _ = run_step(RESUME_EXPORT_SCRIPT, ["--application-id", application_id])
+            if eok:
+                print("    resume DOCX: written from verified template slots")
+            else:
+                tail = eout.strip().splitlines()[-1] if eout.strip() else "unavailable"
+                print(f"    resume DOCX: not written -- {tail[:180]}")
+                cur.execute(
+                    """INSERT INTO pipeline_events
+                          (application_id, from_step, to_step, actor, reason, detail_json)
+                       VALUES (%s, %s, %s, 'resume_template_export', %s, %s);""",
+                    (application_id, step, step, "Verified local Word resume export blocked or unavailable.",
+                     Jsonb({"output": eout[-1500:]})),
+                )
             transition(cur, application_id=application_id, to_step="docs_verified",
                        actor="truth_quality_checker", reason="All claims supported.")
             transition(cur, application_id=application_id, to_step="awaiting_approval",

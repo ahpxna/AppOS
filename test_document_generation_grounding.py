@@ -22,10 +22,15 @@ def test_cover_letter_keeps_only_known_company_sources():
         "paragraphs": [
             {
                 "text": "I am drawn to the company's published incident-response work.",
-                "source_asset_id": "none",
+                "source_asset_id": "asset-1",
                 "purpose": "motivation",
                 "uses_company_context": True,
                 "company_source_urls": ["https://company.example/about"],
+                "company_insight": "The company publishes incident-response work.",
+                "company_evidence_quote": "published incident-response work",
+                "why_company_fit": "The published focus gives a concrete reason to discuss the candidate's security coursework.",
+                "jd_requirement_quote": "Python analysis",
+                "candidate_evidence_quote": "completed a course project using Python",
             },
             {
                 "text": "I completed a course project using Python.",
@@ -33,6 +38,8 @@ def test_cover_letter_keeps_only_known_company_sources():
                 "purpose": "evidence",
                 "uses_company_context": False,
                 "company_source_urls": [],
+                "jd_requirement_quote": "Python analysis",
+                "candidate_evidence_quote": "completed a course project using Python",
             },
             {
                 "text": "I admire an unsupported company claim.",
@@ -47,7 +54,7 @@ def test_cover_letter_keeps_only_known_company_sources():
     }
 
     content, used, evidence, dropped = docgen.validate_and_render(
-        "cover_letter", parsed, {"asset-1"}, {"https://company.example/about"}
+        "cover_letter", parsed, {"asset-1"}, {"https://company.example/about"}, jd_text="Python analysis is required."
     )
 
     assert "published incident-response" in content
@@ -75,6 +82,8 @@ def test_cover_letter_prompt_exposes_only_sourced_company_context():
     assert "SOURCED COMPANY CONTEXT" in prompt
     assert "https://company.example/about" in prompt
     assert "company_source_urls" in prompt
+    assert "candidate_evidence_quote" in prompt
+    assert "company-specific" in prompt
 
 
 def test_truth_checker_fails_closed_for_unknown_company_source():
@@ -99,3 +108,26 @@ def test_truth_checker_fails_closed_for_unknown_company_source():
 
     assert results[0]["verdict"] == "unsupported"
     assert "no known company research source" in results[0]["reason"]
+
+
+def test_resume_rejects_an_asset_bound_to_a_different_fixed_project_block():
+    parsed = {
+        "project_updates": [
+            {
+                "slot": 1,
+                "text": "Implemented the project-specific pipeline.",
+                "source_asset_id": "pki-asset",
+                "supports_requirement": "Python",
+            }
+        ],
+        "skill_lines_ranked": [],
+    }
+    content, used, evidence, dropped = docgen.validate_and_render(
+        "resume", parsed, {"caroect-asset", "pki-asset"},
+        fixed_project_assets={1: {"caroect-asset"}, 5: {"pki-asset"}},
+    )
+
+    assert not content
+    assert not used
+    assert evidence["resume_template"]["project_bullets"] == []
+    assert any("not approved for fixed project slot 1-2" in item for item in dropped)

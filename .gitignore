@@ -16,6 +16,9 @@ data/openclaw-workspace/
 data/openclaw-runtime/
 data/pointer-traces/
 data/browser-profiles/
+data/resume-template/
+data/generated-resumes/
+data/project-registry/
 .openclaw/
 
 # === Personal profile data (PII: transcript, resume, coursework) ===
