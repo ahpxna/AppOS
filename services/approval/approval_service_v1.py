@@ -40,8 +40,8 @@ import psycopg
 from psycopg.types.json import Jsonb
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from services.common.config import database_dsn, load_repo_env
-from services.common.autofill_identity import autofill_input_hash, canonical_page_url
-from services.common.immigration_semantics import EXACT_CANDIDATE_ADDITIONAL_CLASSES
+from services.common.autofill_identity import canonical_page_url
+from services.autofill.autofill_context_v1 import load_autofill_context
 
 load_repo_env()
 
@@ -143,44 +143,15 @@ def fetch_artifact_binding(cur, application_id: str, document_id: str, artifact_
     return {"id": row[0], "sha256": row[1], "filename": row[2]}
 
 
-def current_autofill_input_hash(cur, *, document_sha256: str, artifact_sha256: str | None,
-                                page_url: str, page_fingerprint: str) -> str:
-    """Snapshot only values that the deterministic executor may later write."""
-    cur.execute("SELECT field_name, field_value FROM v_autofill_ready_values;")
-    ready_values = {str(name): str(value) for name, value in cur.fetchall()
-                    if str(value).strip() and str(value) != "FILL_ME"}
-    cur.execute(
-        """SELECT current_work_authorization, requires_sponsorship_to_start,
-                  requires_future_sponsorship, us_citizen, us_person,
-                  permanent_work_authorization, user_confirmed_at, confirmation_version
-           FROM immigration_profiles WHERE profile_key = 'primary';"""
-    )
-    row = cur.fetchone()
-    answers: dict[str, dict[str, object]] = {}
-    if row and row[6] and int(row[7] or 0) >= 1:
-        for key, value in zip(("CURRENT_AUTHORIZATION", "SPONSORSHIP_TO_START", "SPONSORSHIP_NOW_OR_FUTURE",
-                               "US_CITIZENSHIP", "US_PERSON", "PERMANENT_WORK_AUTHORIZATION"), row[:6]):
-            if str(value).casefold() in {"yes", "no"}:
-                answers[key] = {"value": str(value).title(), "confirmed_at": str(row[6]),
-                                "confirmation_version": int(row[7])}
-    exact_classes = tuple(item.value for item in EXACT_CANDIDATE_ADDITIONAL_CLASSES)
-    cur.execute(
-        """SELECT field_name, answer, updated_at
-           FROM sensitive_answers
-           WHERE approved_by_user = true
-             AND field_name = ANY(%s)""",
-        ([f"immigration:{item}" for item in exact_classes],),
-    )
-    for field_name, answer, updated_at in cur.fetchall():
-        question_class = str(field_name).removeprefix("immigration:")
-        if question_class in exact_classes and str(answer).casefold() in {"yes", "no"}:
-            answers[question_class] = {
-                "value": str(answer).title(), "confirmed_at": str(updated_at),
-                "confirmation_version": 1,
-            }
-    return autofill_input_hash(profile={"_approval_ready_values": ready_values}, sensitive_answers=answers,
-                               document_sha256=document_sha256, artifact_sha256=artifact_sha256,
-                               page_url=page_url, page_fingerprint_sha256=page_fingerprint)
+def current_autofill_input_hash(cur, *, application_id: str, artifact_binding: Dict[str, Any],
+                                document_sha256: str, page_url: str, page_fingerprint: str) -> str:
+    """Use the exact context shared by preview and execution."""
+    return load_autofill_context(
+        cur, application_id=application_id, artifact_binding=artifact_binding,
+        document_sha256=document_sha256, page_url=page_url,
+        page_fingerprint_sha256=page_fingerprint,
+        data_root=Path(__file__).resolve().parents[2] / "data",
+    ).input_hash
 
 
 def normalise_origin(value: str) -> str:
@@ -332,7 +303,9 @@ def cmd_create(conn, args) -> int:
                 artifact = (fetch_artifact_binding(cur, args.application_id, args.document_id, args.artifact_id)
                             if args.artifact_id else None)
                 input_hash = current_autofill_input_hash(
-                    cur, document_sha256=binding["content_hash"], artifact_sha256=artifact["sha256"] if artifact else None,
+                    cur, application_id=args.application_id,
+                    artifact_binding={"artifact_id": artifact["id"], "artifact_sha256": artifact["sha256"], "artifact_filename": artifact["filename"]} if artifact else {},
+                    document_sha256=binding["content_hash"],
                     page_url=expected_page_url, page_fingerprint=args.expected_page_fingerprint.casefold(),
                 )
             except RuntimeError as exc:

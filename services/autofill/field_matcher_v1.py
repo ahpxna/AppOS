@@ -49,6 +49,7 @@ _STATIC = (
     # A generic "School" label is ambiguous in repeated ATS education rows.
     # Only labels that explicitly say university/college are safe to fill.
     (r"\b(university|college)\b", "education.university"),
+    (r"^degree$|\bdegree\s+(program|type)\b", "education.degree"),
     (r"\bmajor|field of study\b", "education.major"),
     (r"\bgraduation\s*(date|year)?\b", "education.graduation_date"),
     (r"\bcurrent\s+(employer|company)\b", "employment.current_employer"),
@@ -60,7 +61,7 @@ _STATIC = (
 )
 _DERIVED = (
     (r"\byears?.{0,30}\bexperience\b", "derived.years_experience"),
-    (r"\b(highest|education)\s+degree\b|^degree$", "education.degree"),
+    (r"\b(highest|completed)\s+(degree|level of education)\b", "education.degree"),
     (r"\bgpa\b", "education.gpa"),
 )
 _SENSITIVE = (r"\b(race|ethnicity|gender|disability|veteran|export control)\b",)

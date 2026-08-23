@@ -23,6 +23,7 @@ from psycopg.types.json import Jsonb
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from services.discovery.linkedin_discovery_v1 import (
     LinkedInDiscoveryError,
+    linkedin_job_id,
     validate_job_url,
     validate_search_request,
 )
@@ -84,19 +85,30 @@ def intake(cur, *, company: str, title: str, url: str, jd_text: str,
     if len(jd_text) < 200:
         raise IntakeError("JD text is too short; paste/review the full description first.")
     jd_hash = hashlib.sha256(jd_text.encode("utf-8")).hexdigest()
-    cur.execute("SELECT id::text FROM applications WHERE jd_hash = %s;", (jd_hash,))
-    if cur.fetchone():
+    source_job_id = linkedin_job_id(url)
+    cur.execute("SELECT id::text FROM applications WHERE source = 'linkedin' AND source_job_id = %s;", (source_job_id,))
+    existing = cur.fetchone()
+    if existing:
+        cur.execute(
+            """UPDATE applications SET company = %s, job_title = %s, job_url = %s,
+                   jd_text = %s, jd_hash = %s, location = %s, work_mode = %s,
+                   last_seen_at = now(), stale_at = NULL, closed_at = NULL,
+                   last_content_change_at = CASE WHEN jd_hash <> %s THEN now() ELSE last_content_change_at END,
+                   updated_at = now() WHERE id = %s;""",
+            (company, title, url, jd_text, jd_hash, location, work_mode, jd_hash, existing[0]),
+        )
         return None
     cur.execute(
         """
         INSERT INTO applications
           (source, company, job_title, job_url, jd_text, jd_hash, current_step,
-           status, intake_channel, ats_type, location, work_mode, created_at, updated_at)
+           status, intake_channel, ats_type, location, work_mode, source_job_id,
+           first_seen_at, last_seen_at, created_at, updated_at)
         VALUES ('linkedin', %s, %s, %s, %s, %s, 'intake', 'active', %s,
-                'linkedin_user_initiated', %s, %s, now(), now())
+                'linkedin_user_initiated', %s, %s, %s, now(), now(), now(), now())
         RETURNING id::text;
         """,
-        (company, title, url, jd_text, jd_hash, source, location, work_mode),
+        (company, title, url, jd_text, jd_hash, source, location, work_mode, source_job_id),
     )
     app_id = cur.fetchone()[0]
     cur.execute(
@@ -130,7 +142,11 @@ def cmd_queue_discovery(cur, args) -> int:
     """Queue a bounded, user-requested search for the JobOS browser executor."""
     if not feature_enabled("JOBOS_LINKEDIN_AGENT_DISCOVERY_ENABLED"):
         raise IntakeError("LinkedIn autonomous discovery is disabled by configuration.")
-    request = validate_search_request(args.keywords, args.location, args.max_results)
+    request = validate_search_request(
+        args.keywords, args.location, args.max_results, date_posted=args.date_posted,
+        experience_levels=args.experience_level, employment_types=args.employment_type,
+        work_modes=args.work_mode_filter, companies=args.company, sort_by=args.sort_by,
+    )
     cur.execute(
         """INSERT INTO browser_tasks
               (task_type, requested_by, status, priority, input_json, timeout_seconds)
@@ -203,6 +219,12 @@ def main() -> int:
     discovery.add_argument("--keywords", required=True)
     discovery.add_argument("--location", default="")
     discovery.add_argument("--max-results", type=int, default=3)
+    discovery.add_argument("--date-posted", choices=("24h", "week", "month"))
+    discovery.add_argument("--experience-level", action="append", default=[])
+    discovery.add_argument("--employment-type", action="append", default=[])
+    discovery.add_argument("--work-mode-filter", action="append", default=[])
+    discovery.add_argument("--company", action="append", default=[])
+    discovery.add_argument("--sort-by", choices=("recent", "relevant"), default="recent")
     discovery.add_argument("--timeout", type=int, default=300)
     completed = subs.add_parser("ingest-task", help="Ingest one completed capture task into applications.")
     completed.add_argument("--task-id", required=True)

@@ -68,11 +68,9 @@ from services.autofill.autofill_executor_v1 import OpenClawTransport, TransportE
 from services.autofill.autofill_planner_v1 import plan_autofill
 from services.autofill.autofill_session_v1 import AutofillSession, SessionError, SnapshotState
 from services.autofill.form_inspector_v1 import inspect_nodes, inspect_question_groups
-from services.common.autofill_identity import autofill_input_hash, canonical_page_url, page_fingerprint
-from services.common.immigration_semantics import EXACT_CANDIDATE_ADDITIONAL_CLASSES
+from services.common.autofill_identity import canonical_page_url, page_fingerprint
+from services.autofill.autofill_context_v1 import AutofillContextError, load_autofill_context
 from services.common.openclaw_runtime import resolve_openclaw_binary
-from services.common.autofill_field_registry import AUTOFILL_FIELD_REGISTRY
-from services.common.question_memory import normalize_question
 
 load_repo_env()
 
@@ -758,128 +756,21 @@ def require_url(cur, input_json: Dict[str, Any]) -> str:
     return url
 
 
-def load_autofill_profile(cur, application_id: str, artifact_binding: Dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Load only approved values needed by the deterministic planner.
-
-    This is intentionally a structured DB read, not a prompt.  Immigration
-    answers are published only under their exact semantic question class and
-    only after the candidate confirmed the profile.
-    """
-    cur.execute("SELECT field_name, field_value FROM v_autofill_ready_values;")
-    identity = {str(name): str(value) for name, value in cur.fetchall() if str(value).strip() and str(value) != "FILL_ME"}
-    profile: dict[str, Any] = {"personal": {}, "address": {}, "education": {}, "employment": {}, "preferences": {}, "documents": {},
-                               "_approval_ready_values": identity}
-    for source, target in AUTOFILL_FIELD_REGISTRY.items():
-        if source in identity:
-            profile[target[0]][target[1]] = identity[source]
-    if profile["personal"].get("first_name") and profile["personal"].get("last_name"):
-        profile["personal"]["full_name"] = f"{profile['personal']['first_name']} {profile['personal']['last_name']}"
-
-    # Uploads are opt-in and capability-bound.  Never select the newest (or
-    # any other) artifact merely because it belongs to the same document.
-    if artifact_binding.get("artifact_id"):
-        cur.execute(
-            """
-            SELECT gd.doc_type, gda.file_path, gda.filename, gda.sha256
-            FROM generated_document_artifacts gda
-            JOIN generated_documents gd ON gd.id = gda.generated_document_id
-            WHERE gda.id = %s AND gda.application_id = %s
-              AND gd.application_id = %s AND gd.qa_status = 'pass' AND gd.approved = true;
-            """,
-            (artifact_binding["artifact_id"], application_id, application_id),
-        )
-        row = cur.fetchone()
-        if not row:
-            raise PermanentTaskError("The approved upload artifact no longer belongs to this verified application document.")
-        doc_type, file_path, filename, digest = row
-        if str(digest) != str(artifact_binding.get("artifact_sha256")) or str(filename) != str(artifact_binding.get("artifact_filename")):
-            raise PermanentTaskError("The upload artifact changed after approval; issue a new approval.")
-        path = Path(str(file_path)).expanduser().resolve()
-        allowed_root = (REPO_ROOT / "data").resolve()
-        if not path.is_file() or allowed_root not in path.parents:
-            raise PermanentTaskError("Approved upload artifact is outside the managed JobOS data directory.")
-        if hashlib.sha256(path.read_bytes()).hexdigest() != str(digest):
-            raise PermanentTaskError("Approved upload artifact bytes changed after approval.")
-        if str(doc_type) not in {"resume", "cover_letter"} or path.name != str(filename):
-            raise PermanentTaskError("Approved upload artifact has an unsupported document type or filename.")
-        profile["documents"][str(doc_type)] = str(path)
-
-    cur.execute(
-        """
-        SELECT current_work_authorization, requires_sponsorship_to_start,
-               requires_future_sponsorship, us_citizen, us_person,
-               permanent_work_authorization, stem_extension_eligible, user_confirmed_at
-               , confirmation_version
-        FROM immigration_profiles WHERE profile_key = 'primary';
-        """
-    )
-    row = cur.fetchone()
-    answers: dict[str, Any] = {}
-    if row and row[7] and int(row[8] or 0) >= 1:
-        confirmed_at = str(row[7])
-        semantic_values = {
-            "CURRENT_AUTHORIZATION": row[0], "SPONSORSHIP_TO_START": row[1],
-            "SPONSORSHIP_NOW_OR_FUTURE": row[2], "US_CITIZENSHIP": row[3],
-            "US_PERSON": row[4], "PERMANENT_WORK_AUTHORIZATION": row[5],
-        }
-        for question_class, value in semantic_values.items():
-            if str(value).casefold() in {"yes", "no"}:
-                answers[question_class] = {
-                    "value": str(value).title(), "confirmed_at": confirmed_at,
-                    "confirmation_version": int(row[8]),
-                }
-    exact_classes = tuple(item.value for item in EXACT_CANDIDATE_ADDITIONAL_CLASSES)
-    cur.execute(
-        """SELECT field_name, answer, updated_at
-           FROM sensitive_answers
-           WHERE approved_by_user = true
-             AND field_name = ANY(%s)""",
-        ([f"immigration:{item}" for item in exact_classes],),
-    )
-    for field_name, answer, updated_at in cur.fetchall():
-        question_class = str(field_name).removeprefix("immigration:")
-        if question_class in exact_classes and str(answer).casefold() in {"yes", "no"}:
-            answers[question_class] = {
-                "value": str(answer).title(), "confirmed_at": str(updated_at),
-                "confirmation_version": 1,
-            }
-    return profile, answers
-
-
-def load_question_memory(cur, application_id: str) -> dict[str, str]:
-    """Resolve only exact, user-confirmed non-legal answers by safe scope."""
-    cur.execute("SELECT lower(coalesce(company, '')), coalesce(ats_type, '') FROM applications WHERE id = %s;", (application_id,))
-    row = cur.fetchone()
-    if not row:
-        return {}
-    company, ats_type = row
-    cur.execute(
-        """SELECT question_normalized, answer_text
-             FROM application_question_memory
-            WHERE (scope = 'global')
-               OR (scope = 'ats' AND ats_type = %s)
-               OR (scope = 'company' AND company_normalized = %s)
-            ORDER BY CASE scope WHEN 'company' THEN 3 WHEN 'ats' THEN 2 ELSE 1 END DESC,
-                     updated_at DESC;""",
-        (ats_type, normalize_question(company)),
-    )
-    result: dict[str, str] = {}
-    for question, answer in cur.fetchall():
-        result.setdefault(str(question), str(answer))
-    return result
-
-
-def require_ats_autofill_capability(cur, application_id: str) -> None:
+def require_ats_autofill_capability(cur, application_id: str) -> dict[str, bool]:
     """Fail closed when an ATS has not been explicitly proven for this mode."""
     cur.execute("SELECT coalesce(ats_type, 'unknown') FROM applications WHERE id = %s;", (application_id,))
     row = cur.fetchone()
     ats_type = str(row[0]) if row else "unknown"
-    cur.execute("SELECT autofill_mode FROM ats_capabilities WHERE ats_type = %s;", (ats_type,))
+    cur.execute("""SELECT autofill_mode, supports_static_text, supports_radio,
+                          supports_select, supports_upload
+                   FROM ats_capabilities WHERE ats_type = %s;""", (ats_type,))
     capability = cur.fetchone()
     if not capability or capability[0] == "review_only":
         raise PermanentTaskError(
             f"ATS '{ats_type}' is review-only or unregistered. Add a proven single-page capability before browser writes."
         )
+    return {"fill": bool(capability[1]), "check": bool(capability[2]),
+            "select": bool(capability[3]), "upload": bool(capability[4])}
 
 
 def snapshot_state(transport: OpenClawTransport, target_id: str) -> SnapshotState:
@@ -961,8 +852,10 @@ def handle_discover_linkedin_jobs(cur, task) -> Dict[str, Any]:
         raise PermanentTaskError("LinkedIn discovery requires explicit user_initiated=true.")
     try:
         request = validate_search_request(
-            str(inp.get("keywords") or ""), str(inp.get("location") or ""),
-            inp.get("max_results"),
+            str(inp.get("keywords") or ""), str(inp.get("location") or ""), inp.get("max_results"),
+            date_posted=inp.get("date_posted"), experience_levels=inp.get("experience_levels"),
+            employment_types=inp.get("employment_types"), work_modes=inp.get("work_modes"),
+            companies=inp.get("companies"), sort_by=inp.get("sort_by"),
         )
     except LinkedInDiscoveryError as exc:
         raise PermanentTaskError(str(exc)) from exc
@@ -977,7 +870,10 @@ def handle_discover_linkedin_jobs(cur, task) -> Dict[str, Any]:
         "Search the URL below. "
         "This is a bounded, read-only user-requested discovery task.\n"
         f"Search URL: {search_url}\n"
-        f"Read no more than {request['max_results']} result detail pages.\n\n"
+        f"Read no more than {request['max_results']} result detail pages. Apply only these requested filters when LinkedIn exposes them: "
+        f"date_posted={request['date_posted'] or 'any'}, experience_levels={request['experience_levels'] or ['any']}, "
+        f"employment_types={request['employment_types'] or ['any']}, work_modes={request['work_modes'] or ['any']}, "
+        f"companies={request['companies'] or ['any']}, sort={request['sort_by']}.\n\n"
         "First list/focus tabs for profile `remote`. If a LinkedIn jobs-search tab "
         "already has these keywords and location, snapshot it and do not navigate again. "
         "If navigation reports a timeout, immediately list tabs and snapshot the current "
@@ -1033,21 +929,22 @@ def handle_capture_page_snapshot(cur, task) -> Dict[str, Any]:
 
 
 def handle_fill_application_form(cur, task) -> Dict[str, Any]:
-    require_ats_autofill_capability(cur, task["application_id"])
+    action_capabilities = require_ats_autofill_capability(cur, task["application_id"])
     binding = require_bound_approval(cur, task)
     document = require_verified_document(cur, binding["document_id"], task["application_id"])
     document_hash = hashlib.sha256((document["content"] or "").encode("utf-8")).hexdigest()
     if document_hash != task["document_sha256"]:
         raise PermanentTaskError("Bound generated document content changed after approval; reissue approval.")
 
-    profile, sensitive_answers = load_autofill_profile(cur, task["application_id"], binding)
-    remembered_answers = load_question_memory(cur, task["application_id"])
-    current_input_hash = autofill_input_hash(
-        profile=profile, sensitive_answers=sensitive_answers, document_sha256=document_hash,
-        artifact_sha256=binding.get("artifact_sha256"), page_url=binding["expected_initial_url"],
-        page_fingerprint_sha256=binding["expected_page_fingerprint"],
-    )
-    require_current_input_hash(binding, current_input_hash)
+    try:
+        context = load_autofill_context(
+            cur, application_id=task["application_id"], artifact_binding=binding,
+            document_sha256=document_hash, page_url=binding["expected_initial_url"],
+            page_fingerprint_sha256=binding["expected_page_fingerprint"], data_root=REPO_ROOT / "data",
+        )
+    except AutofillContextError as exc:
+        raise PermanentTaskError(str(exc)) from exc
+    require_current_input_hash(binding, context.input_hash)
     transport = OpenClawTransport(binary=OPENCLAW_BIN, profile=os.getenv("JOBOS_BROWSER_PROFILE", "remote"),
                                   timeout=min(int(task["timeout_seconds"]), 90), environment=openclaw_runtime_env())
     execution_started = False
@@ -1057,10 +954,16 @@ def handle_fill_application_form(cur, task) -> Dict[str, Any]:
     def make_plan(state: SnapshotState):
         nonlocal latest_actions
         latest_actions, _ = plan_autofill(
-            list(state.fields), profile, question_groups=list(state.groups),
-            approved_sensitive_answers=sensitive_answers,
-            remembered_answers=remembered_answers,
+            list(state.fields), context.profile, question_groups=list(state.groups),
+            approved_sensitive_answers=context.sensitive_answers,
+            remembered_answers=context.remembered_answers,
         )
+        latest_actions = [
+            action if action.action not in action_capabilities or action_capabilities[action.action]
+            else type(action)("pause", action.ref, None, action.profile_key,
+                              f"ATS capability does not permit {action.action}.", action.question_label)
+            for action in latest_actions
+        ]
         return latest_actions
 
     def begin_execution(target_id: str) -> None:

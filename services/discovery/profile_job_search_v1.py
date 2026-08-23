@@ -66,6 +66,7 @@ def cmd_rank(cur, args) -> int:
         """
         SELECT a.id::text, a.source, a.company, a.job_title, a.job_url, a.jd_text,
                a.current_step, a.status, a.location, a.work_mode, a.stale_at,
+               a.first_seen_at, a.salary_range,
                COALESCE(ia.status, 'UNKNOWN'),
                COALESCE(ia.restriction_type, 'UNKNOWN'),
                COALESCE(ia.jd_policy_result, 'unknown'),
@@ -76,23 +77,26 @@ def cmd_rank(cur, args) -> int:
         FROM applications a
         LEFT JOIN application_immigration_assessments ia ON ia.application_id = a.id
         WHERE (%s OR status = 'active' OR (%s AND status = 'stale'))
+          AND (coalesce(%s, 0) <= 0 OR a.first_seen_at >= now() - make_interval(days => %s))
         ORDER BY a.created_at DESC;
         """,
-        (args.include_inactive, args.include_stale),
+        (args.include_inactive, args.include_stale,
+         preferences.get("freshness_days"), preferences.get("freshness_days")),
     )
     results = []
     for row in cur.fetchall():
         match = rank_job(title=row[3] or "", jd_text=row[5] or "",
                          profile_terms=terms, user_keywords=args.keyword)
         excluded_by = preference_reason(company=row[2] or "", title=row[3] or "",
-                                        location=row[8] or "", work_mode=row[9] or "",
+                                        location=row[8] or "", work_mode=row[9] or "", jd_text=row[5] or "",
+                                        salary_range=row[12] or "",
                                         preferences=preferences)
         if excluded_by or match["discovery_score"] < args.min_score or (row[10] and not args.include_stale):
             continue
         immigration = {
-            "status": row[11], "restriction_type": row[12], "jd_policy": row[13],
-            "jd_policy_evidence": row[14] or [], "everify": row[15],
-            "h1b_history": row[16], "reason": row[17] or "",
+            "status": row[13], "restriction_type": row[14], "jd_policy": row[15],
+            "jd_policy_evidence": row[16] or [], "everify": row[17],
+            "h1b_history": row[18], "reason": row[19] or "",
         }
         if args.exclude_immigration_blocked and immigration["status"] == "BLOCKED":
             continue
@@ -100,6 +104,7 @@ def cmd_rank(cur, args) -> int:
             "application_id": row[0], "source": row[1], "company": row[2],
             "job_title": row[3], "job_url": row[4], "current_step": row[6],
             "status": row[7], "location": row[8], "work_mode": row[9], "stale_at": row[10],
+            "first_seen_at": row[11], "salary_range": row[12],
             "immigration_fit": immigration, **match,
         })
     immigration_order = {"HIGH": 0, "POSSIBLE": 1, "UNKNOWN": 2, "LOW": 3, "BLOCKED": 4}
@@ -107,7 +112,18 @@ def cmd_rank(cur, args) -> int:
         immigration_order.get(item["immigration_fit"]["status"], 5),
         -item["discovery_score"], item["company"] or "", item["job_title"] or "",
     ))
-    print(json.dumps({"profile_term_count": len(terms), "matches": results[:args.limit]}, indent=2))
+    # Cap visible active postings per employer after all safety/fit filters.
+    cap = int(preferences.get("max_active_applications_per_employer") or 1)
+    per_employer: dict[str, int] = {}
+    capped_results = []
+    for item in results:
+        employer = (item["company"] or "").casefold().strip()
+        if item["status"] == "active" and per_employer.get(employer, 0) >= cap:
+            continue
+        if item["status"] == "active":
+            per_employer[employer] = per_employer.get(employer, 0) + 1
+        capped_results.append(item)
+    print(json.dumps({"profile_term_count": len(terms), "matches": capped_results[:args.limit]}, default=str, indent=2))
     return 0
 
 

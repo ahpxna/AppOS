@@ -74,6 +74,7 @@ DSN = database_dsn()
 DISCOVERY_VERSION = "ats_discovery_v1_2026_07_31"
 USER_AGENT = "jobos-ats-discovery/1 (personal job search tool, contact via GitHub repo)"
 REQUEST_TIMEOUT = 30
+STALE_CLOSE_DAYS = max(1, int(os.getenv("JOBOS_STALE_CLOSE_DAYS", "14")))
 
 PLATFORMS = (
     "greenhouse", "lever", "ashby", "smartrecruiters", "recruitee",
@@ -411,10 +412,6 @@ def intake_job(cur, *, jd_text: str, company: str, job_title: str, job_url: str,
              ("remote" if work_mode else None), changed, existing[0]),
         )
         return None
-    cur.execute("SELECT id::text FROM applications WHERE jd_hash = %s;", (jd_hash,))
-    if cur.fetchone():
-        return None
-
     cur.execute(
         """
         INSERT INTO applications
@@ -585,6 +582,17 @@ def poll_company(conn, cid, name, platform, slug, *, apply: bool, with_details: 
                        AND status = 'active'
                        AND last_seen_at < (SELECT started_at FROM ats_discovery_runs WHERE id = %s);""",
                     (cid, platform, run_id),
+                )
+                # A posting that remains absent after the configurable grace
+                # window is closed for discovery/ranking, while retained for
+                # audit and demand-analysis history.
+                cur.execute(
+                    """UPDATE applications
+                           SET closed_at = now(), status = 'closed', updated_at = now()
+                         WHERE ats_company_id = %s AND source = %s
+                           AND intake_channel = 'ats_discovery' AND current_step = 'intake'
+                           AND status = 'stale' AND stale_at < now() - make_interval(days => %s);""",
+                    (cid, platform, STALE_CLOSE_DAYS),
                 )
     conn.commit()
     return ok, seen, new, dup, err

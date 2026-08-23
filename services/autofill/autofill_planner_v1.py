@@ -46,6 +46,13 @@ def _option_for_value(group: QuestionGroup, value: Any):
     return next((item for item in group.options if item.label.casefold() == wanted), None)
 
 
+def _remembered_value(value: Any) -> str | None:
+    if isinstance(value, Mapping):
+        value = value.get("value")
+    text = str(value or "").strip()
+    return text or None
+
+
 def _already_matches(field: FormField, value: Any) -> bool:
     """Skip a redundant write when an ATS already holds the approved value."""
     actual, expected = str(field.value or "").strip(), str(value or "").strip()
@@ -78,7 +85,7 @@ def plan_autofill(
         match = match_field(pseudo)
         matches.append(match)
         value = _answer_for_question(group.label, answers) if match.field_class is FieldClass.SENSITIVE else (
-            _lookup(profile, match.profile_key) if match.profile_key else remembered.get(normalize_question(group.label))
+            _lookup(profile, match.profile_key) if match.profile_key else _remembered_value(remembered.get(normalize_question(group.label)))
         )
         option = _option_for_value(group, value) if value not in (None, "") else None
         if option is None:
@@ -97,9 +104,10 @@ def plan_autofill(
         if match.field_class is FieldClass.SENSITIVE:
             actions.append(PlannedAction("pause", field.ref, None, None, match.reason, field.label))
             continue
-        remembered_value = remembered.get(normalize_question(field.label))
+        remembered_value = _remembered_value(remembered.get(normalize_question(field.label)))
         if match.field_class is FieldClass.UNKNOWN and remembered_value not in (None, ""):
-            actions.append(PlannedAction("fill", field.ref, str(remembered_value), None,
+            action = "select" if field.role in {"combobox", "listbox", "select"} else "pause" if field.role in {"checkbox", "radio"} else "fill"
+            actions.append(PlannedAction(action, field.ref, str(remembered_value) if action != "pause" else None, None,
                                          "Exact human-confirmed question-memory match.", field.label))
             continue
         if match.field_class is FieldClass.UNKNOWN or match.profile_key is None:

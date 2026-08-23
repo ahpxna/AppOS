@@ -29,11 +29,19 @@ def page_fingerprint(snapshot_payload: Mapping[str, Any], *, page_url: str = "")
     radios, selects, and their values.
     """
     anchors = []
+    saw_heading = False
+    saw_container = False
     for line in str(snapshot_payload.get("snapshot") or "").splitlines():
         stable = line.split("[ref=", 1)[0].strip()
         role = stable.removeprefix("-").strip().split(" ", 1)[0].casefold()
-        if role in {"heading", "main", "form", "article", "dialog", "banner"}:
+        # Conditional H2/H3 sections are ordinary ATS behavior. Identity uses
+        # only the first page title and one top-level form/container anchor.
+        if role == "heading" and not saw_heading:
             anchors.append(" ".join(stable.split()))
+            saw_heading = True
+        elif role in {"main", "form", "article", "dialog", "banner"} and not saw_container:
+            anchors.append(" ".join(stable.split()))
+            saw_container = True
     # Some ATS snapshots omit semantic container roles. The exact URL still
     # provides a secure identity; an empty structure must not force a false
     # reconciliation after an otherwise valid conditional form update.

@@ -49,8 +49,6 @@ import subprocess
 import sys
 from typing import Any, Dict, List, Optional, Tuple
 
-import psycopg
-
 from services.common.immigration_semantics import legal_question_pause_reason
 from services.autofill.field_matcher_v1 import FieldClass, match_field as deterministic_match
 from services.autofill.form_inspector_v1 import FormField
@@ -702,6 +700,9 @@ def main() -> int:
     print(f"===== AUTOFILL AGENT ({AGENT_VERSION}) =====")
     print(f"Browser profile: {BROWSER_PROFILE}")
 
+    # Keep --help usable on a fresh clone before dependencies are installed.
+    # Database-backed commands still fail normally if psycopg is absent.
+    import psycopg
     with psycopg.connect(DSN, autocommit=False) as conn:
         try:
             return {

@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from dataclasses import dataclass
 from typing import Any, Iterable
 from urllib.parse import urlparse
 
@@ -17,13 +18,35 @@ from services.discovery.immigration_intelligence import record_jd_immigration_as
 
 MAX_DISCOVERY_RESULTS = 5
 MIN_JD_CHARS = 200
+LINKEDIN_JOB_ID_RE = re.compile(r"/jobs/view/(?P<id>\d+)/?$")
 
 
 class LinkedInDiscoveryError(ValueError):
     pass
 
 
-def validate_search_request(keywords: str, location: str, max_results: int) -> dict[str, Any]:
+@dataclass(frozen=True)
+class LinkedInSearchSpec:
+    keywords: str
+    location: str
+    max_results: int
+    date_posted: str | None = None
+    experience_levels: tuple[str, ...] = ()
+    employment_types: tuple[str, ...] = ()
+    work_modes: tuple[str, ...] = ()
+    companies: tuple[str, ...] = ()
+    sort_by: str = "recent"
+
+
+def _terms(value: Any, *, limit: int = 8) -> tuple[str, ...]:
+    values = value if isinstance(value, (list, tuple)) else str(value or "").split(",")
+    cleaned = tuple(re.sub(r"\s+", " ", str(item).strip()) for item in values if str(item).strip())
+    if len(cleaned) > limit or any(len(item) > 100 for item in cleaned):
+        raise LinkedInDiscoveryError("search filter is too large.")
+    return cleaned
+
+
+def validate_search_request(keywords: str, location: str, max_results: int, **raw: Any) -> dict[str, Any]:
     keywords = re.sub(r"\s+", " ", (keywords or "").strip())
     location = re.sub(r"\s+", " ", (location or "").strip())
     if not keywords:
@@ -32,7 +55,21 @@ def validate_search_request(keywords: str, location: str, max_results: int) -> d
         raise LinkedInDiscoveryError("keywords/location are too long.")
     if not isinstance(max_results, int) or not 1 <= max_results <= MAX_DISCOVERY_RESULTS:
         raise LinkedInDiscoveryError(f"max_results must be 1..{MAX_DISCOVERY_RESULTS}.")
-    return {"keywords": keywords, "location": location, "max_results": max_results}
+    date_posted = str(raw.get("date_posted") or "").casefold() or None
+    if date_posted not in {None, "24h", "week", "month"}:
+        raise LinkedInDiscoveryError("date_posted must be one of 24h, week, month.")
+    sort_by = str(raw.get("sort_by") or "recent").casefold()
+    if sort_by not in {"recent", "relevant"}:
+        raise LinkedInDiscoveryError("sort_by must be recent or relevant.")
+    spec = LinkedInSearchSpec(
+        keywords, location, max_results, date_posted,
+        _terms(raw.get("experience_levels")), _terms(raw.get("employment_types")),
+        _terms(raw.get("work_modes")), _terms(raw.get("companies")), sort_by,
+    )
+    return {"keywords": spec.keywords, "location": spec.location, "max_results": spec.max_results,
+            "date_posted": spec.date_posted, "experience_levels": list(spec.experience_levels),
+            "employment_types": list(spec.employment_types), "work_modes": list(spec.work_modes),
+            "companies": list(spec.companies), "sort_by": spec.sort_by}
 
 
 def validate_job_url(url: str) -> str:
@@ -43,6 +80,14 @@ def validate_job_url(url: str) -> str:
     # Tracking parameters are neither evidence nor a stable identity.  Intake
     # keeps one canonical job URL for deduplication and later human review.
     return f"https://{parsed.hostname.lower()}{parsed.path.rstrip('/')}/"
+
+
+def linkedin_job_id(url: str) -> str:
+    """Return the LinkedIn posting identifier from one canonical job URL."""
+    match = LINKEDIN_JOB_ID_RE.search(urlparse(validate_job_url(url)).path)
+    if not match:
+        raise LinkedInDiscoveryError("LinkedIn job URL has no stable posting id.")
+    return match.group("id")
 
 
 def json_candidates(value: Any) -> Iterable[Any]:
@@ -103,27 +148,43 @@ def normalize_jobs(agent_response: Any, max_results: int) -> list[dict[str, str]
 
 def ingest_discovered_jobs(cur, browser_task_id: str, search_input: dict[str, Any],
                            agent_response: Any) -> dict[str, Any]:
-    request = validate_search_request(str(search_input.get("keywords") or ""),
-                                      str(search_input.get("location") or ""),
-                                      search_input.get("max_results"))
+    request = validate_search_request(
+        str(search_input.get("keywords") or ""), str(search_input.get("location") or ""),
+        search_input.get("max_results"), date_posted=search_input.get("date_posted"),
+        experience_levels=search_input.get("experience_levels"), employment_types=search_input.get("employment_types"),
+        work_modes=search_input.get("work_modes"), companies=search_input.get("companies"),
+        sort_by=search_input.get("sort_by"),
+    )
     rows = normalize_jobs(agent_response, request["max_results"])
     created: list[str] = []
     duplicates = 0
     for row in rows:
         jd_hash = hashlib.sha256(row["jd_text"].encode("utf-8")).hexdigest()
-        cur.execute("SELECT id::text FROM applications WHERE jd_hash = %s;", (jd_hash,))
-        if cur.fetchone():
+        source_job_id = linkedin_job_id(row["url"])
+        cur.execute("SELECT id::text FROM applications WHERE source = 'linkedin' AND source_job_id = %s;", (source_job_id,))
+        existing = cur.fetchone()
+        if existing:
+            cur.execute(
+                """UPDATE applications SET company = %s, job_title = %s, job_url = %s,
+                       jd_text = %s, jd_hash = %s, location = %s, work_mode = %s,
+                       last_seen_at = now(), stale_at = NULL, closed_at = NULL,
+                       last_content_change_at = CASE WHEN jd_hash <> %s THEN now() ELSE last_content_change_at END,
+                       updated_at = now() WHERE id = %s;""",
+                (row["company"], row["title"], row["url"], row["jd_text"], jd_hash,
+                 row["location"], row["work_mode"], jd_hash, existing[0]),
+            )
             duplicates += 1
             continue
         cur.execute(
             """INSERT INTO applications
                  (source, company, job_title, job_url, jd_text, jd_hash, current_step,
-                  status, intake_channel, ats_type, location, work_mode, created_at, updated_at)
+                  status, intake_channel, ats_type, location, work_mode, source_job_id,
+                  first_seen_at, last_seen_at, created_at, updated_at)
                VALUES ('linkedin', %s, %s, %s, %s, %s, 'intake', 'active',
                        'linkedin_browser_discovery', 'linkedin_browser_linked_session',
-                       %s, %s, now(), now()) RETURNING id::text;""",
+                       %s, %s, %s, now(), now(), now(), now()) RETURNING id::text;""",
             (row["company"], row["title"], row["url"], row["jd_text"], jd_hash,
-             row["location"], row["work_mode"]),
+             row["location"], row["work_mode"], source_job_id),
         )
         application_id = cur.fetchone()[0]
         immigration = record_jd_immigration_assessment(cur, application_id, row["jd_text"])

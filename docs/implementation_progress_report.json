@@ -20,6 +20,27 @@
   "code_change_notes": [
     {
       "files": [
+        "services/autofill/autofill_context_v1.py",
+        "scripts/jobos.py",
+        "services/approval/approval_service_v1.py",
+        "services/browser-controller/browser_queue_worker.py",
+        "services/common/autofill_identity.py"
+      ],
+      "summary": "Unified preview, approval, and execution around one approved autofill context. The shared context includes the exact artifact path/hash, static profile values, confirmed immigration answers, and scoped remembered answers before computing the capability input hash. Page identity now uses the canonical job URL plus only stable top-level anchors, so conditional ATS sections do not invalidate a correct job binding. Doctor now treats an unavailable PostgreSQL instance as CORE NOT READY and reports the current migration gate."
+    },
+    {
+      "files": [
+        "services/discovery/linkedin_discovery_v1.py",
+        "services/discovery/linkedin_intake_v1.py",
+        "services/discovery/ats_discovery_v1.py",
+        "services/common/search_preferences.py",
+        "services/discovery/profile_job_search_v1.py",
+        "db/migrations/057_autofill_registry_and_source_identity.sql"
+      ],
+      "summary": "Discovery now identifies LinkedIn postings by their canonical numeric source job ID and no longer rejects unrelated employers solely because their JD text matches. Search ranking applies employment-type, freshness, published-salary, and per-employer limits in addition to prior blacklist/location/work-mode controls. LinkedIn discovery accepts a typed, bounded filter spec. Migration 057 completes the approved identity fields represented by the form registry."
+    },
+    {
+      "files": [
         "services/common/llm_gateway.py",
         "services/profile-ingestion/*.py",
         "services/document-generation/*.py",
@@ -342,7 +363,7 @@
     "Repair Docker Desktop Keychain access or load kasmweb/chrome:1.16.0 through an approved registry path, then start the OpenClaw + browser overlay with an environment-only OPENCLAW_GATEWAY_TOKEN.",
     "Configure OpenClaw model names and re-run scripts/openclaw_bootstrap.py bootstrap --force after reviewing backups."
     ,"Apply migration 050, then use immigration_profile_v1.py set --confirm --apply only with candidate-verified values. Review JD flags and attach employer evidence with source URLs; do not treat E-Verify as a sponsorship guarantee."
-    ,"Before enabling deterministic form writes, apply migrations 054 and 055 and run the disposable database test with JOBOS_TEST_DSN plus JOBOS_RUN_DB_INTEGRATION=1; then use a non-production ATS form for the first browser smoke test."
+    ,"Before enabling deterministic form writes, apply migrations through 057 and review the exact JobOS doctor output; then use a non-production ATS form for the first browser smoke test."
     ,"On a clean clone, run setup_openclaw_jobos.py with --install-runtime before start_openclaw_jobos.py; use docs/profile_onboarding.md to stage private candidate inputs."
   ],
   "privacy_note": "This is a decision/progress report. It intentionally excludes private chain-of-thought and secrets."

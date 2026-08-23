@@ -2,6 +2,13 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class RememberedAnswer:
+    value: str
+    answer_kind: str = "text"
 
 
 def normalize_question(value: str) -> str:
