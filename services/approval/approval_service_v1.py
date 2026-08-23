@@ -658,6 +658,13 @@ def main() -> int:
     pc.add_argument("--expected-origin", help="Required for type=autofill_form, e.g. https://jobs.example.com")
     pc.add_argument("--expected-page-url", help="Exact initial application URL for type=autofill_form.")
     pc.add_argument(
+        "--expected-page-fingerprint",
+        help=(
+            "Read-only snapshot SHA-256 page identity "
+            "for type=autofill_form."
+        ),
+    )
+    pc.add_argument(
         "--expected-autofill-input-hash",
         help=(
             "Exact input SHA-256 emitted by jobos autofill prepare; "
