@@ -16,6 +16,7 @@ sys.path.insert(0, str(ROOT))
 
 from services.common.config import database_dsn, load_repo_env
 from services.common.autofill_identity import canonical_page_url, page_fingerprint
+from services.common.openclaw_runtime import resolve_openclaw_binary
 
 
 def mark(results: list[tuple[str, bool, str]], name: str, ok: bool, detail: str = "") -> None:
@@ -47,8 +48,8 @@ def doctor(*, check_browser: bool) -> int:
         import psycopg
         with psycopg.connect(database_dsn(), connect_timeout=5) as conn, conn.cursor() as cur:
             mark(results, "PostgreSQL", True)
-            cur.execute("SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE migration_id = '057_autofill_registry_and_source_identity.sql')")
-            mark(results, "Migrations through 057", bool(cur.fetchone()[0]))
+            cur.execute("SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE migration_id = '058_autofill_exact_action_scope.sql')")
+            mark(results, "Migrations through 058", bool(cur.fetchone()[0]))
             cur.execute("SELECT to_regclass('public.autofill_action_journal') IS NOT NULL")
             mark(results, "Autofill action journal", bool(cur.fetchone()[0]))
             cur.execute("SELECT count(*) FROM browser_tasks WHERE execution_state = 'needs_reconciliation'")
@@ -58,7 +59,7 @@ def doctor(*, check_browser: bool) -> int:
             mark(results, "Immigration profile confirmed", int(cur.fetchone()[0]) == 1)
     except Exception as exc:
         mark(results, "PostgreSQL", False, str(exc)[:180])
-        mark(results, "Migrations through 057", False, "PostgreSQL unavailable")
+        mark(results, "Migrations through 058", False, "PostgreSQL unavailable")
 
     if check_browser:
         # Health only: it validates gateway/CDP availability but does not list
@@ -73,7 +74,7 @@ def doctor(*, check_browser: bool) -> int:
     for name, ok, detail in results:
         print(f"{'✓' if ok else '⚠'} {name}" + (f" — {detail}" if detail else ""))
     checks = {name: ok for name, ok, _ in results}
-    core = all(checks.get(name, False) for name in ("Python 3.11+", "Environment", "PostgreSQL", "Migrations through 057"))
+    core = all(checks.get(name, False) for name in ("Python 3.11+", "Environment", "PostgreSQL", "Migrations through 058"))
     autofill = core and all(ok for name, ok, _ in results if name in {
         "Autofill action journal", "No unresolved autofill task", "Immigration profile confirmed",
         "OpenClaw runtime", "Managed upload root",
@@ -106,7 +107,8 @@ def autofill_prepare(application_id: str, *, create: bool, yes: bool) -> int:
     from services.autofill.autofill_executor_v1 import OpenClawTransport
     from services.autofill.autofill_planner_v1 import plan_autofill
     from services.autofill.form_inspector_v1 import inspect_nodes, inspect_question_groups
-    from services.common.openclaw_runtime import resolve_openclaw_binary
+    from services.common.immigration_semantics import classify_immigration_question
+    from services.common.question_memory import normalize_question
     with psycopg.connect(database_dsn(), autocommit=False) as conn, conn.cursor() as cur:
         cur.execute("SELECT company, job_title, coalesce(ats_type, 'unknown') FROM applications WHERE id = %s;", (application_id,))
         application = cur.fetchone()
@@ -173,11 +175,23 @@ def autofill_prepare(application_id: str, *, create: bool, yes: bool) -> int:
         ]
         writes = [item for item in actions if item.action in {"fill", "select", "check", "upload"}]
         pauses = [item.question_label or item.reason for item in actions if item.action == "pause"]
+        action_scope = {
+            "profile_keys": sorted({item.profile_key for item in writes if item.profile_key and not item.profile_key.startswith("documents.")}),
+            "document_types": sorted({item.profile_key.removeprefix("documents.") for item in writes if item.profile_key and item.profile_key.startswith("documents.")}),
+            "sensitive_classes": sorted({kind.value for item in writes if item.question_label
+                                         for kind in [classify_immigration_question(item.question_label)] if kind is not None}),
+            "remembered_questions": sorted({normalize_question(item.question_label) for item in writes
+                                            if item.profile_key is None and item.question_label and classify_immigration_question(item.question_label) is None}),
+        }
         summary = {
             "company": application[0], "role": application[1], "application_id": application_id,
             "pinned_target_id": target.target_id, "page_url": canonical_url,
-            "page_fingerprint": fingerprint, "resume_artifact": document[3],
-            "will_write": len(writes), "will_pause": pauses,
+            "page_fingerprint": fingerprint, "resume_artifact": document[3], "resume_artifact_sha256": document[4],
+            "will_write": len(writes),
+            "write_actions": [{"action": item.action, "field": item.question_label, "profile_key": item.profile_key,
+                               "value": item.value, "source": "confirmed_immigration" if item.question_label and classify_immigration_question(item.question_label) else "approved_profile"}
+                              for item in writes],
+            "action_scope": action_scope, "will_pause": pauses,
             "submit": "human_only",
         }
         print(json.dumps(summary, indent=2))
@@ -191,6 +205,7 @@ def autofill_prepare(application_id: str, *, create: bool, yes: bool) -> int:
             "--type", "autofill_form", "--application-id", application_id,
             "--document-id", document[0], "--expected-origin", _origin(canonical_url),
             "--expected-page-url", canonical_url, "--expected-page-fingerprint", fingerprint,
+            "--autofill-action-scope-json", json.dumps(action_scope, separators=(",", ":")),
             "--apply",
         ]
         if document[2]:

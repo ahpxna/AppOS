@@ -20,6 +20,17 @@
   "code_change_notes": [
     {
       "files": [
+        "services/autofill/autofill_session_v1.py",
+        "services/discovery/ats_discovery_v1.py",
+        "db/migrations/058_autofill_exact_action_scope.sql",
+        "services/approval/approval_service_v1.py",
+        "services/browser-controller/browser_queue_worker.py",
+        "scripts/jobos.py"
+      ],
+      "summary": "Final Ubuntu hardening fixes the static-field verification branch so a post-write textbox verification no longer attempts radio-group lookup, repairs the ATS discovery source_job_id INSERT placeholder, and makes doctor import the OpenClaw runtime resolver safely. Migration 058 binds approvals to the exact reviewed profile keys, immigration semantic classes, remembered questions, and document types. Newly revealed dynamic form fields outside that scope pause. All generic ATS browser-write capabilities are review-only by default until deliberately promoted after a local pilot."
+    },
+    {
+      "files": [
         "services/autofill/autofill_context_v1.py",
         "scripts/jobos.py",
         "services/approval/approval_service_v1.py",
@@ -363,7 +374,7 @@
     "Repair Docker Desktop Keychain access or load kasmweb/chrome:1.16.0 through an approved registry path, then start the OpenClaw + browser overlay with an environment-only OPENCLAW_GATEWAY_TOKEN.",
     "Configure OpenClaw model names and re-run scripts/openclaw_bootstrap.py bootstrap --force after reviewing backups."
     ,"Apply migration 050, then use immigration_profile_v1.py set --confirm --apply only with candidate-verified values. Review JD flags and attach employer evidence with source URLs; do not treat E-Verify as a sponsorship guarantee."
-    ,"Before enabling deterministic form writes, apply migrations through 057 and review the exact JobOS doctor output; then use a non-production ATS form for the first browser smoke test."
+    ,"Before enabling deterministic form writes, apply migrations through 058 and review the exact JobOS doctor output; browser writes remain review-only until an ATS capability is explicitly promoted after a local pilot."
     ,"On a clean clone, run setup_openclaw_jobos.py with --install-runtime before start_openclaw_jobos.py; use docs/profile_onboarding.md to stage private candidate inputs."
   ],
   "privacy_note": "This is a decision/progress report. It intentionally excludes private chain-of-thought and secrets."

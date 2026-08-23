@@ -71,6 +71,8 @@ from services.autofill.form_inspector_v1 import inspect_nodes, inspect_question_
 from services.common.autofill_identity import canonical_page_url, page_fingerprint
 from services.autofill.autofill_context_v1 import AutofillContextError, load_autofill_context
 from services.common.openclaw_runtime import resolve_openclaw_binary
+from services.common.immigration_semantics import classify_immigration_question
+from services.common.question_memory import normalize_question
 
 load_repo_env()
 
@@ -367,7 +369,8 @@ def claim_next_task(cur) -> Optional[Dict[str, Any]]:
                   approval_request_id::text, expected_origin,
                   generated_document_id::text, document_sha256,
                   bound_artifact_id::text, artifact_sha256, artifact_filename,
-                  expected_initial_url, expected_page_fingerprint, autofill_input_hash;
+                  expected_initial_url, expected_page_fingerprint, autofill_input_hash,
+                  autofill_action_scope;
         """,
         (WORKER_ID, LEASE_SECONDS),
     )
@@ -383,6 +386,7 @@ def claim_next_task(cur) -> Optional[Dict[str, Any]]:
         "generated_document_id": row[9], "document_sha256": row[10],
         "bound_artifact_id": row[11], "artifact_sha256": row[12], "artifact_filename": row[13],
         "expected_initial_url": row[14], "expected_page_fingerprint": row[15], "autofill_input_hash": row[16],
+        "autofill_action_scope": row[17] or {},
     }
 
 
@@ -498,7 +502,7 @@ def require_bound_approval(cur, task: Dict[str, Any]) -> Dict[str, Any]:
         SELECT id::text, target_action, bound_document_id::text,
                bound_document_sha256, expected_origin, bound_artifact_id::text,
                bound_artifact_sha256, bound_artifact_filename, expected_initial_url,
-               expected_page_fingerprint, bound_autofill_input_hash
+               expected_page_fingerprint, bound_autofill_input_hash, bound_autofill_action_scope
         FROM approval_requests
         WHERE id = %s
           AND application_id = %s
@@ -513,7 +517,7 @@ def require_bound_approval(cur, task: Dict[str, Any]) -> Dict[str, Any]:
         raise PermanentTaskError(
             "No valid unused approval exists for this exact application capability."
         )
-    approved_id, target_action, bound_doc, bound_hash, bound_origin, artifact_id, artifact_hash, artifact_filename, page_url, page_fingerprint_sha, input_hash = row
+    approved_id, target_action, bound_doc, bound_hash, bound_origin, artifact_id, artifact_hash, artifact_filename, page_url, page_fingerprint_sha, input_hash, action_scope = row
     if target_action != "fill_application_form":
         raise PermanentTaskError(f"Approval {approved_id} is not for fill_application_form.")
     if bound_doc != document_id or bound_hash != document_sha256:
@@ -532,12 +536,13 @@ def require_bound_approval(cur, task: Dict[str, Any]) -> Dict[str, Any]:
     if not all((page_url, page_fingerprint_sha, input_hash)) or not page_matches or (
         page_fingerprint_sha != task.get("expected_page_fingerprint")
         or input_hash != task.get("autofill_input_hash")
+        or (action_scope or {}) != (task.get("autofill_action_scope") or {})
     ):
         raise PermanentTaskError("Approval page/input binding does not match this task.")
     return {"id": approved_id, "document_id": document_id, "expected_origin": origin,
             "artifact_id": artifact_id, "artifact_sha256": artifact_hash, "artifact_filename": artifact_filename,
             "expected_initial_url": page_url, "expected_page_fingerprint": page_fingerprint_sha,
-            "autofill_input_hash": input_hash}
+            "autofill_input_hash": input_hash, "autofill_action_scope": action_scope or {}}
 
 
 def require_current_input_hash(binding: Dict[str, Any], current_hash: str) -> None:
@@ -546,6 +551,22 @@ def require_current_input_hash(binding: Dict[str, Any], current_hash: str) -> No
         raise PermanentTaskError(
             "Candidate profile or confirmed legal answer changed after approval; issue a new approval."
         )
+
+
+def action_is_in_approved_scope(action, scope: Dict[str, Any]) -> bool:
+    """Do not let a dynamic ATS reveal an unreviewed extra write."""
+    if action.action not in {"fill", "select", "check", "upload"}:
+        return True
+    key = action.profile_key or ""
+    if key.startswith("documents."):
+        return key.removeprefix("documents.") in set(scope.get("document_types") or [])
+    if key:
+        return key in set(scope.get("profile_keys") or [])
+    question = action.question_label or ""
+    semantic = classify_immigration_question(question)
+    if semantic is not None:
+        return semantic.value in set(scope.get("sensitive_classes") or [])
+    return normalize_question(question) in set(scope.get("remembered_questions") or [])
 
 
 def _durable_connection():
@@ -959,9 +980,10 @@ def handle_fill_application_form(cur, task) -> Dict[str, Any]:
             remembered_answers=context.remembered_answers,
         )
         latest_actions = [
-            action if action.action not in action_capabilities or action_capabilities[action.action]
+            action if action_is_in_approved_scope(action, binding["autofill_action_scope"]) and
+                      (action.action not in action_capabilities or action_capabilities[action.action])
             else type(action)("pause", action.ref, None, action.profile_key,
-                              f"ATS capability does not permit {action.action}.", action.question_label)
+                              "Action is outside the approved scope or unsupported by this ATS.", action.question_label)
             for action in latest_actions
         ]
         return latest_actions

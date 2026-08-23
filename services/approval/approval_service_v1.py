@@ -302,13 +302,16 @@ def cmd_create(conn, args) -> int:
                     raise RuntimeError("--expected-page-fingerprint must be a SHA-256 hex value from the read-only page identity command.")
                 artifact = (fetch_artifact_binding(cur, args.application_id, args.document_id, args.artifact_id)
                             if args.artifact_id else None)
+                action_scope = json.loads(args.autofill_action_scope_json or "{}")
+                if not isinstance(action_scope, dict) or not isinstance(action_scope.get("profile_keys"), list):
+                    raise RuntimeError("--autofill-action-scope-json must contain profile_keys from jobos autofill prepare.")
                 input_hash = current_autofill_input_hash(
                     cur, application_id=args.application_id,
                     artifact_binding={"artifact_id": artifact["id"], "artifact_sha256": artifact["sha256"], "artifact_filename": artifact["filename"]} if artifact else {},
                     document_sha256=binding["content_hash"],
                     page_url=expected_page_url, page_fingerprint=args.expected_page_fingerprint.casefold(),
                 )
-            except RuntimeError as exc:
+            except (RuntimeError, json.JSONDecodeError) as exc:
                 print(f"ERROR: {exc}")
                 return 1
             payload.update({
@@ -321,6 +324,7 @@ def cmd_create(conn, args) -> int:
                 "artifact_id": artifact["id"] if artifact else None,
                 "artifact_sha256": artifact["sha256"] if artifact else None,
                 "artifact_filename": artifact["filename"] if artifact else None,
+                "autofill_action_scope": action_scope,
             })
             idempotency_key = hash_json({
                 "type": args.type, "application_id": args.application_id,
@@ -329,6 +333,7 @@ def cmd_create(conn, args) -> int:
                 "expected_page_fingerprint": args.expected_page_fingerprint.casefold(), "autofill_input_hash": input_hash,
                 "artifact_id": artifact["id"] if artifact else None,
                 "artifact_sha256": artifact["sha256"] if artifact else None,
+                "autofill_action_scope": action_scope,
             })
         elif args.type == "fit_review" and args.application_id:
             payload["content_hash"] = hash_json({
@@ -371,10 +376,10 @@ def cmd_create(conn, args) -> int:
                max_attempts, idempotency_key, target_action, bound_document_id,
                bound_document_sha256, expected_origin, bound_artifact_id,
                bound_artifact_sha256, bound_artifact_filename, expected_initial_url,
-               expected_page_fingerprint, bound_autofill_input_hash, created_at)
+               expected_page_fingerprint, bound_autofill_input_hash, bound_autofill_action_scope, created_at)
             VALUES (%s, %s, %s, 'pending', %s, %s,
                     now() + make_interval(mins => %s), %s, %s, %s, %s,
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
             RETURNING id::text, token_expires_at;
             """,
             (
@@ -385,6 +390,7 @@ def cmd_create(conn, args) -> int:
                 payload.get("document_id"), payload.get("document_sha256"), payload.get("expected_origin"),
                 payload.get("artifact_id"), payload.get("artifact_sha256"), payload.get("artifact_filename"),
                 payload.get("expected_initial_url"), payload.get("expected_page_fingerprint"), payload.get("autofill_input_hash"),
+                Jsonb(payload.get("autofill_action_scope") or {}),
             ),
         )
         request_id, expires = cur.fetchone()
@@ -514,15 +520,17 @@ def redeem(conn, token: str, *, decision: str, note: str, actor: str) -> int:
                    generated_document_id, document_sha256, timeout_seconds,
                    bound_artifact_id, artifact_sha256, artifact_filename,
                    expected_initial_url, expected_page_fingerprint, autofill_input_hash,
+                   autofill_action_scope,
                    idempotency_key, created_at)
                 VALUES ('fill_application_form', %s, %s, 'queued', 'high',
-                        '{}'::jsonb, %s, %s, %s, %s, 300, %s, %s, %s, %s, %s, %s, %s, now())
+                        '{}'::jsonb, %s, %s, %s, %s, 300, %s, %s, %s, %s, %s, %s, %s, %s, now())
                 ON CONFLICT (approval_request_id) WHERE approval_request_id IS NOT NULL DO NOTHING;
                 """,
                 (actor, application_id, request_id, payload["expected_origin"],
                  payload["document_id"], payload["document_sha256"], payload.get("artifact_id"),
                  payload.get("artifact_sha256"), payload.get("artifact_filename"), payload["expected_initial_url"],
-                 payload["expected_page_fingerprint"], payload["autofill_input_hash"], f"autofill:{request_id}"),
+                 payload["expected_page_fingerprint"], payload["autofill_input_hash"],
+                 Jsonb(payload.get("autofill_action_scope") or {}), f"autofill:{request_id}"),
             )
             log_event(cur, request_id, "autofill_task_queued", actor, {
                 "expected_origin": payload["expected_origin"], "document_id": payload["document_id"],
@@ -625,6 +633,7 @@ def main() -> int:
     pc.add_argument("--expected-origin", help="Required for type=autofill_form, e.g. https://jobs.example.com")
     pc.add_argument("--expected-page-url", help="Exact initial application URL for type=autofill_form.")
     pc.add_argument("--expected-page-fingerprint", help="Read-only snapshot SHA-256 identity for type=autofill_form.")
+    pc.add_argument("--autofill-action-scope-json", help="Exact action-scope JSON emitted by jobos autofill prepare.")
     pc.add_argument("--apply", action="store_true")
 
     pa = sub.add_parser("approve")

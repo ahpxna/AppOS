@@ -420,7 +420,7 @@ def intake_job(cur, *, jd_text: str, company: str, job_title: str, job_url: str,
            ats_company_id, ats_external_id, source_job_id,
            first_seen_at, last_seen_at, created_at, updated_at)
         VALUES (%s, %s, %s, %s, %s, %s, 'intake', 'active', 'ats_discovery',
-                %s, %s, %s, %s, %s, now(), now(), now(), now())
+                %s, %s, %s, %s, %s, %s, now(), now(), now(), now())
         RETURNING id::text;
         """,
         (ats_type, company, job_title, job_url, jd_text, jd_hash,

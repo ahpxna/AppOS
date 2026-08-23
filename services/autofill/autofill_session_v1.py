@@ -101,7 +101,7 @@ class AutofillSession:
 
     @staticmethod
     def _verified(action: PlannedAction, state: SnapshotState) -> bool:
-        if action.action in {"check", "verify"}:
+        if action.action == "check":
             # The option ref may change on an ATS rerender: recover by the
             # question and desired option label, never by a stale old ref.
             return any(
