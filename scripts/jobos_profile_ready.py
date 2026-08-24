@@ -932,15 +932,6 @@ def main() -> int:
         }, indent=2), file=sys.stderr)
         return 1
 
-    # The main parse command must fail before dependency/DB setup when the
-    # operator has not supplied any profile document.
-    if args.command == "run" and not raw_documents():
-        print(json.dumps({
-            "error": f"No supported documents found under {RAW_ROOT}",
-            "resume_profile_ready": False,
-        }, indent=2), file=sys.stderr)
-        return 1
-
     # Status/project-source can operate without importing DB dependencies.
     if args.command not in {"status", "project-source"}:
         ensure_venv_and_reexec(no_install=args.no_install)

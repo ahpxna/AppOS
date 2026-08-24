@@ -133,6 +133,30 @@ def test_fixed_fields_conflicts_gpa_staleness_and_certification_lifecycle():
     assert conflict["fixed_fields_ready"] is False
 
 
+def test_fixed_fields_reject_gpa_above_scale_and_invalid_cert_dates():
+    from services.common import fixed_profile_policy as policy
+
+    today = date(2026, 8, 24)
+    fields = complete_fixed_fields(policy, today=today)
+    fields["education.gpa.show_on_resume"] = _verified(True, "Yes", today, show=False)
+    fields["education.gpa.value"] = _verified("5.0", "5.0", today)
+    fields["education.gpa.scale"] = _verified("4.0", "4.0", today)
+    fields["education.gpa.status"] = _verified("final", "final", today)
+    report = policy.readiness_from_records(fields, [], today=today)
+    assert report["fixed_fields_ready"] is False
+    assert "education.gpa.value" in report["invalid_fields"]
+
+    fields["education.gpa.value"] = _verified("3.8", "3.8", today)
+    future_cert = [{
+        "name": "Future Cert", "show_on_resume": True,
+        "certification_status": "earned", "verification_status": "user_verified",
+        "earned_at": date(2026, 9, 1), "expires_at": date(2027, 9, 1),
+    }]
+    cert_report = policy.readiness_from_records(fields, future_cert, today=today)
+    assert cert_report["fixed_fields_ready"] is False
+    assert cert_report["invalid_visible_certifications"] == ["Future Cert"]
+
+
 def test_fixed_field_document_extractor_only_accepts_explicit_labels():
     fixed = load_path("fixed_profile_fields_test", "services/profile-ingestion/fixed_profile_fields_v1.py")
     payload = fixed.candidate_suggestions_from_text(
@@ -242,6 +266,63 @@ def test_project_source_material_hash_is_snapshot_independent_but_material_sensi
     changed = dict(material)
     changed["tools"] = ["Python", "Fastapi"]
     assert first != fresh._material_hash(changed)
+
+
+def test_repository_claims_ignore_python_comments_and_docstrings(tmp_path: Path):
+    claims = load_repo_claims()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "app.py").write_text(
+        "\"\"\"Planned: fail closed, approval review, reconciliation and SHA-256.\"\"\"\n"
+        "# TODO: implement fail closed approval review reconciliation and SHA-256\n"
+        "print('hello')  # approval review should be added later\n",
+        encoding="utf-8",
+    )
+    extracted = claims.extract_claims(repo)
+    assert not [item for item in extracted if item["claim_key"].startswith("control:")]
+
+
+def test_repository_claims_still_detect_real_python_controls(tmp_path: Path):
+    claims = load_repo_claims()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "worker.py").write_text(
+        "import hashlib\n"
+        "digest = hashlib.sha256(b'x').hexdigest()\n"
+        "needs_reconciliation = True\n"
+        "approval = True\n"
+        "sql = 'SELECT id FROM tasks FOR UPDATE'\n",
+        encoding="utf-8",
+    )
+    keys = {item["claim_key"] for item in claims.extract_claims(repo)}
+    assert "control:sha256_integrity" in keys
+    assert "control:reconciliation" in keys
+    assert "control:approval_review" in keys
+    assert "control:row_locking" in keys
+
+
+def test_repository_test_surface_requires_test_filename_or_directory(tmp_path: Path):
+    claims = load_repo_claims()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "contest.py").write_text("print('not a test')\n", encoding="utf-8")
+    assert "surface:automated_tests" not in {item["claim_key"] for item in claims.extract_claims(repo)}
+    (repo / "tests").mkdir()
+    (repo / "tests" / "test_worker.py").write_text("def test_ok(): assert True\n", encoding="utf-8")
+    assert "surface:automated_tests" in {item["claim_key"] for item in claims.extract_claims(repo)}
+
+
+def test_last_known_good_is_rejected_after_newer_unanalyzed_snapshot_is_observed():
+    fresh = load_repo_freshness()
+    assert fresh._last_known_good_eligible(
+        has_last_analyzed=True, age_hours=1.0, snapshot_is_current=True, max_stale_hours=24
+    ) is True
+    assert fresh._last_known_good_eligible(
+        has_last_analyzed=True, age_hours=1.0, snapshot_is_current=False, max_stale_hours=24
+    ) is False
+    assert fresh._last_known_good_eligible(
+        has_last_analyzed=True, age_hours=25.0, snapshot_is_current=True, max_stale_hours=24
+    ) is False
 
 
 def test_offline_repository_claims_are_file_line_and_blob_pinned(tmp_path: Path):
@@ -390,7 +471,7 @@ def test_security_claim_requires_implementation_source(tmp_path: Path):
     claims = load_repo_claims()
     repo = tmp_path / "repo"
     repo.mkdir()
-    (repo / "worker.py").write_text("approval = True\n# fail-closed\n", encoding="utf-8")
+    (repo / "worker.py").write_text("approval = True\nraise PermanentTaskError('blocked')\n", encoding="utf-8")
     extracted = claims.extract_claims(repo)
     keys = {item["claim_key"] for item in extracted}
     assert "control:approval_review" in keys

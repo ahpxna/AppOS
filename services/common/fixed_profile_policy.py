@@ -102,6 +102,7 @@ def readiness_from_records(fields: dict[str, dict[str, Any]], certifications: It
     missing: list[str] = []
     conflicts: list[str] = []
     stale: list[str] = []
+    invalid: list[str] = []
     verified_statuses = {"user_verified", "document_verified", "excluded"}
 
     for definition in FIELD_DEFINITIONS:
@@ -144,6 +145,18 @@ def readiness_from_records(fields: dict[str, dict[str, Any]], certifications: It
                 verified_date = _verified_at_date(row.get("verified_at"))
                 if verified_date is None or (now_date - verified_date).days > 90:
                     stale.append(key)
+        value_row = fields.get("education.gpa.value") or {}
+        scale_row = fields.get("education.gpa.scale") or {}
+        try:
+            gpa_value = float(str(value_row.get("display_value") or value_row.get("value") or ""))
+            gpa_scale = float(str(scale_row.get("display_value") or scale_row.get("value") or ""))
+        except (TypeError, ValueError):
+            invalid.extend(["education.gpa.value", "education.gpa.scale"])
+        else:
+            if gpa_scale <= 0:
+                invalid.append("education.gpa.scale")
+            if gpa_value < 0 or (gpa_scale > 0 and gpa_value > gpa_scale):
+                invalid.append("education.gpa.value")
 
     invalid_certifications: list[str] = []
     for cert in certifications:
@@ -152,21 +165,38 @@ def readiness_from_records(fields: dict[str, dict[str, Any]], certifications: It
         status = cert.get("certification_status")
         verification = cert.get("verification_status")
         expiry = cert.get("expires_at")
+        earned = cert.get("earned_at")
         if isinstance(expiry, str) and expiry:
             try:
                 expiry = date.fromisoformat(expiry)
             except ValueError:
                 expiry = None
-        if status != "earned" or verification not in {"user_verified", "document_verified"} or (expiry and expiry < now_date):
+        if isinstance(earned, str) and earned:
+            try:
+                earned = date.fromisoformat(earned)
+            except ValueError:
+                earned = None
+        invalid_cert_date = bool(
+            (earned and earned > now_date)
+            or (earned and expiry and expiry < earned)
+        )
+        if (
+            status != "earned"
+            or verification not in {"user_verified", "document_verified"}
+            or (expiry and expiry < now_date)
+            or invalid_cert_date
+        ):
             invalid_certifications.append(str(cert.get("name") or "unknown certification"))
 
     missing = sorted(set(missing))
     stale = sorted(set(stale))
+    invalid = sorted(set(invalid))
     return {
-        "fixed_fields_ready": not missing and not conflicts and not stale and not invalid_certifications,
+        "fixed_fields_ready": not missing and not conflicts and not stale and not invalid and not invalid_certifications,
         "missing_fields": missing,
         "conflicting_fields": sorted(set(conflicts)),
         "stale_fields": stale,
+        "invalid_fields": invalid,
         "invalid_visible_certifications": invalid_certifications,
         "gpa_show_on_resume": gpa_show,
     }

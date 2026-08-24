@@ -240,6 +240,8 @@ def explain_blockers(report: dict[str, Any]) -> list[str]:
         blockers.append("conflicting fixed fields: " + ", ".join(fixed["conflicting_fields"]))
     if fixed.get("stale_fields"):
         blockers.append("fixed fields need reconfirmation: " + ", ".join(fixed["stale_fields"]))
+    if fixed.get("invalid_fields"):
+        blockers.append("invalid fixed field values: " + ", ".join(fixed["invalid_fields"]))
     if fixed.get("pending_document_conflicts"):
         blockers.append(f"{fixed['pending_document_conflicts']} official-document fixed-field suggestion(s) conflict with the verified value")
     if fixed.get("invalid_visible_certifications"):

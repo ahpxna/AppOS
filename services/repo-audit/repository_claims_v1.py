@@ -8,10 +8,13 @@ stale independently when that evidence file changes.
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
+import io
 import json
 import re
 import sys
+import tokenize
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -120,11 +123,109 @@ def resolve_candidate_paths(repo: Path, relative_paths: Iterable[str] | None) ->
     return sorted(set(paths))
 
 
+def _python_code_evidence_text(text: str) -> str:
+    """Remove Python comments and docstrings while preserving line numbers.
+
+    Repository claims are implementation evidence.  TODO comments and prose
+    docstrings must not manufacture security/technology claims merely because
+    they mention a planned control.  String literals remain intact because SQL
+    statements and state constants inside strings can be executable evidence.
+    """
+    lines = text.splitlines()
+    comment_columns: dict[int, int] = {}
+    try:
+        for token in tokenize.generate_tokens(io.StringIO(text).readline):
+            if token.type == tokenize.COMMENT:
+                line_no, column = token.start
+                current = comment_columns.get(line_no)
+                comment_columns[line_no] = column if current is None else min(current, column)
+    except (tokenize.TokenError, IndentationError):
+        pass
+
+    docstring_lines: set[int] = set()
+    try:
+        tree = ast.parse(text)
+        nodes = [tree, *(node for node in ast.walk(tree) if isinstance(
+            node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+        ))]
+        for node in nodes:
+            body = getattr(node, "body", None) or []
+            if not body:
+                continue
+            first = body[0]
+            if (
+                isinstance(first, ast.Expr)
+                and isinstance(first.value, ast.Constant)
+                and isinstance(first.value.value, str)
+            ):
+                start = int(getattr(first, "lineno", 0) or 0)
+                end = int(getattr(first, "end_lineno", start) or start)
+                docstring_lines.update(range(start, end + 1))
+    except (SyntaxError, ValueError):
+        pass
+
+    cleaned: list[str] = []
+    for index, line in enumerate(lines, 1):
+        if index in docstring_lines:
+            cleaned.append("")
+            continue
+        column = comment_columns.get(index)
+        cleaned.append(line[:column] if column is not None else line)
+    return "\n".join(cleaned)
+
+
+def _evidence_text(path: Path, text: str) -> str:
+    if path.suffix.casefold() == ".py":
+        return _python_code_evidence_text(text)
+    # For non-Python languages, reject obvious comment-only lines.  This is
+    # intentionally conservative without pretending to be a parser for every
+    # supported language.  README/docs are already excluded from implementation
+    # controls entirely.
+    cleaned: list[str] = []
+    in_block_comment = False
+    for line in text.splitlines():
+        stripped = line.lstrip()
+        if in_block_comment:
+            if "*/" in stripped:
+                in_block_comment = False
+                stripped = stripped.split("*/", 1)[1].lstrip()
+                cleaned.append(stripped)
+            else:
+                cleaned.append("")
+            continue
+        if stripped.startswith("/*"):
+            if "*/" not in stripped[2:]:
+                in_block_comment = True
+                cleaned.append("")
+            else:
+                cleaned.append(stripped.split("*/", 1)[1].lstrip())
+            continue
+        if stripped.startswith(("//", "#", "--", "*")):
+            cleaned.append("")
+        else:
+            cleaned.append(line)
+    return "\n".join(cleaned)
+
+
 def _line_for(text: str, pattern: re.Pattern[str]) -> tuple[int | None, str | None]:
     for index, line in enumerate(text.splitlines(), 1):
         if pattern.search(line):
             return index, line.strip()[:600]
     return None, None
+
+
+def _is_test_source(path: Path, repo: Path) -> bool:
+    rel = path.relative_to(repo)
+    parts = {part.casefold() for part in rel.parts[:-1]}
+    if parts.intersection({"test", "tests", "__tests__"}):
+        return True
+    name = path.name.casefold()
+    stem = path.stem.casefold()
+    if stem.startswith("test_") or stem.endswith("_test"):
+        return True
+    if re.search(r"(?:^|[._-])(?:test|spec)(?:[._-]|$)", name):
+        return True
+    return False
 
 
 def _claim(*, key: str, kind: str, text: str, rel: str, blob_sha: str,
@@ -152,7 +253,8 @@ def _tech_claims(repo: Path, paths: list[Path]) -> list[dict[str, Any]]:
     for path in paths:
         rel = path.relative_to(repo).as_posix()
         name = path.name.casefold()
-        text = safe_text(path)
+        raw_text = safe_text(path)
+        text = _evidence_text(path, raw_text)
         blob = file_blob_sha(path)
         for tech, hints in TECH_FILE_HINTS.items():
             matched = False
@@ -201,7 +303,7 @@ def extract_claims(repo: Path, relative_paths: Iterable[str] | None = None) -> l
     claims = _tech_claims(repo, paths)
     seen = {c["claim_key"] for c in claims}
 
-    test_paths = [p for p in paths if "test" in p.name.casefold() or "tests" in p.relative_to(repo).parts]
+    test_paths = [p for p in paths if _is_test_source(p, repo)]
     if test_paths:
         path = test_paths[0]
         rel = path.relative_to(repo).as_posix()
@@ -241,8 +343,9 @@ def extract_claims(repo: Path, relative_paths: Iterable[str] | None = None) -> l
         # source from the immutable checkout.
         if path.suffix.casefold() not in SECURITY_CONTENT_SUFFIXES and path.name.casefold() not in SECURITY_CONTENT_FILENAMES:
             continue
-        text = safe_text(path)
-        if not text:
+        raw_text = safe_text(path)
+        text = _evidence_text(path, raw_text)
+        if not text.strip():
             continue
         rel = path.relative_to(repo).as_posix()
         blob = file_blob_sha(path)

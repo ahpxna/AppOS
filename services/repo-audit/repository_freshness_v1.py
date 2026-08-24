@@ -898,6 +898,18 @@ def freshness_status() -> dict[str, Any]:
     return {"configured_projects": len(output), "projects": output, "projects_fresh": fresh}
 
 
+
+
+def _last_known_good_eligible(*, has_last_analyzed: bool, age_hours: float | None,
+                              snapshot_is_current: bool, max_stale_hours: int) -> bool:
+    """Allow LKG only when no newer unanalyzed HEAD has already been observed."""
+    return bool(
+        has_last_analyzed
+        and age_hours is not None
+        and age_hours <= max_stale_hours
+        and snapshot_is_current
+    )
+
 def pre_resume_refresh(*, max_stale_hours: int = DEFAULT_MAX_STALE_HOURS) -> dict[str, Any]:
     result = refresh_all(apply=True)
     if result["ok"]:
@@ -911,7 +923,8 @@ def pre_resume_refresh(*, max_stale_hours: int = DEFAULT_MAX_STALE_HOURS) -> dic
             cur.execute(
                 """
                 SELECT rs.last_analyzed_snapshot_id IS NOT NULL,
-                       EXTRACT(EPOCH FROM (now() - s.analyzed_at))/3600.0
+                       EXTRACT(EPOCH FROM (now() - s.analyzed_at))/3600.0,
+                       rs.current_snapshot_id = rs.last_analyzed_snapshot_id
                 FROM repository_evidence_sources rs
                 LEFT JOIN repository_snapshots s ON s.id=rs.last_analyzed_snapshot_id
                 WHERE rs.provider='github' AND rs.repo_full_name=%s;
@@ -920,8 +933,19 @@ def pre_resume_refresh(*, max_stale_hours: int = DEFAULT_MAX_STALE_HOURS) -> dic
             )
             row = cur.fetchone()
             hours = float(row[1]) if row and row[1] is not None else None
-            if not row or not row[0] or hours is None or hours > max_stale_hours:
-                blocked.append({**failure, "last_known_good_age_hours": hours})
+            snapshot_is_current = bool(row and row[2])
+            eligible = _last_known_good_eligible(
+                has_last_analyzed=bool(row and row[0]),
+                age_hours=hours,
+                snapshot_is_current=snapshot_is_current,
+                max_stale_hours=max_stale_hours,
+            )
+            if not eligible:
+                blocked.append({
+                    **failure,
+                    "last_known_good_age_hours": hours,
+                    "newer_unanalyzed_snapshot_observed": bool(row and row[0] and not snapshot_is_current),
+                })
     result["last_known_good_policy_hours"] = max_stale_hours
     result["blocked"] = blocked
     result["ok"] = not blocked
