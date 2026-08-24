@@ -999,8 +999,7 @@ def handle_discover_linkedin_jobs(cur, task) -> Dict[str, Any]:
 
     return {
         "search_url": search_url, "search": request, "submitted": False,
-        "auto_ingest": intake, "agent_response": agent_response,
-    }s
+        "auto_ingest": intake, "agent_response": agent_response,}
 
 
 def handle_capture_page_snapshot(cur, task) -> Dict[str, Any]:
