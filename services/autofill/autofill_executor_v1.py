@@ -31,10 +31,18 @@ class BrowserTarget:
 class OpenClawTransport:
     """Use only documented OpenClaw browser primitives on one stable tab."""
     def __init__(self, *, binary: str = "openclaw", profile: str = "remote", timeout: int = 60,
-                 environment: dict[str, str] | None = None, uploads_dir: Path | None = None):
+                 environment: dict[str, str] | None = None, uploads_dir: Path | None = None,
+                 approved_upload_hashes: dict[str, str] | None = None):
         self.binary, self.profile, self.timeout = binary, profile, timeout
         self.environment = environment or dict(os.environ)
         self.uploads_dir = uploads_dir or Path(os.getenv("JOBOS_OPENCLAW_UPLOADS_DIR", "/tmp/openclaw/uploads"))
+        # ``None`` means this transport is read-only/non-uploading.  Production
+        # autofill passes an explicit map (possibly empty), so an upload without
+        # an exact approval-bound SHA-256 fails closed.
+        self.approved_upload_hashes = None if approved_upload_hashes is None else {
+            str(Path(path).expanduser().resolve()): str(digest).casefold()
+            for path, digest in approved_upload_hashes.items()
+        }
 
     def _run(self, args: list[str], *, json_output: bool = False) -> str:
         if shutil.which(self.binary) is None:
@@ -159,16 +167,47 @@ class OpenClawTransport:
                 return path
         raise TransportError("OpenClaw screenshot completed without an accessible local image path.")
 
+    @staticmethod
+    def _sha256_file(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
     def _stage_upload(self, value: str) -> str:
         source = Path(value).expanduser().resolve()
         if not source.is_file():
             raise TransportError(f"Approved upload artifact is missing: {source}")
-        digest = hashlib.sha256(source.read_bytes()).hexdigest()
+        digest = self._sha256_file(source)
+        if self.approved_upload_hashes is not None:
+            expected = self.approved_upload_hashes.get(str(source))
+            if not expected:
+                raise TransportError(
+                    "Upload path is not bound to an approval SHA-256; refusing unapproved bytes."
+                )
+            if digest.casefold() != expected:
+                raise TransportError(
+                    "Approved upload artifact bytes changed after preflight; issue a fresh approval."
+                )
+        else:
+            expected = digest
+
         self.uploads_dir.mkdir(parents=True, exist_ok=True)
-        staged = self.uploads_dir / f"{digest[:16]}-{source.name}"
-        if not staged.exists() or hashlib.sha256(staged.read_bytes()).hexdigest() != digest:
+        staged = self.uploads_dir / f"{expected[:16]}-{source.name}"
+        if not staged.exists() or self._sha256_file(staged) != expected:
             shutil.copyfile(source, staged)
             staged.chmod(0o600)
+        # Re-hash the actual staged bytes.  This closes the copy-time race where
+        # the source changes after the first digest but before/during copy.
+        if self._sha256_file(staged) != expected:
+            try:
+                staged.unlink()
+            except OSError:
+                pass
+            raise TransportError(
+                "Staged upload bytes do not match the approval-bound SHA-256; refusing upload."
+            )
         return str(staged)
 
     def execute(self, target_id: str, command: dict[str, str]) -> None:

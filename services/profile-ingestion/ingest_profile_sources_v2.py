@@ -252,6 +252,7 @@ def main() -> int:
     ap.add_argument("--parsed-root", default=str(PARSED_ROOT))
     ap.add_argument("--max-words", type=int, default=720)
     ap.add_argument("--overlap-words", type=int, default=80)
+    ap.add_argument("--force-reingest", action="store_true", help="Rebuild unchanged source rows/chunks and reset mapping intentionally.")
     args = ap.parse_args()
 
     source_root = Path(args.source_root)
@@ -357,6 +358,22 @@ def main() -> int:
                 raw_values = {k: v for k, v in raw_values.items() if k in raw_cols}
 
                 raw_id = existing_raw_id(cur, raw_cols, digest, original_path)
+                if raw_id and not args.force_reingest:
+                    cur.execute(
+                        """SELECT rf.sha256, rf.original_local_path, pd.id
+                             FROM raw_files rf
+                             LEFT JOIN profile_documents pd
+                               ON pd.raw_file_id = rf.id AND pd.document_title = %s
+                            WHERE rf.id = %s
+                            LIMIT 1""",
+                        (title_from_path(rel), raw_id),
+                    )
+                    existing = cur.fetchone()
+                    if (existing and str(existing[0] or "") == digest
+                            and str(existing[1] or "") == original_path and existing[2]):
+                        print("  unchanged: preserving existing document mapping/evidence state")
+                        continue
+
                 if raw_id:
                     update_values = dict(raw_values)
                     update_values.pop("sha256", None)

@@ -46,6 +46,7 @@ SOURCE_ROOT = ROOT / "data" / "profile_sources_v2"
 PARSED_ROOT = ROOT / "data" / "profile_parsed_v2"
 VENV_PYTHON = ROOT / ".venv" / "bin" / "python"
 REQUIREMENTS = ROOT / "requirements.txt"
+MANIFEST_PATH = SOURCE_ROOT / ".jobos_profile_ready_manifest.json"
 TEMPLATE = ROOT / "data" / "resume-template" / "VU PHAN AN NGUYEN-official_For_all.docx"
 
 SUPPORTED_RAW_SUFFIXES = {".docx", ".pdf", ".md", ".txt"}
@@ -107,7 +108,25 @@ def bucket_for(path: Path) -> str:
     return BUCKETS.get(rel.parts[0].casefold(), "00_official")
 
 
-def stage_raw_documents(*, replace: bool) -> list[dict[str, str]]:
+def _load_stage_manifest() -> dict[str, dict[str, str]]:
+    if not MANIFEST_PATH.exists():
+        return {}
+    try:
+        data = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise PipelineError(f"Cannot read staging manifest {MANIFEST_PATH}: {exc}") from exc
+    entries = data.get("entries", {}) if isinstance(data, dict) else {}
+    return entries if isinstance(entries, dict) else {}
+
+
+def _write_stage_manifest(entries: dict[str, dict[str, str]]) -> None:
+    MANIFEST_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = MANIFEST_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"version": 1, "entries": entries}, indent=2), encoding="utf-8")
+    tmp.replace(MANIFEST_PATH)
+
+
+def stage_raw_documents(*, replace: bool) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
     docs = raw_documents()
     if not docs:
         raise PipelineError(
@@ -115,7 +134,36 @@ def stage_raw_documents(*, replace: bool) -> list[dict[str, str]]:
             "Add at least one .docx/.pdf/.md/.txt file before running the profile pipeline."
         )
 
+    previous = _load_stage_manifest()
+    desired_sources = {str(source.relative_to(RAW_ROOT)) for source in docs}
+
+    # Remove only files that this runner staged previously. Never delete an
+    # untracked/canonical source from profile_sources_v2.
+    removed: list[dict[str, str]] = []
+    for source_rel, entry in previous.items():
+        if source_rel in desired_sources:
+            continue
+        dest_rel = str(entry.get("destination") or "")
+        expected_sha = str(entry.get("sha256") or "")
+        destination = SOURCE_ROOT / dest_rel if dest_rel else None
+        if destination and destination.is_file():
+            if expected_sha and sha256_file(destination) != expected_sha:
+                raise PipelineError(
+                    f"Managed staged source {destination} changed outside the runner; refusing to prune it automatically."
+                )
+            destination.unlink()
+            sidecar = (PARSED_ROOT / dest_rel).with_suffix(".txt")
+            if sidecar.is_file():
+                sidecar.unlink()
+        removed.append({
+            "source": source_rel,
+            "destination": str((SOURCE_ROOT / dest_rel).relative_to(ROOT)) if dest_rel else "",
+            "sha256": expected_sha,
+            "action": "removed",
+        })
+
     staged: list[dict[str, str]] = []
+    manifest: dict[str, dict[str, str]] = {}
     for source in docs:
         bucket = bucket_for(source)
         destination = SOURCE_ROOT / bucket / source.name
@@ -137,6 +185,9 @@ def stage_raw_documents(*, replace: bool) -> list[dict[str, str]]:
         else:
             shutil.copy2(source, destination)
 
+        source_rel = str(source.relative_to(RAW_ROOT))
+        dest_rel = str(destination.relative_to(SOURCE_ROOT))
+        manifest[source_rel] = {"destination": dest_rel, "sha256": source_sha}
         staged.append({
             "source": str(source.relative_to(ROOT)),
             "destination": str(destination.relative_to(ROOT)),
@@ -144,8 +195,53 @@ def stage_raw_documents(*, replace: bool) -> list[dict[str, str]]:
             "sha256": source_sha,
             "action": action,
         })
-    return staged
+    _write_stage_manifest(manifest)
+    return staged, removed
 
+
+
+def deactivate_removed_managed_sources(removed: list[dict[str, str]]) -> int:
+    """Retire DB truth derived from drop-folder files intentionally removed by the operator."""
+    if not removed:
+        return 0
+    psycopg, database_dsn = load_db_helpers()
+    retired = 0
+    with psycopg.connect(database_dsn(), autocommit=False) as conn, conn.cursor() as cur:
+        for item in removed:
+            destination = str((ROOT / item["destination"]).resolve()) if item.get("destination") else ""
+            cur.execute(
+                """SELECT id FROM raw_files
+                     WHERE source = 'profile_sources_v2' AND sha256 = %s
+                       AND original_local_path = %s AND is_active = true
+                     FOR UPDATE""",
+                (item.get("sha256"), destination),
+            )
+            row = cur.fetchone()
+            if not row:
+                continue
+            raw_id = row[0]
+            cur.execute("UPDATE raw_files SET is_active = false WHERE id = %s", (raw_id,))
+            cur.execute(
+                """UPDATE profile_documents
+                      SET status = 'superseded', contains_profile_evidence = false, updated_at = now()
+                    WHERE raw_file_id = %s AND status <> 'superseded'""",
+                (raw_id,),
+            )
+            cur.execute(
+                """UPDATE profile_assets
+                      SET status = 'superseded', updated_at = now(),
+                          review_note = concat_ws(' ', nullif(review_note, ''),
+                              'Source removed from data/profile_raw; asset retired by unified profile pipeline.')
+                    WHERE status <> 'superseded' AND (
+                          created_from_raw_file_id = %s OR id IN (
+                              SELECT profile_asset_id FROM profile_asset_evidence_items WHERE raw_file_id = %s
+                          )
+                    )""",
+                (raw_id, raw_id),
+            )
+            retired += 1
+        conn.commit()
+    return retired
 
 def write_plain_text_sidecars() -> int:
     """Make .md/.txt sources usable by the V2 ingestor without another parser."""
@@ -356,15 +452,15 @@ def query_profile_state() -> dict[str, Any]:
 
 
 
-def staged_sources_synced() -> bool:
-    """Return True when every currently staged source already has the same DB raw-file/document identity."""
-    sources = sorted(p for p in SOURCE_ROOT.rglob("*") if is_real_source(p)) if SOURCE_ROOT.exists() else []
-    if not sources:
+def staged_sources_synced(staged: list[dict[str, str]]) -> bool:
+    """Return True when every drop-folder source has the same staged DB identity."""
+    if not staged:
         return False
     psycopg, database_dsn = load_db_helpers()
     with psycopg.connect(database_dsn(), autocommit=True) as conn, conn.cursor() as cur:
-        for source in sources:
-            digest = sha256_file(source)
+        for item in staged:
+            source = ROOT / item["destination"]
+            digest = str(item["sha256"])
             cur.execute(
                 """SELECT EXISTS (
                      SELECT 1
@@ -372,9 +468,10 @@ def staged_sources_synced() -> bool:
                      JOIN profile_documents pd ON pd.raw_file_id = rf.id
                      WHERE rf.source = 'profile_sources_v2'
                        AND rf.sha256 = %s
+                       AND rf.original_local_path = %s
                        AND rf.is_active = true
                    )""",
-                (digest,),
+                (digest, str(source.resolve())),
             )
             if not bool(cur.fetchone()[0]):
                 return False
@@ -437,7 +534,7 @@ def reject_asset(asset_id: str, note: str, *, apply: bool) -> int:
     return 0
 
 
-def run_to_review(*, replace_staged: bool, ingest_sources: bool) -> dict[str, Any]:
+def run_to_review(*, replace_staged: bool, ingest_sources: bool, force_parse: bool) -> dict[str, Any]:
     if ingest_sources:
         sidecars = write_plain_text_sidecars()
         emit("plain_text_sidecars", written=sidecars)
@@ -446,7 +543,10 @@ def run_to_review(*, replace_staged: bool, ingest_sources: bool) -> dict[str, An
         if existing_bridge.exists():
             run_checked([sys.executable, str(existing_bridge)], label="reuse_existing_parsed_text")
 
-        run_checked([sys.executable, "services/profile-ingestion/parse_profile_sources_v2.py"], label="parse_profile_sources")
+        parse_cmd = [sys.executable, "services/profile-ingestion/parse_profile_sources_v2.py"]
+        if force_parse:
+            parse_cmd.append("--force")
+        run_checked(parse_cmd, label="parse_profile_sources")
         # Handle raw .md/.txt after parser reports them as unsupported; the ingestor
         # sees the sidecars created above.
         write_plain_text_sidecars()
@@ -557,9 +657,10 @@ def run_pipeline(args: argparse.Namespace) -> int:
     # into data/profile_raw. This makes the command genuinely resumable: the
     # second run after human review does not destructively re-ingest unchanged
     # sources and does not repeat LLM stages.
-    staged = stage_raw_documents(replace=args.replace_staged)
-    emit("raw_sources", count=len(staged), files=staged)
-    synced = staged_sources_synced()
+    staged, removed = stage_raw_documents(replace=args.replace_staged)
+    retired = deactivate_removed_managed_sources(removed)
+    emit("raw_sources", count=len(staged), files=staged, removed=removed, retired_sources=retired)
+    synced = staged_sources_synced(staged)
 
     before = query_profile_state()
     emit("profile_state_before", sources_synced=synced, **{k: v for k, v in before.items() if k != "review_queue"})
@@ -580,6 +681,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
         state = run_to_review(
             replace_staged=args.replace_staged,
             ingest_sources=not synced,
+            force_parse=any(item["action"] != "unchanged" for item in staged),
         )
 
     if state["assets_draft"]:
@@ -659,6 +761,15 @@ def main() -> int:
     reject.add_argument("--apply", action="store_true")
 
     args = parser.parse_args()
+
+    # Fail immediately on an empty drop folder before venv/DB setup. This is
+    # the common operator mistake and should not trigger installs or services.
+    if args.command == "run" and not raw_documents():
+        print(json.dumps({
+            "error": f"No supported documents found under {RAW_ROOT}",
+            "resume_profile_ready": False,
+        }, indent=2), file=sys.stderr)
+        return 1
 
     # Status can inspect the drop folder without forcing dependency installation.
     if args.command != "status":

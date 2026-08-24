@@ -33,22 +33,61 @@ def show(cur, task_id: str) -> None:
                "status": item[3], "started_at": str(item[4]), "verified_at": str(item[5])})
 
 def close(cur, task_id: str) -> None:
+    # Lock the task/capability pair before changing either side.  Most uncertain
+    # writes still have an executing approval, but a crash after
+    # durable_finish_execution() can leave the approval already consumed while
+    # later queue bookkeeping marks the task needs_reconciliation.  Consumed is
+    # terminal and must stay consumed; closing reconciliation only retires the
+    # uncertain task state and never makes that capability replayable.
     cur.execute(
-        """UPDATE approval_requests a SET status = 'expired', executing_task_id = NULL
-           FROM browser_tasks b
-           WHERE b.id = %s AND a.id = b.approval_request_id
-             AND a.status = 'executing' AND b.execution_state = 'needs_reconciliation'""",
+        """SELECT b.approval_request_id::text, b.execution_state, a.status
+             FROM browser_tasks b
+             JOIN approval_requests a ON a.id = b.approval_request_id
+            WHERE b.id = %s
+            FOR UPDATE OF b, a""",
         (task_id,),
     )
-    if cur.rowcount != 1:
-        raise SystemExit("Only an executing task marked needs_reconciliation can be closed.")
+    row = cur.fetchone()
+    if not row:
+        raise SystemExit("Task or bound approval not found.")
+    approval_id, execution_state, approval_status = row
+    if execution_state != "needs_reconciliation":
+        raise SystemExit("Only a task marked needs_reconciliation can be closed.")
+
+    if approval_status == "executing":
+        cur.execute(
+            """UPDATE approval_requests
+                  SET status = 'expired', executing_task_id = NULL,
+                      action_note = COALESCE(action_note,
+                          'Reconciliation closed explicitly; capability will not replay.')
+                WHERE id = %s AND status = 'executing'
+                RETURNING id""",
+            (approval_id,),
+        )
+        if cur.fetchone() is None:
+            raise SystemExit("Approval changed before reconciliation could be closed.")
+    elif approval_status == "consumed":
+        # Preserve consumed_at/consumed_by and the single-use audit record.
+        cur.execute(
+            """UPDATE approval_requests
+                  SET executing_task_id = NULL,
+                      action_note = COALESCE(action_note,
+                          'Reconciliation closed after durable execution; consumed capability remains terminal.')
+                WHERE id = %s AND status = 'consumed'""",
+            (approval_id,),
+        )
+    else:
+        raise SystemExit(
+            f"Bound approval is {approval_status!r}; expected executing or consumed for reconciliation."
+        )
+
     cur.execute(
         """UPDATE browser_tasks
               SET status = 'failed', execution_state = 'partial',
                   locked_by = NULL, lease_expires_at = NULL,
                   finished_at = COALESCE(finished_at, now()),
                   error_message = COALESCE(error_message, '') ||
-                      E'\nReconciliation closed explicitly; capability expired and will not replay.'
+                      E'\nReconciliation closed explicitly; capability will not replay.'
             WHERE id = %s AND execution_state = 'needs_reconciliation'
             RETURNING id;""",
         (task_id,),
@@ -59,7 +98,7 @@ def close(cur, task_id: str) -> None:
         """UPDATE application_attempts
               SET status = 'reconciled', finished_at = COALESCE(finished_at, now()),
                   detail_json = detail_json || '{"reconciled": true, "replay": false}'::jsonb
-            WHERE browser_task_id = %s AND status = 'needs_review';""",
+            WHERE browser_task_id = %s AND status IN ('needs_review', 'completed', 'partial');""",
         (task_id,),
     )
     print("Closed non-replayable capability. Inspect the form, then issue a fresh approval if needed.")

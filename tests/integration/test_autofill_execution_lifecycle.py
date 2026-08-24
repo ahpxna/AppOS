@@ -473,3 +473,68 @@ def test_production_fill_handler_never_calls_openclaw_agent(db, monkeypatch):
 def test_fill_handler_is_deterministic_handler():
     worker = _load_worker()
     assert worker.HANDLERS["fill_application_form"] is worker.handle_fill_application_form
+
+
+def test_review_materialization_failure_does_not_reclassify_completed_browser_execution(db, monkeypatch):
+    worker = _load_worker()
+    with db.connect(TEST_DSN) as conn, conn.cursor() as cur:
+        cur.execute(
+            """UPDATE browser_tasks
+                  SET status = 'failed', error_message = 'integration test isolation',
+                      finished_at = now(), locked_by = NULL, lease_expires_at = NULL
+                WHERE status = 'queued'"""
+        )
+        conn.commit()
+
+    seeded = _record(db, task_status="queued")
+    transport = MultiFieldFakeTransport(
+        url=seeded["expected_initial_url"], fingerprint=seeded["expected_page_fingerprint"],
+    )
+    _patch_multifield_worker(worker, monkeypatch, seeded, transport)
+
+    from services.review import review_service_v1 as review
+
+    def fail_materialization(*_args, **_kwargs):
+        raise RuntimeError("synthetic review materialization failure")
+
+    monkeypatch.setattr(review, "ensure_autofill_review", fail_materialization)
+    with db.connect(TEST_DSN) as conn:
+        assert worker.process_one(conn) is True
+
+    assert transport.write_refs == ["first", "email", "phone"]
+    with db.connect(TEST_DSN) as conn, conn.cursor() as cur:
+        cur.execute("SELECT status, execution_state FROM browser_tasks WHERE id = %s", (seeded["id"],))
+        assert cur.fetchone() == ("completed", "completed")
+        cur.execute("SELECT status, consumed_at IS NOT NULL FROM approval_requests WHERE id = %s", (seeded["approval_request_id"],))
+        assert cur.fetchone() == ("consumed", True)
+        cur.execute("SELECT count(*) FROM human_review_items WHERE browser_task_id = %s", (seeded["id"],))
+        assert cur.fetchone()[0] == 0
+
+
+def test_reconciliation_close_accepts_already_consumed_capability_without_reopening_it(db):
+    worker, reconcile, task = _load_worker(), _load_reconcile(), _record(db)
+    binding = _binding(worker, db, task)
+    worker.durable_begin_execution(task, binding, "fixture-tab")
+    result = SimpleNamespace(
+        status="completed", target_id="fixture-tab",
+        verified_refs=("name-ref",), failed_refs=(),
+    )
+    worker.durable_finish_execution(task, binding, result)
+    with db.connect(TEST_DSN) as conn, conn.cursor() as cur:
+        cur.execute(
+            """UPDATE browser_tasks
+                  SET status = 'failed', execution_state = 'needs_reconciliation'
+                WHERE id = %s""",
+            (task["id"],),
+        )
+        conn.commit()
+    with db.connect(TEST_DSN) as conn, conn.cursor() as cur:
+        reconcile.close(cur, task["id"])
+        conn.commit()
+    with db.connect(TEST_DSN) as conn, conn.cursor() as cur:
+        cur.execute("SELECT status, consumed_at IS NOT NULL, executing_task_id FROM approval_requests WHERE id = %s", (task["approval_request_id"],))
+        assert cur.fetchone() == ("consumed", True, None)
+        cur.execute("SELECT status, execution_state FROM browser_tasks WHERE id = %s", (task["id"],))
+        assert cur.fetchone() == ("failed", "partial")
+        cur.execute("SELECT status FROM application_attempts WHERE browser_task_id = %s", (task["id"],))
+        assert cur.fetchone() == ("reconciled",)

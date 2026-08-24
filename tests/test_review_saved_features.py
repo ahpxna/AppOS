@@ -129,3 +129,39 @@ def test_reconciliation_review_cannot_be_dismissed_while_browser_state_is_uncert
     logic = source[start:end]
     assert 'task[0] == "needs_reconciliation"' in logic
     assert "Reject/revise cannot dismiss" in logic
+
+
+def test_review_materialization_is_after_durable_task_completion_commit():
+    source = (Path(__file__).resolve().parents[1] / "services" / "browser-controller" / "browser_queue_worker.py").read_text(encoding="utf-8")
+    start = source.index("def process_one")
+    end = source.index("def main()", start)
+    logic = source[start:end]
+    completed = logic.index('complete_task(cur, task["id"], result)')
+    review = logic.index("ensure_autofill_review", completed)
+    assert "conn.commit()" in logic[completed:review]
+    assert "review materialization" in logic[review:].casefold()
+
+
+def test_reconciliation_close_supports_consumed_capability_without_reopening_it():
+    source = (Path(__file__).resolve().parents[1] / "services" / "autofill" / "autofill_reconcile_v1.py").read_text(encoding="utf-8")
+    start = source.index("def close")
+    end = source.index("def main()", start)
+    logic = source[start:end]
+    assert 'approval_status == "executing"' in logic
+    assert 'approval_status == "consumed"' in logic
+    assert "consumed_at" in logic
+    assert "status = 'approved'" not in logic
+
+
+def test_consumed_capability_clears_executing_task_marker_and_screenshot_is_best_effort():
+    source = (Path(__file__).resolve().parents[1] / "services" / "browser-controller" / "browser_queue_worker.py").read_text(encoding="utf-8")
+    finish_start = source.index("def durable_finish_execution")
+    finish_end = source.index("def durable_mark_reconciliation", finish_start)
+    finish_logic = source[finish_start:finish_end]
+    assert "executing_task_id = NULL" in finish_logic
+
+    handler_start = source.index("def handle_fill_application_form")
+    handler_end = source.index("HANDLERS =", handler_start)
+    handler_logic = source[handler_start:handler_end]
+    assert "except Exception as screenshot_exc" in handler_logic
+    assert "browser writes remain final" in handler_logic

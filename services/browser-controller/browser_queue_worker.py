@@ -883,7 +883,8 @@ def durable_finish_execution(task: Dict[str, Any], binding: Dict[str, Any], resu
         cur.execute(
             """
             UPDATE approval_requests
-            SET status = 'consumed', consumed_at = now(), consumed_by = %s
+            SET status = 'consumed', consumed_at = now(), consumed_by = %s,
+                executing_task_id = NULL
             WHERE id = %s AND application_id = %s
               AND status = 'executing' AND executing_task_id = %s
             RETURNING id;
@@ -1267,8 +1268,16 @@ def handle_fill_application_form(cur, task) -> Dict[str, Any]:
     except AutofillContextError as exc:
         raise PermanentTaskError(str(exc)) from exc
     require_current_input_hash(binding, context.input_hash)
-    transport = OpenClawTransport(binary=OPENCLAW_BIN, profile=os.getenv("JOBOS_BROWSER_PROFILE", "remote"),
-                                  timeout=min(int(task["timeout_seconds"]), 90), environment=openclaw_runtime_env())
+    approved_upload_hashes = {}
+    if binding.get("artifact_id") and binding.get("artifact_sha256"):
+        for approved_path in (context.profile.get("documents") or {}).values():
+            if approved_path:
+                approved_upload_hashes[str(Path(str(approved_path)).expanduser().resolve())] = str(binding["artifact_sha256"])
+    transport = OpenClawTransport(
+        binary=OPENCLAW_BIN, profile=os.getenv("JOBOS_BROWSER_PROFILE", "remote"),
+        timeout=min(int(task["timeout_seconds"]), 90), environment=openclaw_runtime_env(),
+        approved_upload_hashes=approved_upload_hashes,
+    )
     execution_started = False
     pinned_target_id: str | None = None
     latest_actions = []
@@ -1340,9 +1349,15 @@ def handle_fill_application_form(cur, task) -> Dict[str, Any]:
         durable.chmod(0o600)
         screenshot_path = str(durable.resolve())
         cur.execute("UPDATE browser_tasks SET screenshot_url = %s WHERE id = %s;", (screenshot_path, task["id"]))
-    except (TransportError, OSError, shutil.Error):
-        # Browser side effects are final at this point. The review hub will
-        # show the completed form without an image rather than attempt replay.
+    except Exception as screenshot_exc:
+        # Screenshot capture is a post-execution review artifact, not part of
+        # the deterministic browser write transaction.  Even an unexpected
+        # capture/serialization failure must not reclassify already-verified
+        # writes as uncertain or trigger replay/reconciliation.
+        print(
+            "  warning: post-autofill screenshot capture failed; "
+            f"browser writes remain final: {type(screenshot_exc).__name__}: {screenshot_exc}"
+        )
         screenshot_path = None
     return {
         "status": result.status, "verified_refs": list(result.verified_refs),
@@ -1432,12 +1447,30 @@ def process_one(conn) -> bool:
             result["worker_version"] = WORKER_VERSION
             result["elapsed_seconds"] = round(elapsed, 1)
             complete_task(cur, task["id"], result)
-            if task["task_type"] == "fill_application_form":
-                from services.review.review_service_v1 import ensure_autofill_review
-                ensure_autofill_review(
-                    cur, task["id"], screenshot_path=result.get("screenshot_path"), result=result,
-                )
+        # Browser completion is a durable boundary of its own.  A failure in
+        # Human Review materialization must never reclassify already-verified
+        # browser writes as uncertain or send the task through retry logic.
         conn.commit()
+
+        if task["task_type"] == "fill_application_form":
+            try:
+                with conn.cursor() as cur:
+                    from services.review.review_service_v1 import ensure_autofill_review
+                    ensure_autofill_review(
+                        cur, task["id"], screenshot_path=result.get("screenshot_path"), result=result,
+                    )
+                conn.commit()
+            except Exception as review_exc:
+                conn.rollback()
+                # sync_inbox() can deterministically recreate this materialized
+                # review from the completed browser task later.  Do not replay
+                # or reconcile browser side effects merely because the UI layer
+                # failed to materialize.
+                print(
+                    "  warning: autofill completed but review materialization "
+                    f"was deferred: {type(review_exc).__name__}: {review_exc}"
+                )
+
         print(f"  completed in {elapsed:.1f}s")
         emit_trace(
             trace_id,

@@ -241,8 +241,9 @@ def test_openclaw_fill_uses_documented_fields_payload_and_pinned_target():
 
 def test_openclaw_upload_stages_managed_copy_before_ref_upload():
     class CaptureTransport(OpenClawTransport):
-        def __init__(self, uploads_dir):
-            super().__init__(binary="openclaw", profile="remote", uploads_dir=uploads_dir)
+        def __init__(self, uploads_dir, approved_hashes):
+            super().__init__(binary="openclaw", profile="remote", uploads_dir=uploads_dir,
+                             approved_upload_hashes=approved_hashes)
             self.calls = []
         def _run(self, args, *, json_output=False):
             self.calls.append((args, json_output))
@@ -253,10 +254,51 @@ def test_openclaw_upload_stages_managed_copy_before_ref_upload():
         source = root / "resume.pdf"
         source.write_bytes(b"approved resume")
         uploads = root / "openclaw-uploads"
-        transport = CaptureTransport(uploads)
+        digest = __import__("hashlib").sha256(source.read_bytes()).hexdigest()
+        transport = CaptureTransport(uploads, {str(source.resolve()): digest})
         transport.execute("target-8", {"action": "upload", "target": "e15", "value": str(source)})
         staged = next(uploads.iterdir())
         assert staged.read_bytes() == b"approved resume"
         assert transport.calls == [
             (["upload", str(staged), "--ref", "e15", "--target-id", "target-8"], False)
         ]
+
+
+def test_openclaw_upload_refuses_bytes_changed_after_approval():
+    class CaptureTransport(OpenClawTransport):
+        def __init__(self, uploads_dir, approved_hashes):
+            super().__init__(binary="openclaw", profile="remote", uploads_dir=uploads_dir,
+                             approved_upload_hashes=approved_hashes)
+        def _run(self, args, *, json_output=False):
+            raise AssertionError("OpenClaw must not receive a changed artifact")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        source = root / "resume.pdf"
+        source.write_bytes(b"approved resume")
+        digest = __import__("hashlib").sha256(source.read_bytes()).hexdigest()
+        transport = CaptureTransport(root / "uploads", {str(source.resolve()): digest})
+        source.write_bytes(b"changed after approval")
+        try:
+            transport.execute("target-8", {"action": "upload", "target": "e15", "value": str(source)})
+        except Exception as exc:
+            assert "changed after preflight" in str(exc)
+            return
+        raise AssertionError("changed artifact bytes were uploaded")
+
+def test_openclaw_upload_requires_an_exact_bound_hash_in_production_mode():
+    class CaptureTransport(OpenClawTransport):
+        def _run(self, args, *, json_output=False):
+            raise AssertionError("OpenClaw must not receive an unbound artifact")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        source = Path(tmp) / "resume.pdf"
+        source.write_bytes(b"approved resume")
+        transport = CaptureTransport(binary="openclaw", profile="remote",
+                                     uploads_dir=Path(tmp) / "uploads", approved_upload_hashes={})
+        try:
+            transport.execute("target-8", {"action": "upload", "target": "e15", "value": str(source)})
+        except Exception as exc:
+            assert "not bound to an approval SHA-256" in str(exc)
+            return
+        raise AssertionError("unbound artifact bytes were uploaded")
