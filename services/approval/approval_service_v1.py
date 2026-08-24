@@ -575,6 +575,85 @@ def redeem(conn, token: str, *, decision: str, note: str, actor: str) -> int:
         return 0
 
 
+def decide_request_by_id(conn, request_id: str, *, decision: str, note: str,
+                         actor: str, commit: bool = True) -> dict[str, object]:
+    """Apply a Review Hub decision through the canonical approval boundary.
+
+    The caller is an authenticated local review UI adapter, not a bearer-token
+    shortcut. Exact document, page, artifact, input-hash and action-scope
+    checks run again before a one-time browser task can be queued.
+    """
+    if decision not in {"approve", "reject", "deny"}:
+        return {"ok": False, "error": "decision must be approve/reject"}
+    normalized = "approve" if decision == "approve" else "deny"
+    with conn.cursor() as cur:
+        cur.execute(
+            """UPDATE approval_requests SET status = 'expired'
+                WHERE id = %s AND status = 'pending' AND token_expires_at <= now();""",
+            (request_id,),
+        )
+        cur.execute(
+            """SELECT id::text, type, application_id::text, status, attempt_count,
+                      max_attempts, payload_json, summary_text
+                 FROM approval_requests WHERE id = %s FOR UPDATE;""",
+            (request_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return {"ok": False, "error": "Approval request not found."}
+        rid, atype, application_id, status, attempts, max_attempts, payload, summary = row
+        if status != "pending":
+            return {"ok": False, "error": f"Approval request is {status}."}
+        if attempts >= max_attempts:
+            return {"ok": False, "error": "Approval request is locked out."}
+        request = {"type": atype, "application_id": application_id,
+                   "payload_json": payload or {}, "status": status,
+                   "summary_text": summary}
+        try:
+            assert_binding_matches(cur, request)
+        except RuntimeError as exc:
+            log_event(cur, rid, "binding_mismatch", actor, {"error": str(exc)})
+            if commit:
+                conn.commit()
+            return {"ok": False, "error": str(exc)}
+        new_status = "approved" if normalized == "approve" else "denied"
+        cur.execute(
+            """UPDATE approval_requests
+                  SET status = %s, action_taken = %s, action_note = %s, responded_at = now()
+                WHERE id = %s AND status = 'pending';""",
+            (new_status, normalized, note, rid),
+        )
+        if cur.rowcount != 1:
+            return {"ok": False, "error": "Approval request changed state concurrently."}
+        if application_id and new_status == "approved" and atype == "autofill_form":
+            bound = request["payload_json"]
+            cur.execute(
+                """INSERT INTO browser_tasks
+                     (task_type, requested_by, application_id, status, priority,
+                      input_json, approval_request_id, expected_origin,
+                      generated_document_id, document_sha256, timeout_seconds,
+                      bound_artifact_id, artifact_sha256, artifact_filename,
+                      expected_initial_url, expected_page_fingerprint, autofill_input_hash,
+                      autofill_action_scope, idempotency_key, created_at)
+                   VALUES ('fill_application_form', %s, %s, 'queued', 'high',
+                           '{}'::jsonb, %s, %s, %s, %s, 300, %s, %s, %s, %s, %s, %s, %s, %s, now())
+                   ON CONFLICT (approval_request_id) WHERE approval_request_id IS NOT NULL DO NOTHING;""",
+                (actor, application_id, rid, bound["expected_origin"],
+                 bound["document_id"], bound["document_sha256"], bound.get("artifact_id"),
+                 bound.get("artifact_sha256"), bound.get("artifact_filename"),
+                 bound["expected_initial_url"], bound["expected_page_fingerprint"],
+                 bound["autofill_input_hash"], Jsonb(bound.get("autofill_action_scope") or {}),
+                 f"autofill:{rid}"),
+            )
+            log_event(cur, rid, "autofill_task_queued", actor,
+                      {"expected_origin": bound["expected_origin"], "document_id": bound["document_id"]})
+        log_event(cur, rid, new_status, actor, {"note": note, "channel": "trusted_review_ui"})
+    if commit:
+        conn.commit()
+    return {"ok": True, "request_id": rid, "status": new_status,
+            "type": atype, "application_id": application_id}
+
+
 # ---------------------------------------------------------------- list / expire
 
 def cmd_list(conn, args) -> int:

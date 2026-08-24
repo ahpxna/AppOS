@@ -17,6 +17,7 @@ from psycopg.types.json import Jsonb
 from services.discovery.immigration_intelligence import record_jd_immigration_assessment
 
 MAX_DISCOVERY_RESULTS = 5
+MAX_SAVED_RESULTS = 20
 MIN_JD_CHARS = 200
 LINKEDIN_JOB_ID_RE = re.compile(r"/jobs/view/(?P<id>\d+)/?$")
 
@@ -70,6 +71,13 @@ def validate_search_request(keywords: str, location: str, max_results: int, **ra
             "date_posted": spec.date_posted, "experience_levels": list(spec.experience_levels),
             "employment_types": list(spec.employment_types), "work_modes": list(spec.work_modes),
             "companies": list(spec.companies), "sort_by": spec.sort_by}
+
+
+def validate_saved_request(max_results: int) -> dict[str, Any]:
+    """Validate the independently bounded, user-requested Saved Jobs read."""
+    if not isinstance(max_results, int) or not 1 <= max_results <= MAX_SAVED_RESULTS:
+        raise LinkedInDiscoveryError(f"max_results must be 1..{MAX_SAVED_RESULTS} for Saved Jobs.")
+    return {"max_results": max_results}
 
 
 def validate_job_url(url: str) -> str:
@@ -201,3 +209,69 @@ def ingest_discovered_jobs(cur, browser_task_id: str, search_input: dict[str, An
         created.append(application_id)
     return {"requested_max_results": request["max_results"], "returned_valid_jobs": len(rows),
             "created_application_ids": created, "duplicates": duplicates}
+
+
+def ingest_saved_jobs(cur, browser_task_id: str, saved_input: dict[str, Any],
+                      agent_response: Any) -> dict[str, Any]:
+    """Ingest existing LinkedIn Saved Jobs through the normal application boundary.
+
+    This only persists already-saved job records returned by the read-only
+    browser task; it never changes a LinkedIn saved state.
+    """
+    request = validate_saved_request(saved_input.get("max_results"))
+    sync_id = str(saved_input.get("saved_sync_id") or "").strip() or None
+    rows = normalize_jobs(agent_response, request["max_results"])
+    created: list[str] = []
+    duplicates = 0
+    for row in rows:
+        jd_hash = hashlib.sha256(row["jd_text"].encode("utf-8")).hexdigest()
+        source_job_id = linkedin_job_id(row["url"])
+        cur.execute("SELECT id::text FROM applications WHERE source = 'linkedin' AND source_job_id = %s;", (source_job_id,))
+        existing = cur.fetchone()
+        if existing:
+            cur.execute(
+                """UPDATE applications SET company = %s, job_title = %s, job_url = %s,
+                       jd_text = %s, jd_hash = %s, location = %s, work_mode = %s,
+                       discovery_channel = 'saved', linkedin_saved_at = now(),
+                       linkedin_saved_sync_id = %s, last_seen_at = now(), stale_at = NULL,
+                       closed_at = NULL,
+                       last_content_change_at = CASE WHEN jd_hash <> %s THEN now() ELSE last_content_change_at END,
+                       updated_at = now() WHERE id = %s;""",
+                (row["company"], row["title"], row["url"], row["jd_text"], jd_hash,
+                 row["location"], row["work_mode"], sync_id, jd_hash, existing[0]),
+            )
+            duplicates += 1
+            continue
+        cur.execute(
+            """INSERT INTO applications
+                 (source, company, job_title, job_url, jd_text, jd_hash, current_step,
+                  status, intake_channel, ats_type, location, work_mode, source_job_id,
+                  discovery_channel, linkedin_saved_at, linkedin_saved_sync_id,
+                  first_seen_at, last_seen_at, created_at, updated_at)
+               VALUES ('linkedin', %s, %s, %s, %s, %s, 'intake', 'active',
+                       'linkedin_saved_jobs', 'linkedin_browser_linked_session', %s, %s, %s,
+                       'saved', now(), %s, now(), now(), now(), now()) RETURNING id::text;""",
+            (row["company"], row["title"], row["url"], row["jd_text"], jd_hash,
+             row["location"], row["work_mode"], source_job_id, sync_id),
+        )
+        application_id = cur.fetchone()[0]
+        immigration = record_jd_immigration_assessment(cur, application_id, row["jd_text"])
+        cur.execute(
+            """INSERT INTO pipeline_events
+                 (application_id, from_step, to_step, actor, reason, detail_json)
+               VALUES (%s, NULL, 'intake', 'linkedin_saved_jobs',
+                       'User-initiated read-only LinkedIn Saved Jobs capture.', %s);""",
+            (application_id, Jsonb({"browser_task_id": browser_task_id, "saved_sync_id": sync_id,
+                "max_results": request["max_results"], "job_url": row["url"],
+                "immigration_assessment": immigration, "discovery_channel": "saved"})),
+        )
+        created.append(application_id)
+    if sync_id:
+        cur.execute(
+            """UPDATE linkedin_saved_syncs SET status = 'completed', jobs_seen = %s,
+                      jobs_created = %s, duplicates = %s, completed_at = now(), error_message = NULL
+                 WHERE id = %s;""",
+            (len(rows), len(created), duplicates, sync_id),
+        )
+    return {"requested_max_results": request["max_results"], "returned_valid_jobs": len(rows),
+            "created_application_ids": created, "duplicates": duplicates, "saved_sync_id": sync_id}

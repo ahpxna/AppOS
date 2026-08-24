@@ -16,7 +16,7 @@ TEST_DSN = os.getenv("JOBOS_TEST_DSN", "")
 RUN = os.getenv("JOBOS_RUN_DB_INTEGRATION") == "1"
 
 
-def test_migrations_054_055_support_one_durable_autofill_lifecycle():
+def test_migrations_054_058_support_one_durable_autofill_lifecycle():
     if not RUN:
         pytest.skip("set JOBOS_RUN_DB_INTEGRATION=1 and JOBOS_TEST_DSN for the disposable PostgreSQL integration test")
     if not TEST_DSN or "test" not in TEST_DSN.casefold():
@@ -24,8 +24,8 @@ def test_migrations_054_055_support_one_durable_autofill_lifecycle():
 
     psycopg = pytest.importorskip("psycopg")
     with psycopg.connect(TEST_DSN) as conn, conn.cursor() as cur:
-        cur.execute("SELECT 1 FROM schema_migrations WHERE migration_id = '055_autofill_exact_input_and_page_identity.sql'")
-        assert cur.fetchone(), "apply all migrations through 055 before this test"
+        cur.execute("SELECT 1 FROM schema_migrations WHERE migration_id = '058_autofill_exact_action_scope.sql'")
+        assert cur.fetchone(), "apply all migrations through 058 before this test"
         cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name = 'browser_tasks'")
         assert {"execution_state", "pinned_target_id"} <= {row[0] for row in cur.fetchall()}
 
@@ -45,28 +45,39 @@ def test_migrations_054_055_support_one_durable_autofill_lifecycle():
             (document_id, application_id, "a" * 64),
         )
         artifact_id = cur.fetchone()[0]
+        action_scope = """
+        {
+          "profile_keys": ["personal.first_name"],
+          "document_types": [],
+          "sensitive_classes": [],
+          "remembered_questions": []
+        }
+        """
         cur.execute(
             """INSERT INTO approval_requests
                (type, application_id, payload_json, status, approval_token_hash, token_expires_at,
                 target_action, bound_document_id, bound_document_sha256, expected_origin,
                 bound_artifact_id, bound_artifact_sha256, bound_artifact_filename,
-                expected_initial_url, expected_page_fingerprint, bound_autofill_input_hash)
+                expected_initial_url, expected_page_fingerprint, bound_autofill_input_hash,
+                bound_autofill_action_scope)
                VALUES ('autofill_form', %s, '{}'::jsonb, 'approved', 'test-token', now() + interval '5 minutes',
                        'fill_application_form', %s, %s, 'https://jobs.example.test', %s, %s, 'test-resume.docx',
-                       'https://jobs.example.test/job-1/apply', %s, %s)
+                       'https://jobs.example.test/job-1/apply', %s, %s, %s::jsonb)
                RETURNING id""",
-            (application_id, document_id, content_hash, artifact_id, "a" * 64, "b" * 64, "c" * 64),
+            (application_id, document_id, content_hash, artifact_id, "a" * 64, "b" * 64, "c" * 64, action_scope),
         )
         approval_id = cur.fetchone()[0]
         cur.execute(
             """INSERT INTO browser_tasks
                (task_type, requested_by, application_id, status, approval_request_id,
-                generated_document_id, document_sha256, expected_origin, expected_initial_url,
-                expected_page_fingerprint, autofill_input_hash)
+                generated_document_id, document_sha256, expected_origin, bound_artifact_id,
+                artifact_sha256, artifact_filename, expected_initial_url,
+                expected_page_fingerprint, autofill_input_hash, autofill_action_scope)
                VALUES ('fill_application_form', 'integration-test', %s, 'running', %s, %s, %s, 'https://jobs.example.test',
-                       'https://jobs.example.test/job-1/apply', %s, %s)
+                       %s, %s, 'test-resume.docx', 'https://jobs.example.test/job-1/apply', %s, %s, %s::jsonb)
                RETURNING id""",
-            (application_id, approval_id, document_id, content_hash, "b" * 64, "c" * 64),
+            (application_id, approval_id, document_id, content_hash, artifact_id, "a" * 64,
+             "b" * 64, "c" * 64, action_scope),
         )
         task_id = cur.fetchone()[0]
 

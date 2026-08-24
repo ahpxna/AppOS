@@ -39,7 +39,7 @@ docker compose version >/dev/null 2>&1 || {
 if command -v apt-get >/dev/null 2>&1; then
   echo "Installing Ubuntu packages (Python venv/pip and optional OCR binaries)..."
   sudo apt-get update
-  sudo apt-get install -y python3-venv python3-pip poppler-utils tesseract-ocr
+  sudo apt-get install -y python3-venv python3-pip poppler-utils tesseract-ocr libreoffice-writer
 fi
 
 if [[ ! -f .env ]]; then

@@ -26,6 +26,7 @@ from services.discovery.linkedin_discovery_v1 import (
     linkedin_job_id,
     validate_job_url,
     validate_search_request,
+    validate_saved_request,
 )
 from services.common.config import database_dsn
 
@@ -162,6 +163,34 @@ def cmd_queue_discovery(cur, args) -> int:
     return 0
 
 
+def cmd_queue_saved(cur, args) -> int:
+    """Queue a bounded, read-only sync of jobs already saved by the user."""
+    if not feature_enabled("JOBOS_LINKEDIN_SAVED_DISCOVERY_ENABLED"):
+        raise IntakeError("LinkedIn Saved Jobs discovery is disabled by configuration.")
+    request = validate_saved_request(args.max_results)
+    cur.execute(
+        """INSERT INTO linkedin_saved_syncs(requested_limit, status)
+           VALUES (%s, 'queued') RETURNING id::text;""",
+        (request["max_results"],),
+    )
+    sync_id = cur.fetchone()[0]
+    cur.execute(
+        """INSERT INTO browser_tasks(
+               task_type, requested_by, status, priority, input_json, timeout_seconds)
+           VALUES ('discover_linkedin_saved_jobs', 'linkedin_intake_v1', 'queued', 'normal', %s, %s)
+           RETURNING id::text;""",
+        (Jsonb({"max_results": request["max_results"], "user_initiated": True,
+                "source": "linkedin", "auto_ingest": True, "saved_sync_id": sync_id}),
+         args.timeout),
+    )
+    task_id = cur.fetchone()[0]
+    cur.execute("UPDATE linkedin_saved_syncs SET browser_task_id = %s WHERE id = %s;", (task_id, sync_id))
+    print(json.dumps({"saved_sync_id": sync_id, "browser_task_id": task_id,
+                      "max_results": request["max_results"],
+                      "next": "Run the JobOS browser worker; saved jobs are auto-ingested read-only."}, indent=2))
+    return 0
+
+
 def cmd_ingest_task(cur, args) -> int:
     """Move a completed capture into applications after its text is reviewed."""
     cur.execute("SELECT status, input_json, result_json, error_message FROM browser_tasks WHERE id = %s;", (args.task_id,))
@@ -226,6 +255,9 @@ def main() -> int:
     discovery.add_argument("--company", action="append", default=[])
     discovery.add_argument("--sort-by", choices=("recent", "relevant"), default="recent")
     discovery.add_argument("--timeout", type=int, default=300)
+    saved = subs.add_parser("queue-saved", help="Queue a bounded read-only sync of LinkedIn Saved Jobs.")
+    saved.add_argument("--max-results", type=int, default=10)
+    saved.add_argument("--timeout", type=int, default=600)
     completed = subs.add_parser("ingest-task", help="Ingest one completed capture task into applications.")
     completed.add_argument("--task-id", required=True)
     completed.add_argument("--company", required=True)
@@ -241,9 +273,10 @@ def main() -> int:
             with conn.cursor() as cur:
                 code = {
                     "queue-fetch": cmd_queue, "queue-discovery": cmd_queue_discovery,
+                    "queue-saved": cmd_queue_saved,
                     "ingest-task": cmd_ingest_task, "import": cmd_import,
                 }[args.command](cur, args)
-            if getattr(args, "apply", False) or args.command in {"queue-fetch", "queue-discovery", "ingest-task"}:
+            if getattr(args, "apply", False) or args.command in {"queue-fetch", "queue-discovery", "queue-saved", "ingest-task"}:
                 conn.commit()
             else:
                 conn.rollback()

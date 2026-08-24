@@ -48,10 +48,12 @@ def doctor(*, check_browser: bool) -> int:
         import psycopg
         with psycopg.connect(database_dsn(), connect_timeout=5) as conn, conn.cursor() as cur:
             mark(results, "PostgreSQL", True)
-            cur.execute("SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE migration_id = '058_autofill_exact_action_scope.sql')")
-            mark(results, "Migrations through 058", bool(cur.fetchone()[0]))
+            cur.execute("SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE migration_id = '061_telegram_review_channel.sql')")
+            mark(results, "Migrations through 061", bool(cur.fetchone()[0]))
             cur.execute("SELECT to_regclass('public.autofill_action_journal') IS NOT NULL")
             mark(results, "Autofill action journal", bool(cur.fetchone()[0]))
+            cur.execute("SELECT to_regclass('public.human_review_items') IS NOT NULL")
+            mark(results, "Human Review Hub", bool(cur.fetchone()[0]))
             cur.execute("SELECT count(*) FROM browser_tasks WHERE execution_state = 'needs_reconciliation'")
             unresolved = int(cur.fetchone()[0])
             mark(results, "No unresolved autofill task", unresolved == 0, f"{unresolved} unresolved")
@@ -59,7 +61,7 @@ def doctor(*, check_browser: bool) -> int:
             mark(results, "Immigration profile confirmed", int(cur.fetchone()[0]) == 1)
     except Exception as exc:
         mark(results, "PostgreSQL", False, str(exc)[:180])
-        mark(results, "Migrations through 058", False, "PostgreSQL unavailable")
+        mark(results, "Migrations through 061", False, "PostgreSQL unavailable")
 
     if check_browser:
         # Health only: it validates gateway/CDP availability but does not list
@@ -74,10 +76,10 @@ def doctor(*, check_browser: bool) -> int:
     for name, ok, detail in results:
         print(f"{'✓' if ok else '⚠'} {name}" + (f" — {detail}" if detail else ""))
     checks = {name: ok for name, ok, _ in results}
-    core = all(checks.get(name, False) for name in ("Python 3.11+", "Environment", "PostgreSQL", "Migrations through 058"))
+    core = all(checks.get(name, False) for name in ("Python 3.11+", "Environment", "PostgreSQL", "Migrations through 061"))
     autofill = core and all(ok for name, ok, _ in results if name in {
         "Autofill action journal", "No unresolved autofill task", "Immigration profile confirmed",
-        "OpenClaw runtime", "Managed upload root",
+        "OpenClaw runtime", "Managed upload root", "Human Review Hub",
     })
     print(f"\nCORE READY: {'YES' if core else 'NO'}")
     print(f"AUTOFILL READY: {'YES' if autofill else 'NO'}")
@@ -254,12 +256,46 @@ def status() -> int:
         reconciliation = int(cur.fetchone()[0])
         cur.execute("SELECT coalesce(status, 'unknown'), count(*) FROM application_attempts GROUP BY 1 ORDER BY 1;")
         attempts = {str(attempt_status): count for attempt_status, count in cur.fetchall()}
+        cur.execute("SELECT count(*) FROM human_review_items WHERE status IN ('pending','needs_revision');")
+        pending_reviews = int(cur.fetchone()[0])
     print(json.dumps({
         "applications_by_status": applications, "applications_by_source": sources,
-        "browser_tasks": browser_tasks, "attempts": attempts,
+        "browser_tasks": browser_tasks, "attempts": attempts, "pending_human_reviews": pending_reviews,
         "needs_reconciliation": reconciliation, "submit": "human_only",
     }, indent=2))
     return 0
+
+
+def saved_sync(max_results: int, timeout: int) -> int:
+    load_repo_env()
+    command = [sys.executable, str(ROOT / "services" / "discovery" / "linkedin_intake_v1.py"),
+               "queue-saved", "--max-results", str(max_results), "--timeout", str(timeout)]
+    return subprocess.call(command, cwd=ROOT)
+
+
+def review_command(command: str, item_id: str | None = None, note: str = "",
+                   answer_text: str = "", answer_scope: str = "company") -> int:
+    load_repo_env()
+    argv = [sys.executable, str(ROOT / "services" / "review" / "review_service_v1.py"), command]
+    if item_id:
+        argv.append(item_id)
+    if note and command in {"approve", "reject", "revise"}:
+        argv.extend(("--note", note))
+    if command == "answer":
+        argv.extend(("--text", answer_text, "--scope", answer_scope))
+    return subprocess.call(argv, cwd=ROOT)
+
+
+def telegram_start(*, once: bool = False, dispatch_only: bool = False, discover_id: bool = False) -> int:
+    load_repo_env()
+    argv = [sys.executable, str(ROOT / "services" / "telegram" / "telegram_review_bot_v1.py")]
+    if once:
+        argv.append("--once")
+    if dispatch_only:
+        argv.append("--dispatch-only")
+    if discover_id:
+        argv.append("--discover-id")
+    return subprocess.call(argv, cwd=ROOT)
 
 
 def main() -> int:
@@ -273,12 +309,50 @@ def main() -> int:
     prepare_parser.add_argument("--application-id", required=True)
     prepare_parser.add_argument("--create", action="store_true", help="After showing the plan, prompt to create a one-time approval.")
     prepare_parser.add_argument("--yes", action="store_true", help="Create without an interactive confirmation; use only after reviewing the printed plan.")
-    commands.add_parser("status", help="Read-only product status: applications, browser tasks, and attempts.")
+    commands.add_parser("status", help="Read-only product status: applications, browser tasks, attempts, and human reviews.")
+
+    saved_parser = commands.add_parser("saved", help="LinkedIn Saved Jobs read-only intake.")
+    saved_sub = saved_parser.add_subparsers(dest="saved_command", required=True)
+    saved = saved_sub.add_parser("sync", help="Queue a bounded Saved Jobs sync.")
+    saved.add_argument("--limit", type=int, default=10)
+    saved.add_argument("--timeout", type=int, default=600)
+
+    review_parser = commands.add_parser("review", help="Unified Human Review Hub.")
+    review_sub = review_parser.add_subparsers(dest="review_command", required=True)
+    review_sub.add_parser("sync")
+    review_sub.add_parser("inbox")
+    show = review_sub.add_parser("show")
+    show.add_argument("item_id")
+    for decision in ("approve", "reject", "revise"):
+        item = review_sub.add_parser(decision)
+        item.add_argument("item_id")
+        item.add_argument("--note", default="")
+    answer = review_sub.add_parser("answer")
+    answer.add_argument("item_id")
+    answer.add_argument("--text", required=True)
+    answer.add_argument("--scope", choices=("company", "ats", "global"), default="company")
+
+    telegram_parser = commands.add_parser("telegram", help="Telegram remote review adapter.")
+    telegram_sub = telegram_parser.add_subparsers(dest="telegram_command", required=True)
+    start = telegram_sub.add_parser("start")
+    start.add_argument("--once", action="store_true")
+    start.add_argument("--dispatch-only", action="store_true")
+    telegram_sub.add_parser("discover-id", help="Print recent Telegram user/chat ids after you send /start to the bot.")
     args = parser.parse_args()
     if args.command == "doctor":
         return doctor(check_browser=args.check_browser)
     if args.command == "status":
         return status()
+    if args.command == "saved":
+        return saved_sync(args.limit, args.timeout)
+    if args.command == "review":
+        return review_command(args.review_command, getattr(args, "item_id", None),
+                              getattr(args, "note", ""), getattr(args, "text", ""),
+                              getattr(args, "scope", "company"))
+    if args.command == "telegram":
+        if args.telegram_command == "discover-id":
+            return telegram_start(discover_id=True)
+        return telegram_start(once=args.once, dispatch_only=args.dispatch_only)
     return autofill_prepare(args.application_id, create=args.create, yes=args.yes)
 
 

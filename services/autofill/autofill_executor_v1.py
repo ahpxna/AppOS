@@ -103,6 +103,62 @@ class OpenClawTransport:
             raise TransportError("OpenClaw snapshot JSON is not an object.")
         return data
 
+    @staticmethod
+    def _find_media_path(value: Any) -> Path | None:
+        """Find an existing local screenshot path in OpenClaw output."""
+        if isinstance(value, dict):
+            for key in ("path", "file", "mediaPath", "screenshotPath", "outputPath"):
+                raw = value.get(key)
+                if isinstance(raw, str):
+                    candidate = Path(raw.removeprefix("file://")).expanduser()
+                    if candidate.is_file():
+                        return candidate.resolve()
+            for nested in value.values():
+                found = OpenClawTransport._find_media_path(nested)
+                if found:
+                    return found
+        elif isinstance(value, list):
+            for nested in value:
+                found = OpenClawTransport._find_media_path(nested)
+                if found:
+                    return found
+        elif isinstance(value, str):
+            for token in value.replace("\n", " ").split():
+                raw = token.strip("\"'(),[]{}")
+                if raw.startswith("file://"):
+                    raw = raw[7:]
+                candidate = Path(raw).expanduser()
+                if candidate.is_file() and candidate.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}:
+                    return candidate.resolve()
+        return None
+
+    def screenshot(self, target_id: str, *, full_page: bool = True) -> Path:
+        """Capture only the already-pinned tab; never invoke an LLM agent."""
+        args = ["screenshot", "--target-id", target_id]
+        if full_page:
+            args.append("--full-page")
+        try:
+            raw = self._run(args, json_output=True)
+            try:
+                parsed = self._json(raw)
+            except TransportError:
+                parsed = raw
+            path = self._find_media_path(parsed)
+            if path:
+                return path
+        except TransportError:
+            if not full_page:
+                raise
+            raw = self._run(["screenshot", "--target-id", target_id], json_output=True)
+            try:
+                parsed = self._json(raw)
+            except TransportError:
+                parsed = raw
+            path = self._find_media_path(parsed)
+            if path:
+                return path
+        raise TransportError("OpenClaw screenshot completed without an accessible local image path.")
+
     def _stage_upload(self, value: str) -> str:
         source = Path(value).expanduser().resolve()
         if not source.is_file():

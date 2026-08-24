@@ -63,8 +63,10 @@ from services.common.config import database_dsn, load_repo_env
 from services.discovery.linkedin_discovery_v1 import (
     LinkedInDiscoveryError,
     ingest_discovered_jobs,
+    ingest_saved_jobs,
     validate_job_url,
     validate_search_request,
+    validate_saved_request,
 )
 from services.autofill.autofill_agent_v1 import parse_snapshot
 from services.autofill.autofill_executor_v1 import OpenClawTransport, TransportError
@@ -112,6 +114,7 @@ LEASE_SECONDS = int(os.getenv("JOBOS_BROWSER_LEASE_SECONDS", "600"))
 SUPPORTED_TASKS = {
     "fetch_job_description",
     "discover_linkedin_jobs",
+    "discover_linkedin_saved_jobs",
     "capture_page_snapshot",
     "fill_application_form",
 }
@@ -1002,6 +1005,61 @@ def handle_discover_linkedin_jobs(cur, task) -> Dict[str, Any]:
         "auto_ingest": intake, "agent_response": agent_response,}
 
 
+def handle_discover_linkedin_saved_jobs(cur, task) -> Dict[str, Any]:
+    """Read only the jobs the user has already saved on LinkedIn.
+
+    This is deliberately a separate handler: it does not modify the existing
+    LinkedIn discovery, parallel bypass, CAPTCHA detection, or CapSolver flow.
+    """
+    if not feature_enabled("JOBOS_LINKEDIN_SAVED_DISCOVERY_ENABLED"):
+        raise PermanentTaskError("LinkedIn Saved Jobs discovery is disabled by configuration.")
+    inp = task["input_json"]
+    if inp.get("user_initiated") is not True:
+        raise PermanentTaskError("Saved Jobs sync requires explicit user_initiated=true.")
+    try:
+        request = validate_saved_request(inp.get("max_results"))
+    except LinkedInDiscoveryError as exc:
+        raise PermanentTaskError(str(exc)) from exc
+    saved_url = "https://www.linkedin.com/my-items/saved-jobs/"
+    check_domain(cur, saved_url)
+    sync_id = str(inp.get("saved_sync_id") or "").strip() or None
+    if sync_id:
+        cur.execute(
+            """UPDATE linkedin_saved_syncs
+                  SET status = 'running', started_at = coalesce(started_at, now()), error_message = NULL
+                WHERE id = %s;""",
+            (sync_id,),
+        )
+    msg = (
+        "Use the OpenClaw browser tool with profile exactly `remote`, already manually authenticated. "
+        "Open/read this LinkedIn Saved Jobs page only. This task is READ ONLY.\n"
+        f"Saved Jobs URL: {saved_url}\n"
+        f"Read at most {request['max_results']} existing saved job postings and their complete visible job descriptions.\n\n"
+        "Never authenticate, save/unsave, apply, message, upload, fill fields, submit, or change LinkedIn preferences. "
+        "If login or a checkpoint appears, stop and report it.\n"
+        "Return ONLY JSON: {\"jobs\":[{\"company\":\"...\",\"title\":\"...\",\"location\":\"...\","
+        "\"work_mode\":\"remote|hybrid|on-site|unknown\",\"url\":\"https://www.linkedin.com/jobs/view/<numeric-id>/\","
+        "\"jd_text\":\"full visible job description\"}]}. "
+        "Each record needs a grounded canonical URL and 200+ JD characters."
+    )
+    try:
+        agent_response = openclaw_agent(
+            agent=OPENCLAW_AGENT_LINKEDIN_DISCOVERY, message=msg,
+            timeout=task["timeout_seconds"], session_id=f"jobos-saved-{task['id']}",
+        )
+    except RuntimeError as exc:
+        raise TransientTaskError(str(exc)) from exc
+    blocker_text = json.dumps(agent_response, ensure_ascii=False).casefold()
+    if any(word in blocker_text for word in ("captcha", "checkpoint", "sign in", "login required")):
+        raise PermanentTaskError("LinkedIn Saved Jobs requires human login/checkpoint handling; no LinkedIn state changed.")
+    try:
+        intake = ingest_saved_jobs(cur, task["id"], inp, agent_response)
+    except LinkedInDiscoveryError as exc:
+        raise PermanentTaskError(f"LinkedIn Saved Jobs result refused: {exc}") from exc
+    return {"saved_url": saved_url, "saved": request, "submitted": False,
+            "auto_ingest": intake, "agent_response": agent_response}
+
+
 def handle_capture_page_snapshot(cur, task) -> Dict[str, Any]:
     url = require_url(cur, task["input_json"])
     msg = (
@@ -1099,6 +1157,22 @@ def handle_fill_application_form(cur, task) -> Dict[str, Any]:
         # reviewed and approved afresh instead of leaving idempotency stuck.
         durable_close_unstarted_approval(task, binding, f"Preflight refused: {exc}")
         raise PermanentTaskError(str(exc)) from exc
+    screenshot_path = None
+    try:
+        # This is deliberately performed only after the deterministic session
+        # is closed. A failed review artifact must never replay browser writes.
+        captured = transport.screenshot(result.target_id, full_page=True)
+        durable_dir = REPO_ROOT / "data" / "review-artifacts" / str(task["application_id"]) / str(task["id"])
+        durable_dir.mkdir(parents=True, exist_ok=True)
+        durable = durable_dir / "autofill.png"
+        shutil.copy2(captured, durable)
+        durable.chmod(0o600)
+        screenshot_path = str(durable.resolve())
+        cur.execute("UPDATE browser_tasks SET screenshot_url = %s WHERE id = %s;", (screenshot_path, task["id"]))
+    except TransportError:
+        # Browser side effects are final at this point. The review hub will
+        # show the completed form without an image rather than attempt replay.
+        screenshot_path = None
     return {
         "status": result.status, "verified_refs": list(result.verified_refs),
         "failed_refs": list(result.failed_refs), "executed_refs": list(result.executed_refs),
@@ -1106,12 +1180,14 @@ def handle_fill_application_form(cur, task) -> Dict[str, Any]:
         "paused": [action.question_label or action.reason for action in latest_actions if action.action == "pause"],
         "approval_consumed": execution_started,
         "approval_closed_without_write": not execution_started,
+        "screenshot_path": screenshot_path,
         "submitted": False, }
 
 
 HANDLERS = {
     "fetch_job_description": handle_fetch_job_description,
     "discover_linkedin_jobs": handle_discover_linkedin_jobs,
+    "discover_linkedin_saved_jobs": handle_discover_linkedin_saved_jobs,
     "capture_page_snapshot": handle_capture_page_snapshot,
     "fill_application_form": handle_fill_application_form,
 }
@@ -1164,6 +1240,11 @@ def process_one(conn) -> bool:
             result["worker_version"] = WORKER_VERSION
             result["elapsed_seconds"] = round(elapsed, 1)
             complete_task(cur, task["id"], result)
+            if task["task_type"] == "fill_application_form":
+                from services.review.review_service_v1 import ensure_autofill_review
+                ensure_autofill_review(
+                    cur, task["id"], screenshot_path=result.get("screenshot_path"), result=result,
+                )
         conn.commit()
         print(f"  completed in {elapsed:.1f}s")
         emit_trace(
