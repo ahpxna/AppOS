@@ -26,6 +26,7 @@ data/profile_raw/
 data/profile_parsed/
 data/profile_parsed_v2/
 data/profile_sources_v2/
+data/profile_description_drafts_2026_08/
 !data/job_jds/
 
 # === Python ===
