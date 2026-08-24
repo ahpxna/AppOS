@@ -52,13 +52,20 @@ from services.autofill.parallel_bypass import _fake_mouse_routine
 
 import psycopg
 from psycopg.types.json import Jsonb
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
+from services.common.observability import emit_trace, make_trace_id
+from services.common.config import database_dsn, load_repo_env
+from services.autofill.parallel_bypass import _fake_mouse_routine
 # Make `services.*` importable regardless of cwd/PYTHONPATH when this file
 # is run directly. Without this, `from services.common...` below raises
 # ModuleNotFoundError unless the caller happens to have the repo root on
 # PYTHONPATH already. Confirmed live 2026-08-01.
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from services.common.observability import emit_trace, make_trace_id
+from services.autofill.parallel_bypass import _fake_mouse_routine
 from services.common.config import database_dsn, load_repo_env
 from services.discovery.linkedin_discovery_v1 import (
     LinkedInDiscoveryError,
@@ -704,6 +711,21 @@ def durable_finish_execution(task: Dict[str, Any], binding: Dict[str, Any], resu
             (execution_state, Jsonb({"verified_refs": list(result.verified_refs),
                                      "failed_refs": list(result.failed_refs)}), task["id"]),
         )
+        if execution_state == "completed":
+            cur.execute(
+                """UPDATE applications
+                      SET current_step = 'form_filled', updated_at = now()
+                    WHERE id = %s AND current_step = 'awaiting_approval';""",
+                (task["application_id"],),
+            )
+            if cur.rowcount == 1:
+                cur.execute(
+                    """INSERT INTO pipeline_events(
+                           application_id, from_step, to_step, actor, reason, detail_json)
+                       VALUES (%s, 'awaiting_approval', 'form_filled', %s,
+                               'Deterministic autofill completed; final submit remains human-only.', %s);""",
+                    (task["application_id"], WORKER_ID, Jsonb({"browser_task_id": task["id"]})),
+                )
 
 
 def durable_mark_reconciliation(task: Dict[str, Any], target_id: str | None, reason: str) -> None:
@@ -1169,7 +1191,7 @@ def handle_fill_application_form(cur, task) -> Dict[str, Any]:
         durable.chmod(0o600)
         screenshot_path = str(durable.resolve())
         cur.execute("UPDATE browser_tasks SET screenshot_url = %s WHERE id = %s;", (screenshot_path, task["id"]))
-    except TransportError:
+    except (TransportError, OSError, shutil.Error):
         # Browser side effects are final at this point. The review hub will
         # show the completed form without an image rather than attempt replay.
         screenshot_path = None
@@ -1191,6 +1213,27 @@ HANDLERS = {
     "capture_page_snapshot": handle_capture_page_snapshot,
     "fill_application_form": handle_fill_application_form,
 }
+
+
+def update_saved_sync_failure(cur, task: Dict[str, Any], status: str, error: str) -> None:
+    """Keep the Saved Jobs sync record aligned with the browser task lifecycle."""
+    if task.get("task_type") != "discover_linkedin_saved_jobs":
+        return
+    sync_id = str((task.get("input_json") or {}).get("saved_sync_id") or "").strip()
+    if not sync_id:
+        return
+    if status == "queued":
+        cur.execute(
+            """UPDATE linkedin_saved_syncs SET status = 'queued', error_message = %s
+                 WHERE id = %s;""",
+            (error[:2000], sync_id),
+        )
+    elif status == "failed":
+        cur.execute(
+            """UPDATE linkedin_saved_syncs SET status = 'failed', error_message = %s,
+                      completed_at = now() WHERE id = %s;""",
+            (error[:2000], sync_id),
+        )
 
 
 # ---------------------------------------------------------------- loop
@@ -1263,6 +1306,7 @@ def process_one(conn) -> bool:
         conn.rollback()
         with conn.cursor() as cur:
             fail_task(cur, task["id"], str(e))
+            update_saved_sync_failure(cur, task, "failed", str(e))
         conn.commit()
         print(f"  refused (no retry): {e}")
         emit_trace(
@@ -1281,6 +1325,7 @@ def process_one(conn) -> bool:
         conn.rollback()
         with conn.cursor() as cur:
             status = requeue_or_fail(cur, task, str(e))
+            update_saved_sync_failure(cur, task, status, str(e))
         conn.commit()
         print(f"  transient error -> {status}: {e}")
         emit_trace(
@@ -1299,6 +1344,7 @@ def process_one(conn) -> bool:
         conn.rollback()
         with conn.cursor() as cur:
             status = requeue_or_fail(cur, task, f"{type(e).__name__}: {e}")
+            update_saved_sync_failure(cur, task, status, f"{type(e).__name__}: {e}")
         conn.commit()
         print(f"  unexpected error -> {status}: {type(e).__name__}: {e}")
         emit_trace(

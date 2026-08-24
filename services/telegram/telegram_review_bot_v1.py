@@ -147,18 +147,66 @@ def _message_text(row: tuple[Any, ...]) -> str:
 
 
 def _record_delivery(cur, item_id: str, chat_id: int, message_id: int | None,
-                     kind: str, *, status: str = "sent", error: str | None = None) -> None:
+                     kind: str, *, status: str = "sent", error: str | None = None,
+                     artifact_sha256: str | None = None) -> None:
     cur.execute(
         """INSERT INTO telegram_review_deliveries(
-               review_item_id, chat_id, message_id, delivery_kind, status, error_message)
-           VALUES (%s, %s, %s, %s, %s, %s);""",
-        (item_id, chat_id, message_id, kind, status, error),
+               review_item_id, chat_id, message_id, delivery_kind, status, error_message, artifact_sha256)
+           VALUES (%s, %s, %s, %s, %s, %s, %s);""",
+        (item_id, chat_id, message_id, kind, status, error, artifact_sha256),
     )
+
+
+def _deliver_artifact(cur, token: str, *, item_id: str, chat_id: int,
+                      artifact: dict[str, Any]) -> bool:
+    """Deliver one exact artifact once, independently of summary delivery."""
+    path = Path(artifact["file_path"]).expanduser()
+    if not path.is_file():
+        return False
+    cur.execute(
+        """SELECT 1 FROM telegram_review_deliveries
+             WHERE review_item_id = %s AND chat_id = %s AND delivery_kind = 'artifact'
+               AND artifact_sha256 = %s AND status = 'sent' LIMIT 1;""",
+        (item_id, chat_id, artifact["sha256"]),
+    )
+    if cur.fetchone():
+        return False
+    method = "sendPhoto" if artifact["mime_type"].startswith("image/") else "sendDocument"
+    field = "photo" if method == "sendPhoto" else "document"
+    try:
+        with path.open("rb") as stream:
+            sent = api(token, method, data={"chat_id": str(chat_id), "caption": artifact["filename"]},
+                       files={field: (artifact["filename"], stream, artifact["mime_type"])})
+        _record_delivery(cur, item_id, chat_id, int(sent["result"]["message_id"]), "artifact",
+                         artifact_sha256=artifact["sha256"])
+        return True
+    except TelegramError as exc:
+        _record_delivery(cur, item_id, chat_id, None, "artifact", status="failed",
+                         error=str(exc)[:1000], artifact_sha256=artifact["sha256"])
+        raise
 
 
 def dispatch_pending(conn, token: str, allowed_user_id: int, chat_id: int, *, limit: int = 20) -> int:
     with conn.cursor() as cur:
         sync_inbox(cur)
+        # Artifacts can be rendered/captured after their review summary was
+        # already delivered. Send them from their own ledger, never gated by
+        # the summary delivery row.
+        cur.execute(
+            """SELECT DISTINCT v.review_item_id::text
+                 FROM v_human_review_inbox v
+                 JOIN human_review_artifacts a ON a.review_item_id = v.review_item_id
+                WHERE NOT EXISTS (
+                      SELECT 1 FROM telegram_review_deliveries d
+                       WHERE d.review_item_id = v.review_item_id AND d.chat_id = %s
+                         AND d.delivery_kind = 'artifact' AND d.artifact_sha256 = a.sha256
+                         AND d.status = 'sent')
+                LIMIT %s;""",
+            (chat_id, limit),
+        )
+        for (item_id,) in cur.fetchall():
+            for artifact in review_artifacts(cur, item_id):
+                _deliver_artifact(cur, token, item_id=item_id, chat_id=chat_id, artifact=artifact)
         cur.execute(
             """SELECT v.review_item_id::text, v.item_type, v.priority, v.title,
                       v.summary_text, v.company, v.job_title, v.payload_json
@@ -174,20 +222,7 @@ def dispatch_pending(conn, token: str, allowed_user_id: int, chat_id: int, *, li
         for row in rows:
             item_id = row[0]
             for artifact in review_artifacts(cur, item_id):
-                path = Path(artifact["file_path"]).expanduser()
-                if not path.is_file():
-                    continue
-                method = "sendPhoto" if artifact["mime_type"].startswith("image/") else "sendDocument"
-                field = "photo" if method == "sendPhoto" else "document"
-                try:
-                    with path.open("rb") as stream:
-                        sent = api(token, method,
-                                   data={"chat_id": str(chat_id), "caption": artifact["filename"]},
-                                   files={field: (artifact["filename"], stream, artifact["mime_type"])})
-                    _record_delivery(cur, item_id, chat_id, int(sent["result"]["message_id"]), "artifact")
-                except TelegramError as exc:
-                    _record_delivery(cur, item_id, chat_id, None, "artifact", status="failed", error=str(exc)[:1000])
-                    raise
+                _deliver_artifact(cur, token, item_id=item_id, chat_id=chat_id, artifact=artifact)
             keyboard = _keyboard(cur, item_id, allowed_user_id, row[1], row[7] or {})
             data: dict[str, Any] = {"chat_id": str(chat_id), "text": _message_text(row)}
             if keyboard:

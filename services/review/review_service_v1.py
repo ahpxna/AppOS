@@ -136,6 +136,17 @@ def ensure_document_review(cur, document_id: str) -> str | None:
             ("Document content or QA state changed; a fresh review item was issued.", existing[0]),
         )
     cur.execute(
+        """SELECT 1 FROM human_review_items
+             WHERE generated_document_id = %s AND item_type = 'document_review'
+               AND source_sha256 = %s
+               AND coalesce(payload_json->>'qa_status', '') = %s
+               AND status IN ('approved','rejected','resolved')
+             LIMIT 1;""",
+        (document_id, source_sha, qa_status),
+    )
+    if cur.fetchone():
+        return None
+    cur.execute(
         """INSERT INTO human_review_items(
                review_bundle_id, application_id, item_type, status, generated_document_id,
                title, summary_text, source_sha256, priority, payload_json)
@@ -212,13 +223,22 @@ def ensure_autofill_review(cur, browser_task_id: str, *, screenshot_path: str | 
     bundle_id = ensure_bundle(cur, app_id, kind="autofill")
     review_status = "pending" if execution_state in {"completed", "partial"} else "needs_revision"
     cur.execute(
+        """SELECT status, source_sha256 FROM human_review_items
+             WHERE browser_task_id = %s AND item_type = 'autofill_review'
+             LIMIT 1;""",
+        (browser_task_id,),
+    )
+    existing = cur.fetchone()
+    if existing and existing[0] in {'approved', 'rejected', 'resolved', 'expired'}:
+        return None
+    cur.execute(
         """INSERT INTO human_review_items(
                review_bundle_id, application_id, item_type, status, browser_task_id,
                title, summary_text, source_sha256, priority, payload_json)
            VALUES (%s, %s, 'autofill_review', %s, %s, 'Review autofilled form', %s, %s, 'urgent', %s)
            ON CONFLICT (browser_task_id)
              WHERE browser_task_id IS NOT NULL AND item_type = 'autofill_review'
-           DO UPDATE SET status = EXCLUDED.status, summary_text = EXCLUDED.summary_text,
+           DO UPDATE SET summary_text = EXCLUDED.summary_text,
                          source_sha256 = EXCLUDED.source_sha256,
                          payload_json = EXCLUDED.payload_json, updated_at = now()
            RETURNING id::text;""",
@@ -318,6 +338,15 @@ def ensure_question_review(cur, *, application_id: str, document_id: str,
         return None
     bundle_id = ensure_bundle(cur, application_id)
     source_sha = _sha256_text(f"{document_id}|{normalized}|{missing_information}")
+    cur.execute(
+        """SELECT 1 FROM human_review_items
+             WHERE application_id = %s AND item_type = 'question_required'
+               AND source_sha256 = %s AND status IN ('approved','rejected','resolved','expired')
+             LIMIT 1;""",
+        (application_id, source_sha),
+    )
+    if cur.fetchone():
+        return None
     cur.execute(
         """INSERT INTO human_review_items(
                review_bundle_id, application_id, item_type, status, generated_document_id,

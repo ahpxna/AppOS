@@ -175,6 +175,7 @@ def ingest_discovered_jobs(cur, browser_task_id: str, search_input: dict[str, An
             cur.execute(
                 """UPDATE applications SET company = %s, job_title = %s, job_url = %s,
                        jd_text = %s, jd_hash = %s, location = %s, work_mode = %s,
+                       discovery_channel = 'search',
                        last_seen_at = now(), stale_at = NULL, closed_at = NULL,
                        last_content_change_at = CASE WHEN jd_hash <> %s THEN now() ELSE last_content_change_at END,
                        updated_at = now() WHERE id = %s;""",
@@ -187,10 +188,11 @@ def ingest_discovered_jobs(cur, browser_task_id: str, search_input: dict[str, An
             """INSERT INTO applications
                  (source, company, job_title, job_url, jd_text, jd_hash, current_step,
                   status, intake_channel, ats_type, location, work_mode, source_job_id,
+                  discovery_channel,
                   first_seen_at, last_seen_at, created_at, updated_at)
                VALUES ('linkedin', %s, %s, %s, %s, %s, 'intake', 'active',
                        'linkedin_browser_discovery', 'linkedin_browser_linked_session',
-                       %s, %s, %s, now(), now(), now(), now()) RETURNING id::text;""",
+                       %s, %s, %s, 'search', now(), now(), now(), now()) RETURNING id::text;""",
             (row["company"], row["title"], row["url"], row["jd_text"], jd_hash,
              row["location"], row["work_mode"], source_job_id),
         )

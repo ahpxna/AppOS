@@ -48,8 +48,8 @@ def doctor(*, check_browser: bool) -> int:
         import psycopg
         with psycopg.connect(database_dsn(), connect_timeout=5) as conn, conn.cursor() as cur:
             mark(results, "PostgreSQL", True)
-            cur.execute("SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE migration_id = '061_telegram_review_channel.sql')")
-            mark(results, "Migrations through 061", bool(cur.fetchone()[0]))
+            cur.execute("SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE migration_id = '062_telegram_artifact_delivery_ledger.sql')")
+            mark(results, "Migrations through 062", bool(cur.fetchone()[0]))
             cur.execute("SELECT to_regclass('public.autofill_action_journal') IS NOT NULL")
             mark(results, "Autofill action journal", bool(cur.fetchone()[0]))
             cur.execute("SELECT to_regclass('public.human_review_items') IS NOT NULL")
@@ -61,7 +61,7 @@ def doctor(*, check_browser: bool) -> int:
             mark(results, "Immigration profile confirmed", int(cur.fetchone()[0]) == 1)
     except Exception as exc:
         mark(results, "PostgreSQL", False, str(exc)[:180])
-        mark(results, "Migrations through 061", False, "PostgreSQL unavailable")
+        mark(results, "Migrations through 062", False, "PostgreSQL unavailable")
 
     if check_browser:
         # Health only: it validates gateway/CDP availability but does not list
@@ -76,7 +76,7 @@ def doctor(*, check_browser: bool) -> int:
     for name, ok, detail in results:
         print(f"{'✓' if ok else '⚠'} {name}" + (f" — {detail}" if detail else ""))
     checks = {name: ok for name, ok, _ in results}
-    core = all(checks.get(name, False) for name in ("Python 3.11+", "Environment", "PostgreSQL", "Migrations through 061"))
+    core = all(checks.get(name, False) for name in ("Python 3.11+", "Environment", "PostgreSQL", "Migrations through 062"))
     autofill = core and all(ok for name, ok, _ in results if name in {
         "Autofill action journal", "No unresolved autofill task", "Immigration profile confirmed",
         "OpenClaw runtime", "Managed upload root", "Human Review Hub",
