@@ -240,7 +240,24 @@ def test_expired_capability_never_writes_and_idempotency_can_be_reissued(db):
     with db.connect(TEST_DSN) as conn, conn.cursor() as cur:
         with pytest.raises(worker.PermanentTaskError): worker.require_bound_approval(cur, task)
         cur.execute("UPDATE approval_requests SET status = 'expired' WHERE id = %s", (task["approval_request_id"],))
-        cur.execute("INSERT INTO approval_requests (type, status, payload_json, idempotency_key) VALUES ('fit_review', 'pending', '{}'::jsonb, 'expired-fixture')")
+        cur.execute(
+            """
+            INSERT INTO approval_requests (
+                type,
+                status,
+                payload_json,
+                approval_token_hash,
+                idempotency_key
+            )
+            VALUES (
+                'fit_review',
+                'pending',
+                '{}'::jsonb,
+                'fixture-token',
+                'expired-fixture'
+            )
+            """
+        )
 
 
 def test_crash_with_journal_requires_reconciliation_and_is_never_requeued(db):
@@ -269,7 +286,24 @@ def test_reconciliation_closes_old_capability_and_allows_fresh_one(db):
         cur.execute("SELECT status, executing_task_id FROM approval_requests WHERE id = %s", (task["approval_request_id"],))
         assert cur.fetchone() == ("expired", None)
         # The active-idempotency index intentionally excludes expired rows.
-        cur.execute("INSERT INTO approval_requests (type, status, payload_json, idempotency_key) VALUES ('fit_review', 'pending', '{}'::jsonb, 'reconcile-fixture')")
+        cur.execute(
+            """
+            INSERT INTO approval_requests (
+                type,
+                status,
+                payload_json,
+                approval_token_hash,
+                idempotency_key
+            )
+            VALUES (
+                'fit_review',
+                'pending',
+                '{}'::jsonb,
+                'fixture-token',
+                'reconcile-fixture'
+            )
+            """
+        )
 
 
 def test_lease_reaper_retries_only_provably_pre_io_execution(db):
@@ -302,6 +336,22 @@ def _patch_multifield_worker(worker, monkeypatch, seeded, transport):
 
 def test_production_worker_path_claims_exact_approval_journals_each_write_and_completes(db, monkeypatch):
     worker = _load_worker()
+
+    # Isolate this production-path test from queued seed/migration tasks.
+    with db.connect(TEST_DSN) as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE browser_tasks
+            SET status = 'failed',
+                error_message = 'integration test isolation',
+                finished_at = now(),
+                locked_by = NULL,
+                lease_expires_at = NULL
+            WHERE status = 'queued'
+            """
+        )
+        conn.commit()
+
     seeded = _record(db, task_status="queued")
     transport = MultiFieldFakeTransport(
         url=seeded["expected_initial_url"], fingerprint=seeded["expected_page_fingerprint"],
