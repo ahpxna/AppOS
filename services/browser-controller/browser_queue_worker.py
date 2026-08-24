@@ -252,8 +252,54 @@ def browser_cdp_health() -> tuple[bool, str]:
 
 def reap_expired_leases(cur) -> int:
     # A crash before an action is journaled is provably pre-I/O. Release that
-    # exact capability/task pair for a safe retry. Once a journal row exists,
-    # an external write may have happened and the task must be reconciled.
+    # exact capability/task pair for a safe retry, but respect max_retries.
+    # Once a journal row exists, an external write may have happened and the
+    # task must be reconciled instead of replayed.
+    cur.execute(
+        """
+        WITH exhausted AS (
+          SELECT b.id AS task_id, b.approval_request_id
+          FROM browser_tasks b
+          JOIN approval_requests a ON a.id = b.approval_request_id
+          WHERE b.status = 'running'
+            AND b.lease_expires_at < now()
+            AND b.execution_state = 'executing'
+            AND b.retry_count >= b.max_retries
+            AND a.status = 'executing'
+            AND a.executing_task_id = b.id
+            AND NOT EXISTS (
+              SELECT 1 FROM autofill_action_journal j WHERE j.browser_task_id = b.id
+            )
+          FOR UPDATE OF b, a SKIP LOCKED
+        ), closed AS (
+          UPDATE approval_requests a
+          SET status = 'expired', executing_task_id = NULL,
+              action_note = COALESCE(action_note, 'Autofill task exhausted before external I/O.')
+          FROM exhausted e
+          WHERE a.id = e.approval_request_id
+          RETURNING e.task_id
+        )
+        UPDATE browser_tasks b
+        SET status = 'failed', execution_state = 'not_started',
+            locked_by = NULL, lease_expires_at = NULL,
+            retry_count = retry_count + 1, finished_at = now(),
+            error_message = COALESCE(error_message, 'Max retries exceeded before browser I/O.')
+        FROM closed c
+        WHERE b.id = c.task_id
+        RETURNING b.id;
+        """
+    )
+    exhausted_pre_io_rows = cur.fetchall()
+    exhausted_pre_io = len(exhausted_pre_io_rows)
+    for (task_id,) in exhausted_pre_io_rows:
+        cur.execute(
+            """UPDATE application_attempts
+                  SET status = 'failed', finished_at = COALESCE(finished_at, now()),
+                      detail_json = detail_json || %s
+                WHERE browser_task_id = %s AND status = 'started';""",
+            (Jsonb({"reason": "lease expired; retries exhausted before browser I/O"}), task_id),
+        )
+
     cur.execute(
         """
         WITH safe AS (
@@ -263,12 +309,13 @@ def reap_expired_leases(cur) -> int:
           WHERE b.status = 'running'
             AND b.lease_expires_at < now()
             AND b.execution_state = 'executing'
+            AND b.retry_count < b.max_retries
             AND a.status = 'executing'
             AND a.executing_task_id = b.id
             AND NOT EXISTS (
               SELECT 1 FROM autofill_action_journal j WHERE j.browser_task_id = b.id
             )
-          FOR UPDATE
+          FOR UPDATE OF b, a SKIP LOCKED
         ), released AS (
           UPDATE approval_requests a
           SET status = 'approved', executing_task_id = NULL
@@ -284,10 +331,19 @@ def reap_expired_leases(cur) -> int:
         RETURNING b.id;
         """
     )
-    pre_io = len(cur.fetchall())
-    # Once deterministic execution started, the browser may already contain a
-    # side effect. Never place such a task back on the queue after a worker
-    # crash: retain it for explicit reconciliation instead.
+    pre_io_rows = cur.fetchall()
+    pre_io = len(pre_io_rows)
+    for (task_id,) in pre_io_rows:
+        cur.execute(
+            """UPDATE application_attempts
+                  SET status = 'failed', finished_at = COALESCE(finished_at, now()),
+                      detail_json = detail_json || %s
+                WHERE browser_task_id = %s AND status = 'started';""",
+            (Jsonb({"reason": "worker lease expired before first browser action; safe retry"}), task_id),
+        )
+
+    # Once deterministic execution may have produced a side effect, never put
+    # the task back on the queue after a worker crash.
     cur.execute(
         """
         UPDATE browser_tasks
@@ -296,11 +352,21 @@ def reap_expired_leases(cur) -> int:
             error_message = COALESCE(error_message, 'Worker lease expired during browser execution; reconcile before retrying.')
         WHERE status = 'running'
           AND lease_expires_at < now()
-          AND execution_state IN ('executing', 'partial')
+          AND execution_state IN ('executing', 'partial', 'completed', 'needs_reconciliation')
         RETURNING id;
         """
     )
-    unsafe = len(cur.fetchall())
+    unsafe_rows = cur.fetchall()
+    unsafe = len(unsafe_rows)
+    for (task_id,) in unsafe_rows:
+        cur.execute(
+            """UPDATE application_attempts
+                  SET status = 'needs_review', finished_at = COALESCE(finished_at, now()),
+                      detail_json = detail_json || %s
+                WHERE browser_task_id = %s AND status = 'started';""",
+            (Jsonb({"reason": "worker lease expired after browser execution may have started"}), task_id),
+        )
+
     cur.execute(
         """
         UPDATE browser_tasks
@@ -313,21 +379,50 @@ def reap_expired_leases(cur) -> int:
         RETURNING id;
         """
     )
-    return pre_io + unsafe + len(cur.fetchall())
+    plain_pre_io = len(cur.fetchall())
+    return exhausted_pre_io + pre_io + unsafe + plain_pre_io
+
+
+def _expire_bound_pre_io_approval(cur, task: Dict[str, Any], reason: str) -> None:
+    approval_id = task.get("approval_request_id")
+    if not approval_id:
+        return
+    cur.execute(
+        """
+        UPDATE approval_requests
+        SET status = 'expired', executing_task_id = NULL,
+            action_note = COALESCE(action_note, %s)
+        WHERE id = %s AND application_id = %s
+          AND status IN ('pending', 'approved', 'executing')
+          AND consumed_at IS NULL
+          AND (executing_task_id IS NULL OR executing_task_id = %s);
+        """,
+        (reason[:500], approval_id, task.get("application_id"), task["id"]),
+    )
 
 
 def dead_letter_exhausted(cur) -> int:
-    """Archive exhausted tasks using the live-to-archive error-column mapping.
-
-    Fix note: ``browser_tasks`` returns ``error_message`` whereas
-    ``dead_letter_tasks`` stores it as ``last_error``. The explicit mapping
-    prevents the historical CTE column error recorded in the Windows log.
-    """
+    """Archive exhausted, provably pre-I/O tasks and close their capability."""
+    cur.execute(
+        """
+        UPDATE approval_requests a
+        SET status = 'expired', executing_task_id = NULL,
+            action_note = COALESCE(action_note, 'Browser task exhausted before external I/O.')
+        FROM browser_tasks b
+        WHERE b.status = 'running'
+          AND b.lease_expires_at < now()
+          AND b.execution_state = 'not_started'
+          AND b.retry_count >= b.max_retries
+          AND a.id = b.approval_request_id
+          AND a.status IN ('pending', 'approved')
+          AND a.consumed_at IS NULL;
+        """
+    )
     cur.execute(
         """
         WITH dead AS (
           UPDATE browser_tasks
-          SET status = 'failed', locked_by = NULL, lease_expires_at = NULL,
+          SET status = 'dead_letter', locked_by = NULL, lease_expires_at = NULL,
               finished_at = now(),
               error_message = COALESCE(error_message, 'Max retries exceeded')
           WHERE status = 'running'
@@ -360,6 +455,7 @@ def claim_next_task(cur) -> Optional[Dict[str, Any]]:
         WHERE id = (
           SELECT id FROM browser_tasks
           WHERE status = 'queued'
+            AND retry_count <= max_retries
           ORDER BY
             CASE priority WHEN 'high' THEN 0 WHEN 'normal' THEN 1 ELSE 2 END,
             created_at
@@ -416,9 +512,122 @@ def fail_task(cur, task_id: str, error: str) -> None:
     )
 
 
+def close_terminal_capability_if_provably_pre_io(cur, task: Dict[str, Any], reason: str) -> None:
+    """Expire a terminal capability only when durable state proves zero I/O."""
+    if task.get("task_type") != "fill_application_form" or not task.get("approval_request_id"):
+        return
+    cur.execute(
+        """
+        SELECT execution_state,
+               EXISTS (SELECT 1 FROM autofill_action_journal j WHERE j.browser_task_id = b.id)
+          FROM browser_tasks b
+         WHERE b.id = %s
+         FOR UPDATE;
+        """,
+        (task["id"],),
+    )
+    row = cur.fetchone()
+    if not row:
+        return
+    execution_state, has_journal = row
+    if has_journal or execution_state in {"partial", "completed", "needs_reconciliation"}:
+        return
+    if execution_state == "executing":
+        cur.execute(
+            """UPDATE browser_tasks
+                  SET execution_state = 'not_started'
+                WHERE id = %s AND execution_state = 'executing';""",
+            (task["id"],),
+        )
+        cur.execute(
+            """UPDATE application_attempts
+                  SET status = 'failed', finished_at = COALESCE(finished_at, now()),
+                      detail_json = detail_json || %s
+                WHERE browser_task_id = %s AND status = 'started';""",
+            (Jsonb({"reason": reason[:500]}), task["id"]),
+        )
+    _expire_bound_pre_io_approval(cur, task, reason)
+
+
 def requeue_or_fail(cur, task: Dict[str, Any], error: str) -> str:
+    """Retry only when durable state proves that no browser write can replay."""
     new_count = task["retry_count"] + 1
     exhausted = new_count > task["max_retries"]
+
+    if task.get("task_type") == "fill_application_form":
+        cur.execute(
+            """
+            SELECT execution_state,
+                   EXISTS (SELECT 1 FROM autofill_action_journal j WHERE j.browser_task_id = b.id)
+              FROM browser_tasks b
+             WHERE b.id = %s
+             FOR UPDATE;
+            """,
+            (task["id"],),
+        )
+        row = cur.fetchone()
+        execution_state, has_journal = row if row else ("needs_reconciliation", True)
+
+        if has_journal or execution_state in {"partial", "completed", "needs_reconciliation"}:
+            cur.execute(
+                """
+                UPDATE browser_tasks
+                SET status = 'failed', execution_state = 'needs_reconciliation',
+                    retry_count = %s, error_message = %s,
+                    locked_by = NULL, lease_expires_at = NULL, finished_at = now()
+                WHERE id = %s;
+                """,
+                (new_count, error[:2000], task["id"]),
+            )
+            cur.execute(
+                """UPDATE application_attempts
+                      SET status = 'needs_review', finished_at = COALESCE(finished_at, now()),
+                          detail_json = detail_json || %s
+                    WHERE browser_task_id = %s AND status = 'started';""",
+                (Jsonb({"reason": error[:500]}), task["id"]),
+            )
+            return "failed"
+
+        if execution_state == "executing":
+            # No journal means the durable before-action record was never
+            # written, so external I/O is provably absent. Release the exact
+            # executing capability before retrying.
+            cur.execute(
+                """
+                UPDATE approval_requests
+                SET status = 'approved', executing_task_id = NULL
+                WHERE id = %s AND application_id = %s
+                  AND status = 'executing' AND executing_task_id = %s
+                  AND consumed_at IS NULL
+                RETURNING id;
+                """,
+                (task.get("approval_request_id"), task.get("application_id"), task["id"]),
+            )
+            if cur.fetchone() is None:
+                cur.execute(
+                    """UPDATE browser_tasks
+                          SET status = 'failed', execution_state = 'needs_reconciliation',
+                              retry_count = %s, error_message = %s,
+                              locked_by = NULL, lease_expires_at = NULL, finished_at = now()
+                        WHERE id = %s;""",
+                    (new_count, error[:2000], task["id"]),
+                )
+                return "failed"
+            cur.execute(
+                "UPDATE browser_tasks SET execution_state = 'not_started' WHERE id = %s;",
+                (task["id"],),
+            )
+            cur.execute(
+                """UPDATE application_attempts
+                      SET status = 'failed', finished_at = COALESCE(finished_at, now()),
+                          detail_json = detail_json || %s
+                    WHERE browser_task_id = %s AND status = 'started';""",
+                (Jsonb({"reason": "worker failed before first browser action; safe retry"}), task["id"]),
+            )
+
+        if exhausted:
+            _expire_bound_pre_io_approval(cur, task, f"Autofill retries exhausted before browser I/O: {error}")
+
     cur.execute(
         """
         UPDATE browser_tasks
@@ -1245,6 +1454,7 @@ def process_one(conn) -> bool:
     except PermanentTaskError as e:
         conn.rollback()
         with conn.cursor() as cur:
+            close_terminal_capability_if_provably_pre_io(cur, task, str(e))
             fail_task(cur, task["id"], str(e))
             update_saved_sync_failure(cur, task, "failed", str(e))
         conn.commit()

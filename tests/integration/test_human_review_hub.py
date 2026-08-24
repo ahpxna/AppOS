@@ -23,11 +23,19 @@ def db():
 
 def _fixture(db):
     app_id, doc_id = str(uuid.uuid4()), str(uuid.uuid4())
+    jd_hash = "d" * 64
     with db.connect(TEST_DSN) as conn, conn.cursor() as cur:
-        cur.execute("""INSERT INTO applications(id, source, company, job_title, current_step, status, created_at, updated_at)
-                       VALUES (%s, 'test', 'Review Fixture Co', 'Security Engineer', 'docs_verified', 'active', now(), now())""", (app_id,))
-        cur.execute("""INSERT INTO generated_documents(id, application_id, doc_type, version, content, qa_status, approved, created_at)
-                       VALUES (%s, %s, 'resume', 1, 'truth checked resume', 'pass', false, now())""", (doc_id, app_id))
+        cur.execute("""INSERT INTO applications(
+                           id, source, company, job_title, current_step, status,
+                           jd_text, jd_hash, created_at, updated_at)
+                       VALUES (%s, 'test', 'Review Fixture Co', 'Security Engineer',
+                               'docs_verified', 'active', 'fixture job description', %s, now(), now())""",
+                    (app_id, jd_hash))
+        cur.execute("""INSERT INTO generated_documents(
+                           id, application_id, doc_type, version, content, qa_status, approved,
+                           source_jd_hash, created_at)
+                       VALUES (%s, %s, 'resume', 1, 'truth checked resume', 'pass', false, %s, now())""",
+                    (doc_id, app_id, jd_hash))
         conn.commit()
     return app_id, doc_id
 
@@ -153,6 +161,52 @@ def test_new_document_version_supersedes_old_active_slot(db, monkeypatch):
         assert new_item != old_item
         assert rows[old_item] == ("expired", doc_v1)
         assert rows[new_item] == ("needs_revision", doc_v2)
+    finally:
+        _cleanup(db, app_id)
+
+
+def test_human_revision_request_survives_sync_until_document_changes(db, monkeypatch, tmp_path):
+    from services.review import review_service_v1 as review
+    monkeypatch.setenv("JOBOS_REVIEW_AUTO_RENDER_PDFS", "false")
+    app_id, doc_id = _fixture(db)
+    try:
+        _register_pdf_artifact(db, app_id, doc_id, tmp_path / "review" / "resume.pdf")
+        with db.connect(TEST_DSN) as conn, conn.cursor() as cur:
+            item_id = review.ensure_document_review(cur, doc_id)
+            conn.commit()
+        with db.connect(TEST_DSN) as conn:
+            result = review.decide_item(conn, item_id, decision="revise", actor="integration-test")
+            conn.commit()
+        assert result["status"] == "needs_revision"
+        with db.connect(TEST_DSN) as conn, conn.cursor() as cur:
+            again = review.ensure_document_review(cur, doc_id)
+            cur.execute(
+                "SELECT status, payload_json FROM human_review_items WHERE id = %s",
+                (item_id,),
+            )
+            status, payload = cur.fetchone()
+            conn.commit()
+        assert again == item_id
+        assert status == "needs_revision"
+        assert payload["human_revision_required"] is True
+    finally:
+        _cleanup(db, app_id)
+
+
+def test_document_review_rejects_stale_job_description(db, monkeypatch, tmp_path):
+    from services.review import review_service_v1 as review
+    monkeypatch.setenv("JOBOS_REVIEW_AUTO_RENDER_PDFS", "false")
+    app_id, doc_id = _fixture(db)
+    try:
+        _register_pdf_artifact(db, app_id, doc_id, tmp_path / "review" / "resume.pdf")
+        with db.connect(TEST_DSN) as conn, conn.cursor() as cur:
+            item_id = review.ensure_document_review(cur, doc_id)
+            cur.execute("UPDATE applications SET jd_hash = %s WHERE id = %s", ("e" * 64, app_id))
+            conn.commit()
+        with db.connect(TEST_DSN) as conn:
+            with pytest.raises(review.ReviewError, match="job description changed"):
+                review.decide_item(conn, item_id, decision="approve", actor="integration-test")
+            conn.rollback()
     finally:
         _cleanup(db, app_id)
 

@@ -1,4 +1,3 @@
-import os
 import socket
 import uuid
 import sys
@@ -11,6 +10,48 @@ from services.common.config import database_dsn
 WATCHDOG_ID = f"watchdog-{socket.gethostname()}-{uuid.uuid4().hex[:8]}"
 
 DSN = database_dsn()
+
+
+def mark_uncertain_expired_tasks(conn):
+    """Fail closed after any state that may have touched the browser.
+
+    The watchdog has no browser/session context with which to prove that an
+    executing/partial/completed task is safe to replay.  It therefore never
+    requeues those states.  The worker's own lease reaper has the narrower
+    proof for the pre-I/O executing/no-journal case.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            WITH uncertain AS (
+              UPDATE browser_tasks
+              SET
+                status = 'failed',
+                execution_state = 'needs_reconciliation',
+                locked_by = NULL,
+                lease_expires_at = NULL,
+                finished_at = COALESCE(finished_at, now()),
+                error_message = COALESCE(error_message, '') ||
+                  E'\nLease expired after browser execution may have started; manual reconciliation required.'
+              WHERE
+                status = 'running'
+                AND lease_expires_at IS NOT NULL
+                AND lease_expires_at < now()
+                AND execution_state IN ('executing', 'partial', 'completed', 'needs_reconciliation')
+              RETURNING id, task_type, execution_state
+            ), marked_attempts AS (
+              UPDATE application_attempts a
+                 SET status = 'needs_review', finished_at = COALESCE(finished_at, now()),
+                     detail_json = detail_json || '{"reason":"watchdog expired after browser execution may have started"}'::jsonb
+                FROM uncertain u
+               WHERE a.browser_task_id = u.id AND a.status = 'started'
+              RETURNING a.id
+            )
+            SELECT id, task_type, execution_state FROM uncertain;
+            """
+        )
+        return cur.fetchall()
+
 
 def requeue_expired_tasks(conn):
     with conn.cursor() as cur:
@@ -28,14 +69,34 @@ def requeue_expired_tasks(conn):
               AND lease_expires_at IS NOT NULL
               AND lease_expires_at < now()
               AND retry_count < max_retries
-              AND COALESCE(execution_state, 'not_started') <> 'executing'
+              AND execution_state = 'not_started'
             RETURNING id, task_type, retry_count, max_retries;
             """
         )
         return cur.fetchall()
 
+
 def dead_letter_expired_tasks(conn):
     with conn.cursor() as cur:
+        # A no-write task that has exhausted retries must not leave a live
+        # approval capability behind, otherwise the active idempotency key can
+        # prevent the user from issuing a fresh approval.
+        cur.execute(
+            """
+            UPDATE approval_requests a
+            SET status = 'expired', executing_task_id = NULL,
+                action_note = COALESCE(action_note, 'Browser task exhausted before external I/O.')
+            FROM browser_tasks b
+            WHERE b.status = 'running'
+              AND b.lease_expires_at IS NOT NULL
+              AND b.lease_expires_at < now()
+              AND b.retry_count >= b.max_retries
+              AND b.execution_state = 'not_started'
+              AND a.id = b.approval_request_id
+              AND a.status IN ('pending', 'approved')
+              AND a.consumed_at IS NULL;
+            """
+        )
         cur.execute(
             """
             WITH expired AS (
@@ -46,7 +107,7 @@ def dead_letter_expired_tasks(conn):
                 AND lease_expires_at IS NOT NULL
                 AND lease_expires_at < now()
                 AND retry_count >= max_retries
-                AND COALESCE(execution_state, 'not_started') <> 'executing'
+                AND execution_state = 'not_started'
               FOR UPDATE SKIP LOCKED
             ),
             inserted AS (
@@ -86,12 +147,18 @@ def dead_letter_expired_tasks(conn):
         )
         return cur.fetchall()
 
+
 def main():
     print(f"Watchdog ID: {WATCHDOG_ID}")
     with psycopg.connect(DSN, autocommit=False) as conn:
+        uncertain = mark_uncertain_expired_tasks(conn)
         dead = dead_letter_expired_tasks(conn)
         requeued = requeue_expired_tasks(conn)
         conn.commit()
+
+    print(f"Needs reconciliation: {len(uncertain)}")
+    for row in uncertain:
+        print("  reconcile:", row)
 
     print(f"Dead-lettered: {len(dead)}")
     for row in dead:
@@ -100,6 +167,7 @@ def main():
     print(f"Requeued: {len(requeued)}")
     for row in requeued:
         print("  requeued:", row)
+
 
 if __name__ == "__main__":
     main()

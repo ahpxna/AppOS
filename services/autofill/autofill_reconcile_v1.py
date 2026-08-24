@@ -42,7 +42,26 @@ def close(cur, task_id: str) -> None:
     )
     if cur.rowcount != 1:
         raise SystemExit("Only an executing task marked needs_reconciliation can be closed.")
-    cur.execute("UPDATE browser_tasks SET status = 'failed', finished_at = now() WHERE id = %s", (task_id,))
+    cur.execute(
+        """UPDATE browser_tasks
+              SET status = 'failed', execution_state = 'partial',
+                  locked_by = NULL, lease_expires_at = NULL,
+                  finished_at = COALESCE(finished_at, now()),
+                  error_message = COALESCE(error_message, '') ||
+                      E'\nReconciliation closed explicitly; capability expired and will not replay.'
+            WHERE id = %s AND execution_state = 'needs_reconciliation'
+            RETURNING id;""",
+        (task_id,),
+    )
+    if cur.fetchone() is None:
+        raise SystemExit("Underlying browser task changed before reconciliation could be closed.")
+    cur.execute(
+        """UPDATE application_attempts
+              SET status = 'reconciled', finished_at = COALESCE(finished_at, now()),
+                  detail_json = detail_json || '{"reconciled": true, "replay": false}'::jsonb
+            WHERE browser_task_id = %s AND status = 'needs_review';""",
+        (task_id,),
+    )
     print("Closed non-replayable capability. Inspect the form, then issue a fresh approval if needed.")
 
 def main() -> int:

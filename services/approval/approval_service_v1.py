@@ -271,6 +271,15 @@ def log_event(cur, request_id: Optional[str], event: str,
 
 def cmd_create(conn, args) -> int:
     with conn.cursor() as cur:
+        # Expire time-invalid capabilities before the active idempotency lookup.
+        # Otherwise an approved/pending row whose token TTL already elapsed can
+        # be returned as the "existing" approval and block a fresh capability.
+        cur.execute(
+            """UPDATE approval_requests
+                  SET status = 'expired', executing_task_id = NULL
+                WHERE status IN ('pending', 'approved')
+                  AND token_expires_at <= now();"""
+        )
         if args.application_id:
             cur.execute(
                 "SELECT company, job_title, current_step FROM applications WHERE id = %s;",
@@ -524,13 +533,18 @@ def redeem(conn, token: str, *, decision: str, note: str, actor: str) -> int:
             "status": request_row[3],
             "summary_text": request_row[4],
         }
-        try:
-            assert_binding_matches(cur, payload_request)
-        except RuntimeError as e:
-            log_event(cur, request_id, "binding_mismatch", actor, {"error": str(e)})
-            conn.commit()
-            print(f"  {e}")
-            return 1
+        # A positive authorization must still bind to the exact current state.
+        # A denial is always safe to record even when the underlying document,
+        # page, or input hash became stale; otherwise a stale capability can be
+        # impossible to close until its TTL expires.
+        if decision == "approve":
+            try:
+                assert_binding_matches(cur, payload_request)
+            except RuntimeError as e:
+                log_event(cur, request_id, "binding_mismatch", actor, {"error": str(e)})
+                conn.commit()
+                print(f"  {e}")
+                return 1
 
         if attempts >= max_attempts:
             log_event(cur, request_id, "locked_out", actor, {})
@@ -628,13 +642,14 @@ def decide_request_by_id(conn, request_id: str, *, decision: str, note: str,
         request = {"type": atype, "application_id": application_id,
                    "payload_json": payload or {}, "status": status,
                    "summary_text": summary}
-        try:
-            assert_binding_matches(cur, request)
-        except RuntimeError as exc:
-            log_event(cur, rid, "binding_mismatch", actor, {"error": str(exc)})
-            if commit:
-                conn.commit()
-            return {"ok": False, "error": str(exc)}
+        if normalized == "approve":
+            try:
+                assert_binding_matches(cur, request)
+            except RuntimeError as exc:
+                log_event(cur, rid, "binding_mismatch", actor, {"error": str(exc)})
+                if commit:
+                    conn.commit()
+                return {"ok": False, "error": str(exc)}
         new_status = "approved" if normalized == "approve" else "denied"
         cur.execute(
             """UPDATE approval_requests

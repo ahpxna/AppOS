@@ -69,7 +69,7 @@ def _fake_mouse_routine(ws_url: str, regimes_file_path: str, stop_event: threadi
                     }))
                     
                     # 2. Random Click (Tỷ lệ 5% sẽ click chuột trái)
-                    if random.random() < 0.05:
+                    if random.random() < 0.00:
                         ws.send(json.dumps({
                             "id": random.randint(1000, 9999),
                             "method": "Input.dispatchMouseEvent",

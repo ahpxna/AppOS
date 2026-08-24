@@ -57,6 +57,17 @@ def _load_reconcile():
     return module
 
 
+def _load_watchdog():
+    path = ROOT / "services" / "browser-controller" / "watchdog.py"
+    spec = importlib.util.spec_from_file_location("jobos_test_browser_watchdog", path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    module.DSN = TEST_DSN
+    return module
+
+
 @pytest.fixture(scope="session")
 def db():
     psycopg = _require_test_db()
@@ -287,6 +298,10 @@ def test_reconciliation_closes_old_capability_and_allows_fresh_one(db):
         reconcile.close(cur, task["id"])
         cur.execute("SELECT status, executing_task_id FROM approval_requests WHERE id = %s", (task["approval_request_id"],))
         assert cur.fetchone() == ("expired", None)
+        cur.execute("SELECT status, execution_state FROM browser_tasks WHERE id = %s", (task["id"],))
+        assert cur.fetchone() == ("failed", "partial")
+        cur.execute("SELECT status FROM application_attempts WHERE browser_task_id = %s", (task["id"],))
+        assert cur.fetchone() == ("reconciled",)
         # The active-idempotency index intentionally excludes expired rows.
         cur.execute(
             """
@@ -322,6 +337,64 @@ def test_lease_reaper_retries_only_provably_pre_io_execution(db):
         assert cur.fetchone() == ("queued", "not_started")
         cur.execute("SELECT status FROM approval_requests WHERE id = %s", (task["approval_request_id"],))
         assert cur.fetchone() == ("approved",)
+
+
+def test_exhausted_pre_io_execution_closes_capability_instead_of_requeueing(db):
+    worker, task = _load_worker(), _record(db)
+    binding = _binding(worker, db, task)
+    worker.durable_begin_execution(task, binding, "fixture-tab")
+    with db.connect(TEST_DSN) as conn, conn.cursor() as cur:
+        cur.execute(
+            """UPDATE browser_tasks
+                  SET retry_count = max_retries, lease_expires_at = now() - interval '1 minute'
+                WHERE id = %s""",
+            (task["id"],),
+        )
+        assert worker.reap_expired_leases(cur) == 1
+        conn.commit()
+    with db.connect(TEST_DSN) as conn, conn.cursor() as cur:
+        cur.execute("SELECT status, execution_state FROM browser_tasks WHERE id = %s", (task["id"],))
+        assert cur.fetchone() == ("failed", "not_started")
+        cur.execute("SELECT status FROM approval_requests WHERE id = %s", (task["approval_request_id"],))
+        assert cur.fetchone() == ("expired",)
+
+
+def test_retry_helper_never_requeues_after_action_journal_exists(db):
+    worker, task = _load_worker(), _record(db)
+    binding = _binding(worker, db, task)
+    worker.durable_begin_execution(task, binding, "fixture-tab")
+    action = PlannedAction("fill", "name-ref", "Ada", "personal.first_name", "fixture", "First name")
+    worker.durable_journal_start(task, binding, action, "fixture-tab")
+    with db.connect(TEST_DSN) as conn, conn.cursor() as cur:
+        status = worker.requeue_or_fail(cur, task, "synthetic unexpected exception")
+        conn.commit()
+    assert status == "failed"
+    with db.connect(TEST_DSN) as conn, conn.cursor() as cur:
+        cur.execute("SELECT status, execution_state FROM browser_tasks WHERE id = %s", (task["id"],))
+        assert cur.fetchone() == ("failed", "needs_reconciliation")
+        cur.execute("SELECT status FROM approval_requests WHERE id = %s", (task["approval_request_id"],))
+        assert cur.fetchone() == ("executing",)
+
+
+def test_watchdog_never_requeues_partial_browser_state(db):
+    watchdog, task = _load_watchdog(), _record(db)
+    with db.connect(TEST_DSN) as conn, conn.cursor() as cur:
+        cur.execute(
+            """UPDATE browser_tasks
+                  SET execution_state = 'partial', lease_expires_at = now() - interval '1 minute'
+                WHERE id = %s""",
+            (task["id"],),
+        )
+        conn.commit()
+    with db.connect(TEST_DSN) as conn:
+        uncertain = watchdog.mark_uncertain_expired_tasks(conn)
+        requeued = watchdog.requeue_expired_tasks(conn)
+        conn.commit()
+    assert len(uncertain) == 1
+    assert requeued == []
+    with db.connect(TEST_DSN) as conn, conn.cursor() as cur:
+        cur.execute("SELECT status, execution_state FROM browser_tasks WHERE id = %s", (task["id"],))
+        assert cur.fetchone() == ("failed", "needs_reconciliation")
 
 
 def _patch_multifield_worker(worker, monkeypatch, seeded, transport):

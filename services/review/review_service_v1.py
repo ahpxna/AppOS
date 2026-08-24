@@ -198,6 +198,13 @@ def ensure_document_review(cur, document_id: str) -> str | None:
             and existing_qa == qa_status
         )
         if same_review_identity:
+            payload = existing[3] or {}
+            if bool(payload.get("human_revision_required")):
+                # A human Revise decision is an explicit gate. Do not turn the
+                # unchanged document back into a pending approval merely because
+                # its PDF is now renderable. Only a new content/version/QA
+                # identity may supersede this review item.
+                return str(existing[0])
             # A missing PDF is a materialized state problem, not a new review
             # identity. Re-sync the same item instead of expiring/recreating it.
             reviewed_artifact_id = _ensure_review_pdf(
@@ -252,11 +259,12 @@ def ensure_approval_review(cur, approval_request_id: str) -> str | None:
         """SELECT ar.application_id::text, ar.type, ar.status, ar.summary_text,
                   ar.token_expires_at, a.company, a.job_title
              FROM approval_requests ar LEFT JOIN applications a ON a.id = ar.application_id
-            WHERE ar.id = %s;""",
+            WHERE ar.id = %s AND ar.status = 'pending'
+              AND ar.token_expires_at > now();""",
         (approval_request_id,),
     )
     row = cur.fetchone()
-    if not row or row[2] != "pending" or not row[0]:
+    if not row or not row[0]:
         return None
     app_id, approval_type, _status, summary, expires, company, role = row
     bundle_id = ensure_bundle(cur, app_id)
@@ -396,7 +404,8 @@ def ensure_reconciliation_review(cur, browser_task_id: str) -> str | None:
            VALUES (%s, %s, 'reconciliation_required', %s,
                    'Autofill reconciliation required', %s, 'urgent', %s)
            ON CONFLICT (browser_task_id)
-             WHERE browser_task_id IS NOT NULL AND item_type = 'reconciliation_required' AND status = 'pending'
+             WHERE browser_task_id IS NOT NULL AND item_type = 'reconciliation_required'
+               AND status IN ('pending','needs_revision')
            DO UPDATE SET summary_text = EXCLUDED.summary_text,
                          payload_json = EXCLUDED.payload_json, updated_at = now()
            RETURNING id::text;""",
@@ -630,6 +639,19 @@ def decide_item(conn, item_id: str, *, decision: str, actor: str, note: str = ""
         raise ReviewError("decision must be approve, reject, or revise")
     review_decision = decision
     with conn.cursor() as cur:
+        # Keep the lock order consistent with ensure_document_review():
+        # application row first, review item second. Without this, concurrent
+        # inbox sync + human approval can deadlock (app->item vs item->app).
+        cur.execute(
+            "SELECT application_id::text FROM human_review_items WHERE id = %s;",
+            (item_id,),
+        )
+        seed = cur.fetchone()
+        if not seed:
+            raise ReviewError("Review item not found.")
+        cur.execute("SELECT id::text FROM applications WHERE id = %s FOR UPDATE;", (seed[0],))
+        if not cur.fetchone():
+            raise ReviewError("Review item's application no longer exists.")
         cur.execute(
             """SELECT id::text, item_type, status, application_id::text,
                       generated_document_id::text, approval_request_id::text,
@@ -640,18 +662,29 @@ def decide_item(conn, item_id: str, *, decision: str, actor: str, note: str = ""
         row = cur.fetchone()
         if not row:
             raise ReviewError("Review item not found.")
+        if row[3] != seed[0]:
+            raise ReviewError("Review item application binding changed concurrently.")
         _id, item_type, status, app_id, document_id, approval_id, browser_task_id, source_sha, reviewed_artifact_id = row
         if status not in {"pending", "needs_revision"}:
             raise ReviewError(f"Review item is already {status}.")
 
         if item_type == "document_review":
-            cur.execute("SELECT content, qa_status FROM generated_documents WHERE id = %s FOR UPDATE;", (document_id,))
+            cur.execute(
+                """SELECT gd.content, gd.qa_status, gd.doc_type, gd.source_jd_hash, a.jd_hash
+                     FROM generated_documents gd
+                     JOIN applications a ON a.id = gd.application_id
+                    WHERE gd.id = %s AND gd.application_id = %s
+                    FOR UPDATE OF gd;""",
+                (document_id, app_id),
+            )
             doc = cur.fetchone()
             if not doc or _sha256_text(doc[0] or "") != source_sha:
                 raise ReviewError("Document changed after review creation; sync a fresh review item.")
             if decision == "approve":
                 if doc[1] != "pass":
                     raise ReviewError("Only a QA-passed document may be approved.")
+                if not doc[3] or not doc[4] or doc[3] != doc[4]:
+                    raise ReviewError("The job description changed after this document was generated; regenerate and re-review it.")
                 if not reviewed_artifact_id:
                     raise ReviewError("An exact reviewed PDF artifact is required before document approval.")
                 cur.execute(
@@ -659,12 +692,12 @@ def decide_item(conn, item_id: str, *, decision: str, actor: str, note: str = ""
                               hra.generated_document_artifact_id::text, gda.generated_document_id::text
                          FROM human_review_artifacts hra
                          LEFT JOIN generated_document_artifacts gda ON gda.id = hra.generated_document_artifact_id
-                        WHERE hra.id = %s;""",
-                    (reviewed_artifact_id,),
+                        WHERE hra.id = %s AND hra.review_item_id = %s
+                          AND gda.application_id = %s;""",
+                    (reviewed_artifact_id, item_id, app_id),
                 )
                 artifact = cur.fetchone()
-                cur.execute("SELECT doc_type FROM generated_documents WHERE id = %s;", (document_id,))
-                doc_type = cur.fetchone()[0]
+                doc_type = doc[2]
                 required_kind = "resume_pdf" if doc_type == "resume" else "cover_letter_pdf"
                 if (not artifact or artifact[0] != required_kind or artifact[4] != document_id
                         or not Path(artifact[1]).is_file() or _sha256_file(Path(artifact[1])) != artifact[2]):
@@ -680,6 +713,14 @@ def decide_item(conn, item_id: str, *, decision: str, actor: str, note: str = ""
                                 (document_id, artifact[3], app_id))
             else:
                 cur.execute("UPDATE generated_documents SET approved = false, approved_at = NULL WHERE id = %s;", (document_id,))
+                if decision == "revise":
+                    cur.execute(
+                        """UPDATE human_review_items
+                              SET payload_json = payload_json || %s, updated_at = now()
+                            WHERE id = %s;""",
+                        (Jsonb({"human_revision_required": True,
+                                "human_revision_source_sha256": source_sha}), item_id),
+                    )
 
         elif item_type == "approval_request":
             capability_decision = "reject" if decision == "revise" else decision
@@ -730,11 +771,13 @@ def decide_item(conn, item_id: str, *, decision: str, actor: str, note: str = ""
             raise ReviewError("Question items require an explicit answer; use the answer command.")
 
         elif item_type == "reconciliation_required":
-            if decision == "approve":
-                cur.execute("SELECT execution_state FROM browser_tasks WHERE id = %s;", (browser_task_id,))
-                task = cur.fetchone()
-                if task and task[0] == "needs_reconciliation":
-                    raise ReviewError("Underlying task still needs reconciliation; close it with autofill_reconcile_v1 first.")
+            cur.execute("SELECT execution_state FROM browser_tasks WHERE id = %s;", (browser_task_id,))
+            task = cur.fetchone()
+            if task and task[0] == "needs_reconciliation":
+                raise ReviewError(
+                    "Underlying task still needs reconciliation; close it with autofill_reconcile_v1 first. "
+                    "Reject/revise cannot dismiss an uncertain browser side effect."
+                )
 
         elif item_type == "application_ready":
             raise ReviewError("Final submission is human-only in the real browser. This review item has no remote approval action.")
