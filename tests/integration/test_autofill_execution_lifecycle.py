@@ -247,6 +247,7 @@ def test_expired_capability_never_writes_and_idempotency_can_be_reissued(db):
                 status,
                 payload_json,
                 approval_token_hash,
+                token_expires_at,
                 idempotency_key
             )
             VALUES (
@@ -254,6 +255,7 @@ def test_expired_capability_never_writes_and_idempotency_can_be_reissued(db):
                 'pending',
                 '{}'::jsonb,
                 'fixture-token',
+                now() + interval '5 minutes',
                 'expired-fixture'
             )
             """
@@ -293,6 +295,7 @@ def test_reconciliation_closes_old_capability_and_allows_fresh_one(db):
                 status,
                 payload_json,
                 approval_token_hash,
+                token_expires_at,
                 idempotency_key
             )
             VALUES (
@@ -300,6 +303,7 @@ def test_reconciliation_closes_old_capability_and_allows_fresh_one(db):
                 'pending',
                 '{}'::jsonb,
                 'fixture-token',
+                now() + interval '5 minutes',
                 'reconcile-fixture'
             )
             """
@@ -367,7 +371,7 @@ def test_production_worker_path_claims_exact_approval_journals_each_write_and_co
         assert cur.fetchone() == ("completed", "completed")
         cur.execute("SELECT status, consumed_at IS NOT NULL FROM approval_requests WHERE id = %s", (seeded["approval_request_id"],))
         assert cur.fetchone() == ("consumed", True)
-        cur.execute("SELECT action_ref, status FROM autofill_action_journal WHERE browser_task_id = %s", (seeded["id"],))
+        cur.execute("SELECT target_ref, status FROM autofill_action_journal WHERE browser_task_id = %s", (seeded["id"],))
         journal = cur.fetchall()
         assert {row[0] for row in journal} == {"first", "email", "phone"}
         assert len(journal) == 3
