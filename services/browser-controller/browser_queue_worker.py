@@ -1363,7 +1363,33 @@ def handle_fill_application_form(cur, task) -> Dict[str, Any]:
         "screenshot_path": screenshot_path,
         "submitted": False, }
 
+def handle_capture_page_snapshot(cur, task) -> Dict[str, Any]:
+    url = require_url(cur, task["input_json"])
+    msg = (
+        "Open this URL and list every form field: label, input type, whether it "
+        "is required, and any select options.\n"
+        f"URL: {url}\n\n"
+        "This is a read-only inspection. Do not type into any field. "
+        "Do not submit."
+    )
+    return {
+        "url": url,
+        "agent_response": openclaw_agent(
+            agent=OPENCLAW_AGENT_BROWSE,
+            message=msg,
+            timeout=task["timeout_seconds"],
+            session_id=f"jobos-task-{task['id']}",
+        ),
+    }
 
+
+HANDLERS = {
+    "fetch_job_description": handle_fetch_job_description,
+    "discover_linkedin_jobs": handle_discover_linkedin_jobs,
+    "discover_linkedin_saved_jobs": handle_discover_linkedin_saved_jobs,
+    "capture_page_snapshot": handle_capture_page_snapshot,
+    "fill_application_form": handle_fill_application_form,
+}
 def update_saved_sync_failure(cur, task: Dict[str, Any], status: str, error: str) -> None:
     """Keep the Saved Jobs sync record aligned with the browser task lifecycle."""
     if task.get("task_type") != "discover_linkedin_saved_jobs":
