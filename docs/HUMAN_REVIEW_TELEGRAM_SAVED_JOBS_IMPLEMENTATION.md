@@ -27,7 +27,7 @@ Telegram approval of an autofill screenshot means only “the populated form loo
 | `services/review/review_service_v1.py` | Create | Canonical materialized review inbox for docs, questions, capability approvals, autofill screenshots, reconciliation, final human submit. |
 | `services/review/render_review_artifacts_v1.py` | Create | Deterministic physical PDF artifacts; resume reuses fixed template renderer; cover letter renders truth-checked content. |
 | `services/telegram/telegram_review_bot_v1.py` | Create | Long polling; sends PDF/screenshots; allowlisted user; opaque hashed callbacks; `/answer`; `discover-id`. |
-| `scripts/jobos.py` | Modify | `saved sync`, `review ...`, `telegram discover-id/start`; doctor through migration 061. |
+| `scripts/jobos.py` | Modify | `saved sync`, `review ...`, `telegram discover-id/start`; doctor through migration 062. |
 | `.env.example` | Modify | Saved Jobs, Review Hub, Telegram configuration. |
 | `scripts/bootstrap_ubuntu_24.sh` | Modify | Installs LibreOffice Writer for PDF export. |
 | `tests/test_review_saved_features.py` | Create | Pure boundary tests. |

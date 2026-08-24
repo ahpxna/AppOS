@@ -221,7 +221,7 @@ def ensure_autofill_review(cur, browser_task_id: str, *, screenshot_path: str | 
     paused = list(result.get("paused") or [])
     source_sha = _sha256_text(json.dumps(result, sort_keys=True, separators=(",", ":"), default=str))
     bundle_id = ensure_bundle(cur, app_id, kind="autofill")
-    review_status = "pending" if execution_state in {"completed", "partial"} else "needs_revision"
+    review_status = "pending" if execution_state == "completed" else "needs_revision"
     cur.execute(
         """SELECT status, source_sha256 FROM human_review_items
              WHERE browser_task_id = %s AND item_type = 'autofill_review'
@@ -258,6 +258,12 @@ def ensure_autofill_review(cur, browser_task_id: str, *, screenshot_path: str | 
                    VALUES (%s, 'autofill_screenshot', %s, %s, 'image/png', %s)
                    ON CONFLICT (review_item_id, artifact_kind, sha256) DO NOTHING;""",
                 (item_id, str(path.resolve()), path.name, digest),
+            )
+            cur.execute(
+                """UPDATE human_review_items
+                      SET payload_json = payload_json || %s, updated_at = now()
+                    WHERE id = %s;""",
+                (Jsonb({"screenshot_sha256": digest}), item_id),
             )
     return item_id
 
@@ -587,22 +593,33 @@ def decide_item(conn, item_id: str, *, decision: str, actor: str, note: str = ""
             if decision == "approve":
                 cur.execute("SELECT status, execution_state, result_json FROM browser_tasks WHERE id = %s;", (browser_task_id,))
                 task = cur.fetchone()
-                if not task or task[0] != "completed" or task[1] not in {"completed", "partial"}:
-                    raise ReviewError("Autofill task is no longer in a reviewable completed state.")
+                if not task or task[0] != "completed" or task[1] != "completed":
+                    raise ReviewError("Only a fully completed deterministic autofill may be approved.")
                 current_sha = _sha256_text(json.dumps(task[2] or {}, sort_keys=True, separators=(",", ":"), default=str))
                 if source_sha and current_sha != source_sha:
                     raise ReviewError("Autofill result changed after screenshot review was created.")
-                if task[1] == "completed":
-                    cur.execute("UPDATE applications SET current_step = 'application_ready', updated_at = now() WHERE id = %s AND current_step = 'form_filled';", (app_id,))
-                    transitioned = cur.rowcount == 1
-                    if transitioned:
-                        cur.execute(
-                            """INSERT INTO pipeline_events(application_id, from_step, to_step, actor, reason, detail_json)
-                               VALUES (%s, 'form_filled', 'application_ready', %s,
-                                       'Human reviewed post-autofill screenshot; final submit remains human-only.', %s);""",
-                            (app_id, actor, Jsonb({"review_item_id": item_id, "browser_task_id": browser_task_id})),
-                        )
-                    ensure_application_ready_review(cur, app_id)
+                cur.execute(
+                    """SELECT file_path, sha256 FROM human_review_artifacts
+                         WHERE review_item_id = %s AND artifact_kind = 'autofill_screenshot'
+                         ORDER BY created_at DESC LIMIT 1;""",
+                    (item_id,),
+                )
+                screenshot = cur.fetchone()
+                if not screenshot:
+                    raise ReviewError("A verified post-autofill screenshot is required before approval.")
+                screenshot_path = Path(screenshot[0]).expanduser()
+                if not screenshot_path.is_file() or _sha256_file(screenshot_path) != screenshot[1]:
+                    raise ReviewError("Autofill screenshot is missing or changed; capture a fresh review artifact.")
+                cur.execute("UPDATE applications SET current_step = 'application_ready', updated_at = now() WHERE id = %s AND current_step = 'form_filled';", (app_id,))
+                transitioned = cur.rowcount == 1
+                if transitioned:
+                    cur.execute(
+                        """INSERT INTO pipeline_events(application_id, from_step, to_step, actor, reason, detail_json)
+                           VALUES (%s, 'form_filled', 'application_ready', %s,
+                                   'Human reviewed post-autofill screenshot; final submit remains human-only.', %s);""",
+                        (app_id, actor, Jsonb({"review_item_id": item_id, "browser_task_id": browser_task_id})),
+                    )
+                ensure_application_ready_review(cur, app_id)
 
         elif item_type == "question_required":
             raise ReviewError("Question items require an explicit answer; use the answer command.")

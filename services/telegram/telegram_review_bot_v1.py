@@ -99,7 +99,8 @@ def _keyboard(cur, item_id: str, allowed_user_id: int, item_type: str,
               payload: dict[str, Any]) -> str | None:
     if item_type in {"question_required", "application_ready"}:
         return None
-    if item_type == "autofill_review" and payload.get("execution_state") not in {"completed", "partial"}:
+    if item_type == "autofill_review" and (
+            payload.get("execution_state") != "completed" or not payload.get("screenshot_sha256")):
         revise = _callback_token(cur, item_id, "revise", allowed_user_id)
         reject = _callback_token(cur, item_id, "reject", allowed_user_id)
         return json.dumps({"inline_keyboard": [[

@@ -46,27 +46,20 @@ import urllib.request
 from urllib.parse import urlencode, urlsplit
 from pathlib import Path
 from typing import Any, Dict, Optional
-import threading
-import requests
-from services.autofill.parallel_bypass import _fake_mouse_routine
 
-import psycopg
-from psycopg.types.json import Jsonb
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+import threading
+import requests
+
+import psycopg
+from psycopg.types.json import Jsonb
+
 from services.common.observability import emit_trace, make_trace_id
 from services.common.config import database_dsn, load_repo_env
 from services.autofill.parallel_bypass import _fake_mouse_routine
-# Make `services.*` importable regardless of cwd/PYTHONPATH when this file
-# is run directly. Without this, `from services.common...` below raises
-# ModuleNotFoundError unless the caller happens to have the repo root on
-# PYTHONPATH already. Confirmed live 2026-08-01.
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from services.common.observability import emit_trace, make_trace_id
-from services.autofill.parallel_bypass import _fake_mouse_routine
-from services.common.config import database_dsn, load_repo_env
 from services.discovery.linkedin_discovery_v1 import (
     LinkedInDiscoveryError,
     ingest_discovered_jobs,
@@ -95,7 +88,6 @@ DSN = database_dsn()
 
 # Prefer the pinned JobOS runtime when setup installed it.  A global OpenClaw
 # can otherwise inherit an unsupported Node version or a different plugin set.
-REPO_ROOT = Path(__file__).resolve().parents[2]
 OPENCLAW_BIN = resolve_openclaw_binary()
 # Agent ids as defined in ~/.openclaw/openclaw.json -> agents.list
 OPENCLAW_AGENT_BROWSE = os.getenv("OPENCLAW_AGENT_BROWSE", "main")
