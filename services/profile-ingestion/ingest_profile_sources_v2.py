@@ -227,22 +227,61 @@ def choose_chunk_columns(cols: set[str]) -> Tuple[str, str]:
 
 
 def existing_raw_id(cur, cols: set[str], digest: str, original_path: str):
-    predicates = []
-    params = []
+    """Return only an exact content identity.
 
-    if "sha256" in cols:
-        predicates.append("sha256 = %s")
-        params.append(digest)
-    if "original_local_path" in cols:
-        predicates.append("original_local_path = %s")
-        params.append(original_path)
-
-    if not predicates:
+    Older code used ``sha256 OR original_local_path``.  On an in-place DOCX/PDF
+    edit that reused the old row while intentionally *not* updating ``sha256``,
+    producing stale bytes with a current path.  Content SHA is now the revision
+    boundary; path is used only to retire older revisions.
+    """
+    if "sha256" not in cols:
         return None
-
-    cur.execute(f"SELECT id FROM raw_files WHERE {' OR '.join(predicates)} LIMIT 1", params)
+    cur.execute("SELECT id, original_local_path FROM raw_files WHERE sha256=%s LIMIT 1", (digest,))
     row = cur.fetchone()
-    return row[0] if row else None
+    if not row:
+        return None
+    if "original_local_path" in cols and row[1] and str(row[1]) != original_path:
+        raise RuntimeError(
+            "Two logical profile sources contain identical bytes but raw_files has a global SHA identity. "
+            f"Existing path={row[1]!r}, new path={original_path!r}. Keep one canonical copy or change the content."
+        )
+    return row[0]
+
+
+def retire_previous_path_revisions(cur, *, original_path: str, digest: str) -> int:
+    """Retire prior active truth when the same managed source path changes SHA."""
+    cur.execute(
+        """SELECT id FROM raw_files
+             WHERE source=%s AND original_local_path=%s AND is_active=true
+               AND sha256 IS DISTINCT FROM %s
+             FOR UPDATE""",
+        (SOURCE_NAME, original_path, digest),
+    )
+    old_ids = [row[0] for row in cur.fetchall()]
+    for raw_id in old_ids:
+        cur.execute("UPDATE raw_files SET is_active=false WHERE id=%s", (raw_id,))
+        cur.execute(
+            """UPDATE profile_documents
+                  SET status='superseded', contains_profile_evidence=false, updated_at=now()
+                WHERE raw_file_id=%s AND status<>'superseded'""",
+            (raw_id,),
+        )
+        # 068 adds freshness_status; status='superseded' is already an existing
+        # profile-asset lifecycle state and prevents L6 from reading the old
+        # revision even on databases upgraded from an earlier release.
+        cur.execute(
+            """UPDATE profile_assets
+                  SET status='superseded', updated_at=now(),
+                      review_note=concat_ws(' ', nullif(review_note,''),
+                        'Source content SHA changed; retired by profile source revision ingestion.')
+                WHERE status<>'superseded' AND (
+                    created_from_raw_file_id=%s OR id IN (
+                      SELECT profile_asset_id FROM profile_asset_evidence_items WHERE raw_file_id=%s
+                    )
+                )""",
+            (raw_id, raw_id),
+        )
+    return len(old_ids)
 
 
 def main() -> int:
@@ -357,6 +396,11 @@ def main() -> int:
                 }
                 raw_values = {k: v for k, v in raw_values.items() if k in raw_cols}
 
+                retired_revisions = retire_previous_path_revisions(
+                    cur, original_path=original_path, digest=digest
+                )
+                if retired_revisions:
+                    print(f"  retired prior path revisions: {retired_revisions}")
                 raw_id = existing_raw_id(cur, raw_cols, digest, original_path)
                 if raw_id and not args.force_reingest:
                     cur.execute(

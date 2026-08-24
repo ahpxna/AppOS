@@ -23,7 +23,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_REGISTRY_PATH = Path(
     os.getenv("JOBOS_PROJECT_REGISTRY_PATH", REPO_ROOT / "data/project-registry/project_profiles.json")
 ).expanduser()
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # These are the six project blocks already present in the approved Word
 # template.  Their IDs and resume slots are immutable.  Adding a new project
@@ -48,7 +48,11 @@ _MUTABLE_LIST_FIELDS = (
     "asset_title_aliases", "technology_tags", "skill_tags", "jd_keyword_tags",
     "allowed_facts", "do_not_overclaim", "evidence_locations", "source_urls",
 )
-_MUTABLE_TEXT_FIELDS = ("project_summary", "scope_status", "template_title", "template_date", "template_github_url")
+_MUTABLE_TEXT_FIELDS = (
+    "project_summary", "scope_status", "template_title", "template_date", "template_github_url",
+    "github_repo_full_name", "github_default_branch", "dynamic_source_mode",
+)
+_MUTABLE_DICT_FIELDS = ("dynamic_source_policy",)
 
 
 class ProjectRegistryError(ValueError):
@@ -80,6 +84,15 @@ def _base_project(item: Mapping[str, Any]) -> dict[str, Any]:
         "do_not_overclaim": [],
         "evidence_locations": [],
         "source_urls": [],
+        "github_repo_full_name": "",
+        "github_default_branch": "main",
+        "dynamic_source_mode": "github_primary",
+        "dynamic_source_policy": {
+            "implementation": {"github": 0.70, "document": 0.30},
+            "tests_runtime": {"github": 0.80, "document": 0.20},
+            "purpose_motivation": {"github": 0.40, "document": 0.60},
+            "ownership_identity": {"user": 1.00},
+        },
     }
 
 
@@ -132,6 +145,22 @@ def _normalise_registry(raw: Any) -> dict[str, Any]:
                 # project by replacing a custom alias list in the form.
                 merged = target[field] + _clean_list(source[field]) if field == "asset_title_aliases" else _clean_list(source[field])
                 target[field] = list(dict.fromkeys(merged))
+        for field in _MUTABLE_DICT_FIELDS:
+            if field in source:
+                if not isinstance(source[field], dict):
+                    raise ProjectRegistryError(f"{target['project_id']}.{field} must be an object.")
+                target[field] = deepcopy(source[field])
+        repo_name = target.get("github_repo_full_name", "")
+        if repo_name and not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo_name):
+            raise ProjectRegistryError(f"{target['project_id']}.github_repo_full_name must be owner/repository.")
+        branch = target.get("github_default_branch", "main") or "main"
+        if any(ch.isspace() for ch in branch) or branch.startswith("-"):
+            raise ProjectRegistryError(f"{target['project_id']}.github_default_branch is invalid.")
+        target["github_default_branch"] = branch
+        mode = target.get("dynamic_source_mode") or "github_primary"
+        if mode not in {"github_primary", "document_only"}:
+            raise ProjectRegistryError(f"{target['project_id']}.dynamic_source_mode must be github_primary or document_only.")
+        target["dynamic_source_mode"] = mode
     return result
 
 
@@ -209,3 +238,25 @@ def map_parsed_records(records: Iterable[Mapping[str, Any]], registry: Mapping[s
     """Attach a non-destructive mapping object to each parsed record."""
     clean = _normalise_registry(registry if registry is not None else load_registry())
     return [{**dict(record), "jobos_project_mapping": map_parsed_profile_record(record, clean)} for record in records]
+
+
+def configured_github_projects(registry: Mapping[str, Any] | None = None) -> list[dict[str, Any]]:
+    """Return only fixed projects that have an explicit GitHub repository mapping."""
+    clean = _normalise_registry(registry if registry is not None else load_registry())
+    return [deepcopy(project) for project in clean["projects"] if project.get("github_repo_full_name")]
+
+
+def set_project_github_source(project_id: str, repo_full_name: str, *, branch: str = "main",
+                              path: Path | None = None) -> Path:
+    """Persist one explicit project->GitHub mapping without changing fixed resume slots."""
+    registry = load_registry(path)
+    matched = False
+    for project in registry["projects"]:
+        if project["project_id"] == project_id:
+            project["github_repo_full_name"] = _clean_text(repo_full_name, 200)
+            project["github_default_branch"] = _clean_text(branch, 200) or "main"
+            matched = True
+            break
+    if not matched:
+        raise ProjectRegistryError(f"Unknown fixed project_id: {project_id}")
+    return save_registry(registry, path)

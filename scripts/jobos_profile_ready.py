@@ -534,6 +534,106 @@ def reject_asset(asset_id: str, note: str, *, apply: bool) -> int:
     return 0
 
 
+def sync_source_revisions() -> None:
+    run_checked([
+        sys.executable, "services/profile-ingestion/profile_source_revisions_v1.py",
+        "sync", "--apply",
+    ], label="sync_profile_source_revisions")
+
+
+def fixed_fields_status() -> dict[str, Any]:
+    sys.path.insert(0, str(ROOT))
+    from services.common.profile_freshness import assess_resume_profile
+    psycopg, database_dsn = load_db_helpers()
+    with psycopg.connect(database_dsn(), autocommit=True) as conn, conn.cursor() as cur:
+        return assess_resume_profile(cur)
+
+
+def run_fixed_fields_wizard() -> None:
+    run_checked([
+        sys.executable, "services/profile-ingestion/fixed_profile_fields_v1.py",
+        "wizard", "--actor", "candidate", "--apply",
+    ], label="fixed_resume_fields_wizard")
+
+
+def run_github_refresh(*, skip: bool = False) -> None:
+    if skip:
+        emit("stage_skip", stage="github_project_refresh", reason="explicit --skip-github-refresh")
+        return
+    run_checked([
+        sys.executable, "services/repo-audit/repository_freshness_v1.py",
+        "refresh",
+    ], label="github_project_refresh")
+
+
+def freshness_payload() -> dict[str, Any]:
+    sys.path.insert(0, str(ROOT))
+    from services.common.profile_freshness import assess_resume_profile, explain_blockers
+    psycopg, database_dsn = load_db_helpers()
+    with psycopg.connect(database_dsn(), autocommit=True) as conn, conn.cursor() as cur:
+        report = assess_resume_profile(cur)
+    return {"resume": report, "blockers": explain_blockers(report)}
+
+
+def configure_project_source(project_id: str, repo_full_name: str, branch: str, *, document_only: bool = False) -> int:
+    sys.path.insert(0, str(ROOT))
+    from services.common.project_registry import load_registry, save_registry, ProjectRegistryError
+    registry = load_registry()
+    matched = False
+    for project in registry["projects"]:
+        if project["project_id"] != project_id:
+            continue
+        matched = True
+        if document_only:
+            project["dynamic_source_mode"] = "document_only"
+            project["github_repo_full_name"] = ""
+        else:
+            if "/" not in repo_full_name:
+                raise PipelineError("--repo must be owner/repository.")
+            project["dynamic_source_mode"] = "github_primary"
+            project["github_repo_full_name"] = repo_full_name.strip()
+            project["github_default_branch"] = branch.strip() or "main"
+        break
+    if not matched:
+        raise PipelineError(f"Unknown fixed project_id: {project_id}")
+    try:
+        path = save_registry(registry)
+    except ProjectRegistryError as exc:
+        raise PipelineError(str(exc)) from exc
+    print(json.dumps({"project_id": project_id, "registry": str(path), "document_only": document_only,
+                      "repo": None if document_only else repo_full_name, "branch": None if document_only else branch}, indent=2))
+    return 0
+
+
+def confirm_repository(repo_full_name: str, actor: str, *, apply: bool) -> int:
+    psycopg, database_dsn = load_db_helpers()
+    with psycopg.connect(database_dsn(), autocommit=False) as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT id::text, ownership_status FROM repository_evidence_sources WHERE provider='github' AND repo_full_name=%s FOR UPDATE",
+            (repo_full_name,),
+        )
+        row = cur.fetchone()
+        if not row:
+            raise PipelineError("Repository source not imported yet. Run `refresh` once, then confirm ownership.")
+        cur.execute(
+            """
+            UPDATE repository_evidence_sources
+            SET ownership_status='confirmed_by_user', status='ownership_confirmed',
+                ownership_confirmed_at=now(), ownership_confirmed_by=%s, updated_at=now()
+            WHERE id=%s;
+            """,
+            (actor, row[0]),
+        )
+        result = {"repository_source_id": row[0], "repo": repo_full_name,
+                  "ownership_status": "confirmed_by_user", "committed": apply}
+        if apply:
+            conn.commit()
+        else:
+            conn.rollback()
+    print(json.dumps(result, indent=2))
+    return 0
+
+
 def run_to_review(*, replace_staged: bool, ingest_sources: bool, force_parse: bool) -> dict[str, Any]:
     if ingest_sources:
         sidecars = write_plain_text_sidecars()
@@ -553,6 +653,10 @@ def run_to_review(*, replace_staged: bool, ingest_sources: bool, force_parse: bo
         run_checked([sys.executable, "services/profile-ingestion/ingest_profile_sources_v2.py", "--apply"], label="ingest_profile_sources")
     else:
         emit("stage_skip", stage="parse_and_ingest", reason="staged source SHA identities already exist in DB")
+
+    # Always refresh logical-source/revision provenance. Content SHA decides
+    # revision identity; Office/PDF timestamps are retained only as metadata.
+    sync_source_revisions()
 
     run_checked([
         sys.executable, "services/profile-ingestion/map_profile_documents_qwen_v1.py",
@@ -684,6 +788,13 @@ def run_pipeline(args: argparse.Namespace) -> int:
             force_parse=any(item["action"] != "unchanged" for item in staged),
         )
 
+    # GitHub refresh runs after document-derived candidates exist so the
+    # authority-reconciled project asset can combine user-authored purpose with
+    # current implementation evidence. Unconfigured projects remain explicit
+    # blockers rather than being guessed from old documents.
+    run_github_refresh(skip=args.skip_github_refresh)
+    state = query_profile_state()
+
     if state["assets_draft"]:
         print("\nPROFILE ASSET REVIEW REQUIRED")
         print("The automated pipeline stops here by design. Review each claim before it can enter a resume.\n")
@@ -695,10 +806,31 @@ def run_pipeline(args: argparse.Namespace) -> int:
         print("  python scripts/jobos_profile_ready.py run   # resume automatically after review")
         return 3
 
+    fresh = freshness_payload()
+    fixed = fresh["resume"]["fixed_fields"]
+    if not fixed["fixed_fields_ready"]:
+        if not args.non_interactive_fixed_fields and sys.stdin.isatty():
+            run_fixed_fields_wizard()
+            fresh = freshness_payload()
+            fixed = fresh["resume"]["fixed_fields"]
+        if not fixed["fixed_fields_ready"]:
+            print(json.dumps({
+                "resume_profile_ready": False,
+                "fixed_fields_ready": False,
+                "blockers": fresh["blockers"],
+                "next": "Run `python scripts/jobos_profile_ready.py fixed-fields wizard --apply` and confirm the fixed resume fields.",
+            }, indent=2))
+            return 4
+
     state = finish_after_review()
-    resume_ready = bool(state["resume_base_pack"] and state["assets_approved"] and state["capabilities_approved"])
+    fresh = freshness_payload()
+    resume_ready = bool(
+        state["resume_base_pack"] and state["assets_approved"] and state["capabilities_approved"]
+        and fresh["resume"]["resume_profile_ready"]
+    )
     result = {
         "resume_profile_ready": resume_ready,
+        "freshness": fresh,
         "resume_template_present": TEMPLATE.is_file(),
         "state": {k: v for k, v in state.items() if k != "review_queue"},
         "next": (
@@ -729,7 +861,11 @@ def status_command() -> int:
     payload["database"] = {"ready": ok, "detail": detail}
     if ok:
         payload["profile_state"] = query_profile_state()
-    print(json.dumps(payload, indent=2))
+        try:
+            payload["freshness"] = freshness_payload()
+        except Exception as exc:
+            payload["freshness"] = {"ready": False, "error": str(exc)}
+    print(json.dumps(payload, indent=2, default=str))
     return 0
 
 
@@ -746,8 +882,33 @@ def main() -> int:
     run = sub.add_parser("run", help="Run/resume the complete profile pipeline.")
     run.add_argument("--replace-staged", action="store_true", help="Replace changed staged copies intentionally.")
     run.add_argument("--no-start-db", action="store_true", help="Do not start docker-compose PostgreSQL automatically.")
+    run.add_argument("--skip-github-refresh", action="store_true", help="Offline diagnostic only: do not poll configured GitHub projects.")
+    run.add_argument("--non-interactive-fixed-fields", action="store_true", help="Do not open the fixed-field wizard; report missing fields and stop.")
 
     sub.add_parser("status", help="Show raw-input and profile readiness state.")
+    sub.add_parser("freshness", help="Show fixed-field/document/GitHub freshness and resume blockers.")
+    refresh = sub.add_parser("refresh", help="Refresh configured GitHub project snapshots and affected claims.")
+    refresh.add_argument("--project-id")
+    refresh.add_argument("--watch", action="store_true")
+    refresh.add_argument("--interval-seconds", type=int, default=86400)
+
+    fixed = sub.add_parser("fixed-fields", help="Manage user-verified GPA, education, contact and certification fields.")
+    fixed_sub = fixed.add_subparsers(dest="fixed_command", required=True)
+    fixed_sub.add_parser("status")
+    fixed_wiz = fixed_sub.add_parser("wizard")
+    fixed_wiz.add_argument("--apply", action="store_true")
+    fixed_wiz.add_argument("--actor", default="candidate")
+
+    project_source = sub.add_parser("project-source", help="Bind one fixed resume project to its authoritative GitHub repository.")
+    project_source.add_argument("project_id")
+    project_source.add_argument("--repo", default="")
+    project_source.add_argument("--branch", default="main")
+    project_source.add_argument("--document-only", action="store_true")
+
+    confirm_repo = sub.add_parser("confirm-repo", help="Explicitly confirm ownership of one imported repository source.")
+    confirm_repo.add_argument("repo_full_name")
+    confirm_repo.add_argument("--actor", default="candidate")
+    confirm_repo.add_argument("--apply", action="store_true")
     sub.add_parser("review", help="List profile assets waiting for human review.")
 
     approve = sub.add_parser("approve", help="Approve exactly one reviewed profile asset.")
@@ -771,13 +932,47 @@ def main() -> int:
         }, indent=2), file=sys.stderr)
         return 1
 
-    # Status can inspect the drop folder without forcing dependency installation.
-    if args.command != "status":
+    # The main parse command must fail before dependency/DB setup when the
+    # operator has not supplied any profile document.
+    if args.command == "run" and not raw_documents():
+        print(json.dumps({
+            "error": f"No supported documents found under {RAW_ROOT}",
+            "resume_profile_ready": False,
+        }, indent=2), file=sys.stderr)
+        return 1
+
+    # Status/project-source can operate without importing DB dependencies.
+    if args.command not in {"status", "project-source"}:
         ensure_venv_and_reexec(no_install=args.no_install)
 
     try:
         if args.command == "status":
             return status_command()
+        if args.command == "freshness":
+            print(json.dumps(freshness_payload(), indent=2, default=str))
+            return 0
+        if args.command == "refresh":
+            cmd = [sys.executable, "services/repo-audit/repository_freshness_v1.py"]
+            if args.watch:
+                cmd += ["watch", "--interval-seconds", str(args.interval_seconds)]
+                if args.project_id:
+                    cmd += ["--project-id", args.project_id]
+            else:
+                cmd += ["refresh"]
+                if args.project_id:
+                    cmd += ["--project-id", args.project_id]
+            return subprocess.run(cmd, cwd=ROOT).returncode
+        if args.command == "fixed-fields":
+            cmd = [sys.executable, "services/profile-ingestion/fixed_profile_fields_v1.py", args.fixed_command]
+            if args.fixed_command == "wizard":
+                cmd += ["--actor", args.actor]
+                if args.apply:
+                    cmd.append("--apply")
+            return subprocess.run(cmd, cwd=ROOT).returncode
+        if args.command == "project-source":
+            return configure_project_source(args.project_id, args.repo, args.branch, document_only=args.document_only)
+        if args.command == "confirm-repo":
+            return confirm_repository(args.repo_full_name, args.actor, apply=args.apply)
         if args.command == "review":
             return list_review_assets()
         if args.command == "approve":

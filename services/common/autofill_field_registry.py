@@ -30,6 +30,8 @@ AUTOFILL_FIELD_REGISTRY = {
     "degree": ("education", "degree"),
     "major": ("education", "major"),
     "graduation_date": ("education", "graduation_date"),
+    "gpa": ("education", "gpa"),
+    "gpa_scale": ("education", "gpa_scale"),
     "current_employer": ("employment", "current_employer"),
     "current_title": ("employment", "current_title"),
     "desired_title": ("employment", "desired_title"),

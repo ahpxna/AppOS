@@ -23,6 +23,7 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 import urllib.error
@@ -805,6 +806,30 @@ def insert_document(
     return str(cur.fetchone()[0])
 
 
+# ---------------------------------------------------------------- freshness preflight
+
+def run_live_project_freshness(*, max_stale_hours: int) -> tuple[bool, str]:
+    """Poll current configured GitHub HEADs before a resume can be generated.
+
+    Daily watching is only a convenience.  This live gate is the correctness
+    invariant that prevents an old approved project asset from surviving a new
+    commit unnoticed.
+    """
+    script = Path(__file__).resolve().parents[1] / "repo-audit" / "repository_freshness_v1.py"
+    proc = subprocess.run(
+        [sys.executable, str(script), "pre-resume", "--max-stale-hours", str(max_stale_hours)],
+        cwd=Path(__file__).resolve().parents[2], capture_output=True, text=True, timeout=600,
+    )
+    detail = ((proc.stdout or "") + (proc.stderr or "")).strip()[-4000:]
+    return proc.returncode == 0, detail
+
+
+def database_resume_freshness(cur) -> tuple[bool, dict[str, Any], list[str]]:
+    from services.common.profile_freshness import assess_resume_profile, explain_blockers
+    report = assess_resume_profile(cur)
+    return bool(report.get("resume_profile_ready")), report, explain_blockers(report)
+
+
 # ---------------------------------------------------------------- main
 
 def main() -> int:
@@ -823,11 +848,27 @@ def main() -> int:
     p.add_argument("--print-prompt", action="store_true")
     p.add_argument("--force", action="store_true",
                    help="Generate even when fit_decision is reject.")
+    p.add_argument("--skip-live-project-refresh", action="store_true",
+                   help="Offline diagnostic only. DB freshness gates still apply; current GitHub HEAD is not polled.")
+    p.add_argument("--project-max-stale-hours", type=int,
+                   default=int(os.getenv("JOBOS_PROJECT_MAX_STALE_HOURS", "24")),
+                   help="Last-known-good GitHub snapshot age allowed only when GitHub is temporarily unavailable.")
     args = p.parse_args()
 
     if args.doc_type == "short_answers" and not args.question:
         print("ERROR: --doc-type short_answers requires at least one --question.")
         return 2
+
+    if args.doc_type == "resume":
+        if args.skip_live_project_refresh:
+            print("WARNING: --skip-live-project-refresh disables the live GitHub HEAD poll; use only for offline diagnostics.")
+        else:
+            ok, detail = run_live_project_freshness(max_stale_hours=args.project_max_stale_hours)
+            if not ok:
+                print("ERROR: live project freshness preflight failed. Resume generation is blocked.")
+                if detail:
+                    print(detail)
+                return 2
 
     print("===== DOCUMENT GENERATOR V1 =====")
     print(f"Generator: {GENERATOR_VERSION}")
@@ -837,6 +878,14 @@ def main() -> int:
 
     with psycopg.connect(DSN, autocommit=False) as conn:
         with conn.cursor() as cur:
+            if args.doc_type == "resume":
+                ready, freshness_report, blockers = database_resume_freshness(cur)
+                if not ready:
+                    print("ERROR: resume profile freshness gate is blocked.")
+                    for blocker in blockers:
+                        print(f"  - {blocker}")
+                    print(json.dumps({"freshness": freshness_report}, indent=2, default=str))
+                    return 2
             try:
                 app = fetch_application_context(cur, args.application_id)
             except RuntimeError as e:

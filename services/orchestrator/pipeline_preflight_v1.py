@@ -51,6 +51,15 @@ REQUIRED_RELATIONS = (
     "allowed_domains",
     "immigration_profiles",
     "application_immigration_assessments",
+    "profile_source_documents",
+    "profile_source_revisions",
+    "candidate_fixed_fields",
+    "candidate_fixed_field_suggestions",
+    "candidate_certifications",
+    "repository_evidence_sources",
+    "repository_snapshots",
+    "repository_claims",
+    "project_source_conflicts",
 )
 
 
@@ -150,6 +159,17 @@ def database_report() -> list[dict[str, Any]]:
                     approved_capabilities=approved_capabilities,
                     fresh_briefs=fresh_briefs,
                     present_base_packs=sorted(present_packs),
+                ))
+
+                from services.common.profile_freshness import assess_resume_profile, explain_blockers
+                freshness = assess_resume_profile(cur)
+                freshness_blockers = explain_blockers(freshness)
+                checks.append(item(
+                    "resume_freshness_gate",
+                    "pass" if freshness["resume_profile_ready"] else "blocked",
+                    "Fixed fields, source revisions, GitHub project snapshots and resume context are current."
+                    if freshness["resume_profile_ready"] else "; ".join(freshness_blockers),
+                    blockers=freshness_blockers, freshness=freshness,
                 ))
 
                 cur.execute("SELECT count(*) FROM applications WHERE status = 'active';")

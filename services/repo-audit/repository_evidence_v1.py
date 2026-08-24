@@ -202,7 +202,7 @@ def source_row(cur, source_id: str) -> dict[str, Any]:
     cur.execute(
         """
         SELECT id::text, repo_full_name, canonical_url, description, primary_language,
-               topics, ownership_status, status
+               topics, ownership_status, status, current_snapshot_id::text, revision_sha, freshness_status
         FROM repository_evidence_sources WHERE id = %s;
         """, (source_id,),
     )
@@ -211,7 +211,8 @@ def source_row(cur, source_id: str) -> dict[str, Any]:
         raise ValueError(f"Repository source not found: {source_id}")
     return {"id": row[0], "repo_full_name": row[1], "canonical_url": row[2],
             "description": row[3] or "", "primary_language": row[4] or "",
-            "topics": row[5] or [], "ownership_status": row[6], "status": row[7]}
+            "topics": row[5] or [], "ownership_status": row[6], "status": row[7],
+            "current_snapshot_id": row[8], "revision_sha": row[9], "freshness_status": row[10]}
 
 
 def confirm_ownership(cur, source_id: str, actor: str) -> dict[str, Any]:
@@ -276,6 +277,8 @@ def build_asset(cur, source_id: str, role_families: list[str]) -> str:
     source = source_row(cur, source_id)
     if source["ownership_status"] != "confirmed_by_user" or source["status"] != "ownership_confirmed":
         raise ValueError("Confirm repository ownership before compiling a reviewable profile asset.")
+    if source.get("current_snapshot_id") and source.get("freshness_status") != "fresh":
+        raise ValueError("Repository source is not fresh; refresh/analyze the current GitHub HEAD before building an asset.")
     cur.execute(
         """
         SELECT id::text, evidence_type, evidence_text, source_url, source_path, evidence_json
@@ -298,8 +301,9 @@ def build_asset(cur, source_id: str, role_families: list[str]) -> str:
         JOIN profile_assets pa ON pa.id = realink.profile_asset_id
         WHERE realink.repository_source_id = %s
           AND pa.compiler_version = %s
+          AND realink.repository_snapshot_id IS NOT DISTINCT FROM %s
         ORDER BY pa.created_at DESC LIMIT 1;
-        """, (source_id, ASSET_COMPILER_VERSION),
+        """, (source_id, ASSET_COMPILER_VERSION, source.get("current_snapshot_id")),
     )
     existing = cur.fetchone()
     if existing:
@@ -310,22 +314,25 @@ def build_asset(cur, source_id: str, role_families: list[str]) -> str:
           (asset_title, asset_type, abstraction_level, status, canonical_narrative,
            job_oriented_summary, resume_bullet_bank, cover_letter_positioning,
            role_families, tool_tags, project_tags, do_not_overclaim_rules,
-           compiler_version, source_strategy, confidence, review_note)
+           compiler_version, source_strategy, confidence, review_note,
+           source_snapshot_hash, freshness_status, source_authority_json)
         VALUES (%s, 'project_asset', 'source_preserving_asset', 'needs_review', %s,
                 %s, %s, %s, %s, %s, %s, %s, %s, 'repository_evidence_compilation',
-                0.55, 'Repository metadata and audit evidence require explicit user approval.')
+                0.55, 'Repository metadata and audit evidence require explicit user approval.',
+                %s, 'fresh', %s)
         RETURNING id::text;
         """,
         (material["title"], material["canonical_narrative"], material["summary"],
          material["resume"], material["cover"], unique_terms(role_families), material["tools"],
-         material["project_tags"], material["rules"], ASSET_COMPILER_VERSION),
+         material["project_tags"], material["rules"], ASSET_COMPILER_VERSION,
+         source.get("revision_sha"), Jsonb({"implementation": {"github": 0.70, "document": 0.30}})),
     )
     asset_id = cur.fetchone()[0]
     cur.execute(
         """INSERT INTO repository_evidence_asset_links
-             (repository_source_id, profile_asset_id, compiler_version)
-           VALUES (%s, %s, %s);""",
-        (source_id, asset_id, ASSET_COMPILER_VERSION),
+             (repository_source_id, profile_asset_id, compiler_version, repository_snapshot_id)
+           VALUES (%s, %s, %s, %s);""",
+        (source_id, asset_id, ASSET_COMPILER_VERSION, source.get("current_snapshot_id")),
     )
     for rank, item in enumerate(evidence, 1):
         cur.execute(
