@@ -14,13 +14,8 @@ from psycopg.types.json import Jsonb
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from services.common.model_config import get_model  # noqa: E402
 from services.common.llm_gateway import embed_texts  # noqa: E402
+from services.common.config import database_dsn  # noqa: E402
 
-
-DB_HOST = os.getenv("JOBOS_DB_HOST", "127.0.0.1")
-DB_PORT = int(os.getenv("JOBOS_DB_PORT", "5433"))
-DB_NAME = os.getenv("JOBOS_DB_NAME", "job_apply_os")
-DB_USER = os.getenv("JOBOS_DB_USER", "jobos")
-DB_PASSWORD = os.getenv("JOBOS_DB_PASSWORD", "jobos_local_dev_password_change_later")
 
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 EMBED_MODEL = get_model("embed")
@@ -29,10 +24,7 @@ EMBED_DIM = int(os.getenv("PROFILE_EMBED_DIM", "768"))
 COMPONENT_NAME = "profile_chunk_embedder"
 TASK_TYPE = "embed_profile_chunk"
 
-DSN = (
-    f"host={DB_HOST} port={DB_PORT} dbname={DB_NAME} "
-    f"user={DB_USER} password={DB_PASSWORD}"
-)
+DSN = database_dsn()
 
 
 def content_hash(text: str) -> str:

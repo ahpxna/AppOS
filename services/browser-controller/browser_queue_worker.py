@@ -51,15 +51,11 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-import threading
-import requests
-
 import psycopg
 from psycopg.types.json import Jsonb
 
 from services.common.observability import emit_trace, make_trace_id
 from services.common.config import database_dsn, load_repo_env
-from services.autofill.parallel_bypass import _fake_mouse_routine
 from services.discovery.linkedin_discovery_v1 import (
     LinkedInDiscoveryError,
     ingest_discovered_jobs,
@@ -938,73 +934,25 @@ def handle_discover_linkedin_jobs(cur, task) -> Dict[str, Any]:
         "cannot be grounded in the snapshot, return {\"jobs\":[]} rather than guessing."
     )
 
-    # =====================================================================
-    # 1. BẬT FAKE MOUSE (PHÒNG BỆNH)
-    # =====================================================================
-    import threading
-    import requests
-    from services.autofill.parallel_bypass import _fake_mouse_routine, execute_parallel_bypass
-    
-    mouse_stop_event = threading.Event()
-    mouse_thread = None
     try:
-        # BROWSER_CDP_URL đã được định nghĩa ở đầu file (thường là http://127.0.0.1:9222)
-        res = requests.get(f"{BROWSER_CDP_URL}/json", timeout=2)
-        tabs = res.json()
-        ws_url = next(t["webSocketDebuggerUrl"] for t in tabs if t["type"] == "page")
-        
-        mouse_thread = threading.Thread(
-            target=_fake_mouse_routine,
-            args=(ws_url, "data/pointer-regimes.json", mouse_stop_event)
-        )
-        mouse_thread.start()
-        print("  [FakeMouse] Đã bật khiên bảo vệ Brownian Motion...")
-    except Exception as e:
-        print(f"  [FakeMouse] Bỏ qua Fake Mouse vì không thể kết nối CDP: {e}")
-
-    try:
-        # Cào lần 1
         agent_response = openclaw_agent(
             agent=OPENCLAW_AGENT_LINKEDIN_DISCOVERY, message=msg, timeout=task["timeout_seconds"],
             session_id=f"jobos-task-{task['id']}",
         )
-    finally:
-        # Luôn tắt chuột phòng bệnh
-        mouse_stop_event.set()
-        if mouse_thread and mouse_thread.is_alive():
-            mouse_thread.join()
+    except RuntimeError as exc:
+        raise TransientTaskError(str(exc)) from exc
 
-    # =====================================================================
-    # 2. CHECK CAPTCHA & PARALLEL BYPASS (CHỮA BỆNH VÀ PERMANENT FAILURE)
-    # =====================================================================
-    agent_raw_output = str(agent_response).lower()
-    if "captcha" in agent_raw_output or "verification" in agent_raw_output or "security check" in agent_raw_output:
-        print("  [Bypass] Đụng độ CAPTCHA LinkedIn! Kích hoạt CapSolver + Fake Mouse...")
-        try:
-            # Lấy port linh hoạt từ BROWSER_CDP_URL (Mặc định 9222)
-            cdp_port = int(BROWSER_CDP_URL.split(":")[-1].replace("/", ""))
-            
-            # Gọi API CapSolver và múa chuột song song để vượt rào
-            execute_parallel_bypass(
-                cdp_port=cdp_port,
-                website_url=search_url,
-                website_key="2CB16598-CB82-458A-898B-53544380C934", # FunCaptcha public key mặc định của LinkedIn
-                regimes_path="data/pointer-regimes.json",
-                captcha_type="FunCaptchaTaskProxyless"
-            )
-            print("  [Bypass] Vượt rào thành công! Thử cào lại lần 2...")
-            
-            # Cào lại lần 2 sau khi đã giải CAPTCHA
-            agent_response = openclaw_agent(
-                agent=OPENCLAW_AGENT_LINKEDIN_DISCOVERY, message=msg, timeout=task["timeout_seconds"],
-                session_id=f"jobos-task-{task['id']}",
-            )
-            
-            # Nếu lần 2 vẫn dính -> Buông súng, đánh dấu Permanent Failure
-            if "captcha" in str(agent_response).lower() or "security check" in str(agent_response).lower():
-                raise PermanentTaskError("CapSolver đã giải nhưng vẫn bị chặn. Đánh dấu lỗi vĩnh viễn (Permanent Failure)!")
-        except Exception as e:
-            raise PermanentTaskError(f"Bypass thất bại: {e}")
+    # Discovery is read-only. Login, checkpoint, CAPTCHA, or verification is
+    # a terminal human-intervention boundary: never retry or alter LinkedIn.
+    blocker_text = json.dumps(agent_response, ensure_ascii=False).casefold()
+    if any(marker in blocker_text for marker in (
+        "captcha", "verification", "security check", "checkpoint",
+        "sign in", "login required",
+    )):
+        raise PermanentTaskError(
+            "LinkedIn discovery stopped for human login/CAPTCHA/verification handling; "
+            "no retry or LinkedIn state change was attempted."
+        )
 
     # =====================================================================
     # 3. LƯU VÀO DB

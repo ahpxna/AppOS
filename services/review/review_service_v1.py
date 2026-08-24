@@ -123,21 +123,29 @@ def ensure_document_review(cur, document_id: str) -> str | None:
         if qa_status == "pass"
         else f"{company} — {role}. Truth/quality gate returned {qa_status}; revise/regenerate before approval."
     )
-    # If the exact reviewable object changed after it was already delivered,
-    # retire that UI capability and issue a fresh review id so Telegram/CLI
-    # cannot silently reuse an old button/message for new content or QA state.
+    # A document-review capability is scoped to the current application slot,
+    # not merely an individual generated-document row.  This matches migration
+    # 063's unique active slot invariant and makes a new version supersede the
+    # prior resume/cover-letter review instead of colliding with it.
     cur.execute(
-        """SELECT id::text, status, source_sha256, payload_json
+        """SELECT id::text, status, source_sha256, payload_json,
+                  generated_document_id::text
              FROM human_review_items
-            WHERE generated_document_id = %s AND item_type = 'document_review'
+            WHERE application_id = %s AND item_type = 'document_review'
+              AND payload_json->>'doc_type' = %s
               AND status IN ('pending','needs_revision')
             ORDER BY created_at DESC LIMIT 1 FOR UPDATE;""",
-        (document_id,),
+        (app_id, doc_type),
     )
     existing = cur.fetchone()
     if existing:
         existing_qa = str((existing[3] or {}).get("qa_status") or "")
-        if existing[2] == source_sha and existing[1] == target_status and existing_qa == qa_status:
+        if (
+            existing[4] == str(document_id)
+            and existing[2] == source_sha
+            and existing[1] == target_status
+            and existing_qa == qa_status
+        ):
             bind_canonical_review_pdf(cur, existing[0], document_id, doc_type)
             return str(existing[0])
         cur.execute(
@@ -508,9 +516,17 @@ def sync_inbox(cur) -> dict[str, int]:
     reconcile_materialized_review_state(cur)
     counts = {"documents": 0, "questions": 0, "approvals": 0,
               "autofill": 0, "reconciliation": 0, "application_ready": 0}
-    cur.execute("""SELECT id::text FROM generated_documents
-                    WHERE doc_type IN ('resume','cover_letter')
-                      AND qa_status IN ('pass','fail','revise') AND approved = false;""")
+    # Only the newest version in each application/document slot is actionable.
+    # Historical versions remain auditable but must never create concurrent
+    # Telegram/CLI decisions or violate the active-slot invariant.
+    cur.execute(
+        """SELECT DISTINCT ON (application_id, doc_type) id::text
+             FROM generated_documents
+            WHERE doc_type IN ('resume','cover_letter')
+              AND qa_status IN ('pass','fail','revise')
+              AND approved = false
+            ORDER BY application_id, doc_type, version DESC, created_at DESC, id DESC;"""
+    )
     for (doc_id,) in cur.fetchall():
         if ensure_document_review(cur, doc_id):
             counts["documents"] += 1
@@ -650,13 +666,16 @@ def decide_item(conn, item_id: str, *, decision: str, actor: str, note: str = ""
                     raise ReviewError("Autofill screenshot is missing or changed; capture a fresh review artifact.")
                 cur.execute("UPDATE applications SET current_step = 'application_ready', updated_at = now() WHERE id = %s AND current_step = 'form_filled';", (app_id,))
                 transitioned = cur.rowcount == 1
-                if transitioned:
-                    cur.execute(
-                        """INSERT INTO pipeline_events(application_id, from_step, to_step, actor, reason, detail_json)
-                           VALUES (%s, 'form_filled', 'application_ready', %s,
-                                   'Human reviewed post-autofill screenshot; final submit remains human-only.', %s);""",
-                        (app_id, actor, Jsonb({"review_item_id": item_id, "browser_task_id": browser_task_id})),
+                if not transitioned:
+                    raise ReviewError(
+                        "Application is no longer at form_filled; a fresh human review is required."
                     )
+                cur.execute(
+                    """INSERT INTO pipeline_events(application_id, from_step, to_step, actor, reason, detail_json)
+                       VALUES (%s, 'form_filled', 'application_ready', %s,
+                               'Human reviewed post-autofill screenshot; final submit remains human-only.', %s);""",
+                    (app_id, actor, Jsonb({"review_item_id": item_id, "browser_task_id": browser_task_id})),
+                )
                 ensure_application_ready_review(cur, app_id)
 
         elif item_type == "question_required":
