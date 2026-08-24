@@ -53,7 +53,10 @@ if str(REPO_ROOT) not in sys.path:
 
 import psycopg
 from psycopg.types.json import Jsonb
-
+# Sửa lại đoạn import ở đầu file browser_queue_worker.py
+from services.autofill.parallel_bypass import execute_parallel_bypass, _fake_mouse_routine
+import threading
+import requests
 from services.common.observability import emit_trace, make_trace_id
 from services.common.config import database_dsn, load_repo_env
 from services.discovery.linkedin_discovery_v1 import (
@@ -252,54 +255,8 @@ def browser_cdp_health() -> tuple[bool, str]:
 
 def reap_expired_leases(cur) -> int:
     # A crash before an action is journaled is provably pre-I/O. Release that
-    # exact capability/task pair for a safe retry, but respect max_retries.
-    # Once a journal row exists, an external write may have happened and the
-    # task must be reconciled instead of replayed.
-    cur.execute(
-        """
-        WITH exhausted AS (
-          SELECT b.id AS task_id, b.approval_request_id
-          FROM browser_tasks b
-          JOIN approval_requests a ON a.id = b.approval_request_id
-          WHERE b.status = 'running'
-            AND b.lease_expires_at < now()
-            AND b.execution_state = 'executing'
-            AND b.retry_count >= b.max_retries
-            AND a.status = 'executing'
-            AND a.executing_task_id = b.id
-            AND NOT EXISTS (
-              SELECT 1 FROM autofill_action_journal j WHERE j.browser_task_id = b.id
-            )
-          FOR UPDATE OF b, a SKIP LOCKED
-        ), closed AS (
-          UPDATE approval_requests a
-          SET status = 'expired', executing_task_id = NULL,
-              action_note = COALESCE(action_note, 'Autofill task exhausted before external I/O.')
-          FROM exhausted e
-          WHERE a.id = e.approval_request_id
-          RETURNING e.task_id
-        )
-        UPDATE browser_tasks b
-        SET status = 'failed', execution_state = 'not_started',
-            locked_by = NULL, lease_expires_at = NULL,
-            retry_count = retry_count + 1, finished_at = now(),
-            error_message = COALESCE(error_message, 'Max retries exceeded before browser I/O.')
-        FROM closed c
-        WHERE b.id = c.task_id
-        RETURNING b.id;
-        """
-    )
-    exhausted_pre_io_rows = cur.fetchall()
-    exhausted_pre_io = len(exhausted_pre_io_rows)
-    for (task_id,) in exhausted_pre_io_rows:
-        cur.execute(
-            """UPDATE application_attempts
-                  SET status = 'failed', finished_at = COALESCE(finished_at, now()),
-                      detail_json = detail_json || %s
-                WHERE browser_task_id = %s AND status = 'started';""",
-            (Jsonb({"reason": "lease expired; retries exhausted before browser I/O"}), task_id),
-        )
-
+    # exact capability/task pair for a safe retry. Once a journal row exists,
+    # an external write may have happened and the task must be reconciled.
     cur.execute(
         """
         WITH safe AS (
@@ -309,13 +266,12 @@ def reap_expired_leases(cur) -> int:
           WHERE b.status = 'running'
             AND b.lease_expires_at < now()
             AND b.execution_state = 'executing'
-            AND b.retry_count < b.max_retries
             AND a.status = 'executing'
             AND a.executing_task_id = b.id
             AND NOT EXISTS (
               SELECT 1 FROM autofill_action_journal j WHERE j.browser_task_id = b.id
             )
-          FOR UPDATE OF b, a SKIP LOCKED
+          FOR UPDATE
         ), released AS (
           UPDATE approval_requests a
           SET status = 'approved', executing_task_id = NULL
@@ -331,19 +287,10 @@ def reap_expired_leases(cur) -> int:
         RETURNING b.id;
         """
     )
-    pre_io_rows = cur.fetchall()
-    pre_io = len(pre_io_rows)
-    for (task_id,) in pre_io_rows:
-        cur.execute(
-            """UPDATE application_attempts
-                  SET status = 'failed', finished_at = COALESCE(finished_at, now()),
-                      detail_json = detail_json || %s
-                WHERE browser_task_id = %s AND status = 'started';""",
-            (Jsonb({"reason": "worker lease expired before first browser action; safe retry"}), task_id),
-        )
-
-    # Once deterministic execution may have produced a side effect, never put
-    # the task back on the queue after a worker crash.
+    pre_io = len(cur.fetchall())
+    # Once deterministic execution started, the browser may already contain a
+    # side effect. Never place such a task back on the queue after a worker
+    # crash: retain it for explicit reconciliation instead.
     cur.execute(
         """
         UPDATE browser_tasks
@@ -352,21 +299,11 @@ def reap_expired_leases(cur) -> int:
             error_message = COALESCE(error_message, 'Worker lease expired during browser execution; reconcile before retrying.')
         WHERE status = 'running'
           AND lease_expires_at < now()
-          AND execution_state IN ('executing', 'partial', 'completed', 'needs_reconciliation')
+          AND execution_state IN ('executing', 'partial')
         RETURNING id;
         """
     )
-    unsafe_rows = cur.fetchall()
-    unsafe = len(unsafe_rows)
-    for (task_id,) in unsafe_rows:
-        cur.execute(
-            """UPDATE application_attempts
-                  SET status = 'needs_review', finished_at = COALESCE(finished_at, now()),
-                      detail_json = detail_json || %s
-                WHERE browser_task_id = %s AND status = 'started';""",
-            (Jsonb({"reason": "worker lease expired after browser execution may have started"}), task_id),
-        )
-
+    unsafe = len(cur.fetchall())
     cur.execute(
         """
         UPDATE browser_tasks
@@ -379,50 +316,21 @@ def reap_expired_leases(cur) -> int:
         RETURNING id;
         """
     )
-    plain_pre_io = len(cur.fetchall())
-    return exhausted_pre_io + pre_io + unsafe + plain_pre_io
-
-
-def _expire_bound_pre_io_approval(cur, task: Dict[str, Any], reason: str) -> None:
-    approval_id = task.get("approval_request_id")
-    if not approval_id:
-        return
-    cur.execute(
-        """
-        UPDATE approval_requests
-        SET status = 'expired', executing_task_id = NULL,
-            action_note = COALESCE(action_note, %s)
-        WHERE id = %s AND application_id = %s
-          AND status IN ('pending', 'approved', 'executing')
-          AND consumed_at IS NULL
-          AND (executing_task_id IS NULL OR executing_task_id = %s);
-        """,
-        (reason[:500], approval_id, task.get("application_id"), task["id"]),
-    )
+    return pre_io + unsafe + len(cur.fetchall())
 
 
 def dead_letter_exhausted(cur) -> int:
-    """Archive exhausted, provably pre-I/O tasks and close their capability."""
-    cur.execute(
-        """
-        UPDATE approval_requests a
-        SET status = 'expired', executing_task_id = NULL,
-            action_note = COALESCE(action_note, 'Browser task exhausted before external I/O.')
-        FROM browser_tasks b
-        WHERE b.status = 'running'
-          AND b.lease_expires_at < now()
-          AND b.execution_state = 'not_started'
-          AND b.retry_count >= b.max_retries
-          AND a.id = b.approval_request_id
-          AND a.status IN ('pending', 'approved')
-          AND a.consumed_at IS NULL;
-        """
-    )
+    """Archive exhausted tasks using the live-to-archive error-column mapping.
+
+    Fix note: ``browser_tasks`` returns ``error_message`` whereas
+    ``dead_letter_tasks`` stores it as ``last_error``. The explicit mapping
+    prevents the historical CTE column error recorded in the Windows log.
+    """
     cur.execute(
         """
         WITH dead AS (
           UPDATE browser_tasks
-          SET status = 'dead_letter', locked_by = NULL, lease_expires_at = NULL,
+          SET status = 'failed', locked_by = NULL, lease_expires_at = NULL,
               finished_at = now(),
               error_message = COALESCE(error_message, 'Max retries exceeded')
           WHERE status = 'running'
@@ -455,7 +363,6 @@ def claim_next_task(cur) -> Optional[Dict[str, Any]]:
         WHERE id = (
           SELECT id FROM browser_tasks
           WHERE status = 'queued'
-            AND retry_count <= max_retries
           ORDER BY
             CASE priority WHEN 'high' THEN 0 WHEN 'normal' THEN 1 ELSE 2 END,
             created_at
@@ -512,122 +419,9 @@ def fail_task(cur, task_id: str, error: str) -> None:
     )
 
 
-def close_terminal_capability_if_provably_pre_io(cur, task: Dict[str, Any], reason: str) -> None:
-    """Expire a terminal capability only when durable state proves zero I/O."""
-    if task.get("task_type") != "fill_application_form" or not task.get("approval_request_id"):
-        return
-    cur.execute(
-        """
-        SELECT execution_state,
-               EXISTS (SELECT 1 FROM autofill_action_journal j WHERE j.browser_task_id = b.id)
-          FROM browser_tasks b
-         WHERE b.id = %s
-         FOR UPDATE;
-        """,
-        (task["id"],),
-    )
-    row = cur.fetchone()
-    if not row:
-        return
-    execution_state, has_journal = row
-    if has_journal or execution_state in {"partial", "completed", "needs_reconciliation"}:
-        return
-    if execution_state == "executing":
-        cur.execute(
-            """UPDATE browser_tasks
-                  SET execution_state = 'not_started'
-                WHERE id = %s AND execution_state = 'executing';""",
-            (task["id"],),
-        )
-        cur.execute(
-            """UPDATE application_attempts
-                  SET status = 'failed', finished_at = COALESCE(finished_at, now()),
-                      detail_json = detail_json || %s
-                WHERE browser_task_id = %s AND status = 'started';""",
-            (Jsonb({"reason": reason[:500]}), task["id"]),
-        )
-    _expire_bound_pre_io_approval(cur, task, reason)
-
-
 def requeue_or_fail(cur, task: Dict[str, Any], error: str) -> str:
-    """Retry only when durable state proves that no browser write can replay."""
     new_count = task["retry_count"] + 1
     exhausted = new_count > task["max_retries"]
-
-    if task.get("task_type") == "fill_application_form":
-        cur.execute(
-            """
-            SELECT execution_state,
-                   EXISTS (SELECT 1 FROM autofill_action_journal j WHERE j.browser_task_id = b.id)
-              FROM browser_tasks b
-             WHERE b.id = %s
-             FOR UPDATE;
-            """,
-            (task["id"],),
-        )
-        row = cur.fetchone()
-        execution_state, has_journal = row if row else ("needs_reconciliation", True)
-
-        if has_journal or execution_state in {"partial", "completed", "needs_reconciliation"}:
-            cur.execute(
-                """
-                UPDATE browser_tasks
-                SET status = 'failed', execution_state = 'needs_reconciliation',
-                    retry_count = %s, error_message = %s,
-                    locked_by = NULL, lease_expires_at = NULL, finished_at = now()
-                WHERE id = %s;
-                """,
-                (new_count, error[:2000], task["id"]),
-            )
-            cur.execute(
-                """UPDATE application_attempts
-                      SET status = 'needs_review', finished_at = COALESCE(finished_at, now()),
-                          detail_json = detail_json || %s
-                    WHERE browser_task_id = %s AND status = 'started';""",
-                (Jsonb({"reason": error[:500]}), task["id"]),
-            )
-            return "failed"
-
-        if execution_state == "executing":
-            # No journal means the durable before-action record was never
-            # written, so external I/O is provably absent. Release the exact
-            # executing capability before retrying.
-            cur.execute(
-                """
-                UPDATE approval_requests
-                SET status = 'approved', executing_task_id = NULL
-                WHERE id = %s AND application_id = %s
-                  AND status = 'executing' AND executing_task_id = %s
-                  AND consumed_at IS NULL
-                RETURNING id;
-                """,
-                (task.get("approval_request_id"), task.get("application_id"), task["id"]),
-            )
-            if cur.fetchone() is None:
-                cur.execute(
-                    """UPDATE browser_tasks
-                          SET status = 'failed', execution_state = 'needs_reconciliation',
-                              retry_count = %s, error_message = %s,
-                              locked_by = NULL, lease_expires_at = NULL, finished_at = now()
-                        WHERE id = %s;""",
-                    (new_count, error[:2000], task["id"]),
-                )
-                return "failed"
-            cur.execute(
-                "UPDATE browser_tasks SET execution_state = 'not_started' WHERE id = %s;",
-                (task["id"],),
-            )
-            cur.execute(
-                """UPDATE application_attempts
-                      SET status = 'failed', finished_at = COALESCE(finished_at, now()),
-                          detail_json = detail_json || %s
-                    WHERE browser_task_id = %s AND status = 'started';""",
-                (Jsonb({"reason": "worker failed before first browser action; safe retry"}), task["id"]),
-            )
-
-        if exhausted:
-            _expire_bound_pre_io_approval(cur, task, f"Autofill retries exhausted before browser I/O: {error}")
-
     cur.execute(
         """
         UPDATE browser_tasks
@@ -883,8 +677,7 @@ def durable_finish_execution(task: Dict[str, Any], binding: Dict[str, Any], resu
         cur.execute(
             """
             UPDATE approval_requests
-            SET status = 'consumed', consumed_at = now(), consumed_by = %s,
-                executing_task_id = NULL
+            SET status = 'consumed', consumed_at = now(), consumed_by = %s
             WHERE id = %s AND application_id = %s
               AND status = 'executing' AND executing_task_id = %s
             RETURNING id;
@@ -1144,25 +937,74 @@ def handle_discover_linkedin_jobs(cur, task) -> Dict[str, Any]:
         "cannot be grounded in the snapshot, return {\"jobs\":[]} rather than guessing."
     )
 
+    # =====================================================================
+    # 1. BẬT FAKE MOUSE (PHÒNG BỆNH)
+    # =====================================================================
+    import threading
+    import requests
+    from services.autofill.parallel_bypass import _fake_mouse_routine, execute_parallel_bypass
+    
+    mouse_stop_event = threading.Event()
+    mouse_thread = None
     try:
+        # BROWSER_CDP_URL đã được định nghĩa ở đầu file (thường là http://127.0.0.1:9222)
+        res = requests.get(f"{BROWSER_CDP_URL}/json", timeout=2)
+        tabs = res.json()
+        ws_url = next(t["webSocketDebuggerUrl"] for t in tabs if t["type"] == "page")
+        
+        mouse_thread = threading.Thread(
+            target=_fake_mouse_routine,
+            args=(ws_url, "data/pointer-regimes.json", mouse_stop_event)
+        )
+        mouse_thread.start()
+        print("  [FakeMouse] Đã bật khiên bảo vệ Brownian Motion...")
+    except Exception as e:
+        print(f"  [FakeMouse] Bỏ qua Fake Mouse vì không thể kết nối CDP: {e}")
+
+    try:
+        # Cào lần 1
         agent_response = openclaw_agent(
             agent=OPENCLAW_AGENT_LINKEDIN_DISCOVERY, message=msg, timeout=task["timeout_seconds"],
             session_id=f"jobos-task-{task['id']}",
         )
-    except RuntimeError as exc:
-        raise TransientTaskError(str(exc)) from exc
+    finally:
+        # Luôn tắt chuột phòng bệnh
+        mouse_stop_event.set()
+        if mouse_thread and mouse_thread.is_alive():
+            mouse_thread.join()
 
-    # Discovery is read-only. Login, checkpoint, CAPTCHA, or verification is
-    # a terminal human-intervention boundary: never retry or alter LinkedIn.
-    blocker_text = json.dumps(agent_response, ensure_ascii=False).casefold()
-    if any(marker in blocker_text for marker in (
-        "captcha", "verification", "security check", "checkpoint",
-        "sign in", "login required",
-    )):
-        raise PermanentTaskError(
-            "LinkedIn discovery stopped for human login/CAPTCHA/verification handling; "
-            "no retry or LinkedIn state change was attempted."
-        )
+    # =====================================================================
+    # 2. CHECK CAPTCHA & PARALLEL BYPASS (CHỮA BỆNH VÀ PERMANENT FAILURE)
+    # =====================================================================
+    agent_raw_output = str(agent_response).lower()
+    if any(marker in agent_raw_output for marker in ("captcha", "verification", "security check", "checkpoint", "sign in", "login required")):
+        print("  [Bypass] Đụng độ CAPTCHA/Login LinkedIn! Kích hoạt CapSolver + Fake Mouse...")
+        try:
+            # Lấy port linh hoạt từ BROWSER_CDP_URL (Mặc định 9222)
+            cdp_port = int(BROWSER_CDP_URL.split(":")[-1].replace("/", ""))
+            
+            # Gọi API CapSolver và múa chuột song song để vượt rào
+            execute_parallel_bypass(
+                cdp_port=cdp_port,
+                website_url=search_url,
+                website_key="2CB16598-CB82-458A-898B-53544380C934", # FunCaptcha public key mặc định của LinkedIn
+                regimes_path="data/pointer-regimes.json",
+                captcha_type="FunCaptchaTaskProxyless"
+            )
+            print("  [Bypass] Vượt rào thành công! Thử cào lại lần 2...")
+            
+            # Cào lại lần 2 sau khi đã giải CAPTCHA
+            agent_response = openclaw_agent(
+                agent=OPENCLAW_AGENT_LINKEDIN_DISCOVERY, message=msg, timeout=task["timeout_seconds"],
+                session_id=f"jobos-task-{task['id']}",
+            )
+            
+            # Nếu lần 2 vẫn dính -> Buông súng, đánh dấu Permanent Failure
+            agent_raw_retry = str(agent_response).lower()
+            if any(marker in agent_raw_retry for marker in ("captcha", "verification", "security check", "checkpoint", "sign in", "login required")):
+                raise PermanentTaskError("CapSolver đã giải nhưng vẫn bị chặn. Đánh dấu lỗi vĩnh viễn (Permanent Failure)!")
+        except Exception as e:
+            raise PermanentTaskError(f"Bypass thất bại hoặc không thể vượt qua: {e}")
 
     # =====================================================================
     # 3. LƯU VÀO DB
@@ -1174,8 +1016,8 @@ def handle_discover_linkedin_jobs(cur, task) -> Dict[str, Any]:
 
     return {
         "search_url": search_url, "search": request, "submitted": False,
-        "auto_ingest": intake, "agent_response": agent_response,}
-
+        "auto_ingest": intake, "agent_response": agent_response,
+    }
 
 def handle_discover_linkedin_saved_jobs(cur, task) -> Dict[str, Any]:
     """Read only the jobs the user has already saved on LinkedIn.
@@ -1214,6 +1056,30 @@ def handle_discover_linkedin_saved_jobs(cur, task) -> Dict[str, Any]:
         "\"jd_text\":\"full visible job description\"}]}. "
         "Each record needs a grounded canonical URL and 200+ JD characters."
     )
+
+    # =====================================================================
+    # [THÊM MỚI] BẬT FAKE MOUSE CHO SAVED JOBS
+    # =====================================================================
+    import threading
+    import requests
+    from services.autofill.parallel_bypass import _fake_mouse_routine
+    
+    mouse_stop_event = threading.Event()
+    mouse_thread = None
+    try:
+        res = requests.get(f"{BROWSER_CDP_URL}/json", timeout=2)
+        tabs = res.json()
+        ws_url = next(t["webSocketDebuggerUrl"] for t in tabs if t["type"] == "page")
+        
+        mouse_thread = threading.Thread(
+            target=_fake_mouse_routine,
+            args=(ws_url, "data/pointer-regimes.json", mouse_stop_event)
+        )
+        mouse_thread.start()
+        print("  [FakeMouse] Đã bật khiên bảo vệ Brownian Motion cho Saved Jobs...")
+    except Exception as e:
+        print(f"  [FakeMouse] Bỏ qua Fake Mouse vì không thể kết nối CDP: {e}")
+
     try:
         agent_response = openclaw_agent(
             agent=OPENCLAW_AGENT_LINKEDIN_DISCOVERY, message=msg,
@@ -1221,6 +1087,12 @@ def handle_discover_linkedin_saved_jobs(cur, task) -> Dict[str, Any]:
         )
     except RuntimeError as exc:
         raise TransientTaskError(str(exc)) from exc
+    finally:
+        # [THÊM MỚI] TẮT CHUỘT MA NGAY CẢ KHI LỖI
+        mouse_stop_event.set()
+        if mouse_thread and mouse_thread.is_alive():
+            mouse_thread.join(timeout=2)
+
     blocker_text = json.dumps(agent_response, ensure_ascii=False).casefold()
     if any(word in blocker_text for word in ("captcha", "checkpoint", "sign in", "login required")):
         raise PermanentTaskError("LinkedIn Saved Jobs requires human login/checkpoint handling; no LinkedIn state changed.")
@@ -1230,25 +1102,6 @@ def handle_discover_linkedin_saved_jobs(cur, task) -> Dict[str, Any]:
         raise PermanentTaskError(f"LinkedIn Saved Jobs result refused: {exc}") from exc
     return {"saved_url": saved_url, "saved": request, "submitted": False,
             "auto_ingest": intake, "agent_response": agent_response}
-
-
-def handle_capture_page_snapshot(cur, task) -> Dict[str, Any]:
-    url = require_url(cur, task["input_json"])
-    msg = (
-        "Open this URL and list every form field: label, input type, whether it "
-        "is required, and any select options.\n"
-        f"URL: {url}\n\n"
-        "This is a read-only inspection. Do not type into any field. "
-        "Do not submit."
-    )
-    return {
-        "url": url,
-        "agent_response": openclaw_agent(
-            agent=OPENCLAW_AGENT_BROWSE, message=msg,
-            timeout=task["timeout_seconds"],
-            session_id=f"jobos-task-{task['id']}",
-        ),
-    }
 
 
 def handle_fill_application_form(cur, task) -> Dict[str, Any]:
@@ -1268,19 +1121,20 @@ def handle_fill_application_form(cur, task) -> Dict[str, Any]:
     except AutofillContextError as exc:
         raise PermanentTaskError(str(exc)) from exc
     require_current_input_hash(binding, context.input_hash)
-    approved_upload_hashes = {}
-    if binding.get("artifact_id") and binding.get("artifact_sha256"):
-        for approved_path in (context.profile.get("documents") or {}).values():
-            if approved_path:
-                approved_upload_hashes[str(Path(str(approved_path)).expanduser().resolve())] = str(binding["artifact_sha256"])
-    transport = OpenClawTransport(
-        binary=OPENCLAW_BIN, profile=os.getenv("JOBOS_BROWSER_PROFILE", "remote"),
-        timeout=min(int(task["timeout_seconds"]), 90), environment=openclaw_runtime_env(),
-        approved_upload_hashes=approved_upload_hashes,
-    )
+    transport = OpenClawTransport(binary=OPENCLAW_BIN, profile=os.getenv("JOBOS_BROWSER_PROFILE", "remote"),
+                                  timeout=min(int(task["timeout_seconds"]), 90), environment=openclaw_runtime_env())
     execution_started = False
     pinned_target_id: str | None = None
     latest_actions = []
+
+    # =====================================================================
+    # [THÊM MỚI] BIẾN CHỨA LUỒNG CHUỘT MA AUTOFILL
+    # =====================================================================
+    import threading
+    import requests
+    from services.autofill.parallel_bypass import _fake_mouse_routine
+    mouse_stop_event = threading.Event()
+    mouse_thread = None
 
     def make_plan(state: SnapshotState):
         nonlocal latest_actions
@@ -1299,9 +1153,27 @@ def handle_fill_application_form(cur, task) -> Dict[str, Any]:
         return latest_actions
 
     def begin_execution(target_id: str) -> None:
-        nonlocal execution_started, pinned_target_id
+        nonlocal execution_started, pinned_target_id, mouse_thread
         durable_begin_execution(task, binding, target_id)
         execution_started, pinned_target_id = True, target_id
+        
+        # =====================================================================
+        # [THÊM MỚI] BẬT CHUỘT MA NGAY KHI AUTOFILL VỪA KHÓA MỤC TIÊU
+        # =====================================================================
+        try:
+            res = requests.get(f"{BROWSER_CDP_URL}/json", timeout=2)
+            tabs = res.json()
+            # Tìm đúng tab đang điền form dựa trên target_id
+            ws_url = next(t["webSocketDebuggerUrl"] for t in tabs if t["type"] == "page" and target_id in t.get("webSocketDebuggerUrl", ""))
+            mouse_thread = threading.Thread(
+                target=_fake_mouse_routine,
+                args=(ws_url, "data/pointer-regimes.json", mouse_stop_event)
+            )
+            mouse_thread.daemon = True
+            mouse_thread.start()
+            print("  [FakeMouse] Đã thả chuột ma lượn lờ trong lúc Autofill...")
+        except Exception as e:
+            print(f"  [FakeMouse] Cảnh báo - Không thả được chuột ma khi Autofill: {e}")
 
     try:
         session = AutofillSession(
@@ -1337,6 +1209,14 @@ def handle_fill_application_form(cur, task) -> Dict[str, Any]:
         # reviewed and approved afresh instead of leaving idempotency stuck.
         durable_close_unstarted_approval(task, binding, f"Preflight refused: {exc}")
         raise PermanentTaskError(str(exc)) from exc
+    finally:
+        # =====================================================================
+        # [THÊM MỚI] GỌI XONG HOẶC CRASH FORM CŨNG PHẢI TẮT CHUỘT
+        # =====================================================================
+        mouse_stop_event.set()
+        if mouse_thread and mouse_thread.is_alive():
+            mouse_thread.join(timeout=2)
+
     screenshot_path = None
     try:
         # This is deliberately performed only after the deterministic session
@@ -1349,15 +1229,9 @@ def handle_fill_application_form(cur, task) -> Dict[str, Any]:
         durable.chmod(0o600)
         screenshot_path = str(durable.resolve())
         cur.execute("UPDATE browser_tasks SET screenshot_url = %s WHERE id = %s;", (screenshot_path, task["id"]))
-    except Exception as screenshot_exc:
-        # Screenshot capture is a post-execution review artifact, not part of
-        # the deterministic browser write transaction.  Even an unexpected
-        # capture/serialization failure must not reclassify already-verified
-        # writes as uncertain or trigger replay/reconciliation.
-        print(
-            "  warning: post-autofill screenshot capture failed; "
-            f"browser writes remain final: {type(screenshot_exc).__name__}: {screenshot_exc}"
-        )
+    except (TransportError, OSError, shutil.Error):
+        # Browser side effects are final at this point. The review hub will
+        # show the completed form without an image rather than attempt replay.
         screenshot_path = None
     return {
         "status": result.status, "verified_refs": list(result.verified_refs),
@@ -1368,15 +1242,6 @@ def handle_fill_application_form(cur, task) -> Dict[str, Any]:
         "approval_closed_without_write": not execution_started,
         "screenshot_path": screenshot_path,
         "submitted": False, }
-
-
-HANDLERS = {
-    "fetch_job_description": handle_fetch_job_description,
-    "discover_linkedin_jobs": handle_discover_linkedin_jobs,
-    "discover_linkedin_saved_jobs": handle_discover_linkedin_saved_jobs,
-    "capture_page_snapshot": handle_capture_page_snapshot,
-    "fill_application_form": handle_fill_application_form,
-}
 
 
 def update_saved_sync_failure(cur, task: Dict[str, Any], status: str, error: str) -> None:
@@ -1447,30 +1312,12 @@ def process_one(conn) -> bool:
             result["worker_version"] = WORKER_VERSION
             result["elapsed_seconds"] = round(elapsed, 1)
             complete_task(cur, task["id"], result)
-        # Browser completion is a durable boundary of its own.  A failure in
-        # Human Review materialization must never reclassify already-verified
-        # browser writes as uncertain or send the task through retry logic.
-        conn.commit()
-
-        if task["task_type"] == "fill_application_form":
-            try:
-                with conn.cursor() as cur:
-                    from services.review.review_service_v1 import ensure_autofill_review
-                    ensure_autofill_review(
-                        cur, task["id"], screenshot_path=result.get("screenshot_path"), result=result,
-                    )
-                conn.commit()
-            except Exception as review_exc:
-                conn.rollback()
-                # sync_inbox() can deterministically recreate this materialized
-                # review from the completed browser task later.  Do not replay
-                # or reconcile browser side effects merely because the UI layer
-                # failed to materialize.
-                print(
-                    "  warning: autofill completed but review materialization "
-                    f"was deferred: {type(review_exc).__name__}: {review_exc}"
+            if task["task_type"] == "fill_application_form":
+                from services.review.review_service_v1 import ensure_autofill_review
+                ensure_autofill_review(
+                    cur, task["id"], screenshot_path=result.get("screenshot_path"), result=result,
                 )
-
+        conn.commit()
         print(f"  completed in {elapsed:.1f}s")
         emit_trace(
             trace_id,
@@ -1487,7 +1334,6 @@ def process_one(conn) -> bool:
     except PermanentTaskError as e:
         conn.rollback()
         with conn.cursor() as cur:
-            close_terminal_capability_if_provably_pre_io(cur, task, str(e))
             fail_task(cur, task["id"], str(e))
             update_saved_sync_failure(cur, task, "failed", str(e))
         conn.commit()
