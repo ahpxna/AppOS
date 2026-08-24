@@ -41,3 +41,16 @@ def test_screenshot_path_extraction_requires_existing_file(tmp_path: Path):
     image.write_bytes(b"png")
     assert OpenClawTransport._find_media_path({"data": {"path": str(image)}}) == image.resolve()
     assert OpenClawTransport._find_media_path({"path": str(tmp_path / "missing.png")}) is None
+
+
+
+def test_linkedin_search_discovery_has_fail_closed_blocker_boundary():
+    worker = (Path(__file__).resolve().parents[1] / "services" / "browser-controller" / "browser_queue_worker.py").read_text(encoding="utf-8")
+    start = worker.index("def handle_discover_linkedin_jobs")
+    end = worker.index("def handle_discover_linkedin_saved_jobs", start)
+    handler = worker[start:end]
+    assert "execute_parallel_bypass" not in handler
+    assert "_fake_mouse_routine" not in handler
+    assert "raise PermanentTaskError" in handler
+    for marker in ("captcha", "verification", "security check", "checkpoint", "login required"):
+        assert marker in handler.casefold()

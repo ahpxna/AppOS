@@ -61,13 +61,15 @@ def ensure_bundle(cur, application_id: str, *, kind: str = "application") -> str
 
 
 def bind_canonical_review_pdf(cur, review_item_id: str, document_id: str, doc_type: str) -> str | None:
-    """Bind one verified PDF, never a mutable list of alternate artifacts."""
+    """Bind one verified PDF for the exact generated-document slot."""
     cur.execute(
         """SELECT id::text, file_path, filename, sha256
              FROM generated_document_artifacts
-            WHERE generated_document_id = %s AND lower(filename) LIKE '%%.pdf'
+            WHERE generated_document_id = %s
+              AND artifact_type = %s
+              AND lower(filename) LIKE '%%.pdf'
             ORDER BY created_at DESC;""",
-        (document_id,),
+        (document_id, doc_type),
     )
     kind = "resume_pdf" if doc_type == "resume" else "cover_letter_pdf"
     for artifact_id, file_path, filename, stored_sha in cur.fetchall():
@@ -75,7 +77,7 @@ def bind_canonical_review_pdf(cur, review_item_id: str, document_id: str, doc_ty
         if not path.is_file():
             continue
         actual_sha = _sha256_file(path)
-        if stored_sha and stored_sha != actual_sha:
+        if stored_sha != actual_sha:
             continue
         cur.execute(
             """INSERT INTO human_review_artifacts(
@@ -93,10 +95,56 @@ def bind_canonical_review_pdf(cur, review_item_id: str, document_id: str, doc_ty
         )
         bound = cur.fetchone()
         if bound:
-            cur.execute("UPDATE human_review_items SET reviewed_artifact_id = %s WHERE id = %s;",
-                        (bound[0], review_item_id))
+            cur.execute(
+                """UPDATE human_review_items
+                      SET reviewed_artifact_id = %s,
+                          payload_json = payload_json - 'artifact_render_error',
+                          updated_at = now()
+                    WHERE id = %s;""",
+                (bound[0], review_item_id),
+            )
             return str(bound[0])
     return None
+
+
+def _ensure_review_pdf(cur, item_id: str, document_id: str, doc_type: str, qa_status: str) -> str | None:
+    """Bind/render the canonical review PDF without changing review identity."""
+    reviewed_artifact_id = bind_canonical_review_pdf(cur, item_id, document_id, doc_type)
+    auto_render = os.getenv("JOBOS_REVIEW_AUTO_RENDER_PDFS", "true").strip().casefold() in {
+        "1", "true", "yes", "on"
+    }
+    if reviewed_artifact_id or qa_status != "pass" or not auto_render:
+        return reviewed_artifact_id
+    try:
+        from services.review.render_review_artifacts_v1 import render_document_pdf
+
+        render_document_pdf(cur, document_id)
+        return bind_canonical_review_pdf(cur, item_id, document_id, doc_type)
+    except Exception as exc:
+        cur.execute(
+            """UPDATE human_review_items
+                  SET payload_json = payload_json || %s, updated_at = now()
+                WHERE id = %s;""",
+            (Jsonb({"artifact_render_error": str(exc)[:500]}), item_id),
+        )
+        return None
+
+
+def _set_document_review_state(cur, item_id: str, *, qa_status: str,
+                               reviewed_artifact_id: str | None, summary: str,
+                               target_status: str) -> None:
+    """Materialize the actionable status for one stable review item."""
+    status = target_status
+    summary_text = summary
+    if qa_status == "pass" and not reviewed_artifact_id:
+        status = "needs_revision"
+        summary_text = summary + " Canonical PDF artifact is required before approval."
+    cur.execute(
+        """UPDATE human_review_items
+              SET status = %s, summary_text = %s, updated_at = now()
+            WHERE id = %s;""",
+        (status, summary_text, item_id),
+    )
 
 
 def ensure_document_review(cur, document_id: str) -> str | None:
@@ -113,6 +161,13 @@ def ensure_document_review(cur, document_id: str) -> str | None:
     app_id, doc_type, version, content, qa_status, approved, company, role = row
     if doc_type not in {"resume", "cover_letter"} or qa_status not in {"pass", "fail", "revise"} or approved:
         return None
+
+    # Serialize review creation per application. Without this lock, two concurrent
+    # sync workers can both observe an empty slot and race into the unique index.
+    cur.execute("SELECT id::text FROM applications WHERE id = %s FOR UPDATE;", (app_id,))
+    if not cur.fetchone():
+        raise ReviewError(f"Application not found: {app_id}")
+
     bundle_id = ensure_bundle(cur, app_id)
     source_sha = _sha256_text(content or "")
     label = "Resume" if doc_type == "resume" else "Cover letter"
@@ -123,10 +178,7 @@ def ensure_document_review(cur, document_id: str) -> str | None:
         if qa_status == "pass"
         else f"{company} — {role}. Truth/quality gate returned {qa_status}; revise/regenerate before approval."
     )
-    # A document-review capability is scoped to the current application slot,
-    # not merely an individual generated-document row.  This matches migration
-    # 063's unique active slot invariant and makes a new version supersede the
-    # prior resume/cover-letter review instead of colliding with it.
+
     cur.execute(
         """SELECT id::text, status, source_sha256, payload_json,
                   generated_document_id::text
@@ -140,19 +192,32 @@ def ensure_document_review(cur, document_id: str) -> str | None:
     existing = cur.fetchone()
     if existing:
         existing_qa = str((existing[3] or {}).get("qa_status") or "")
-        if (
+        same_review_identity = (
             existing[4] == str(document_id)
             and existing[2] == source_sha
-            and existing[1] == target_status
             and existing_qa == qa_status
-        ):
-            bind_canonical_review_pdf(cur, existing[0], document_id, doc_type)
-            return str(existing[0])
-        cur.execute(
-            """UPDATE human_review_items SET status = 'expired', decision_note = %s,
-                      decided_at = now(), updated_at = now() WHERE id = %s;""",
-            ("Document content or QA state changed; a fresh review item was issued.", existing[0]),
         )
+        if same_review_identity:
+            # A missing PDF is a materialized state problem, not a new review
+            # identity. Re-sync the same item instead of expiring/recreating it.
+            reviewed_artifact_id = _ensure_review_pdf(
+                cur, existing[0], document_id, doc_type, qa_status
+            )
+            _set_document_review_state(
+                cur, existing[0], qa_status=qa_status,
+                reviewed_artifact_id=reviewed_artifact_id,
+                summary=summary, target_status=target_status,
+            )
+            return str(existing[0])
+
+        cur.execute(
+            """UPDATE human_review_items
+                  SET status = 'expired', decision_note = %s,
+                      decided_at = now(), updated_at = now()
+                WHERE id = %s;""",
+            ("Document content, version, or QA state changed; a fresh review item was issued.", existing[0]),
+        )
+
     cur.execute(
         """SELECT 1 FROM human_review_items
              WHERE generated_document_id = %s AND item_type = 'document_review'
@@ -164,6 +229,7 @@ def ensure_document_review(cur, document_id: str) -> str | None:
     )
     if cur.fetchone():
         return None
+
     cur.execute(
         """INSERT INTO human_review_items(
                review_bundle_id, application_id, item_type, status, generated_document_id,
@@ -174,29 +240,11 @@ def ensure_document_review(cur, document_id: str) -> str | None:
          Jsonb({"doc_type": doc_type, "version": version, "qa_status": qa_status})),
     )
     item_id = str(cur.fetchone()[0])
-    reviewed_artifact_id = bind_canonical_review_pdf(cur, item_id, document_id, doc_type)
-    auto_render = os.getenv("JOBOS_REVIEW_AUTO_RENDER_PDFS", "true").strip().casefold() in {"1", "true", "yes", "on"}
-    if not reviewed_artifact_id and auto_render and qa_status == "pass":
-        try:
-            from services.review.render_review_artifacts_v1 import render_document_pdf
-            render_document_pdf(cur, document_id)
-            reviewed_artifact_id = bind_canonical_review_pdf(cur, item_id, document_id, doc_type)
-        except Exception as exc:
-            cur.execute(
-                """UPDATE human_review_items
-                      SET payload_json = payload_json || %s, updated_at = now()
-                    WHERE id = %s;""",
-                (Jsonb({"artifact_render_error": str(exc)[:500]}), item_id),
-            )
-    if qa_status == "pass" and not reviewed_artifact_id:
-        cur.execute(
-            """UPDATE human_review_items
-                  SET status = 'needs_revision',
-                      summary_text = summary_text || ' Canonical PDF artifact is required before approval.',
-                      updated_at = now()
-                WHERE id = %s;""",
-            (item_id,),
-        )
+    reviewed_artifact_id = _ensure_review_pdf(cur, item_id, document_id, doc_type, qa_status)
+    _set_document_review_state(
+        cur, item_id, qa_status=qa_status, reviewed_artifact_id=reviewed_artifact_id,
+        summary=summary, target_status=target_status,
+    )
     return item_id
 
 def ensure_approval_review(cur, approval_request_id: str) -> str | None:
