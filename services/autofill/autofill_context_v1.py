@@ -123,6 +123,10 @@ def load_autofill_context(
             sensitive[question_class] = {"value": str(answer).title(), "confirmed_at": str(updated_at),
                                          "confirmation_version": 1}
     remembered = _load_remembered_answers(cur, application_id)
+    cur.execute("SELECT jd_hash FROM applications WHERE id = %s;", (application_id,))
+    app_row = cur.fetchone()
+    if not app_row or not app_row[0]:
+        raise AutofillContextError("Application has no current JD hash; regenerate documents before autofill.")
 
     return AutofillContext(
         profile,
@@ -134,6 +138,7 @@ def load_autofill_context(
             remembered_answers=remembered,
             document_sha256=document_sha256,
             artifact_sha256=artifact.get("artifact_sha256"),
+            job_jd_hash=str(app_row[0]),
             page_url=page_url,
             page_fingerprint_sha256=page_fingerprint_sha256,
         ),

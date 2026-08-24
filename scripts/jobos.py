@@ -48,8 +48,8 @@ def doctor(*, check_browser: bool) -> int:
         import psycopg
         with psycopg.connect(database_dsn(), connect_timeout=5) as conn, conn.cursor() as cur:
             mark(results, "PostgreSQL", True)
-            cur.execute("SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE migration_id = '062_telegram_artifact_delivery_ledger.sql')")
-            mark(results, "Migrations through 062", bool(cur.fetchone()[0]))
+            cur.execute("SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE migration_id = '063_review_exact_artifact_and_jd_binding.sql')")
+            mark(results, "Migrations through 063", bool(cur.fetchone()[0]))
             cur.execute("SELECT to_regclass('public.autofill_action_journal') IS NOT NULL")
             mark(results, "Autofill action journal", bool(cur.fetchone()[0]))
             cur.execute("SELECT to_regclass('public.human_review_items') IS NOT NULL")
@@ -61,7 +61,7 @@ def doctor(*, check_browser: bool) -> int:
             mark(results, "Immigration profile confirmed", int(cur.fetchone()[0]) == 1)
     except Exception as exc:
         mark(results, "PostgreSQL", False, str(exc)[:180])
-        mark(results, "Migrations through 062", False, "PostgreSQL unavailable")
+        mark(results, "Migrations through 063", False, "PostgreSQL unavailable")
 
     if check_browser:
         # Health only: it validates gateway/CDP availability but does not list
@@ -76,7 +76,7 @@ def doctor(*, check_browser: bool) -> int:
     for name, ok, detail in results:
         print(f"{'✓' if ok else '⚠'} {name}" + (f" — {detail}" if detail else ""))
     checks = {name: ok for name, ok, _ in results}
-    core = all(checks.get(name, False) for name in ("Python 3.11+", "Environment", "PostgreSQL", "Migrations through 062"))
+    core = all(checks.get(name, False) for name in ("Python 3.11+", "Environment", "PostgreSQL", "Migrations through 063"))
     autofill = core and all(ok for name, ok, _ in results if name in {
         "Autofill action journal", "No unresolved autofill task", "Immigration profile confirmed",
         "OpenClaw runtime", "Managed upload root", "Human Review Hub",
@@ -112,7 +112,12 @@ def autofill_prepare(application_id: str, *, create: bool, yes: bool) -> int:
     from services.common.immigration_semantics import classify_immigration_question
     from services.common.question_memory import normalize_question
     with psycopg.connect(database_dsn(), autocommit=False) as conn, conn.cursor() as cur:
-        cur.execute("SELECT company, job_title, coalesce(ats_type, 'unknown') FROM applications WHERE id = %s;", (application_id,))
+        cur.execute(
+            """SELECT company, job_title, coalesce(ats_type, 'unknown'),
+                      approved_resume_id::text, approved_resume_artifact_id::text
+                 FROM applications WHERE id = %s;""",
+            (application_id,),
+        )
         application = cur.fetchone()
         if not application:
             raise RuntimeError("Application was not found.")
@@ -126,18 +131,17 @@ def autofill_prepare(application_id: str, *, create: bool, yes: bool) -> int:
                                "select": bool(capability[3]), "upload": bool(capability[4])}
         cur.execute(
             """SELECT gd.id::text, gd.content, gda.id::text, gda.filename, gda.sha256
-                 FROM generated_documents gd
-                 LEFT JOIN generated_document_artifacts gda
-                   ON gda.generated_document_id = gd.id AND gda.application_id = gd.application_id
-                 WHERE gd.application_id = %s AND gd.doc_type = 'resume'
-                   AND gd.qa_status = 'pass' AND gd.approved = true
-                 ORDER BY gda.created_at DESC NULLS LAST, gd.created_at DESC
-                 LIMIT 1;""",
+                 FROM applications a
+                 JOIN generated_documents gd ON gd.id = a.approved_resume_id
+                 JOIN generated_document_artifacts gda ON gda.id = a.approved_resume_artifact_id
+                WHERE a.id = %s AND gd.application_id = a.id AND gd.doc_type = 'resume'
+                  AND gd.qa_status = 'pass' AND gd.approved = true
+                  AND gda.application_id = a.id AND gda.generated_document_id = gd.id;""",
             (application_id,),
         )
         document = cur.fetchone()
         if not document:
-            raise RuntimeError("No verified, user-approved resume exists for this application.")
+            raise RuntimeError("No exact reviewed resume PDF artifact is approved for this application.")
         transport = OpenClawTransport(
             binary=resolve_openclaw_binary(required=True),
             profile=os.getenv("JOBOS_BROWSER_PROFILE", "remote"),

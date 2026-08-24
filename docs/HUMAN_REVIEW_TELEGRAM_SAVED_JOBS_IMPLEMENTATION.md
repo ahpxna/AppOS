@@ -19,6 +19,8 @@ Telegram approval of an autofill screenshot means only “the populated form loo
 | `db/migrations/059_linkedin_saved_jobs.sql` | Create | `linkedin_saved_syncs`; Saved Jobs provenance on `applications`; bounded 1–20 batch. |
 | `db/migrations/060_human_review_hub.sql` | Create | `review_bundles`, `human_review_items`, `human_review_artifacts`, unified inbox view, `application_ready` state. |
 | `db/migrations/061_telegram_review_channel.sql` | Create | Delivery ledger, hashed single-use callback tokens, durable long-poll offset. |
+| `db/migrations/062_telegram_artifact_delivery_ledger.sql` | Create | Artifact delivery ledger so PDFs/screenshots rendered after a summary can still be delivered. |
+| `db/migrations/063_review_exact_artifact_and_jd_binding.sql` | Create | Exact reviewed-PDF and source-JD bindings; no historical document is assumed current. |
 | `services/discovery/linkedin_discovery_v1.py` | Modify | Shared strict LinkedIn JD normalization; `validate_saved_request`; `ingest_saved_jobs`. |
 | `services/discovery/linkedin_intake_v1.py` | Modify | `queue-saved`; one sync record + one browser task. |
 | `services/browser-controller/browser_queue_worker.py` | Modify | Remove FakeMouse; Saved Jobs handler; durable post-autofill screenshot; review-item creation; `form_filled` only after completed deterministic execution. |
@@ -27,7 +29,7 @@ Telegram approval of an autofill screenshot means only “the populated form loo
 | `services/review/review_service_v1.py` | Create | Canonical materialized review inbox for docs, questions, capability approvals, autofill screenshots, reconciliation, final human submit. |
 | `services/review/render_review_artifacts_v1.py` | Create | Deterministic physical PDF artifacts; resume reuses fixed template renderer; cover letter renders truth-checked content. |
 | `services/telegram/telegram_review_bot_v1.py` | Create | Long polling; sends PDF/screenshots; allowlisted user; opaque hashed callbacks; `/answer`; `discover-id`. |
-| `scripts/jobos.py` | Modify | `saved sync`, `review ...`, `telegram discover-id/start`; doctor through migration 062. |
+| `scripts/jobos.py` | Modify | `saved sync`, `review ...`, `telegram discover-id/start`; doctor through migration 063. |
 | `.env.example` | Modify | Saved Jobs, Review Hub, Telegram configuration. |
 | `scripts/bootstrap_ubuntu_24.sh` | Modify | Installs LibreOffice Writer for PDF export. |
 | `tests/test_review_saved_features.py` | Create | Pure boundary tests. |

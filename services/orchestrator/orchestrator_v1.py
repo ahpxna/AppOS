@@ -513,7 +513,17 @@ def advance_one(cur, application_id: str, *, apply: bool) -> None:
 
 
     elif step == "docs_generated":
-        ok, out, transient = run_step(VERIFY_SCRIPT, ["--pending", "--apply"])
+        cur.execute(
+            """SELECT id::text FROM generated_documents
+                 WHERE application_id = %s AND doc_type = 'resume'
+                 ORDER BY version DESC, created_at DESC LIMIT 1;""",
+            (application_id,),
+        )
+        resume_row = cur.fetchone()
+        if not resume_row:
+            record_failure(cur, application_id, step, "Resume draft was not found for this application.", transient=True)
+            return
+        ok, out, transient = run_step(VERIFY_SCRIPT, ["--document-id", resume_row[0], "--apply"])
         if not ok and transient:
             record_failure(cur, application_id, step, out, transient=True)
             return
@@ -524,8 +534,8 @@ def advance_one(cur, application_id: str, *, apply: bool) -> None:
             """
             SELECT id::text, qa_status, revision_round
             FROM generated_documents
-            WHERE application_id = %s
-            ORDER BY (qa_status = 'pass') DESC, created_at DESC
+            WHERE application_id = %s AND doc_type = 'resume'
+            ORDER BY version DESC, created_at DESC
             LIMIT 1;
             """,
             (application_id,),
@@ -534,22 +544,6 @@ def advance_one(cur, application_id: str, *, apply: bool) -> None:
         doc_id, qa, rround = (r[0], r[1], r[2]) if r else (None, None, 0)
 
         if qa == "pass":
-            # The export step only reads the QA-passed evidence map and patches
-            # the fixed local Word template's project/skill slots. The user
-            # reviews the DOCX and chooses Print/Save as PDF in their editor.
-            eok, eout, _ = run_step(RESUME_EXPORT_SCRIPT, ["--application-id", application_id])
-            if eok:
-                print("    resume DOCX: written from verified template slots")
-            else:
-                tail = eout.strip().splitlines()[-1] if eout.strip() else "unavailable"
-                print(f"    resume DOCX: not written -- {tail[:180]}")
-                cur.execute(
-                    """INSERT INTO pipeline_events
-                          (application_id, from_step, to_step, actor, reason, detail_json)
-                       VALUES (%s, %s, %s, 'resume_template_export', %s, %s);""",
-                    (application_id, step, step, "Verified local Word resume export blocked or unavailable.",
-                     Jsonb({"output": eout[-1500:]})),
-                )
             transition(cur, application_id=application_id, to_step="docs_verified",
                        actor="truth_quality_checker", reason="All claims supported.")
             transition(cur, application_id=application_id, to_step="awaiting_approval",

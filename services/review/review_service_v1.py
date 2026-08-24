@@ -60,7 +60,8 @@ def ensure_bundle(cur, application_id: str, *, kind: str = "application") -> str
     return str(cur.fetchone()[0])
 
 
-def attach_existing_document_pdfs(cur, review_item_id: str, document_id: str, doc_type: str) -> int:
+def bind_canonical_review_pdf(cur, review_item_id: str, document_id: str, doc_type: str) -> str | None:
+    """Bind one verified PDF, never a mutable list of alternate artifacts."""
     cur.execute(
         """SELECT id::text, file_path, filename, sha256
              FROM generated_document_artifacts
@@ -69,7 +70,6 @@ def attach_existing_document_pdfs(cur, review_item_id: str, document_id: str, do
         (document_id,),
     )
     kind = "resume_pdf" if doc_type == "resume" else "cover_letter_pdf"
-    count = 0
     for artifact_id, file_path, filename, stored_sha in cur.fetchall():
         path = Path(file_path).expanduser()
         if not path.is_file():
@@ -85,8 +85,18 @@ def attach_existing_document_pdfs(cur, review_item_id: str, document_id: str, do
                ON CONFLICT (review_item_id, artifact_kind, sha256) DO NOTHING;""",
             (review_item_id, artifact_id, kind, str(path.resolve()), filename, actual_sha),
         )
-        count += int(cur.rowcount > 0)
-    return count
+        cur.execute(
+            """SELECT id::text FROM human_review_artifacts
+                 WHERE review_item_id = %s AND generated_document_artifact_id = %s
+                   AND artifact_kind = %s AND sha256 = %s;""",
+            (review_item_id, artifact_id, kind, actual_sha),
+        )
+        bound = cur.fetchone()
+        if bound:
+            cur.execute("UPDATE human_review_items SET reviewed_artifact_id = %s WHERE id = %s;",
+                        (bound[0], review_item_id))
+            return str(bound[0])
+    return None
 
 
 def ensure_document_review(cur, document_id: str) -> str | None:
@@ -128,7 +138,7 @@ def ensure_document_review(cur, document_id: str) -> str | None:
     if existing:
         existing_qa = str((existing[3] or {}).get("qa_status") or "")
         if existing[2] == source_sha and existing[1] == target_status and existing_qa == qa_status:
-            attach_existing_document_pdfs(cur, existing[0], document_id, doc_type)
+            bind_canonical_review_pdf(cur, existing[0], document_id, doc_type)
             return str(existing[0])
         cur.execute(
             """UPDATE human_review_items SET status = 'expired', decision_note = %s,
@@ -156,13 +166,13 @@ def ensure_document_review(cur, document_id: str) -> str | None:
          Jsonb({"doc_type": doc_type, "version": version, "qa_status": qa_status})),
     )
     item_id = str(cur.fetchone()[0])
-    attached = attach_existing_document_pdfs(cur, item_id, document_id, doc_type)
+    reviewed_artifact_id = bind_canonical_review_pdf(cur, item_id, document_id, doc_type)
     auto_render = os.getenv("JOBOS_REVIEW_AUTO_RENDER_PDFS", "true").strip().casefold() in {"1", "true", "yes", "on"}
-    if attached == 0 and auto_render and qa_status == "pass":
+    if not reviewed_artifact_id and auto_render and qa_status == "pass":
         try:
             from services.review.render_review_artifacts_v1 import render_document_pdf
             render_document_pdf(cur, document_id)
-            attach_existing_document_pdfs(cur, item_id, document_id, doc_type)
+            reviewed_artifact_id = bind_canonical_review_pdf(cur, item_id, document_id, doc_type)
         except Exception as exc:
             cur.execute(
                 """UPDATE human_review_items
@@ -170,6 +180,15 @@ def ensure_document_review(cur, document_id: str) -> str | None:
                     WHERE id = %s;""",
                 (Jsonb({"artifact_render_error": str(exc)[:500]}), item_id),
             )
+    if qa_status == "pass" and not reviewed_artifact_id:
+        cur.execute(
+            """UPDATE human_review_items
+                  SET status = 'needs_revision',
+                      summary_text = summary_text || ' Canonical PDF artifact is required before approval.',
+                      updated_at = now()
+                WHERE id = %s;""",
+            (item_id,),
+        )
     return item_id
 
 def ensure_approval_review(cur, approval_request_id: str) -> str | None:
@@ -550,14 +569,14 @@ def decide_item(conn, item_id: str, *, decision: str, actor: str, note: str = ""
         cur.execute(
             """SELECT id::text, item_type, status, application_id::text,
                       generated_document_id::text, approval_request_id::text,
-                      browser_task_id::text, source_sha256
+                      browser_task_id::text, source_sha256, reviewed_artifact_id::text
                  FROM human_review_items WHERE id = %s FOR UPDATE;""",
             (item_id,),
         )
         row = cur.fetchone()
         if not row:
             raise ReviewError("Review item not found.")
-        _id, item_type, status, app_id, document_id, approval_id, browser_task_id, source_sha = row
+        _id, item_type, status, app_id, document_id, approval_id, browser_task_id, source_sha, reviewed_artifact_id = row
         if status not in {"pending", "needs_revision"}:
             raise ReviewError(f"Review item is already {status}.")
 
@@ -569,13 +588,32 @@ def decide_item(conn, item_id: str, *, decision: str, actor: str, note: str = ""
             if decision == "approve":
                 if doc[1] != "pass":
                     raise ReviewError("Only a QA-passed document may be approved.")
-                cur.execute("UPDATE generated_documents SET approved = true, approved_at = now() WHERE id = %s;", (document_id,))
+                if not reviewed_artifact_id:
+                    raise ReviewError("An exact reviewed PDF artifact is required before document approval.")
+                cur.execute(
+                    """SELECT hra.artifact_kind, hra.file_path, hra.sha256,
+                              hra.generated_document_artifact_id::text, gda.generated_document_id::text
+                         FROM human_review_artifacts hra
+                         LEFT JOIN generated_document_artifacts gda ON gda.id = hra.generated_document_artifact_id
+                        WHERE hra.id = %s;""",
+                    (reviewed_artifact_id,),
+                )
+                artifact = cur.fetchone()
                 cur.execute("SELECT doc_type FROM generated_documents WHERE id = %s;", (document_id,))
                 doc_type = cur.fetchone()[0]
+                required_kind = "resume_pdf" if doc_type == "resume" else "cover_letter_pdf"
+                if (not artifact or artifact[0] != required_kind or artifact[4] != document_id
+                        or not Path(artifact[1]).is_file() or _sha256_file(Path(artifact[1])) != artifact[2]):
+                    raise ReviewError("The exact PDF artifact reviewed by the user is missing, changed, or unbound.")
+                cur.execute("UPDATE generated_documents SET approved = true, approved_at = now() WHERE id = %s;", (document_id,))
                 if doc_type == "resume":
-                    cur.execute("UPDATE applications SET approved_resume_id = %s WHERE id = %s;", (document_id, app_id))
+                    cur.execute("""UPDATE applications SET approved_resume_id = %s,
+                                  approved_resume_artifact_id = %s WHERE id = %s;""",
+                                (document_id, artifact[3], app_id))
                 elif doc_type == "cover_letter":
-                    cur.execute("UPDATE applications SET approved_cover_letter_id = %s WHERE id = %s;", (document_id, app_id))
+                    cur.execute("""UPDATE applications SET approved_cover_letter_id = %s,
+                                  approved_cover_letter_artifact_id = %s WHERE id = %s;""",
+                                (document_id, artifact[3], app_id))
             else:
                 cur.execute("UPDATE generated_documents SET approved = false, approved_at = NULL WHERE id = %s;", (document_id,))
 

@@ -553,12 +553,12 @@ def insert_revision(
         INSERT INTO generated_documents (
           application_id, doc_type, version, content, format,
           asset_ids_used, evidence_map, generator_version,
-          qa_status, approved, revision_of, revision_round, created_at
+          source_jd_hash, qa_status, approved, revision_of, revision_round, created_at
         )
         SELECT application_id, doc_type,
                (SELECT COALESCE(MAX(version), 0) + 1 FROM generated_documents
                  WHERE application_id = gd.application_id AND doc_type = gd.doc_type),
-               %s, 'markdown', %s, %s, %s, NULL, false, gd.id, gd.revision_round + 1, now()
+               %s, 'markdown', %s, %s, %s, gd.source_jd_hash, NULL, false, gd.id, gd.revision_round + 1, now()
         FROM generated_documents gd
         WHERE gd.id = %s
         RETURNING id::text;

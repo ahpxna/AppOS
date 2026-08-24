@@ -790,15 +790,16 @@ def insert_document(
           application_id, doc_type, version, content, format,
           asset_ids_used, evidence_map,
           generator_version, generator_model, target_role_family,
-          qa_status, approved, created_at
+          source_jd_hash, qa_status, approved, created_at
         )
-        VALUES (%s, %s, %s, %s, 'markdown', %s, %s, %s, %s, %s, NULL, false, now())
+        SELECT %s, %s, %s, %s, 'markdown', %s, %s, %s, %s, %s, jd_hash, NULL, false, now()
+          FROM applications WHERE id = %s
         RETURNING id::text;
         """,
         (
             application_id, doc_type, version, content,
             Jsonb(asset_ids), Jsonb(evidence_map),
-            GENERATOR_VERSION, model, role_family,
+            GENERATOR_VERSION, model, role_family, application_id,
         ),
     )
     return str(cur.fetchone()[0])

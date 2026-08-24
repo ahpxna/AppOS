@@ -61,6 +61,7 @@ def autofill_input_hash(
     artifact_sha256: str | None,
     page_url: str,
     page_fingerprint_sha256: str,
+    job_jd_hash: str | None = None,
 ) -> str:
     # The DB view's named values are the canonical static profile snapshot.
     # Runtime-only document paths must not affect a capability: artifact bytes
@@ -72,6 +73,7 @@ def autofill_input_hash(
         "remembered_answers": remembered_answers,
         "document_sha256": document_sha256,
         "artifact_sha256": artifact_sha256,
+        "job_jd_hash": job_jd_hash,
         "page_url": canonical_page_url(page_url),
         "page_fingerprint_sha256": page_fingerprint_sha256,
     }

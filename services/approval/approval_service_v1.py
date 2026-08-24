@@ -110,9 +110,9 @@ def fetch_document_binding(cur, application_id: str, document_id: str) -> Dict[s
     """Return one QA-passed, user-approved document for one application."""
     cur.execute(
         """
-        SELECT id::text, doc_type, version, content
-        FROM generated_documents
-        WHERE id = %s AND application_id = %s
+        SELECT gd.id::text, gd.doc_type, gd.version, gd.content, gd.source_jd_hash
+        FROM generated_documents gd JOIN applications a ON a.id = gd.application_id
+        WHERE gd.id = %s AND gd.application_id = %s
           AND qa_status = 'pass' AND approved = true;
         """,
         (document_id, application_id),
@@ -122,9 +122,14 @@ def fetch_document_binding(cur, application_id: str, document_id: str) -> Dict[s
         raise RuntimeError(
             "document must belong to this application and have passed QA and user approval."
         )
+    cur.execute("SELECT jd_hash FROM applications WHERE id = %s;", (application_id,))
+    app_row = cur.fetchone()
+    if not row[4] or not app_row or row[4] != app_row[0]:
+        raise RuntimeError("Approved document was generated for a different JD version; regenerate and re-review it.")
     return {
         "id": row[0], "doc_type": row[1], "version": row[2],
         "content_hash": hashlib.sha256((row[3] or "").encode("utf-8")).hexdigest(),
+        "source_jd_hash": row[4],
     }
 
 
@@ -235,6 +240,20 @@ def assert_binding_matches(cur, request_row: Dict[str, Any]) -> None:
             artifact = fetch_artifact_binding(cur, application_id, document_id, str(artifact_id))
             if artifact["sha256"] != payload.get("artifact_sha256") or artifact["filename"] != payload.get("artifact_filename"):
                 raise RuntimeError("Autofill approval no longer matches the exact upload artifact.")
+        current_hash = current_autofill_input_hash(
+            cur,
+            application_id=application_id,
+            artifact_binding={
+                "artifact_id": artifact_id,
+                "artifact_sha256": payload.get("artifact_sha256"),
+                "artifact_filename": payload.get("artifact_filename"),
+            } if artifact_id else {},
+            document_sha256=binding["content_hash"],
+            page_url=str(payload.get("expected_initial_url") or ""),
+            page_fingerprint=str(payload.get("expected_page_fingerprint") or ""),
+        )
+        if current_hash != payload.get("autofill_input_hash"):
+            raise RuntimeError("Autofill inputs or JD changed after preview; prepare and approve a fresh plan.")
 
 
 def log_event(cur, request_id: Optional[str], event: str,
