@@ -227,24 +227,27 @@ def choose_chunk_columns(cols: set[str]) -> Tuple[str, str]:
 
 
 def existing_raw_id(cur, cols: set[str], digest: str, original_path: str):
-    """Return only an exact content identity.
+    """Return the global content identity, allowing a removed source to be renamed/moved.
 
-    Older code used ``sha256 OR original_local_path``.  On an in-place DOCX/PDF
-    edit that reused the old row while intentionally *not* updating ``sha256``,
-    producing stale bytes with a current path.  Content SHA is now the revision
-    boundary; path is used only to retire older revisions.
+    ``raw_files.sha256`` is globally unique.  If identical bytes are still active
+    at another existing path, that is an ambiguous duplicate and remains an
+    error.  If the old row is inactive or its old path no longer exists, reuse
+    the content row and let normal ingestion update the current path/title.
     """
     if "sha256" not in cols:
         return None
-    cur.execute("SELECT id, original_local_path FROM raw_files WHERE sha256=%s LIMIT 1", (digest,))
+    cur.execute("SELECT id, original_local_path, is_active FROM raw_files WHERE sha256=%s LIMIT 1", (digest,))
     row = cur.fetchone()
     if not row:
         return None
-    if "original_local_path" in cols and row[1] and str(row[1]) != original_path:
-        raise RuntimeError(
-            "Two logical profile sources contain identical bytes but raw_files has a global SHA identity. "
-            f"Existing path={row[1]!r}, new path={original_path!r}. Keep one canonical copy or change the content."
-        )
+    old_path = str(row[1] or "")
+    if "original_local_path" in cols and old_path and old_path != original_path:
+        old_still_exists = Path(old_path).is_file()
+        if bool(row[2]) and old_still_exists:
+            raise RuntimeError(
+                "Two active logical profile sources contain identical bytes but raw_files has a global SHA identity. "
+                f"Existing path={old_path!r}, new path={original_path!r}. Keep one canonical copy."
+            )
     return row[0]
 
 

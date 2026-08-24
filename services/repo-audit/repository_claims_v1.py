@@ -65,6 +65,15 @@ TECH_CONTENT_PATTERNS: dict[str, re.Pattern[str]] = {
 TECH_CONTENT_SUFFIXES = {".py", ".js", ".jsx", ".ts", ".tsx", ".toml", ".json", ".txt", ".cfg", ".ini"}
 TECH_CONTENT_FILENAMES = {"requirements.txt", "pyproject.toml", "package.json", "setup.py", "setup.cfg"}
 
+# Security/reliability controls are implementation claims.  README/docs text may
+# describe intended behavior but cannot prove the code actually implements it.
+SECURITY_CONTENT_SUFFIXES = {
+    ".py", ".js", ".jsx", ".ts", ".tsx", ".go", ".rs", ".java", ".kt",
+    ".rb", ".php", ".sql", ".sh", ".tf", ".hcl", ".yaml", ".yml",
+    ".json", ".toml", ".ini", ".cfg",
+}
+SECURITY_CONTENT_FILENAMES = {"dockerfile", "makefile", "procfile"}
+
 
 def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
@@ -227,6 +236,11 @@ def extract_claims(repo: Path, relative_paths: Iterable[str] | None = None) -> l
         seen.add("delivery:github_actions")
 
     for path in paths:
+        # Do not promote README/docs prose into implementation controls.  A
+        # security/reliability claim must be anchored in executable/config/SQL
+        # source from the immutable checkout.
+        if path.suffix.casefold() not in SECURITY_CONTENT_SUFFIXES and path.name.casefold() not in SECURITY_CONTENT_FILENAMES:
+            continue
         text = safe_text(path)
         if not text:
             continue

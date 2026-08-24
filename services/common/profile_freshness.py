@@ -39,7 +39,8 @@ def fixed_state_from_cursor(cur) -> tuple[dict[str, dict[str, Any]], list[dict[s
     return fields, certifications
 
 
-def assess_resume_profile(cur, *, today: date | None = None) -> dict[str, Any]:
+def assess_resume_profile(cur, *, today: date | None = None,
+                          allow_last_known_good_hours: int | None = None) -> dict[str, Any]:
     fields, certifications = fixed_state_from_cursor(cur)
     fixed = readiness_from_records(fields, certifications, today=today)
     cur.execute(
@@ -49,11 +50,22 @@ def assess_resume_profile(cur, *, today: date | None = None) -> dict[str, Any]:
     fixed["pending_document_conflicts"] = pending_fixed_conflicts
     if pending_fixed_conflicts:
         fixed["fixed_fields_ready"] = False
-    registry = load_registry()
-    required_projects = [p for p in registry["projects"] if p.get("dynamic_source_mode", "github_primary") == "github_primary"]
-    missing_project_mappings = [p["project_id"] for p in required_projects if not p.get("github_repo_full_name")]
 
-    configured = [p for p in required_projects if p.get("github_repo_full_name")]
+    registry = load_registry()
+    github_required = [
+        p for p in registry["projects"]
+        if p.get("dynamic_source_mode", "github_primary") == "github_primary"
+    ]
+    document_only = [
+        p for p in registry["projects"]
+        if p.get("dynamic_source_mode", "github_primary") == "document_only"
+    ]
+    missing_project_mappings = [p["project_id"] for p in github_required if not p.get("github_repo_full_name")]
+    configured = [p for p in github_required if p.get("github_repo_full_name")]
+    configured_project_ids = [p["project_id"] for p in configured]
+    document_only_project_ids = [p["project_id"] for p in document_only]
+    all_project_ids = configured_project_ids + document_only_project_ids
+
     project_rows: dict[str, dict[str, Any]] = {}
     if configured:
         cur.execute(
@@ -73,9 +85,25 @@ def assess_resume_profile(cur, *, today: date | None = None) -> dict[str, Any]:
                 "head_sha": row[5], "last_refresh_error": row[6],
             }
 
+    lkg_age_hours: dict[str, float] = {}
+    if configured and allow_last_known_good_hours is not None:
+        cur.execute(
+            """
+            SELECT rs.repo_full_name, EXTRACT(EPOCH FROM (now() - snap.analyzed_at))/3600.0
+            FROM repository_evidence_sources rs
+            LEFT JOIN repository_snapshots snap ON snap.id=rs.last_analyzed_snapshot_id
+            WHERE rs.provider='github' AND rs.repo_full_name = ANY(%s);
+            """,
+            ([p["github_repo_full_name"] for p in configured],),
+        )
+        for repo, hours in cur.fetchall():
+            if hours is not None:
+                lkg_age_hours[repo] = float(hours)
+
     missing_sources: list[str] = []
     stale_sources: list[str] = []
     unconfirmed_sources: list[str] = []
+    last_known_good_sources: list[str] = []
     for project in configured:
         repo = project["github_repo_full_name"]
         row = project_rows.get(repo)
@@ -84,14 +112,37 @@ def assess_resume_profile(cur, *, today: date | None = None) -> dict[str, Any]:
             continue
         if row["ownership_status"] != "confirmed_by_user":
             unconfirmed_sources.append(repo)
-        if row["freshness_status"] != "fresh" or row["current_snapshot_id"] != row["last_analyzed_snapshot_id"]:
-            stale_sources.append(repo)
+        snapshot_current = row["current_snapshot_id"] == row["last_analyzed_snapshot_id"]
+        source_fresh = row["freshness_status"] == "fresh" and snapshot_current
+        if not source_fresh:
+            age = lkg_age_hours.get(repo)
+            lkg_allowed = (
+                allow_last_known_good_hours is not None
+                and row["freshness_status"] == "unavailable"
+                and snapshot_current
+                and age is not None
+                and age <= allow_last_known_good_hours
+            )
+            if lkg_allowed:
+                last_known_good_sources.append(repo)
+            else:
+                stale_sources.append(repo)
 
-    cur.execute("SELECT count(*) FROM repository_claims WHERE freshness_status IN ('affected','contradicted','source_missing')")
-    stale_claims = int(cur.fetchone()[0])
-    cur.execute("SELECT count(*) FROM project_source_conflicts WHERE status='open'")
-    open_conflicts = int(cur.fetchone()[0])
-    configured_project_ids = [p["project_id"] for p in configured]
+    stale_claims = 0
+    open_conflicts = 0
+    if configured_project_ids:
+        cur.execute(
+            "SELECT count(*) FROM repository_claims WHERE project_id = ANY(%s) "
+            "AND freshness_status IN ('affected','contradicted','source_missing')",
+            (configured_project_ids,),
+        )
+        stale_claims = int(cur.fetchone()[0])
+        cur.execute(
+            "SELECT count(*) FROM project_source_conflicts WHERE project_id = ANY(%s) AND status='open'",
+            (configured_project_ids,),
+        )
+        open_conflicts = int(cur.fetchone()[0])
+
     approved_project_ids: set[str] = set()
     if configured_project_ids:
         cur.execute(
@@ -106,16 +157,41 @@ def assess_resume_profile(cur, *, today: date | None = None) -> dict[str, Any]:
         )
         approved_project_ids = {row[0] for row in cur.fetchall()}
     missing_approved_project_assets = sorted(set(configured_project_ids) - approved_project_ids)
-    cur.execute(
-        """
-        SELECT count(*) FROM profile_assets
-        WHERE asset_type='project_asset' AND status='approved'
-          AND freshness_status NOT IN ('fresh','not_applicable');
-        """
-    )
-    stale_assets = int(cur.fetchone()[0])
-    cur.execute("SELECT count(*) FROM profile_assets WHERE asset_type='project_asset' AND status IN ('needs_review','pending_review','draft')")
-    pending_project_assets = int(cur.fetchone()[0])
+
+    approved_document_only_ids: set[str] = set()
+    if document_only_project_ids:
+        cur.execute(
+            """
+            SELECT DISTINCT project_id FROM profile_assets
+            WHERE project_id = ANY(%s)
+              AND asset_type='project_asset'
+              AND source_strategy='project_document_only_v1'
+              AND status='approved' AND freshness_status IN ('fresh','not_applicable');
+            """,
+            (document_only_project_ids,),
+        )
+        approved_document_only_ids = {row[0] for row in cur.fetchall()}
+    missing_document_only_assets = sorted(set(document_only_project_ids) - approved_document_only_ids)
+
+    stale_assets = 0
+    pending_project_assets = 0
+    if all_project_ids:
+        cur.execute(
+            """
+            SELECT count(*) FROM profile_assets
+            WHERE project_id = ANY(%s) AND asset_type='project_asset' AND status='approved'
+              AND freshness_status NOT IN ('fresh','not_applicable');
+            """,
+            (all_project_ids,),
+        )
+        stale_assets = int(cur.fetchone()[0])
+        cur.execute(
+            "SELECT count(*) FROM profile_assets WHERE project_id = ANY(%s) "
+            "AND asset_type='project_asset' AND status IN ('needs_review','pending_review','draft')",
+            (all_project_ids,),
+        )
+        pending_project_assets = int(cur.fetchone()[0])
+
     cur.execute("SELECT count(*) FROM profile_briefs WHERE is_stale=false")
     fresh_briefs = int(cur.fetchone()[0])
     cur.execute(
@@ -127,7 +203,11 @@ def assess_resume_profile(cur, *, today: date | None = None) -> dict[str, Any]:
     )
     resume_base_pack = int(cur.fetchone()[0])
 
-    projects_fresh = not (missing_project_mappings or missing_sources or stale_sources or stale_claims or open_conflicts or stale_assets or pending_project_assets or unconfirmed_sources or missing_approved_project_assets)
+    projects_fresh = not (
+        missing_project_mappings or missing_sources or stale_sources or stale_claims
+        or open_conflicts or stale_assets or pending_project_assets or unconfirmed_sources
+        or missing_approved_project_assets or missing_document_only_assets
+    )
     context_current = bool(fresh_briefs and resume_base_pack)
     ready = bool(fixed["fixed_fields_ready"] and projects_fresh and context_current)
     return {
@@ -137,11 +217,13 @@ def assess_resume_profile(cur, *, today: date | None = None) -> dict[str, Any]:
         "missing_repository_sources": missing_sources,
         "unconfirmed_repository_sources": unconfirmed_sources,
         "stale_repository_sources": stale_sources,
+        "last_known_good_repository_sources": last_known_good_sources,
         "stale_repository_claims": stale_claims,
         "open_project_conflicts": open_conflicts,
         "stale_approved_project_assets": stale_assets,
         "pending_project_assets": pending_project_assets,
         "missing_approved_project_assets": missing_approved_project_assets,
+        "missing_document_only_project_assets": missing_document_only_assets,
         "context_current": context_current,
         "fresh_briefs": fresh_briefs,
         "resume_base_pack": resume_base_pack,
@@ -180,6 +262,8 @@ def explain_blockers(report: dict[str, Any]) -> list[str]:
         blockers.append(f"{report['pending_project_assets']} project asset(s) require review")
     if report.get("missing_approved_project_assets"):
         blockers.append("projects without an approved current authority asset: " + ", ".join(report["missing_approved_project_assets"]))
+    if report.get("missing_document_only_project_assets"):
+        blockers.append("document-only projects without an approved current document asset: " + ", ".join(report["missing_document_only_project_assets"]))
     if not report.get("context_current"):
         blockers.append("profile briefs/base resume context pack are stale or missing")
     return blockers

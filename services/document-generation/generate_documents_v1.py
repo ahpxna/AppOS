@@ -824,9 +824,9 @@ def run_live_project_freshness(*, max_stale_hours: int) -> tuple[bool, str]:
     return proc.returncode == 0, detail
 
 
-def database_resume_freshness(cur) -> tuple[bool, dict[str, Any], list[str]]:
+def database_resume_freshness(cur, *, allow_last_known_good_hours: int | None = None) -> tuple[bool, dict[str, Any], list[str]]:
     from services.common.profile_freshness import assess_resume_profile, explain_blockers
-    report = assess_resume_profile(cur)
+    report = assess_resume_profile(cur, allow_last_known_good_hours=allow_last_known_good_hours)
     return bool(report.get("resume_profile_ready")), report, explain_blockers(report)
 
 
@@ -879,7 +879,10 @@ def main() -> int:
     with psycopg.connect(DSN, autocommit=False) as conn:
         with conn.cursor() as cur:
             if args.doc_type == "resume":
-                ready, freshness_report, blockers = database_resume_freshness(cur)
+                ready, freshness_report, blockers = database_resume_freshness(
+                    cur,
+                    allow_last_known_good_hours=(None if args.skip_live_project_refresh else args.project_max_stale_hours),
+                )
                 if not ready:
                     print("ERROR: resume profile freshness gate is blocked.")
                     for blocker in blockers:

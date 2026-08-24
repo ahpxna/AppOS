@@ -125,7 +125,7 @@ def set_field(key: str, raw_value: Any, *, actor: str, source_revision_id: str |
     shown = definition.show_on_resume_default if show_on_resume is None else bool(show_on_resume)
     psycopg, Jsonb, database_dsn = _load_db()
     with psycopg.connect(database_dsn(), autocommit=False) as conn, conn.cursor() as cur:
-        cur.execute("SELECT value_json, verification_status FROM candidate_fixed_fields WHERE field_key=%s FOR UPDATE", (key,))
+        cur.execute("SELECT value_json, verification_status, source_revision_id FROM candidate_fixed_fields WHERE field_key=%s FOR UPDATE", (key,))
         previous = cur.fetchone()
         if previous:
             cur.execute(
@@ -134,7 +134,7 @@ def set_field(key: str, raw_value: Any, *, actor: str, source_revision_id: str |
                   (field_key, value_json, verification_status, changed_by, source_revision_id)
                 VALUES (%s,%s,%s,%s,%s)
                 """,
-                (key, Jsonb(previous[0]), previous[1], actor, source_revision_id),
+                (key, Jsonb(previous[0]), previous[1], actor, previous[2]),
             )
         cur.execute(
             """
@@ -441,12 +441,32 @@ def wizard(*, actor: str, apply: bool) -> int:
                   f" from {suggestion['logical_source_key']}"
                   + (" [CONFLICTS WITH VERIFIED VALUE]" if suggestion["conflicts_current"] else ""))
 
-        if current.get("verification_status") in VERIFIED and not (suggestion and suggestion["conflicts_current"]):
-            answer = input(f"{definition.prompt} [{current_display}] (Enter=keep, !=change): ").strip()
-            if answer != "!":
-                continue
-
-        value = _ask(definition, None if current_display is None else str(current_display), suggestion_display)
+        if current.get("verification_status") in VERIFIED:
+            if suggestion and suggestion["conflicts_current"]:
+                choice = input(
+                    f"Verified value is [{current_display}] but the document suggests [{suggestion_display}]. "
+                    "Enter=keep verified, a=accept document suggestion, e=enter another value: "
+                ).strip().casefold()
+                if choice in {"", "k", "keep"}:
+                    if apply:
+                        psycopg, _, database_dsn = _load_db()
+                        with psycopg.connect(database_dsn(), autocommit=True) as conn, conn.cursor() as cur:
+                            _resolve_suggestion(cur, suggestion["id"], accepted=False)
+                    continue
+                if choice in {"a", "accept"}:
+                    value = suggestion_display or ""
+                elif choice in {"e", "edit"}:
+                    value = _ask(definition, None if current_display is None else str(current_display), None)
+                else:
+                    print("Unrecognized choice; keeping the verified value.")
+                    continue
+            else:
+                answer = input(f"{definition.prompt} [{current_display}] (Enter=keep, !=change): ").strip()
+                if answer != "!":
+                    continue
+                value = _ask(definition, None if current_display is None else str(current_display), None)
+        else:
+            value = _ask(definition, None if current_display is None else str(current_display), suggestion_display)
         if not value and not definition.required:
             if suggestion and apply:
                 psycopg, _, database_dsn = _load_db()

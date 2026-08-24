@@ -164,16 +164,33 @@ def _git_env(token: str | None) -> dict[str, str]:
     return env
 
 
+def _cached_checkout_matches(destination: Path, marker: Path, head_sha: str) -> bool:
+    """Reuse only an exact, clean cached checkout for the requested immutable HEAD."""
+    if not destination.is_dir() or not marker.is_file():
+        return False
+    try:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+        if payload.get("head_sha") != head_sha:
+            return False
+    except (OSError, json.JSONDecodeError):
+        return False
+    actual = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=destination, capture_output=True, text=True, timeout=15
+    )
+    if actual.returncode != 0 or actual.stdout.strip().lower() != head_sha.lower():
+        return False
+    dirty = subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=all"],
+        cwd=destination, capture_output=True, text=True, timeout=30,
+    )
+    return dirty.returncode == 0 and not dirty.stdout.strip()
+
+
 def ensure_immutable_checkout(*, repo_full_name: str, clone_url: str, head_sha: str, token: str | None) -> Path:
     destination = snapshot_checkout_path(repo_full_name, head_sha)
     marker = destination.parent / "snapshot.json"
-    if destination.is_dir() and marker.is_file():
-        try:
-            payload = json.loads(marker.read_text(encoding="utf-8"))
-            if payload.get("head_sha") == head_sha:
-                return destination
-        except Exception:
-            pass
+    if _cached_checkout_matches(destination, marker, head_sha):
+        return destination
     if shutil.which("git") is None:
         raise RefreshError("git is required to materialize an immutable repository snapshot.")
     if destination.parent.exists():
@@ -274,6 +291,10 @@ def _insert_snapshot(cur, Jsonb, source_id: str, state: dict[str, Any], parent_s
 
 def _map_existing_project_assets(cur, registry: dict[str, Any]) -> int:
     from services.common.project_registry import map_parsed_profile_record
+    mode_by_project = {
+        project["project_id"]: project.get("dynamic_source_mode", "github_primary")
+        for project in registry.get("projects", [])
+    }
     cur.execute(
         """
         SELECT id::text, asset_title, project_tags, tool_tags, canonical_narrative, source_strategy
@@ -287,16 +308,21 @@ def _map_existing_project_assets(cur, registry: dict[str, Any]) -> int:
             "asset_title": title, "project_tags": project_tags or [], "tags": tool_tags or [], "text": narrative or ""
         }, registry)
         if mapping.get("project_id"):
+            project_id = mapping["project_id"]
+            mode = mode_by_project.get(project_id, "github_primary")
+            source_strategy_value = "project_document_only_v1" if mode == "document_only" else source_strategy
+            authority = ({"document": 1.00, "github": 0.00, "mapping": mapping["confidence"]}
+                         if mode == "document_only"
+                         else {"document": 0.30, "github": 0.70, "mapping": mapping["confidence"]})
             cur.execute(
                 """
                 UPDATE profile_assets
-                SET project_id=%s,
+                SET project_id=%s, source_strategy=%s,
                     source_authority_json = source_authority_json || %s::jsonb,
                     updated_at=now()
                 WHERE id=%s;
                 """,
-                (mapping["project_id"], json.dumps({"document": 0.30, "github": 0.70,
-                                                    "mapping": mapping["confidence"]}), asset_id),
+                (project_id, source_strategy_value, json.dumps(authority), asset_id),
             )
             updated += 1
     return updated
@@ -815,12 +841,25 @@ def record_refresh_error(repo_full_name: str, error: str) -> None:
         pass
 
 
+def map_registry_project_assets(*, apply: bool = True) -> int:
+    psycopg, _, database_dsn = _load_db()
+    with psycopg.connect(database_dsn(), autocommit=False) as conn, conn.cursor() as cur:
+        updated = _map_existing_project_assets(cur, load_registry())
+        if apply:
+            conn.commit()
+        else:
+            conn.rollback()
+    return updated
+
+
 def refresh_all(*, project_id: str | None = None, apply: bool = True, token: str | None = None) -> dict[str, Any]:
+    mapped_assets = map_registry_project_assets(apply=apply)
     projects = configured_github_projects()
     if project_id:
         projects = [project for project in projects if project["project_id"] == project_id]
     if not projects:
-        return {"projects": [], "message": "No fixed project has github_repo_full_name configured.", "ok": True}
+        return {"projects": [], "mapped_project_assets": mapped_assets,
+                "message": "No fixed project has github_repo_full_name configured.", "ok": True}
     results = []
     failures = []
     for project in projects:
@@ -830,7 +869,7 @@ def refresh_all(*, project_id: str | None = None, apply: bool = True, token: str
             message = f"{type(exc).__name__}: {exc}"
             record_refresh_error(project["github_repo_full_name"], message)
             failures.append({"project_id": project["project_id"], "repo": project["github_repo_full_name"], "error": message})
-    return {"projects": results, "failures": failures, "ok": not failures}
+    return {"projects": results, "failures": failures, "mapped_project_assets": mapped_assets, "ok": not failures}
 
 
 def freshness_status() -> dict[str, Any]:

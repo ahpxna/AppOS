@@ -96,8 +96,14 @@ def test_069_adds_aggregate_resume_freshness_views():
     assert "stale_approved_project_assets" in text
 
 
-def test_jobos_doctor_requires_latest_069_migration():
+def test_jobos_doctor_requires_latest_070_migration():
     source = (ROOT / "scripts" / "jobos.py").read_text(encoding="utf-8")
-    assert "069_resume_freshness_preflight.sql" in source
-    assert "Migrations through 069" in source
+    assert "070_profile_freshness_hardening.sql" in source
+    assert "Migrations through 070" in source
     assert "Migrations through 063" not in source
+
+
+def test_070_document_only_assets_are_resume_eligible():
+    text = (ROOT / "db" / "migrations" / "070_profile_freshness_hardening.sql").read_text(encoding="utf-8")
+    assert "project_document_only_v1" in text
+    assert "v_document_generation_source_assets" in text

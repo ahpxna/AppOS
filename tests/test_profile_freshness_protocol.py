@@ -286,7 +286,7 @@ def test_resume_database_freshness_wrapper_returns_blockers(monkeypatch):
     generator = load_generator(monkeypatch)
     import services.common.profile_freshness as profile_freshness
 
-    monkeypatch.setattr(profile_freshness, "assess_resume_profile", lambda _cur: {"resume_profile_ready": False})
+    monkeypatch.setattr(profile_freshness, "assess_resume_profile", lambda _cur, **_kw: {"resume_profile_ready": False})
     monkeypatch.setattr(profile_freshness, "explain_blockers", lambda _report: ["fixture blocker"])
     ready, report, blockers = generator.database_resume_freshness(object())
     assert ready is False
@@ -371,4 +371,104 @@ def test_resume_profile_requires_one_approved_current_authority_asset_per_config
 
     ready = freshness.assess_resume_profile(_FreshnessCursor(approved_project_asset=True), today=date(2026, 8, 24))
     assert ready["missing_approved_project_assets"] == []
+    assert ready["resume_profile_ready"] is True
+
+
+def test_readme_prose_cannot_prove_security_implementation(tmp_path: Path):
+    claims = load_repo_claims()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "README.md").write_text(
+        "The system has human approval, fail-closed reconciliation, and SHA-256 integrity.\n",
+        encoding="utf-8",
+    )
+    extracted = claims.extract_claims(repo)
+    assert not [item for item in extracted if item["claim_kind"] in {"security_control", "reliability_control", "concurrency_control"}]
+
+
+def test_security_claim_requires_implementation_source(tmp_path: Path):
+    claims = load_repo_claims()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "worker.py").write_text("approval = True\n# fail-closed\n", encoding="utf-8")
+    extracted = claims.extract_claims(repo)
+    keys = {item["claim_key"] for item in extracted}
+    assert "control:approval_review" in keys
+    assert "control:fail_closed" in keys
+
+
+def test_cached_snapshot_rejects_dirty_worktree(tmp_path: Path):
+    import subprocess
+    fresh = load_repo_freshness()
+    origin = tmp_path / "origin"
+    origin.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=origin, check=True)
+    subprocess.run(["git", "config", "user.email", "fixture@example.com"], cwd=origin, check=True)
+    subprocess.run(["git", "config", "user.name", "Fixture"], cwd=origin, check=True)
+    (origin / "app.py").write_text("print(1)\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=origin, check=True)
+    subprocess.run(["git", "commit", "-qm", "fixture"], cwd=origin, check=True)
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=origin, text=True).strip()
+    fresh.SNAPSHOT_ROOT = tmp_path / "snapshots"
+    checkout = fresh.ensure_immutable_checkout(repo_full_name="owner/repo", clone_url=str(origin), head_sha=head, token=None)
+    (checkout / "app.py").write_text("print('tampered')\n", encoding="utf-8")
+    refreshed = fresh.ensure_immutable_checkout(repo_full_name="owner/repo", clone_url=str(origin), head_sha=head, token=None)
+    assert (refreshed / "app.py").read_text(encoding="utf-8") == "print(1)\n"
+
+
+class _LastKnownGoodCursor(_FreshnessCursor):
+    def execute(self, sql, params=None):
+        q = " ".join(str(sql).split()).casefold()
+        if "extract(epoch from (now() - snap.analyzed_at))" in q:
+            self._rows = [("owner/repo", 2.0)]
+            self._one = None
+        elif "from repository_evidence_sources" in q and "repo_full_name = any" in q:
+            self._rows = [("owner/repo", "unavailable", "confirmed_by_user", "snap-1", "snap-1", "a" * 40, "temporary network failure")]
+            self._one = None
+        else:
+            super().execute(sql, params)
+
+
+def test_database_gate_accepts_bounded_last_known_good_only_when_live_gate_allows_it(monkeypatch):
+    import services.common.profile_freshness as freshness
+    monkeypatch.setattr(freshness, "load_registry", lambda: {
+        "projects": [{"project_id": "applyops", "dynamic_source_mode": "github_primary", "github_repo_full_name": "owner/repo"}]
+    })
+    strict = freshness.assess_resume_profile(_LastKnownGoodCursor(approved_project_asset=True), today=date(2026, 8, 24))
+    assert strict["resume_profile_ready"] is False
+    assert strict["stale_repository_sources"] == ["owner/repo"]
+    bounded = freshness.assess_resume_profile(
+        _LastKnownGoodCursor(approved_project_asset=True), today=date(2026, 8, 24), allow_last_known_good_hours=24
+    )
+    assert bounded["stale_repository_sources"] == []
+    assert bounded["last_known_good_repository_sources"] == ["owner/repo"]
+    assert bounded["resume_profile_ready"] is True
+
+
+class _DocumentOnlyCursor(_FreshnessCursor):
+    def execute(self, sql, params=None):
+        q = " ".join(str(sql).split()).casefold()
+        if "source_strategy='project_document_only_v1'" in q and "select distinct project_id" in q:
+            self._rows = [("applyops",)] if self.approved_project_asset else []
+            self._one = None
+        elif "project_id = any" in q and "freshness_status not in ('fresh','not_applicable')" in q:
+            self._one = (0,)
+            self._rows = []
+        elif "project_id = any" in q and "status in ('needs_review','pending_review','draft')" in q:
+            self._one = (0,)
+            self._rows = []
+        else:
+            super().execute(sql, params)
+
+
+def test_document_only_project_requires_approved_document_asset(monkeypatch):
+    import services.common.profile_freshness as freshness
+    monkeypatch.setattr(freshness, "load_registry", lambda: {
+        "projects": [{"project_id": "applyops", "dynamic_source_mode": "document_only", "github_repo_full_name": ""}]
+    })
+    blocked = freshness.assess_resume_profile(_DocumentOnlyCursor(approved_project_asset=False), today=date(2026, 8, 24))
+    assert blocked["missing_document_only_project_assets"] == ["applyops"]
+    assert blocked["resume_profile_ready"] is False
+    ready = freshness.assess_resume_profile(_DocumentOnlyCursor(approved_project_asset=True), today=date(2026, 8, 24))
+    assert ready["missing_document_only_project_assets"] == []
     assert ready["resume_profile_ready"] is True
