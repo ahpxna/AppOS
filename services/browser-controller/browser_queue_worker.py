@@ -319,18 +319,46 @@ def reap_expired_leases(cur) -> int:
     return pre_io + unsafe + len(cur.fetchall())
 
 
-def dead_letter_exhausted(cur) -> int:
-    """Archive exhausted tasks using the live-to-archive error-column mapping.
 
-    Fix note: ``browser_tasks`` returns ``error_message`` whereas
-    ``dead_letter_tasks`` stores it as ``last_error``. The explicit mapping
-    prevents the historical CTE column error recorded in the Windows log.
-    """
+def _expire_bound_pre_io_approval(cur, task: Dict[str, Any], reason: str) -> None:
+    approval_id = task.get("approval_request_id")
+    if not approval_id:
+        return
+    cur.execute(
+        """
+        UPDATE approval_requests
+        SET status = 'expired', executing_task_id = NULL,
+            action_note = COALESCE(action_note, %s)
+        WHERE id = %s AND application_id = %s
+          AND status IN ('pending', 'approved', 'executing')
+          AND consumed_at IS NULL
+          AND (executing_task_id IS NULL OR executing_task_id = %s);
+        """,
+        (reason[:500], approval_id, task.get("application_id"), task["id"]),
+    )
+
+def dead_letter_exhausted(cur) -> int:
+    """Archive exhausted, provably pre-I/O tasks and close their capability."""
+    cur.execute(
+        """
+        UPDATE approval_requests a
+        SET status = 'expired', executing_task_id = NULL,
+            action_note = COALESCE(action_note, 'Browser task exhausted before external I/O.')
+        FROM browser_tasks b
+        WHERE b.status = 'running'
+          AND b.lease_expires_at < now()
+          AND b.execution_state = 'not_started'
+          AND b.retry_count >= b.max_retries
+          AND a.id = b.approval_request_id
+          AND a.status IN ('pending', 'approved')
+          AND a.consumed_at IS NULL;
+        """
+    )
     cur.execute(
         """
         WITH dead AS (
           UPDATE browser_tasks
-          SET status = 'failed', locked_by = NULL, lease_expires_at = NULL,
+          SET status = 'dead_letter', locked_by = NULL, lease_expires_at = NULL,
               finished_at = now(),
               error_message = COALESCE(error_message, 'Max retries exceeded')
           WHERE status = 'running'
@@ -363,6 +391,7 @@ def claim_next_task(cur) -> Optional[Dict[str, Any]]:
         WHERE id = (
           SELECT id FROM browser_tasks
           WHERE status = 'queued'
+            AND retry_count <= max_retries
           ORDER BY
             CASE priority WHEN 'high' THEN 0 WHEN 'normal' THEN 1 ELSE 2 END,
             created_at
@@ -420,8 +449,84 @@ def fail_task(cur, task_id: str, error: str) -> None:
 
 
 def requeue_or_fail(cur, task: Dict[str, Any], error: str) -> str:
+    """Retry only when durable state proves that no browser write can replay."""
     new_count = task["retry_count"] + 1
     exhausted = new_count > task["max_retries"]
+
+    if task.get("task_type") == "fill_application_form":
+        cur.execute(
+            """
+            SELECT execution_state,
+                   EXISTS (SELECT 1 FROM autofill_action_journal j WHERE j.browser_task_id = b.id)
+              FROM browser_tasks b
+             WHERE b.id = %s
+             FOR UPDATE;
+            """,
+            (task["id"],),
+        )
+        row = cur.fetchone()
+        execution_state, has_journal = row if row else ("needs_reconciliation", True)
+
+        if has_journal or execution_state in {"partial", "completed", "needs_reconciliation"}:
+            cur.execute(
+                """
+                UPDATE browser_tasks
+                SET status = 'failed', execution_state = 'needs_reconciliation',
+                    retry_count = %s, error_message = %s,
+                    locked_by = NULL, lease_expires_at = NULL, finished_at = now()
+                WHERE id = %s;
+                """,
+                (new_count, error[:2000], task["id"]),
+            )
+            cur.execute(
+                """UPDATE application_attempts
+                      SET status = 'needs_review', finished_at = COALESCE(finished_at, now()),
+                          detail_json = detail_json || %s
+                    WHERE browser_task_id = %s AND status = 'started';""",
+                (Jsonb({"reason": error[:500]}), task["id"]),
+            )
+            return "failed"
+
+        if execution_state == "executing":
+            # No journal means the durable before-action record was never
+            # written, so external I/O is provably absent. Release the exact
+            # executing capability before retrying.
+            cur.execute(
+                """
+                UPDATE approval_requests
+                SET status = 'approved', executing_task_id = NULL
+                WHERE id = %s AND application_id = %s
+                  AND status = 'executing' AND executing_task_id = %s
+                  AND consumed_at IS NULL
+                RETURNING id;
+                """,
+                (task.get("approval_request_id"), task.get("application_id"), task["id"]),
+            )
+            if cur.fetchone() is None:
+                cur.execute(
+                    """UPDATE browser_tasks
+                          SET status = 'failed', execution_state = 'needs_reconciliation',
+                              retry_count = %s, error_message = %s,
+                              locked_by = NULL, lease_expires_at = NULL, finished_at = now()
+                        WHERE id = %s;""",
+                    (new_count, error[:2000], task["id"]),
+                )
+                return "failed"
+            cur.execute(
+                "UPDATE browser_tasks SET execution_state = 'not_started' WHERE id = %s;",
+                (task["id"],),
+            )
+            cur.execute(
+                """UPDATE application_attempts
+                      SET status = 'failed', finished_at = COALESCE(finished_at, now()),
+                          detail_json = detail_json || %s
+                    WHERE browser_task_id = %s AND status = 'started';""",
+                (Jsonb({"reason": "worker failed before first browser action; safe retry"}), task["id"]),
+            )
+
+        if exhausted:
+            _expire_bound_pre_io_approval(cur, task, f"Autofill retries exhausted before browser I/O: {error}")
+
     cur.execute(
         """
         UPDATE browser_tasks
@@ -677,7 +782,8 @@ def durable_finish_execution(task: Dict[str, Any], binding: Dict[str, Any], resu
         cur.execute(
             """
             UPDATE approval_requests
-            SET status = 'consumed', consumed_at = now(), consumed_by = %s
+            SET status = 'consumed', consumed_at = now(), consumed_by = %s,
+                executing_task_id = NULL
             WHERE id = %s AND application_id = %s
               AND status = 'executing' AND executing_task_id = %s
             RETURNING id;
@@ -1121,8 +1227,16 @@ def handle_fill_application_form(cur, task) -> Dict[str, Any]:
     except AutofillContextError as exc:
         raise PermanentTaskError(str(exc)) from exc
     require_current_input_hash(binding, context.input_hash)
-    transport = OpenClawTransport(binary=OPENCLAW_BIN, profile=os.getenv("JOBOS_BROWSER_PROFILE", "remote"),
-                                  timeout=min(int(task["timeout_seconds"]), 90), environment=openclaw_runtime_env())
+    approved_upload_hashes = {}
+    if binding.get("artifact_id") and binding.get("artifact_sha256"):
+        for approved_path in (context.profile.get("documents") or {}).values():
+            if approved_path:
+                approved_upload_hashes[str(Path(str(approved_path)).expanduser().resolve())] = str(binding["artifact_sha256"])
+    transport = OpenClawTransport(
+        binary=OPENCLAW_BIN, profile=os.getenv("JOBOS_BROWSER_PROFILE", "remote"),
+        timeout=min(int(task["timeout_seconds"]), 90), environment=openclaw_runtime_env(),
+        approved_upload_hashes=approved_upload_hashes,
+    )
     execution_started = False
     pinned_target_id: str | None = None
     latest_actions = []
@@ -1229,9 +1343,15 @@ def handle_fill_application_form(cur, task) -> Dict[str, Any]:
         durable.chmod(0o600)
         screenshot_path = str(durable.resolve())
         cur.execute("UPDATE browser_tasks SET screenshot_url = %s WHERE id = %s;", (screenshot_path, task["id"]))
-    except (TransportError, OSError, shutil.Error):
-        # Browser side effects are final at this point. The review hub will
-        # show the completed form without an image rather than attempt replay.
+    except Exception as screenshot_exc:
+        # Screenshot capture is a post-execution review artifact, not part of
+        # the deterministic browser write transaction. Even an unexpected
+        # capture/serialization failure must not reclassify already-verified
+        # writes as uncertain or trigger replay/reconciliation.
+        print(
+            "  warning: post-autofill screenshot capture failed; "
+            f"browser writes remain final: {type(screenshot_exc).__name__}: {screenshot_exc}"
+        )
         screenshot_path = None
     return {
         "status": result.status, "verified_refs": list(result.verified_refs),
@@ -1312,12 +1432,29 @@ def process_one(conn) -> bool:
             result["worker_version"] = WORKER_VERSION
             result["elapsed_seconds"] = round(elapsed, 1)
             complete_task(cur, task["id"], result)
-            if task["task_type"] == "fill_application_form":
-                from services.review.review_service_v1 import ensure_autofill_review
-                ensure_autofill_review(
-                    cur, task["id"], screenshot_path=result.get("screenshot_path"), result=result,
-                )
+        # Browser completion is a durable boundary of its own. A failure in
+        # Human Review materialization must never reclassify already-verified
+        # browser writes as uncertain or send the task through retry logic.
         conn.commit()
+
+        if task["task_type"] == "fill_application_form":
+            try:
+                with conn.cursor() as cur:
+                    from services.review.review_service_v1 import ensure_autofill_review
+                    ensure_autofill_review(
+                        cur, task["id"], screenshot_path=result.get("screenshot_path"), result=result,
+                    )
+                conn.commit()
+            except Exception as review_exc:
+                conn.rollback()
+                # sync_inbox() can deterministically recreate this materialized
+                # review later. Never replay/reconcile browser writes because
+                # the review/UI materialization layer failed.
+                print(
+                    "  warning: autofill completed but review materialization "
+                    f"was deferred: {type(review_exc).__name__}: {review_exc}"
+                )
+
         print(f"  completed in {elapsed:.1f}s")
         emit_trace(
             trace_id,

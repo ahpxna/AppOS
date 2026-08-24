@@ -57,10 +57,6 @@ from services.autofill.form_inspector_v1 import FormField
 from services.common.openclaw_runtime import resolve_openclaw_binary
 from services.common.config import database_dsn
 from services.common.autofill_field_registry import PROFILE_PATH_TO_FIELD
-from services.autofill.parallel_bypass import execute_parallel_bypass
-import logging
-from services.autofill.parallel_bypass import execute_parallel_bypass
-import requests
 
 DSN = database_dsn()
 
