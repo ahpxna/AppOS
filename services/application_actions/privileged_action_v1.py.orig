@@ -500,39 +500,6 @@ def _enqueue_state_followup(cur, transport: OpenClawTransport, *, application_id
                               requested_by="auth-state-router")
 
 
-def _snapshot_text_sha256(snapshot: dict[str, Any]) -> str:
-    return hashlib.sha256(str(snapshot.get("snapshot") or "").encode("utf-8")).hexdigest()
-
-
-def _observable_page_change(*, before_target: str, before_url: str, before_snapshot: dict[str, Any],
-                            after: dict[str, Any]) -> bool:
-    """Return whether a post-I/O read proves a visible navigation/modal/page change."""
-    if str(after.get("target_id") or "") != str(before_target):
-        return True
-    if canonical_page_url(str(after.get("url") or "")) != canonical_page_url(str(before_url)):
-        return True
-    return str(after.get("snapshot_sha256") or "") != _snapshot_text_sha256(before_snapshot)
-
-
-def _consent_effect_verified(approved: list[dict[str, Any]], observed: list[dict[str, Any]],
-                             *, page_changed: bool) -> bool:
-    """Require each clicked consent control to become selected or leave via a changed page."""
-    for item in approved:
-        if item.get("selected") is True:
-            continue
-        ref = str(item.get("ref") or "")
-        label = " ".join(str(item.get("label") or "").casefold().split())
-        match = next((candidate for candidate in observed
-                      if str(candidate.get("ref") or "") == ref or
-                         (label and " ".join(str(candidate.get("label") or "").casefold().split()) == label)), None)
-        if match is not None:
-            if match.get("selected") is not True:
-                return False
-        elif not page_changed:
-            return False
-    return True
-
-
 def _after_navigation(cur, transport: OpenClawTransport, application_id: str, source_target: str,
                       before_tabs: list[dict[str, Any]]) -> dict[str, Any]:
     time.sleep(1.5)
@@ -566,15 +533,11 @@ def _after_navigation(cur, transport: OpenClawTransport, application_id: str, so
                 requested_by="application-handoff",
             )
         return {"target_id": target_id, "url": url, "platform": platform, "state": state,
-                "detail": detail, "followup": "trust_domain_required",
-                "snapshot_sha256": _snapshot_text_sha256(snap), "page_fingerprint": fp,
-                "consent_items": _consent_items(nodes)}
+                "detail": detail, "followup": "trust_domain_required"}
 
     _enqueue_state_followup(cur, transport, application_id=application_id, target_id=target_id,
                             url=url, fingerprint=fp, nodes=nodes, state=state)
-    return {"target_id": target_id, "url": url, "platform": platform, "state": state, "detail": detail,
-            "snapshot_sha256": _snapshot_text_sha256(snap), "page_fingerprint": fp,
-            "consent_items": _consent_items(nodes)}
+    return {"target_id": target_id, "url": url, "platform": platform, "state": state, "detail": detail}
 
 
 def _document_hashes_still_match(bindings: dict[str, Any]) -> bool:
@@ -687,8 +650,6 @@ def execute_one(conn, request_id: str) -> dict[str, Any]:
                 if atype == "privileged_begin_application":
                     io_started = True; _click(transport, target_id, str(payload["control_ref"]))
                     result = _after_navigation(cur, transport, app_id, target_id, before_tabs)
-                    if not _observable_page_change(before_target=target_id, before_url=url, before_snapshot=snap, after=result):
-                        raise PrivilegedActionError("Apply handoff click produced no observable navigation or modal change")
                 elif atype in {"privileged_create_employer_account", "privileged_login_employer_account"}:
                     if atype == "privileged_create_employer_account" and payload.get("consent_blockers"):
                         raise PrivilegedActionError("account registration has unapproved terms/consent controls; approve those separately first")
@@ -697,8 +658,6 @@ def execute_one(conn, request_id: str) -> dict[str, Any]:
                         io_started = True; _fill(transport, target_id, str(item["ref"]), value)
                     io_started = True; _click(transport, target_id, str(payload["control_ref"]))
                     result = _after_navigation(cur, transport, app_id, target_id, before_tabs)
-                    if not _observable_page_change(before_target=target_id, before_url=url, before_snapshot=snap, after=result):
-                        raise PrivilegedActionError("employer account action produced no observable browser change")
                     if payload.get("account_email") and payload.get("account_email") != "NaN":
                         cur.execute("UPDATE application_auth_sessions SET account_email=%s, updated_at=now() WHERE application_id=%s;",
                                     (payload.get("account_email"), app_id))
@@ -707,10 +666,6 @@ def execute_one(conn, request_id: str) -> dict[str, Any]:
                         if item.get("selected") is not True:
                             io_started = True; _click(transport, target_id, str(item["ref"]))
                     result = _after_navigation(cur, transport, app_id, target_id, before_tabs)
-                    changed = _observable_page_change(before_target=target_id, before_url=url, before_snapshot=snap, after=result)
-                    if not _consent_effect_verified(payload.get("consent_items") or [], result.get("consent_items") or [],
-                                                    page_changed=changed):
-                        raise PrivilegedActionError("approved consent controls were not observably accepted after browser I/O")
                     result["consent_items"] = payload.get("consent_items") or []
                 elif atype == "privileged_advance_application_step":
                     if payload.get("required_blockers"):
@@ -720,8 +675,6 @@ def execute_one(conn, request_id: str) -> dict[str, Any]:
                         raise PrivilegedActionError("form fields changed after application-step approval")
                     io_started = True; _click(transport, target_id, str(payload["control_ref"]))
                     result = _after_navigation(cur, transport, app_id, target_id, before_tabs)
-                    if not _observable_page_change(before_target=target_id, before_url=url, before_snapshot=snap, after=result):
-                        raise PrivilegedActionError("application wizard step click produced no observable page change")
                 elif atype == "privileged_use_email_verification":
                     cur.execute("""SELECT gmail_message_id, verification_kind, secret_sha256, secret_context_json
                                    FROM email_verification_candidates WHERE id=%s AND application_id=%s AND status IN ('approved','discovered');""",
@@ -742,8 +695,6 @@ def execute_one(conn, request_id: str) -> dict[str, Any]:
                         _require_trusted_target(cur, secret)
                         io_started = True; transport._run(["open", secret])
                         result = _after_navigation(cur, transport, app_id, target_id, before_tabs)
-                    if not _observable_page_change(before_target=target_id, before_url=url, before_snapshot=snap, after=result):
-                        raise PrivilegedActionError("email verification browser I/O produced no observable page change")
                     cur.execute("UPDATE email_verification_candidates SET status='consumed', consumed_at=now() WHERE id=%s;", (payload.get("candidate_id"),))
                 elif atype == "privileged_submit_application":
                     if payload.get("required_blockers"):

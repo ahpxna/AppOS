@@ -259,3 +259,47 @@ def test_openclaw_gmail_hook_wake_bridge_is_additive_and_payload_minimal():
     watcher = (root / "services/auth/gmail_verification_watcher_v1.py").read_text()
     assert "hook payload is untrusted wake data" in watcher
     assert "--wake-listen" in watcher
+
+
+def test_privileged_post_io_observable_change_and_consent_helpers():
+    from services.application_actions.privileged_action_v1 import (
+        _consent_effect_verified, _observable_page_change, _snapshot_text_sha256,
+    )
+
+    before = {"snapshot": "- heading Job\n- button Apply"}
+    unchanged = {"target_id": "t1", "url": "https://jobs.example/app",
+                 "snapshot_sha256": _snapshot_text_sha256(before)}
+    changed_snapshot = {"target_id": "t1", "url": "https://jobs.example/app",
+                        "snapshot_sha256": _snapshot_text_sha256({"snapshot": "- heading Job\n- dialog Easy Apply"})}
+    changed_url = {"target_id": "t1", "url": "https://jobs.example/app/step-2",
+                   "snapshot_sha256": _snapshot_text_sha256(before)}
+    changed_target = {"target_id": "t2", "url": "https://jobs.example/app",
+                      "snapshot_sha256": _snapshot_text_sha256(before)}
+    assert not _observable_page_change(before_target="t1", before_url="https://jobs.example/app",
+                                       before_snapshot=before, after=unchanged)
+    assert _observable_page_change(before_target="t1", before_url="https://jobs.example/app",
+                                   before_snapshot=before, after=changed_snapshot)
+    assert _observable_page_change(before_target="t1", before_url="https://jobs.example/app",
+                                   before_snapshot=before, after=changed_url)
+    assert _observable_page_change(before_target="t1", before_url="https://jobs.example/app",
+                                   before_snapshot=before, after=changed_target)
+
+    approved = [{"ref": "c1", "label": "I agree to terms", "selected": False}]
+    assert _consent_effect_verified(approved, [{"ref": "c1", "label": "I agree to terms", "selected": True}],
+                                    page_changed=False)
+    assert not _consent_effect_verified(approved, [{"ref": "c1", "label": "I agree to terms", "selected": False}],
+                                        page_changed=True)
+    assert _consent_effect_verified(approved, [], page_changed=True)
+    assert not _consent_effect_verified(approved, [], page_changed=False)
+
+
+def test_privileged_executor_fences_unverified_post_io_effects():
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "services/application_actions/privileged_action_v1.py").read_text()
+    execution = source[source.index("def execute_one"):source.index("def recover_stale_executions")]
+    assert "Apply handoff click produced no observable navigation or modal change" in execution
+    assert "employer account action produced no observable browser change" in execution
+    assert "application wizard step click produced no observable page change" in execution
+    assert "approved consent controls were not observably accepted after browser I/O" in execution
+    assert "email verification browser I/O produced no observable page change" in execution
+    assert 'state = "needs_reconciliation" if io_started else "failed"' in execution
