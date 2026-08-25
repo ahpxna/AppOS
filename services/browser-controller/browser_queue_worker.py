@@ -522,22 +522,35 @@ def fail_task(cur, task_id: str, error: str) -> None:
 
 def requeue_or_fail(cur, task: Dict[str, Any], error: str) -> str:
     """Retry only when durable state proves that no browser write can replay."""
-    new_count = task["retry_count"] + 1
-    exhausted = new_count > task["max_retries"]
+    cur.execute(
+        """
+        SELECT task_type, execution_state, retry_count, max_retries,
+               approval_request_id::text, application_id::text,
+               EXISTS (SELECT 1 FROM autofill_action_journal j WHERE j.browser_task_id = b.id)
+          FROM browser_tasks b
+         WHERE b.id = %s
+         FOR UPDATE;
+        """,
+        (task["id"],),
+    )
+    row = cur.fetchone()
+    if row is None:
+        return "failed"
 
-    if task.get("task_type") == "fill_application_form":
-        cur.execute(
-            """
-            SELECT execution_state,
-                   EXISTS (SELECT 1 FROM autofill_action_journal j WHERE j.browser_task_id = b.id)
-              FROM browser_tasks b
-             WHERE b.id = %s
-             FOR UPDATE;
-            """,
-            (task["id"],),
-        )
-        row = cur.fetchone()
-        execution_state, has_journal = row if row else ("needs_reconciliation", True)
+    (task_type, execution_state, retry_count, max_retries,
+     approval_request_id, application_id, has_journal) = row
+    new_count = (retry_count or 0) + 1
+    exhausted = new_count > (max_retries if max_retries is not None else 2)
+    durable_task = {
+        **task,
+        "task_type": task_type,
+        "retry_count": retry_count or 0,
+        "max_retries": max_retries if max_retries is not None else 2,
+        "approval_request_id": approval_request_id,
+        "application_id": application_id,
+    }
+
+    if task_type == "fill_application_form":
 
         if has_journal or execution_state in {"partial", "completed", "needs_reconciliation"}:
             cur.execute(
@@ -572,7 +585,7 @@ def requeue_or_fail(cur, task: Dict[str, Any], error: str) -> str:
                   AND consumed_at IS NULL
                 RETURNING id;
                 """,
-                (task.get("approval_request_id"), task.get("application_id"), task["id"]),
+                (approval_request_id, application_id, task["id"]),
             )
             if cur.fetchone() is None:
                 cur.execute(
@@ -597,7 +610,7 @@ def requeue_or_fail(cur, task: Dict[str, Any], error: str) -> str:
             )
 
         if exhausted:
-            _expire_bound_pre_io_approval(cur, task, f"Autofill retries exhausted before browser I/O: {error}")
+            _expire_bound_pre_io_approval(cur, durable_task, f"Autofill retries exhausted before browser I/O: {error}")
 
     cur.execute(
         """

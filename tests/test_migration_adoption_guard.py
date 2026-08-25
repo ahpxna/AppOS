@@ -37,8 +37,42 @@ def test_adoption_through_050_accepts_complete_contract():
 def test_recorded_adopted_050_is_revalidated(monkeypatch):
     seen = []
     monkeypatch.setattr(apply_migrations, "verify_adoption_contract", lambda _conn, through: seen.append(through))
-    apply_migrations.verify_recorded_adoption(
+    assert apply_migrations.verify_recorded_adoption(
         object(),
         [("050_immigration_and_browser_integrity.sql", "sha", "ledger-v1-adopted")],
-    )
+    ) is False
     assert seen == [50]
+
+
+def test_incomplete_adopted_050_can_recover_only_after_pre_050_verification(monkeypatch):
+    seen = []
+
+    def incomplete(_conn, _through):
+        raise RuntimeError("missing 050")
+
+    monkeypatch.setattr(apply_migrations, "verify_adoption_contract", incomplete)
+    monkeypatch.setattr(
+        apply_migrations,
+        "verify_pre_050_recovery_contract",
+        lambda _conn: seen.append("pre-050"),
+    )
+    assert apply_migrations.verify_recorded_adoption(
+        object(),
+        [("050_immigration_and_browser_integrity.sql", "sha", "ledger-v1-adopted")],
+    ) is True
+    assert seen == ["pre-050"]
+
+
+def test_incomplete_adopted_050_refuses_recovery_when_later_rows_exist(monkeypatch):
+    def incomplete(_conn, _through):
+        raise RuntimeError("missing 050")
+
+    monkeypatch.setattr(apply_migrations, "verify_adoption_contract", incomplete)
+    with pytest.raises(RuntimeError, match="later migrations are already recorded"):
+        apply_migrations.verify_recorded_adoption(
+            object(),
+            [
+                ("050_immigration_and_browser_integrity.sql", "sha", "ledger-v1-adopted"),
+                ("051_immigration_employer_evidence_and_migration_ledger.sql", "sha", "ledger-v1-adopted"),
+            ],
+        )

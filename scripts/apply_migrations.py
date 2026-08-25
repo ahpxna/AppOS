@@ -139,14 +139,109 @@ def verify_adoption_contract(conn: psycopg.Connection, through: int) -> None:
         )
 
 
-def verify_recorded_adoption(conn: psycopg.Connection, rows: list[tuple[str, str, str]]) -> None:
+def verify_pre_050_recovery_contract(conn: psycopg.Connection) -> None:
+    """Prove that migration 050, rather than an older migration, is missing.
+
+    Recovery is deliberately narrower than general adoption.  It is allowed
+    only when the live database has every dependency used by 050 and the
+    immediately preceding 045-049 boundary.  The migration itself still runs
+    transactionally, so an unexpected older-schema mismatch cannot advance the
+    ledger.
+    """
+    row = conn.execute(
+        """
+        SELECT
+          to_regclass('public.applications') IS NOT NULL,
+          to_regclass('public.generated_documents') IS NOT NULL,
+          to_regclass('public.sensitive_answers') IS NOT NULL,
+          to_regclass('public.no_llm_filter_rules') IS NOT NULL,
+          to_regclass('public.approval_requests') IS NOT NULL,
+          to_regclass('public.browser_tasks') IS NOT NULL,
+          to_regclass('public.component_registry') IS NOT NULL,
+          to_regprocedure('public.set_updated_at()') IS NOT NULL,
+          to_regclass('public.v_profile_search_terms') IS NOT NULL,
+          to_regclass('public.market_requirement_signals') IS NOT NULL,
+          to_regclass('public.market_project_ideas') IS NOT NULL,
+          to_regclass('public.repository_evidence_sources') IS NOT NULL,
+          to_regclass('public.repository_evidence_items') IS NOT NULL,
+          to_regclass('public.market_requirement_extraction_runs') IS NOT NULL,
+          EXISTS (SELECT 1 FROM component_registry WHERE name = 'linkedin_browser_discovery');
+        """
+    ).fetchone()
+    labels = (
+        'applications',
+        'generated_documents',
+        'sensitive_answers',
+        'no_llm_filter_rules',
+        'approval_requests',
+        'browser_tasks',
+        'component_registry',
+        'set_updated_at()',
+        'v_profile_search_terms',
+        'market_requirement_signals',
+        'market_project_ideas',
+        'repository_evidence_sources',
+        'repository_evidence_items',
+        'market_requirement_extraction_runs',
+        'linkedin_browser_discovery component',
+    )
+    missing = [label for label, present in zip(labels, row or ()) if not present]
+    if row is None or len(row) != len(labels):
+        missing = list(labels)
+    if missing:
+        raise RuntimeError(
+            'Refusing migration 050 recovery because the live schema does not '
+            'satisfy the pre-050 contract: ' + ', '.join(missing) + '.'
+        )
+
+
+def verify_recorded_adoption(conn: psycopg.Connection, rows: list[tuple[str, str, str]]) -> bool:
+    """Return true only for the one recoverable false-adoption boundary."""
     adopted_050 = any(
         migration_id == '050_immigration_and_browser_integrity.sql'
         and str(runner_version).startswith('ledger-v1-adopted')
         for migration_id, _digest, runner_version in rows
     )
-    if adopted_050:
+    if not adopted_050:
+        return False
+    try:
         verify_adoption_contract(conn, 50)
+        return False
+    except RuntimeError as contract_error:
+        later_rows = [
+            migration_id for migration_id, _digest, _runner in rows
+            if MIGRATION_RE.match(migration_id)
+            and int(MIGRATION_RE.match(migration_id).group(1)) > 50
+        ]
+        if later_rows:
+            raise RuntimeError(
+                'Refusing migration 050 recovery because later migrations are already '
+                'recorded: ' + ', '.join(sorted(later_rows)) + '.'
+            ) from contract_error
+        verify_pre_050_recovery_contract(conn)
+        return True
+
+
+def recover_adopted_050(conn: psycopg.Connection, path: Path) -> None:
+    """Apply a falsely adopted 050 and repair its ledger row atomically."""
+    current = checksum(path)
+    print(f"Applying {path.name}")
+    sql = strip_outer_transaction(path.read_text(encoding="utf-8"))
+    with conn.transaction():
+        conn.execute(sql)
+        result = conn.execute(
+            """
+            UPDATE schema_migrations
+               SET checksum_sha256 = %s, runner_version = 'ledger-v1', applied_at = now()
+             WHERE migration_id = %s
+               AND runner_version LIKE 'ledger-v1-adopted%%';
+            """,
+            (current, path.name),
+        )
+        if result.rowcount != 1:
+            raise RuntimeError(
+                f"Migration 050 recovery expected one adopted ledger row, updated {result.rowcount}."
+            )
 
 
 def adopt_existing(conn: psycopg.Connection, through: int) -> int:
@@ -175,8 +270,25 @@ def apply(args: argparse.Namespace) -> int:
         existing_rows = conn.execute(
             "SELECT migration_id, checksum_sha256, runner_version FROM schema_migrations;"
         ).fetchall()
-        verify_recorded_adoption(conn, existing_rows)
+        recover_050 = verify_recorded_adoption(conn, existing_rows)
         applied = {str(migration_id): str(file_checksum) for migration_id, file_checksum, _runner in existing_rows}
+        if recover_050:
+            path_050 = next(
+                (path for path in files if path.name == '050_immigration_and_browser_integrity.sql'),
+                None,
+            )
+            if path_050 is None:
+                raise RuntimeError('Migration 050 file is missing; cannot repair adopted history.')
+            recorded = applied.get(path_050.name)
+            if recorded != checksum(path_050):
+                raise RuntimeError(
+                    f"Checksum mismatch for adopted {path_050.name}. "
+                    "Do not edit shipped migrations during recovery."
+                )
+            if args.dry_run:
+                print(f"Would apply {path_050.name} and replace its adopted ledger marker.")
+            else:
+                recover_adopted_050(conn, path_050)
         if not applied and is_legacy_database(conn):
             if not args.adopt_existing:
                 raise RuntimeError(
