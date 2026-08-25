@@ -13,6 +13,12 @@ if "psycopg" not in sys.modules:
     psycopg = types.ModuleType("psycopg")
     psycopg.connect = lambda *_a, **_k: None
     sys.modules["psycopg"] = psycopg
+if "psycopg.types" not in sys.modules:
+    sys.modules["psycopg.types"] = types.ModuleType("psycopg.types")
+if "psycopg.types.json" not in sys.modules:
+    psycopg_json = types.ModuleType("psycopg.types.json")
+    psycopg_json.Jsonb = lambda value: value
+    sys.modules["psycopg.types.json"] = psycopg_json
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -135,6 +141,8 @@ def test_official_resume_prompts_treat_titles_as_immutable_but_bullets_as_tailor
     assert "official resume" in sprompt.lower()
     assert "Do not alter employer, job title, dates" in sprompt
     assert "Bullet language may be job-oriented" in sprompt
+    assert "tailored only within this evidence" not in synth.SYSTEM_PROMPT
+    assert "may later reframe an existing bullet JD-first" in synth.SYSTEM_PROMPT
 
 
 def test_profile_ready_versions_force_new_grounding_contract_to_be_rebuilt():

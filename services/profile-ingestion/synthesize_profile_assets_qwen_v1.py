@@ -71,7 +71,7 @@ Return JSON only:
   ]
 }
 
-For official_resume documents, produce one source_document_asset and make resume_bullet_bank preserve the strongest employment_experience source evidence. Employer, job title, dates, and employment type are immutable facts; bullet wording may later be tailored only within this evidence.
+For official_resume documents, produce one source_document_asset and make resume_bullet_bank preserve the strongest employment_experience source evidence. Employer, job title, dates, and employment type are immutable source facts. Do not impose a downstream phrase/evidence lock on existing experience bullets: the resume tailoring agent may later reframe an existing bullet JD-first against the immutable job title and baseline wording. Any new precise technical/factual detail still requires approved user evidence.
 Return 1-2 assets per document. Prefer one strong asset unless the evidence clearly supports two distinct assets.
 """
 
