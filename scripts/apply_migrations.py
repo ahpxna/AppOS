@@ -87,6 +87,68 @@ def is_legacy_database(conn: psycopg.Connection) -> bool:
     return conn.execute("SELECT to_regclass('public.applications') IS NOT NULL;").fetchone()[0]
 
 
+def verify_adoption_contract(conn: psycopg.Connection, through: int) -> None:
+    """Refuse ledger adoption when the claimed schema is not actually present.
+
+    Migration 050 is the first migration adopted by the ledger bootstrap that
+    adds a large, security-relevant schema boundary. A historical database can
+    predate 050 while still containing ``applications``; blindly marking 050 as
+    adopted makes 051 fail later and, worse, makes the ledger lie about schema
+    state. Keep adoption explicit and fail closed instead.
+    """
+    if through < 50:
+        return
+    row = conn.execute(
+        """
+        SELECT
+          to_regclass('public.immigration_profiles') IS NOT NULL,
+          to_regclass('public.immigration_question_rules') IS NOT NULL,
+          to_regclass('public.application_immigration_assessments') IS NOT NULL,
+          EXISTS (SELECT 1 FROM information_schema.columns
+                    WHERE table_schema='public' AND table_name='approval_requests'
+                      AND column_name='bound_document_id'),
+          EXISTS (SELECT 1 FROM information_schema.columns
+                    WHERE table_schema='public' AND table_name='approval_requests'
+                      AND column_name='expected_origin'),
+          EXISTS (SELECT 1 FROM information_schema.columns
+                    WHERE table_schema='public' AND table_name='browser_tasks'
+                      AND column_name='generated_document_id'),
+          EXISTS (SELECT 1 FROM information_schema.columns
+                    WHERE table_schema='public' AND table_name='browser_tasks'
+                      AND column_name='document_sha256');
+        """
+    ).fetchone()
+    labels = (
+        'table immigration_profiles',
+        'table immigration_question_rules',
+        'table application_immigration_assessments',
+        'approval_requests.bound_document_id',
+        'approval_requests.expected_origin',
+        'browser_tasks.generated_document_id',
+        'browser_tasks.document_sha256',
+    )
+    missing = [label for label, present in zip(labels, row or ()) if not present]
+    if row is None or len(row) != len(labels):
+        missing = list(labels)
+    if missing:
+        raise RuntimeError(
+            'Refusing to adopt migration history through 050 because the live schema '
+            'does not satisfy migration 050: ' + ', '.join(missing) + '. '
+            'Do not mark 050 as applied. Back up the database and repair the adopted '
+            'ledger/schema drift before applying 051+.'
+        )
+
+
+def verify_recorded_adoption(conn: psycopg.Connection, rows: list[tuple[str, str, str]]) -> None:
+    adopted_050 = any(
+        migration_id == '050_immigration_and_browser_integrity.sql'
+        and str(runner_version).startswith('ledger-v1-adopted')
+        for migration_id, _digest, runner_version in rows
+    )
+    if adopted_050:
+        verify_adoption_contract(conn, 50)
+
+
 def adopt_existing(conn: psycopg.Connection, through: int) -> int:
     adopted = 0
     for path in migration_files():
@@ -110,14 +172,18 @@ def apply(args: argparse.Namespace) -> int:
         raise RuntimeError("No migration files found.")
     with psycopg.connect(connection_string(), autocommit=True) as conn:
         ensure_ledger(conn)
-        existing_rows = conn.execute("SELECT migration_id, checksum_sha256 FROM schema_migrations;").fetchall()
-        applied = {str(migration_id): str(file_checksum) for migration_id, file_checksum in existing_rows}
+        existing_rows = conn.execute(
+            "SELECT migration_id, checksum_sha256, runner_version FROM schema_migrations;"
+        ).fetchall()
+        verify_recorded_adoption(conn, existing_rows)
+        applied = {str(migration_id): str(file_checksum) for migration_id, file_checksum, _runner in existing_rows}
         if not applied and is_legacy_database(conn):
             if not args.adopt_existing:
                 raise RuntimeError(
                     "Existing database has no migration ledger. Verify its state, then run: "
                     "python scripts/apply_migrations.py --adopt-existing --through 050"
                 )
+            verify_adoption_contract(conn, args.through)
             adopted = adopt_existing(conn, args.through)
             print(f"Adopted {adopted} already-applied migration file(s) through {args.through}.")
             applied = {str(mid): str(digest) for mid, digest in conn.execute(
