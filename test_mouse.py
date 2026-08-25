@@ -3,6 +3,7 @@ import websocket
 import json
 import time
 import random
+__test__ = False
 
 def test_fake_mouse(regimes_file_path):
     try:

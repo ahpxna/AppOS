@@ -96,10 +96,11 @@ def test_069_adds_aggregate_resume_freshness_views():
     assert "stale_approved_project_assets" in text
 
 
-def test_jobos_doctor_requires_latest_070_migration():
+def test_jobos_doctor_requires_latest_071_migration():
     source = (ROOT / "scripts" / "jobos.py").read_text(encoding="utf-8")
-    assert "070_profile_freshness_hardening.sql" in source
-    assert "Migrations through 070" in source
+    assert "071_human_approval_bus_and_privileged_actions.sql" in source
+    assert "Migrations through 071" in source
+    assert (ROOT / "db" / "migrations" / "070_profile_freshness_hardening.sql").is_file()
     assert "Migrations through 063" not in source
 
 

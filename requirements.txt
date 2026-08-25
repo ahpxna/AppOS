@@ -25,3 +25,6 @@ pytest>=8.0,<9
 
 # Needed only when the consent-based pointer recorder is used locally.
 pynput>=1.7,<2
+
+# Local credential vault (AES-256-GCM; secrets never stored plaintext in PostgreSQL).
+cryptography>=45,<47

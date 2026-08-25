@@ -33,6 +33,7 @@ RUNTIME_INSTALLER = REPO_ROOT / "scripts" / "install_openclaw_runtime.py"
 REQUIRED_AGENTS = {"main", "resume", "cover_letter", "repo_coordinator", "linkedin_discovery"}
 REQUIRED_DENIES = {"exec", "process", "write", "edit", "apply_patch", "file_write"}
 RUNTIME_PROVIDER_KEYS = ("DEEPSEEK_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY")
+RUNTIME_JOBOS_KEYS = ("JOBOS_GMAIL_WAKE_TOKEN", "JOBOS_GMAIL_WAKE_URL")
 
 
 def read_env_file(path: Path) -> dict[str, str]:
@@ -76,6 +77,31 @@ def ensure_gateway_token(env_path: Path) -> bool:
         if env_path.stat().st_size:
             handle.write("\n")
         handle.write(f"OPENCLAW_GATEWAY_TOKEN={secrets.token_urlsafe(32)}\n")
+    os.chmod(env_path, 0o600)
+    return True
+
+
+def ensure_jobos_gmail_wake_token(env_path: Path) -> bool:
+    """Create a local-only wake secret when Gmail integration is configured.
+
+    This secret authenticates only OpenClaw -> JobOS loopback wake signals. It
+    is distinct from Gmail OAuth, hook tokens, gateway auth, and Telegram.
+    """
+    current = read_env_file(env_path)
+    existing = current.get("JOBOS_GMAIL_WAKE_TOKEN", "").strip()
+    if existing and not existing.startswith(("CHANGE_ME", "__")):
+        return False
+    gmail = (current.get("JOBOS_GMAIL_ACCOUNT") or current.get("OPENCLAW_GMAIL_ACCOUNT")
+             or current.get("GMAIL_ACCOUNT") or "").strip()
+    if not gmail:
+        return False
+    env_path.parent.mkdir(parents=True, exist_ok=True)
+    with env_path.open("a", encoding="utf-8") as handle:
+        if env_path.exists() and env_path.stat().st_size:
+            handle.write("\n")
+        handle.write(f"JOBOS_GMAIL_WAKE_TOKEN={secrets.token_urlsafe(32)}\n")
+        if not current.get("JOBOS_GMAIL_WAKE_URL", "").strip():
+            handle.write("JOBOS_GMAIL_WAKE_URL=http://127.0.0.1:8791/gmail\n")
     os.chmod(env_path, 0o600)
     return True
 
@@ -130,7 +156,7 @@ def write_provider_runtime_env(openclaw_home: Path) -> list[str]:
     """
     provided = {
         key: os.environ[key].strip()
-        for key in RUNTIME_PROVIDER_KEYS
+        for key in (*RUNTIME_PROVIDER_KEYS, *RUNTIME_JOBOS_KEYS)
         if os.environ.get(key, "").strip()
     }
     if not provided:
@@ -227,6 +253,18 @@ def install_private_runtime() -> dict[str, str]:
     return {"name": "private_openclaw_runtime", "status": "pass", "detail": result.get("openclaw", "installed")}
 
 
+def install_jobos_gmail_wake_transform(target_home: Path) -> Path:
+    """Install the tracked additive Gmail transform into OpenClaw's safe root."""
+    source = REPO_ROOT / "bootstrap" / "openclaw" / "hooks" / "transforms" / "jobos-gmail-wake.mjs"
+    if not source.is_file():
+        raise RuntimeError(f"Missing Gmail wake transform: {source}")
+    dest_dir = target_home / ".openclaw" / "hooks" / "transforms"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / source.name
+    shutil.copy2(source, dest)
+    return dest
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Set up isolated JobOS OpenClaw agents non-interactively.")
     parser.add_argument("--mode", choices=("native", "docker"), default="native")
@@ -268,6 +306,9 @@ def main() -> int:
     generated_gateway_token = False
     if args.generate_gateway_token and not args.dry_run:
         generated_gateway_token = ensure_gateway_token(env_path)
+    generated_gmail_wake_token = False
+    if not args.dry_run:
+        generated_gmail_wake_token = ensure_jobos_gmail_wake_token(env_path)
     env_values = read_env_file(env_path)
     env_values["OPENCLAW_BROWSER_CDP_URL"] = cdp_url
 
@@ -310,6 +351,7 @@ def main() -> int:
             allow_missing=False,
             force=args.force,
         )
+        gmail_wake_transform = install_jobos_gmail_wake_transform(target_home)
         provider_keys = write_provider_runtime_env(target_home / ".openclaw")
 
     config_path = target_home / ".openclaw" / "openclaw.json"
@@ -331,6 +373,8 @@ def main() -> int:
         "writes": True,
         "provider_keys_staged": provider_keys,
         "gateway_token_generated": generated_gateway_token,
+        "gmail_wake_token_generated": generated_gmail_wake_token,
+        "gmail_wake_transform": str(gmail_wake_transform),
         "checks": checks,
         "next": (
             "Start the Docker overlay with docker compose -f docker-compose.yml -f docker-compose.openclaw.yml up -d"

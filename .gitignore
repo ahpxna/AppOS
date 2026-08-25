@@ -47,3 +47,6 @@ bootstrap/openclaw/*.bundle.tar.gz
 # === Editor ===
 .vscode/
 .idea/
+
+# === Local credential vault ===
+data/secrets/

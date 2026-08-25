@@ -8,6 +8,7 @@ import os
 import json
 import subprocess
 import sys
+import shutil
 from pathlib import Path
 
 
@@ -44,12 +45,22 @@ def doctor(*, check_browser: bool) -> int:
     except RuntimeError as exc:
         mark(results, "OpenClaw runtime", False, str(exc))
 
+    gog = shutil.which((os.getenv("JOBOS_GOG_BIN") or "gog").strip())
+    mark(results, "Gmail gog reader", bool(gog), gog or "install/authenticate gog before email verification")
+    vault_path = Path(os.getenv("JOBOS_VAULT_KEY_FILE", str(ROOT / "data" / "secrets" / "jobos-vault.key"))).expanduser()
+    mark(results, "Credential vault key", vault_path.is_file(), str(vault_path))
+    tg = bool((os.getenv("JOBOS_TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+              and (os.getenv("JOBOS_TELEGRAM_ALLOWED_USER_ID") or os.getenv("TELEGRAM_ALLOWED_USER_ID") or "").strip())
+    mark(results, "Telegram approval channel", tg, "configured" if tg else "set Telegram bot + allowed user id")
+
     try:
         import psycopg
         with psycopg.connect(database_dsn(), connect_timeout=5) as conn, conn.cursor() as cur:
             mark(results, "PostgreSQL", True)
-            cur.execute("SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE migration_id = '070_profile_freshness_hardening.sql')")
-            mark(results, "Migrations through 070", bool(cur.fetchone()[0]))
+            cur.execute("SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE migration_id = '071_human_approval_bus_and_privileged_actions.sql')")
+            mark(results, "Migrations through 071", bool(cur.fetchone()[0]))
+            cur.execute("SELECT to_regclass('public.privileged_action_executions') IS NOT NULL")
+            mark(results, "Human Approval Bus", bool(cur.fetchone()[0]))
             cur.execute("SELECT to_regclass('public.autofill_action_journal') IS NOT NULL")
             mark(results, "Autofill action journal", bool(cur.fetchone()[0]))
             cur.execute("SELECT to_regclass('public.human_review_items') IS NOT NULL")
@@ -61,7 +72,7 @@ def doctor(*, check_browser: bool) -> int:
             mark(results, "Immigration profile confirmed", int(cur.fetchone()[0]) == 1)
     except Exception as exc:
         mark(results, "PostgreSQL", False, str(exc)[:180])
-        mark(results, "Migrations through 070", False, "PostgreSQL unavailable")
+        mark(results, "Migrations through 071", False, "PostgreSQL unavailable")
 
     if check_browser:
         # Health only: it validates gateway/CDP availability but does not list
@@ -76,14 +87,14 @@ def doctor(*, check_browser: bool) -> int:
     for name, ok, detail in results:
         print(f"{'✓' if ok else '⚠'} {name}" + (f" — {detail}" if detail else ""))
     checks = {name: ok for name, ok, _ in results}
-    core = all(checks.get(name, False) for name in ("Python 3.11+", "Environment", "PostgreSQL", "Migrations through 070"))
+    core = all(checks.get(name, False) for name in ("Python 3.11+", "Environment", "PostgreSQL", "Migrations through 071"))
     autofill = core and all(ok for name, ok, _ in results if name in {
         "Autofill action journal", "No unresolved autofill task", "Immigration profile confirmed",
-        "OpenClaw runtime", "Managed upload root", "Human Review Hub",
+        "OpenClaw runtime", "Managed upload root", "Human Review Hub", "Human Approval Bus",
     })
     print(f"\nCORE READY: {'YES' if core else 'NO'}")
     print(f"AUTOFILL READY: {'YES' if autofill else 'NO'}")
-    print("SUBMIT: HUMAN ONLY")
+    print("SUBMIT: TELEGRAM HUMAN APPROVAL + PRIVILEGED ONE-SHOT EXECUTOR ONLY")
     return 0 if core else 1
 
 
@@ -198,7 +209,7 @@ def autofill_prepare(application_id: str, *, create: bool, yes: bool) -> int:
                                "value": item.value, "source": "confirmed_immigration" if item.question_label and classify_immigration_question(item.question_label) else "approved_profile"}
                               for item in writes],
             "action_scope": action_scope, "will_pause": pauses,
-            "submit": "human_only",
+            "submit": "telegram_human_approval_required",
         }
         print(json.dumps(summary, indent=2))
         if not create:
@@ -235,6 +246,18 @@ def autofill_prepare(application_id: str, *, create: bool, yes: bool) -> int:
             "--autofill-action-scope-json",
             json.dumps(action_scope, separators=(",", ":")),
 
+            "--review-context-json",
+            json.dumps({
+                "write_actions": summary["write_actions"],
+                "will_pause": summary["will_pause"],
+                "uploads": [item for item in summary["write_actions"] if item.get("action") == "upload"],
+                "pinned_target_id": summary["pinned_target_id"],
+                "page_url": summary["page_url"],
+                "page_fingerprint": summary["page_fingerprint"],
+                "resume_artifact": summary["resume_artifact"],
+                "resume_artifact_sha256": summary["resume_artifact_sha256"],
+            }, separators=(",", ":")),
+
             "--apply",
         ]
         if document[2]:
@@ -265,7 +288,7 @@ def status() -> int:
     print(json.dumps({
         "applications_by_status": applications, "applications_by_source": sources,
         "browser_tasks": browser_tasks, "attempts": attempts, "pending_human_reviews": pending_reviews,
-        "needs_reconciliation": reconciliation, "submit": "human_only",
+        "needs_reconciliation": reconciliation, "submit": "telegram_human_approval_then_privileged_executor",
     }, indent=2))
     return 0
 
@@ -301,6 +324,56 @@ def telegram_start(*, once: bool = False, dispatch_only: bool = False, discover_
         argv.append("--discover-id")
     return subprocess.call(argv, cwd=ROOT)
 
+
+
+def action_command(command: str, *, application_id: str = "", action: str = "",
+                   candidate_id: str = "", request_id: str = "", poll_seconds: int = 5) -> int:
+    load_repo_env()
+    argv = [sys.executable, str(ROOT / "services" / "application_actions" / "privileged_action_v1.py"), command]
+    if command == "prepare":
+        argv.extend(("--application-id", application_id, "--action", action))
+        if candidate_id:
+            argv.extend(("--candidate-id", candidate_id))
+    elif command == "execute" and request_id:
+        argv.extend(("--request-id", request_id))
+    elif command == "worker":
+        argv.extend(("--poll-seconds", str(poll_seconds)))
+    return subprocess.call(argv, cwd=ROOT)
+
+
+def vault_command(command: str, *, origin: str = "", account: str = "", kind: str = "password", length: int = 28) -> int:
+    load_repo_env()
+    argv = [sys.executable, str(ROOT / "services" / "security" / "credential_vault_v1.py"), command]
+    if command != "init":
+        argv.extend(("--origin", origin, "--account", account, "--kind", kind))
+    if command == "generate":
+        argv.extend(("--length", str(length)))
+    return subprocess.call(argv, cwd=ROOT)
+
+
+def gmail_verify_command(*, application_id: str, recipient: str, employer_origin: str = "",
+                         since_seconds: int = 300, max_results: int = 10) -> int:
+    load_repo_env()
+    argv = [sys.executable, str(ROOT / "services" / "auth" / "gmail_verification_v1.py"),
+            "--application-id", application_id, "--recipient", recipient,
+            "--since-unix", str(__import__('time').time() - max(1, since_seconds)),
+            "--max-results", str(max_results)]
+    if employer_origin:
+        argv.extend(("--employer-origin", employer_origin))
+    return subprocess.call(argv, cwd=ROOT)
+
+
+def gmail_watch_command(*, once: bool = False, wake_listen: bool = False,
+                        interval_seconds: int = 10, max_results: int = 10,
+                        wake_host: str = "127.0.0.1", wake_port: int = 8791) -> int:
+    load_repo_env()
+    argv = [sys.executable, str(ROOT / "services" / "auth" / "gmail_verification_watcher_v1.py"),
+            "--interval-seconds", str(interval_seconds), "--max-results", str(max_results)]
+    if once:
+        argv.append("--once")
+    if wake_listen:
+        argv.extend(("--wake-listen", "--wake-host", wake_host, "--wake-port", str(wake_port)))
+    return subprocess.call(argv, cwd=ROOT)
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="JobOS operator commands.")
@@ -342,6 +415,35 @@ def main() -> int:
     start.add_argument("--once", action="store_true")
     start.add_argument("--dispatch-only", action="store_true")
     telegram_sub.add_parser("discover-id", help="Print recent Telegram user/chat ids after you send /start to the bot.")
+
+    action_parser = commands.add_parser("action", help="Prepare/execute human-approved privileged application actions.")
+    action_sub = action_parser.add_subparsers(dest="action_command", required=True)
+    ap = action_sub.add_parser("prepare")
+    ap.add_argument("--application-id", required=True)
+    ap.add_argument("--action", required=True, choices=("begin_application","trust_external_domain","create_employer_account","login_employer_account","use_email_verification","accept_terms","advance_application_step","auth_manual_retry","mfa_retry","checkpoint_retry","submit_application"))
+    ap.add_argument("--candidate-id")
+    ae = action_sub.add_parser("execute"); ae.add_argument("--request-id", required=True)
+    action_sub.add_parser("once", help="Execute the next approved privileged action exactly once.")
+    aw = action_sub.add_parser("worker", help="Continuously execute Telegram-approved privileged actions one at a time.")
+    aw.add_argument("--poll-seconds", type=int, default=5)
+
+    vault_parser = commands.add_parser("vault", help="Encrypted employer credential vault.")
+    vault_sub = vault_parser.add_subparsers(dest="vault_command", required=True)
+    vault_sub.add_parser("init")
+    for name in ("set", "generate", "status", "revoke"):
+        vp = vault_sub.add_parser(name); vp.add_argument("--origin", required=True); vp.add_argument("--account", required=True); vp.add_argument("--kind", default="password")
+        if name == "generate": vp.add_argument("--length", type=int, default=28)
+
+    gmail_parser = commands.add_parser("gmail", help="Bounded Gmail verification reader (Inbox/other labels + Spam).")
+    gmail_sub = gmail_parser.add_subparsers(dest="gmail_command", required=True)
+    gv = gmail_sub.add_parser("verify")
+    gv.add_argument("--application-id", required=True); gv.add_argument("--recipient", required=True)
+    gv.add_argument("--employer-origin", default=""); gv.add_argument("--since-seconds", type=int, default=300); gv.add_argument("--max-results", type=int, default=10)
+    gw = gmail_sub.add_parser("watch")
+    gw.add_argument("--once", action="store_true"); gw.add_argument("--wake-listen", action="store_true")
+    gw.add_argument("--wake-host", default="127.0.0.1"); gw.add_argument("--wake-port", type=int, default=8791)
+    gw.add_argument("--interval-seconds", type=int, default=10); gw.add_argument("--max-results", type=int, default=10)
+
     args = parser.parse_args()
     if args.command == "doctor":
         return doctor(check_browser=args.check_browser)
@@ -357,6 +459,20 @@ def main() -> int:
         if args.telegram_command == "discover-id":
             return telegram_start(discover_id=True)
         return telegram_start(once=args.once, dispatch_only=args.dispatch_only)
+    if args.command == "action":
+        return action_command(args.action_command, application_id=getattr(args, "application_id", ""),
+                              action=getattr(args, "action", ""), candidate_id=getattr(args, "candidate_id", "") or "",
+                              request_id=getattr(args, "request_id", ""), poll_seconds=getattr(args, "poll_seconds", 5))
+    if args.command == "vault":
+        return vault_command(args.vault_command, origin=getattr(args, "origin", ""), account=getattr(args, "account", ""),
+                             kind=getattr(args, "kind", "password"), length=getattr(args, "length", 28))
+    if args.command == "gmail":
+        if args.gmail_command == "watch":
+            return gmail_watch_command(once=args.once, wake_listen=args.wake_listen,
+                                       wake_host=args.wake_host, wake_port=args.wake_port,
+                                       interval_seconds=args.interval_seconds, max_results=args.max_results)
+        return gmail_verify_command(application_id=args.application_id, recipient=args.recipient,
+                                    employer_origin=args.employer_origin, since_seconds=args.since_seconds, max_results=args.max_results)
     return autofill_prepare(args.application_id, create=args.create, yes=args.yes)
 
 

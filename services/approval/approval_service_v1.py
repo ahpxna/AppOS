@@ -299,6 +299,16 @@ def cmd_create(conn, args) -> int:
 
         payload = {"company": company, "job_title": job_title,
                    "service_version": SERVICE_VERSION}
+        if getattr(args, "review_context_json", None):
+            try:
+                review_context = json.loads(args.review_context_json)
+            except json.JSONDecodeError as exc:
+                print(f"ERROR: --review-context-json is invalid JSON: {exc}")
+                return 1
+            if not isinstance(review_context, dict):
+                print("ERROR: --review-context-json must be a JSON object.")
+                return 1
+            payload["review_context"] = review_context
         idempotency_key = None
 
         # Only issue an approval when there is something concrete to approve.
@@ -449,6 +459,26 @@ def cmd_create(conn, args) -> int:
         request_id, expires = cur.fetchone()
         log_event(cur, request_id, "created", args.requested_by,
                   {"type": args.type, "ttl_minutes": args.ttl_minutes})
+
+        # The privileged application-handoff flow marks an authenticated page
+        # as application_form_ready. The frozen browser worker completes its
+        # existing state transition only from awaiting_approval, so normalize
+        # this one new handoff state here when the exact autofill capability is
+        # actually created. Existing flows already at awaiting_approval remain
+        # unchanged.
+        if args.apply and args.type == "autofill_form" and args.application_id:
+            cur.execute(
+                """UPDATE applications SET current_step='awaiting_approval', updated_at=now()
+                     WHERE id=%s AND current_step='application_form_ready';""",
+                (args.application_id,),
+            )
+            if cur.rowcount == 1:
+                cur.execute(
+                    """INSERT INTO pipeline_events(application_id, from_step, to_step, actor, reason, detail_json)
+                       VALUES (%s,'application_form_ready','awaiting_approval',%s,
+                               'Exact form packaged for human autofill approval.',%s);""",
+                    (args.application_id, args.requested_by, Jsonb({"approval_request_id": request_id})),
+                )
 
         if not args.apply:
             conn.rollback()
@@ -785,6 +815,7 @@ def main() -> int:
         ),
     )
     pc.add_argument("--autofill-action-scope-json", help="Exact action-scope JSON emitted by jobos autofill prepare.")
+    pc.add_argument("--review-context-json", help="Best-effort human-review context. Missing context never weakens execution bindings.")
     pc.add_argument("--apply", action="store_true")
 
     pa = sub.add_parser("approve")

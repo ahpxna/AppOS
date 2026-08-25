@@ -185,7 +185,11 @@
         "messageTemplate": "New email from {{messages[0].from}}\nSubject: {{messages[0].subject}}\n{{messages[0].snippet}}\n{{messages[0].body}}",
         "deliver": true,
         "channel": "last",
-        "model": "__HOOKS_MODEL__"
+        "model": "__HOOKS_MODEL__",
+        "transform": {
+          "module": "jobos-gmail-wake.mjs",
+          "export": "transformGmail"
+        }
       }
     ],
     "gmail": {

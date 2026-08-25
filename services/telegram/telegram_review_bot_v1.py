@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
 import os
 import secrets
@@ -24,6 +25,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 from services.common.config import database_dsn, load_repo_env
 from services.review.review_service_v1 import ReviewError, answer_question, decide_item, review_artifacts, sync_inbox
+from services.review.approval_context_v1 import NAN, build_envelope, context_files, snapshot_context
 
 load_repo_env()
 DSN = database_dsn()
@@ -114,53 +116,127 @@ def _keyboard(cur, item_id: str, allowed_user_id: int, item_type: str,
             {"text": "📝 Revise / regenerate", "callback_data": f"rv:{revise}"},
             {"text": "❌ Reject", "callback_data": f"rv:{reject}"},
         ]]}, separators=(",", ":"))
+    approval_type = str(payload.get("approval_type") or "")
+    approve_labels = {
+        "privileged_begin_application": "✅ OPEN APPLY",
+        "privileged_trust_external_domain": "✅ TRUST DOMAIN",
+        "privileged_create_employer_account": "✅ CREATE ACCOUNT",
+        "privileged_login_employer_account": "✅ LOGIN",
+        "privileged_use_email_verification": "✅ USE EMAIL VERIFICATION",
+        "privileged_accept_terms": "✅ ACCEPT TERMS",
+        "privileged_advance_application_step": "✅ NEXT / CONTINUE",
+        "privileged_auth_manual_retry": "🔁 AUTH RETRY",
+        "privileged_mfa_retry": "🔁 RETRY AFTER MFA",
+        "privileged_checkpoint_retry": "🔁 RETRY AFTER I FINISH",
+        "privileged_submit_application": "✅ APPROVE SUBMIT",
+    }
     approve = _callback_token(cur, item_id, "approve", allowed_user_id)
-    revise = _callback_token(cur, item_id, "revise", allowed_user_id)
     reject = _callback_token(cur, item_id, "reject", allowed_user_id)
+    if approval_type in {"privileged_auth_manual_retry", "privileged_mfa_retry", "privileged_checkpoint_retry"}:
+        return json.dumps({"inline_keyboard": [[
+            {"text": approve_labels[approval_type], "callback_data": f"rv:{approve}"},
+            {"text": "❌ CANCEL", "callback_data": f"rv:{reject}"},
+        ]]}, separators=(",", ":"))
+    revise = _callback_token(cur, item_id, "revise", allowed_user_id)
     return json.dumps({"inline_keyboard": [
-        [{"text": "✅ Approve", "callback_data": f"rv:{approve}"}],
+        [{"text": approve_labels.get(approval_type, "✅ Approve"), "callback_data": f"rv:{approve}"}],
         [{"text": "📝 Revise", "callback_data": f"rv:{revise}"},
          {"text": "❌ Reject", "callback_data": f"rv:{reject}"}],
     ]}, separators=(",", ":"))
 
 
-def _message_text(row: tuple[Any, ...]) -> str:
+def _compact(value: Any, limit: int = 120) -> str:
+    if value is None:
+        return NAN
+    if isinstance(value, (dict, list)):
+        text = json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":"))
+    else:
+        text = str(value)
+    text = text.replace("\n", " ")
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def _message_text(row: tuple[Any, ...], envelope: dict[str, Any] | None = None,
+                  diff: dict[str, Any] | None = None) -> str:
     item_id, item_type, priority, title, summary, company, role, payload = row
     payload = payload or {}
-    lines = ["🧭 JobOS Review", f"{company} — {role}", "", str(title)]
+    envelope = envelope if isinstance(envelope, dict) else {}
+    job = envelope.get("job") if isinstance(envelope.get("job"), dict) else {}
+    approval = envelope.get("approval") if isinstance(envelope.get("approval"), dict) else {}
+    browser = envelope.get("browser") if isinstance(envelope.get("browser"), dict) else {}
+    fit = envelope.get("fit") if isinstance(envelope.get("fit"), dict) else {}
+    documents = envelope.get("documents") if isinstance(envelope.get("documents"), dict) else {}
+    form = envelope.get("form") if isinstance(envelope.get("form"), dict) else {}
+    auth = envelope.get("auth") if isinstance(envelope.get("auth"), dict) else {}
+    action_type = approval.get("action_type") or payload.get("approval_type") or item_type
+    lines = ["🧭 JobOS Human Approval", f"{company or NAN} — {role or NAN}", f"Action: {action_type}", "", str(title)]
     if summary:
         lines.extend(["", str(summary)])
-    if item_type == "autofill_review":
-        lines.extend(["", f"Verified: {len(payload.get('verified_refs') or [])}",
-                      f"Failed: {len(payload.get('failed_refs') or [])}",
-                      f"Paused: {len(payload.get('paused') or [])}", "Submit: HUMAN ONLY"])
-    elif item_type == "question_required":
-        lines.extend(["", f"Question: {payload.get('question') or ''}",
-                      f"Reply: /answer {item_id} <your answer>",
-                      "Default memory scope: this company only."])
+    lines.extend([
+        "", "JOB",
+        f"Location: {_compact(job.get('location', NAN))} | Work mode: {_compact(job.get('work_mode', NAN))}",
+        f"Fit: {_compact(fit.get('fit_score', job.get('fit_score', NAN)))} / {_compact(fit.get('fit_decision', job.get('fit_decision', NAN)))}",
+        f"Fit reason: {_compact(fit.get('decision_reason', NAN), 260)}",
+        f"Matched: {_compact(fit.get('matched_requirements', NAN), 260)}",
+        f"Missing/weak: {_compact(fit.get('missing_or_weak_requirements', NAN), 260)}",
+        f"Hard blockers: {_compact(fit.get('hard_blockers', NAN), 180)}",
+        f"JD: {_compact(job.get('job_url', NAN), 180)}",
+        "", "BROWSER",
+        f"URL: {_compact(browser.get('target_url', auth.get('current_url', NAN)), 180)}",
+        f"Auth state: {_compact(auth.get('state', NAN))} | Platform: {_compact(auth.get('platform_hint', NAN))}",
+    ])
+    resume = documents.get("resume") if isinstance(documents, dict) else NAN
+    cover = documents.get("cover_letter") if isinstance(documents, dict) else NAN
+    if isinstance(resume, dict):
+        resume_text = f"{resume.get('filename', NAN)} [{str(resume.get('sha256', NAN))[:12]}]"
+    else:
+        resume_text = NAN
+    if isinstance(cover, dict):
+        cover_text = f"{cover.get('filename', NAN)} [{str(cover.get('sha256', NAN))[:12]}]"
+    else:
+        cover_text = NAN
+    lines.extend(["", "DOCUMENTS", f"Resume: {resume_text}", f"Cover letter: {cover_text}"])
+    proposed = form.get("proposed_fields", NAN) if isinstance(form, dict) else NAN
+    paused = form.get("paused_fields", NAN) if isinstance(form, dict) else NAN
+    blockers = form.get("required_blockers", NAN) if isinstance(form, dict) else NAN
+    lines.extend(["", "FORM", f"Fields: {_compact(proposed, 500)}", f"Paused: {_compact(paused, 240)}", f"Required blockers: {_compact(blockers, 240)}"])
+    if diff:
+        changes = diff.get("changed") if isinstance(diff.get("changed"), list) else []
+        lines.extend(["", "DIFF VS PREVIOUS APPROVAL MESSAGE"])
+        if diff.get("baseline"):
+            lines.append("Baseline: no previous same application/action package.")
+        elif not changes:
+            lines.append("No material context changes.")
+        else:
+            for change in changes[:10]:
+                lines.append(f"• {change.get('path')}: {_compact(change.get('before'), 55)} → {_compact(change.get('after'), 55)}")
+            if len(changes) > 10:
+                lines.append(f"• … {len(changes) - 10} more change(s) in attached context JSON")
+    if item_type == "question_required":
+        lines.extend(["", f"Question: {payload.get('question') or NAN}", f"Reply: /answer {item_id} <your answer>"])
     elif item_type == "reconciliation_required":
-        lines.extend(["", "⚠️ Do not retry autofill until the underlying browser execution is reconciled."])
+        lines.extend(["", "⚠️ Do not retry until the uncertain browser execution is reconciled."])
     elif item_type == "application_ready":
-        lines.extend(["", "🚫 Telegram cannot submit this application.",
-                      "Open the pinned browser tab, inspect the final form, and click Submit yourself."])
-    lines.extend(["", f"Review ID: {item_id}", f"Priority: {priority}"])
+        lines.extend(["", "Final Submit is not part of normal autofill. Prepare a separate privileged Submit approval when ready."])
+    lines.extend(["", "Context delivery is soft-fail: missing sections show NaN and do not remove approval controls.",
+                  f"Review ID: {item_id}", f"Priority: {priority}"])
     return "\n".join(lines)[:3900]
 
 
 def _record_delivery(cur, item_id: str, chat_id: int, message_id: int | None,
                      kind: str, *, status: str = "sent", error: str | None = None,
-                     artifact_sha256: str | None = None) -> None:
+                     artifact_sha256: str | None = None, context_sha256: str | None = None) -> None:
     cur.execute(
         """INSERT INTO telegram_review_deliveries(
-               review_item_id, chat_id, message_id, delivery_kind, status, error_message, artifact_sha256)
-           VALUES (%s, %s, %s, %s, %s, %s, %s);""",
-        (item_id, chat_id, message_id, kind, status, error, artifact_sha256),
+               review_item_id, chat_id, message_id, delivery_kind, status, error_message, artifact_sha256, context_sha256)
+           VALUES (%s, %s, %s, %s, %s, %s, %s, %s);""",
+        (item_id, chat_id, message_id, kind, status, error, artifact_sha256, context_sha256),
     )
 
 
 def _deliver_artifact(cur, token: str, *, item_id: str, chat_id: int,
                       artifact: dict[str, Any]) -> bool:
-    """Deliver one exact artifact once, independently of summary delivery."""
+    """Best-effort exact artifact delivery. Failure never suppresses summary/approval."""
     path = Path(artifact["file_path"]).expanduser()
     if not path.is_file():
         return False
@@ -181,58 +257,94 @@ def _deliver_artifact(cur, token: str, *, item_id: str, chat_id: int,
         _record_delivery(cur, item_id, chat_id, int(sent["result"]["message_id"]), "artifact",
                          artifact_sha256=artifact["sha256"])
         return True
-    except TelegramError as exc:
+    except Exception as exc:
         _record_delivery(cur, item_id, chat_id, None, "artifact", status="failed",
-                         error=str(exc)[:1000], artifact_sha256=artifact["sha256"])
-        raise
+                         error=str(exc)[:1000], artifact_sha256=artifact.get("sha256"))
+        return False
+
+
+def _deliver_memory_artifact(cur, token: str, *, item_id: str, chat_id: int,
+                             filename: str, payload: bytes, mime_type: str) -> bool:
+    digest = hashlib.sha256(payload).hexdigest()
+    cur.execute("""SELECT 1 FROM telegram_review_deliveries
+                    WHERE review_item_id=%s AND chat_id=%s AND delivery_kind='artifact'
+                      AND artifact_sha256=%s AND status='sent' LIMIT 1;""", (item_id, chat_id, digest))
+    if cur.fetchone():
+        return False
+    try:
+        sent = api(token, "sendDocument", data={"chat_id": str(chat_id), "caption": filename},
+                   files={"document": (filename, io.BytesIO(payload), mime_type)})
+        _record_delivery(cur, item_id, chat_id, int(sent["result"]["message_id"]), "artifact",
+                         artifact_sha256=digest)
+        return True
+    except Exception as exc:
+        _record_delivery(cur, item_id, chat_id, None, "artifact", status="failed",
+                         error=str(exc)[:1000], artifact_sha256=digest)
+        return False
 
 
 def dispatch_pending(conn, token: str, allowed_user_id: int, chat_id: int, *, limit: int = 20) -> int:
     with conn.cursor() as cur:
         sync_inbox(cur)
-        # Artifacts can be rendered/captured after their review summary was
-        # already delivered. Send them from their own ledger, never gated by
-        # the summary delivery row.
-        cur.execute(
-            """SELECT DISTINCT v.review_item_id::text
-                 FROM v_human_review_inbox v
-                 JOIN human_review_artifacts a ON a.review_item_id = v.review_item_id
-                WHERE NOT EXISTS (
-                      SELECT 1 FROM telegram_review_deliveries d
-                       WHERE d.review_item_id = v.review_item_id AND d.chat_id = %s
-                         AND d.delivery_kind = 'artifact' AND d.artifact_sha256 = a.sha256
-                         AND d.status = 'sent')
-                LIMIT %s;""",
-            (chat_id, limit),
-        )
-        for (item_id,) in cur.fetchall():
-            for artifact in review_artifacts(cur, item_id):
-                _deliver_artifact(cur, token, item_id=item_id, chat_id=chat_id, artifact=artifact)
         cur.execute(
             """SELECT v.review_item_id::text, v.item_type, v.priority, v.title,
-                      v.summary_text, v.company, v.job_title, v.payload_json
+                      v.summary_text, v.company, v.job_title, v.payload_json,
+                      v.application_id::text
                  FROM v_human_review_inbox v
-                WHERE NOT EXISTS (
-                      SELECT 1 FROM telegram_review_deliveries d
-                       WHERE d.review_item_id = v.review_item_id AND d.chat_id = %s
-                         AND d.delivery_kind = 'summary' AND d.status = 'sent')
                 LIMIT %s;""",
-            (chat_id, limit),
+            (limit,),
         )
         rows = cur.fetchall()
-        for row in rows:
+        delivered = 0
+        for raw in rows:
+            row, application_id = raw[:8], raw[8]
             item_id = row[0]
+            try:
+                envelope = build_envelope(cur, item_id, application_id)
+            except Exception:
+                envelope = {"schema": "jobos-human-approval-envelope-v1", "job": NAN, "fit": NAN,
+                            "approval": NAN, "browser": NAN, "documents": NAN, "form": NAN, "auth": NAN}
+            approval = envelope.get("approval") if isinstance(envelope.get("approval"), dict) else {}
+            action_scope = str(approval.get("action_type") or row[1])
+            try:
+                context_sha, diff = snapshot_context(cur, review_item_id=item_id, application_id=application_id,
+                                                     action_scope=action_scope, envelope=envelope)
+            except Exception:
+                context_sha = hashlib.sha256(json.dumps(envelope, sort_keys=True, default=str).encode()).hexdigest()
+                diff = {"baseline": True, "changed": []}
+            cur.execute("""SELECT 1 FROM telegram_review_deliveries
+                            WHERE review_item_id=%s AND chat_id=%s AND delivery_kind='summary'
+                              AND context_sha256=%s AND status='sent' LIMIT 1;""",
+                        (item_id, chat_id, context_sha))
+            if cur.fetchone():
+                continue
             for artifact in review_artifacts(cur, item_id):
                 _deliver_artifact(cur, token, item_id=item_id, chat_id=chat_id, artifact=artifact)
+            for extra in context_files(envelope):
+                _deliver_artifact(cur, token, item_id=item_id, chat_id=chat_id,
+                                  artifact={"file_path": extra["path"], "filename": extra["filename"],
+                                            "mime_type": extra["mime_type"], "sha256": extra["sha256"]})
+            job = envelope.get("job") if isinstance(envelope.get("job"), dict) else {}
+            jd_text = job.get("jd_text") if isinstance(job, dict) else None
+            if isinstance(jd_text, str) and jd_text != NAN and jd_text.strip():
+                _deliver_memory_artifact(cur, token, item_id=item_id, chat_id=chat_id,
+                                         filename=f"{application_id}-job-description.txt",
+                                         payload=jd_text.encode("utf-8"), mime_type="text/plain")
+            _deliver_memory_artifact(cur, token, item_id=item_id, chat_id=chat_id,
+                                     filename=f"{application_id}-approval-context.json",
+                                     payload=json.dumps({"context": envelope, "diff": diff}, ensure_ascii=False,
+                                                        indent=2, default=str).encode("utf-8"),
+                                     mime_type="application/json")
             keyboard = _keyboard(cur, item_id, allowed_user_id, row[1], row[7] or {})
-            data: dict[str, Any] = {"chat_id": str(chat_id), "text": _message_text(row)}
+            data: dict[str, Any] = {"chat_id": str(chat_id), "text": _message_text(row, envelope, diff)}
             if keyboard:
                 data["reply_markup"] = keyboard
             sent = api(token, "sendMessage", data=data)
-            _record_delivery(cur, item_id, chat_id, int(sent["result"]["message_id"]), "summary")
+            _record_delivery(cur, item_id, chat_id, int(sent["result"]["message_id"]), "summary",
+                             context_sha256=context_sha)
+            delivered += 1
         conn.commit()
-        return len(rows)
-
+        return delivered
 
 def _load_offset(cur) -> int:
     cur.execute("SELECT update_offset FROM telegram_bot_state WHERE bot_key = %s;", (BOT_KEY,))
