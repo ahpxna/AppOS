@@ -99,10 +99,9 @@ def _callback_token(cur, item_id: str, action: str, allowed_user_id: int, ttl_ho
 
 def _keyboard(cur, item_id: str, allowed_user_id: int, item_type: str,
               payload: dict[str, Any]) -> str | None:
-    if item_type in {"question_required", "application_ready"}:
+    if item_type == "question_required":
         return None
-    if item_type == "autofill_review" and (
-            payload.get("execution_state") != "completed" or not payload.get("screenshot_sha256")):
+    if item_type == "autofill_review" and payload.get("execution_state") != "completed":
         revise = _callback_token(cur, item_id, "revise", allowed_user_id)
         reject = _callback_token(cur, item_id, "reject", allowed_user_id)
         return json.dumps({"inline_keyboard": [[
@@ -116,6 +115,20 @@ def _keyboard(cur, item_id: str, allowed_user_id: int, item_type: str,
             {"text": "📝 Revise / regenerate", "callback_data": f"rv:{revise}"},
             {"text": "❌ Reject", "callback_data": f"rv:{reject}"},
         ]]}, separators=(",", ":"))
+    if item_type == "reconciliation_required" and payload.get("privileged_execution_id"):
+        occurred = _callback_token(cur, item_id, "approve", allowed_user_id)
+        not_occurred = _callback_token(cur, item_id, "reject", allowed_user_id)
+        return json.dumps({"inline_keyboard": [[
+            {"text": "✅ OCCURRED", "callback_data": f"rv:{occurred}"},
+            {"text": "⭕ NOT OCCURRED", "callback_data": f"rv:{not_occurred}"},
+        ]]}, separators=(",", ":"))
+    if item_type == "application_ready":
+        prepare_gate = _callback_token(cur, item_id, "approve", allowed_user_id)
+        reject = _callback_token(cur, item_id, "reject", allowed_user_id)
+        return json.dumps({"inline_keyboard": [[
+            {"text": "🔎 PREPARE NEXT GATE", "callback_data": f"rv:{prepare_gate}"},
+            {"text": "❌ ABANDON", "callback_data": f"rv:{reject}"},
+        ]]}, separators=(",", ":"))
     approval_type = str(payload.get("approval_type") or "")
     approve_labels = {
         "privileged_begin_application": "✅ OPEN APPLY",
@@ -124,6 +137,7 @@ def _keyboard(cur, item_id: str, allowed_user_id: int, item_type: str,
         "privileged_login_employer_account": "✅ LOGIN",
         "privileged_use_email_verification": "✅ USE EMAIL VERIFICATION",
         "privileged_accept_terms": "✅ ACCEPT TERMS",
+        "privileged_upload_document": "✅ UPLOAD DOCUMENT",
         "privileged_advance_application_step": "✅ NEXT / CONTINUE",
         "privileged_auth_manual_retry": "🔁 AUTH RETRY",
         "privileged_mfa_retry": "🔁 RETRY AFTER MFA",
@@ -215,7 +229,10 @@ def _message_text(row: tuple[Any, ...], envelope: dict[str, Any] | None = None,
     if item_type == "question_required":
         lines.extend(["", f"Question: {payload.get('question') or NAN}", f"Reply: /answer {item_id} <your answer>"])
     elif item_type == "reconciliation_required":
-        lines.extend(["", "⚠️ Do not retry until the uncertain browser execution is reconciled."])
+        if payload.get("privileged_execution_id"):
+            lines.extend(["", "⚠️ Browser effect is uncertain. Choose OCCURRED or NOT OCCURRED. This consumed approval will never be replayed."])
+        else:
+            lines.extend(["", "⚠️ Do not retry until the uncertain browser execution is reconciled."])
     elif item_type == "application_ready":
         lines.extend(["", "Final Submit is not part of normal autofill. Prepare a separate privileged Submit approval when ready."])
     lines.extend(["", "Context delivery is soft-fail: missing sections show NaN and do not remove approval controls.",
@@ -286,6 +303,8 @@ def _deliver_memory_artifact(cur, token: str, *, item_id: str, chat_id: int,
 def dispatch_pending(conn, token: str, allowed_user_id: int, chat_id: int, *, limit: int = 20) -> int:
     with conn.cursor() as cur:
         sync_inbox(cur)
+        # Materialized review state is durable before any Telegram network side effect.
+        conn.commit()
         cur.execute(
             """SELECT v.review_item_id::text, v.item_type, v.priority, v.title,
                       v.summary_text, v.company, v.job_title, v.payload_json,
@@ -312,38 +331,57 @@ def dispatch_pending(conn, token: str, allowed_user_id: int, chat_id: int, *, li
             except Exception:
                 context_sha = hashlib.sha256(json.dumps(envelope, sort_keys=True, default=str).encode()).hexdigest()
                 diff = {"baseline": True, "changed": []}
+            interactive = row[1] != "question_required"
             cur.execute("""SELECT 1 FROM telegram_review_deliveries
                             WHERE review_item_id=%s AND chat_id=%s AND delivery_kind='summary'
                               AND context_sha256=%s AND status='sent' LIMIT 1;""",
                         (item_id, chat_id, context_sha))
-            if cur.fetchone():
+            summary_sent = bool(cur.fetchone())
+            live_callback = False
+            if interactive:
+                cur.execute("""SELECT 1 FROM telegram_callback_tokens
+                                WHERE review_item_id=%s AND allowed_user_id=%s
+                                  AND used_at IS NULL AND expires_at > now() LIMIT 1;""",
+                            (item_id, allowed_user_id))
+                live_callback = bool(cur.fetchone())
+            if summary_sent and (not interactive or live_callback):
                 continue
+
+            # Create/refresh opaque callbacks and commit them before network I/O.
+            # Thus a delivered button never depends on a later batch commit, and
+            # an expired callback forces a fresh summary even when context is unchanged.
+            keyboard = _keyboard(cur, item_id, allowed_user_id, row[1], row[7] or {})
+            conn.commit()
+
             for artifact in review_artifacts(cur, item_id):
                 _deliver_artifact(cur, token, item_id=item_id, chat_id=chat_id, artifact=artifact)
+                conn.commit()
             for extra in context_files(envelope):
                 _deliver_artifact(cur, token, item_id=item_id, chat_id=chat_id,
                                   artifact={"file_path": extra["path"], "filename": extra["filename"],
                                             "mime_type": extra["mime_type"], "sha256": extra["sha256"]})
+                conn.commit()
             job = envelope.get("job") if isinstance(envelope.get("job"), dict) else {}
             jd_text = job.get("jd_text") if isinstance(job, dict) else None
             if isinstance(jd_text, str) and jd_text != NAN and jd_text.strip():
                 _deliver_memory_artifact(cur, token, item_id=item_id, chat_id=chat_id,
                                          filename=f"{application_id}-job-description.txt",
                                          payload=jd_text.encode("utf-8"), mime_type="text/plain")
+                conn.commit()
             _deliver_memory_artifact(cur, token, item_id=item_id, chat_id=chat_id,
                                      filename=f"{application_id}-approval-context.json",
                                      payload=json.dumps({"context": envelope, "diff": diff}, ensure_ascii=False,
                                                         indent=2, default=str).encode("utf-8"),
                                      mime_type="application/json")
-            keyboard = _keyboard(cur, item_id, allowed_user_id, row[1], row[7] or {})
+            conn.commit()
             data: dict[str, Any] = {"chat_id": str(chat_id), "text": _message_text(row, envelope, diff)}
             if keyboard:
                 data["reply_markup"] = keyboard
             sent = api(token, "sendMessage", data=data)
             _record_delivery(cur, item_id, chat_id, int(sent["result"]["message_id"]), "summary",
                              context_sha256=context_sha)
+            conn.commit()
             delivered += 1
-        conn.commit()
         return delivered
 
 def _load_offset(cur) -> int:
@@ -397,16 +435,49 @@ def handle_callback(conn, token: str, allowed_user_id: int, callback: dict[str, 
                              actor=f"telegram:{sender_id}", note="Telegram review decision")
         with conn.cursor() as cur:
             cur.execute("UPDATE telegram_callback_tokens SET used_at = now() WHERE review_item_id = %s AND used_at IS NULL;", (item_id,))
+        # The human decision is durable before any privileged browser I/O.
         conn.commit()
+        execution_result = None
+        approval_type = str(result.get("approval_type") or "")
+        approval_request_id = str(result.get("approval_request_id") or "")
+        if action == "approve" and approval_type.startswith("privileged_") and approval_request_id:
+            from services.application_actions.privileged_action_v1 import execute_one
+            execution_result = execute_one(conn, approval_request_id)
+            # Materialize any approval/reconciliation produced by the executor.
+            with conn.cursor() as cur:
+                sync_inbox(cur)
+            conn.commit()
         api(token, "answerCallbackQuery", data={"callback_query_id": callback_id, "text": str(result["status"])})
         chat_id = int((callback.get("message") or {}).get("chat", {}).get("id") or 0)
         if chat_id:
+            suffix = ""
+            if execution_result:
+                suffix = f"\nBrowser action: {execution_result.get('action_type')} completed."
+            elif result.get("materialized_approval_request_id"):
+                suffix = "\nFresh exact-bound next gate prepared; approve it separately."
+            elif result.get("reconciliation_outcome"):
+                suffix = f"\nReconciliation: {result['reconciliation_outcome']}."
             api(token, "sendMessage", data={"chat_id": str(chat_id),
-                                             "text": f"✅ Review {item_id}: {result['status']}"})
+                                             "text": f"✅ Review {item_id}: {result['status']}{suffix}"})
     except ReviewError as exc:
         conn.rollback()
         api(token, "answerCallbackQuery", data={"callback_query_id": callback_id,
                                                  "text": str(exc)[:180], "show_alert": "true"})
+    except Exception as exc:
+        # execute_one already persists a consumed approval + needs_reconciliation
+        # when browser I/O may have occurred. Surface that state immediately.
+        try:
+            with conn.cursor() as cur:
+                sync_inbox(cur)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+        api(token, "answerCallbackQuery", data={"callback_query_id": callback_id,
+                                                 "text": "Browser action needs reconciliation", "show_alert": "true"})
+        chat_id = int((callback.get("message") or {}).get("chat", {}).get("id") or 0)
+        if chat_id:
+            api(token, "sendMessage", data={"chat_id": str(chat_id),
+                                             "text": f"⚠️ {str(exc)[:700]}\nA reconciliation item was created if browser I/O was uncertain."})
 
 
 def handle_message(conn, token: str, allowed_user_id: int, message: dict[str, Any]) -> None:

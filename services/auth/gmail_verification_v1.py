@@ -52,13 +52,15 @@ def gmail_account() -> str:
     return account
 
 
-def _run_gog(args: list[str], *, timeout: int = 45) -> Any:
+def _run_gog(args: list[str], *, timeout: int = 45, account: str | None = None) -> Any:
     binary = gog_bin()
     if shutil.which(binary) is None:
         raise GmailVerificationError(f"gog binary not found: {binary}")
-    account = gmail_account()
+    selected_account = (account or gmail_account()).strip()
+    if not selected_account:
+        raise GmailVerificationError("Gmail account binding is empty.")
     command = [binary, "--readonly", "--gmail-no-send", "--no-input", "--wrap-untrusted",
-               "--account", account, "--json", *args]
+               "--account", selected_account, "--json", *args]
     env = dict(os.environ)
     env["GOG_GMAIL_NO_SEND"] = "1"
     try:
@@ -181,13 +183,13 @@ def search_candidate_ids(*, recipient: str, requested_at: datetime, max_results:
     return ids
 
 
-def read_message(message_id: str, *, sanitized: bool) -> Any:
+def read_message(message_id: str, *, sanitized: bool, account: str | None = None) -> Any:
     args = ["gmail", "get", message_id]
     if sanitized:
         args.append("--sanitize-content")
     else:
         args.extend(["--format", "full"])
-    return _run_gog(args)
+    return _run_gog(args, account=account)
 
 
 def _sender_subject(message: Any) -> tuple[str, str]:
@@ -295,7 +297,7 @@ def create_verification_approval(cur, *, application_id: str, candidate_id: str,
                                  expected_url: str, expected_fingerprint: str,
                                  target_id: str, field_ref: str | None = None) -> str:
     cur.execute(
-        """SELECT gmail_message_id, sender, subject, received_at, verification_kind, secret_sha256, secret_context_json
+        """SELECT gmail_account, gmail_message_id, sender, subject, received_at, verification_kind, secret_sha256, secret_context_json
              FROM email_verification_candidates WHERE id=%s AND application_id=%s AND status='discovered';""",
         (candidate_id, application_id),
     )
@@ -303,22 +305,25 @@ def create_verification_approval(cur, *, application_id: str, candidate_id: str,
     if not row:
         raise GmailVerificationError("verification candidate is unavailable")
     payload = {
-        "candidate_id": candidate_id, "gmail_message_id": row[0], "sender": row[1] or "NaN",
-        "subject": row[2] or "NaN", "received_at": row[3].isoformat() if row[3] else "NaN",
-        "verification_kind": row[4], "secret_sha256": row[5], "secret_context": row[6] or {},
+        "candidate_id": candidate_id, "gmail_account": row[0], "gmail_message_id": row[1], "sender": row[2] or "NaN",
+        "subject": row[3] or "NaN", "received_at": row[4].isoformat() if row[4] else "NaN",
+        "verification_kind": row[5], "secret_sha256": row[6], "secret_context": row[7] or {},
         "expected_url": expected_url, "expected_page_fingerprint": expected_fingerprint,
         "target_id": target_id, "field_ref": field_ref or "NaN",
     }
     request_id = create_privileged_request(
         cur, application_id=application_id, action_type="privileged_use_email_verification",
-        payload=payload, summary=f"Use employer email verification ({row[4]}) after Telegram approval.",
+        payload=payload, summary=f"Use employer email verification ({row[5]}) from mailbox {row[0]} after Telegram approval.",
         requested_by="gmail-verification",
     )
     return request_id
 
 
 def refetch_secret(candidate: dict[str, Any]) -> str:
-    message = read_message(str(candidate["gmail_message_id"]), sanitized=candidate["verification_kind"] == "numeric_code")
+    account = str(candidate.get("gmail_account") or "").strip()
+    if not account:
+        raise GmailVerificationError("verification approval is missing its exact Gmail account binding")
+    message = read_message(str(candidate["gmail_message_id"]), sanitized=candidate["verification_kind"] == "numeric_code", account=account)
     secret = _extract_numeric_code(message) if candidate["verification_kind"] == "numeric_code" else _extract_magic_link(message)
     if not secret or hashlib.sha256(secret.encode()).hexdigest() != candidate["secret_sha256"]:
         raise GmailVerificationError("verification email secret changed or cannot be revalidated")

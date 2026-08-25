@@ -24,7 +24,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 from services.application_actions.action_request_v1 import create_privileged_request
 from services.application_actions.privileged_action_v1 import VERIFY_LABELS, _find_exact_control, _find_input, _host_is_allowed, _snapshot, _transport
-from services.auth.gmail_verification_v1 import discover_verification, persist_candidate
+from services.auth.gmail_verification_v1 import discover_verification, gmail_account, persist_candidate
 from services.common.config import database_dsn
 
 
@@ -83,7 +83,7 @@ def process_pending(conn, *, max_results: int = 10) -> int:
                             payload={
                                 "domain": link_host, "expected_origin": link_origin,
                                 "trust_source": "gmail_magic_link", "candidate_id": candidate_id,
-                                "gmail_message_id": candidate["message_id"],
+                                "gmail_account": gmail_account(), "gmail_message_id": candidate["message_id"],
                                 "secret_sha256": candidate["secret_sha256"],
                                 "review_context": {"screenshot_path": "NaN"},
                             },
@@ -95,7 +95,7 @@ def process_pending(conn, *, max_results: int = 10) -> int:
                         continue
 
             payload = {
-                "candidate_id": candidate_id, "gmail_message_id": candidate["message_id"],
+                "candidate_id": candidate_id, "gmail_account": gmail_account(), "gmail_message_id": candidate["message_id"],
                 "sender": candidate.get("sender") or "NaN", "subject": candidate.get("subject") or "NaN",
                 "received_at": candidate.get("received_at").isoformat() if candidate.get("received_at") else "NaN",
                 "verification_kind": candidate["kind"], "secret_sha256": candidate["secret_sha256"],

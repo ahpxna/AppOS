@@ -63,6 +63,7 @@ def main() -> int:
     with psycopg.connect(DSN, autocommit=True) as conn:
         with conn.cursor() as cur:
             document_id, tailoring = load_tailoring(cur, args.application_id)
+    experience = tailoring.get("experience_bullets", [])
     bullets = tailoring.get("project_bullets", [])
     skills = tailoring.get("skill_lines", [])
     subtitles = tailoring.get("project_subtitles", [])
@@ -73,7 +74,7 @@ def main() -> int:
     try:
         render_docx(
             template=args.template.expanduser(), output=docx_path, project_bullets=bullets,
-            skill_lines=skills, project_subtitles=subtitles,
+            skill_lines=skills, project_subtitles=subtitles, experience_bullets=experience,
         )
     except ResumeTemplateError as exc:
         raise SystemExit(f"Resume export blocked: {exc}") from exc

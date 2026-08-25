@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import subprocess
@@ -52,11 +53,21 @@ from services.common.resume_project_header_audit import (
     ResumeHeaderAuditError, load_template_subtitle_baselines, normalize as normalize_subtitle,
     validate_subtitle_change,
 )
+from services.common.resume_experience_bullet_audit import (
+    ResumeExperienceAuditError, load_template_experience_baselines,
+    normalize as normalize_experience, validate_experience_bullet_change,
+)
+from services.common.document_prompt_templates_v1 import (
+    RESUME_TARGET_COVERAGE_PERCENT, COVER_POSITIONING_TARGET_PERCENT,
+    build_resume_tailoring_prompt, build_cover_alignment_blueprint_prompt,
+    build_cover_alignment_audit_prompt, build_cover_letter_tailoring_prompt,
+    material_requirement_summary, requirement_catalog,
+)
 from services.common.config import database_dsn
 
 DSN = database_dsn()
 
-GENERATOR_VERSION = "document_generator_v2_structural_cover_grounding_2026_08_23"
+GENERATOR_VERSION = "document_generator_v4_jd_first_soft_degrade_2026_08_25"
 DEFAULT_OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
 DEFAULT_MODEL = get_model("docgen")
 
@@ -306,173 +317,82 @@ def build_resume_prompt(
     project_assets: Optional[Mapping[int, set[str]]] = None,
     baseline_subtitles: Optional[Mapping[int, str]] = None,
     baseline_bullets: Optional[Mapping[int, str]] = None,
+    experience_baselines: Optional[Mapping[int, Mapping[str, Any]]] = None,
 ) -> str:
-    return f"""You are JobOS Resume Agent V1.
-
-Write resume bullets for this specific job, using ONLY the approved assets below.
-
-TARGET ROLE: {app['job_title']} at {app['company']}
-ROLE FAMILY: {app['role_family']}
-SENIORITY: {app['seniority_level']}
-
-REQUIREMENTS THE FIT ANALYSIS MATCHED:
-{json.dumps(app['matched_requirements'], indent=2, ensure_ascii=False)}
-
-KNOWN GAPS (do not paper over these):
-{json.dumps(app['missing_or_weak_requirements'], indent=2, ensure_ascii=False)}
-
-{GROUNDING_RULES}
-
-APPROVED ASSETS:
-{catalog}
-
-Return ONLY valid JSON, no markdown, no commentary:
-{{
-  "project_updates": [
-    {{
-      "slot": "integer 1..12 from the fixed slot map below",
-      "text": "one project resume bullet, max 30 words, starts with a past-tense verb",
-      "source_asset_id": "<uuid copied exactly from an ASSET block>",
-      "previous_bullet": "exact current template bullet text for this slot, copied from BULLET BASELINE below",
-      "jd_requirement_quote": "exact verbatim phrase from the JD that this bullet addresses",
-      "project_evidence_quote": "exact verbatim phrase from the cited ASSET that supports the new wording",
-      "word_change_rationale": [
-        {{"before": "old/removed word or phrase", "after": "replacement word or phrase", "why": "specific JD + project-evidence reason"}}
-      ],
-      "why_better": "specific reason this bullet is more accurate and more relevant than previous_bullet",
-      "evidence_boundary": "academic project | coursework | research | lab exercise"
-    }}
-  ],
-  "skill_lines_ranked": [
-    {{
-      "category": "one existing resume skill category, max 45 characters",
-      "items": "comma-separated skills, max 220 characters, all backed by the cited asset",
-      "source_asset_id": "<uuid copied exactly from an ASSET block>"
-    }}
-  ],
-  "project_subtitle_updates": [
-    {{
-      "slot": "one of 1, 3, 5, 7, 9, 11; identifies the header that contains this project name",
-      "text": "replacement subtitle only: text between the fixed project name and the fixed GitHub link, max 88 chars",
-      "source_asset_id": "<uuid copied exactly from the matching project ASSET>",
-      "previous_subtitle": "exact template subtitle copied from BASELINE below",
-      "jd_requirement_quote": "exact verbatim phrase from the JD that this subtitle addresses",
-      "project_evidence_quote": "exact verbatim phrase from the cited ASSET that supports the subtitle",
-      "word_change_rationale": [
-        {{"before": "old/removed word or phrase", "after": "replacement word or phrase", "why": "specific JD + project-evidence reason"}}
-      ],
-      "why_better": "specific reason this subtitle is more accurate and more relevant than previous_subtitle"
-    }}
-  ],
-  "not_supported": ["JD requirements no asset can back"],
-  "self_check": "one sentence: confirm no bullet claims professional experience"
-}}
-
-Fixed project slots (title/date/link are immutable): {', '.join(FIXED_RESUME_PROJECTS)}.
-CURRENT FIXED-TEMPLATE SUBTITLE BASELINE (these are the only permitted `previous_subtitle` values):
-{json.dumps(dict(baseline_subtitles or {}), indent=2, ensure_ascii=False)}
-CURRENT FIXED-TEMPLATE BULLET BASELINE (these are the only permitted `previous_bullet` values):
-{json.dumps(dict(baseline_bullets or {}), indent=2, ensure_ascii=False)}
-Allowed source asset IDs for each immutable project block (cite only the IDs
-listed for the slot you update; `NONE` means that block is unavailable):
-{render_fixed_project_asset_rules(project_assets or {slot: set() for slot in FIXED_RESUME_PROJECT_ASSET_TERMS})}
-Select only tightly JD-relevant project slots backed by their asset. Do not
-invent a new project or reuse a weakly related one. For each selected project,
-use at most its two slots: odd primary slots are max 200 characters (target two
-visual lines); even secondary slots are max 105 characters (target one visual
-line). Do not output a secondary slot without its matching primary slot.
-Use full lines when backed by evidence, but rewrite if the final wrapped line
-would contain only a few words. Rank skills by explicit JD relevance first,
-then profile evidence, while retaining diverse categories; omit weak/unproven
-skills. Do not write education, employment, certification, contact,
-company-motivation, project name, project date, GitHub URL/link, or generic
-summary text: those fields are preserved verbatim from the template and this
-model has no control over them.
-Only `project_subtitle_updates.text` may change the words between the project
-name and GitHub link. Every changed substantive subtitle word must appear in
-`word_change_rationale`; no cosmetic or generic keyword edits.
-Every project bullet rewrite has the same evidence requirement: cite one exact
-JD phrase, one exact phrase from the matching project asset, and explain each
-substantive changed word. If the project does not genuinely match the JD, do
-not output a bullet for it. Never introduce a tool, result, responsibility, or
-experience that is not in the approved profile asset.
-Produce at most {min(max_bullets, 12)} project bullets. Fewer strong grounded
-bullets are better than weak filler; any unselected template bullet is cleared.
-"""
+    """Compatibility wrapper around the policy-locked resume prompt template."""
+    return build_resume_tailoring_prompt(
+        app=app, asset_catalog=catalog, max_project_bullets=max_bullets,
+        fixed_projects=FIXED_RESUME_PROJECTS,
+        fixed_project_asset_rules=render_fixed_project_asset_rules(
+            project_assets or {slot: set() for slot in FIXED_RESUME_PROJECT_ASSET_TERMS}
+        ),
+        baseline_subtitles=baseline_subtitles or {},
+        baseline_project_bullets=baseline_bullets or {},
+        experience_baselines=experience_baselines or {},
+    )
 
 
-def build_cover_letter_prompt(app: Dict[str, Any], catalog: str) -> str:
-    company_context = app.get("company_context") or {}
-    return f"""You are JobOS Cover Letter Agent V1.
+def normalize_cover_alignment_blueprint(parsed: Mapping[str, Any], jd_text: str) -> Dict[str, Any]:
+    """Keep only exact JD quotes and assign stable category-local IDs.
 
-Write a short cover letter using approved candidate assets and the separately
-sourced company context below.
+    The extractor is an LLM, so its classification is advisory. Exact-quote
+    validation is deterministic and fails closed: invented/paraphrased targets
+    never reach the cover-letter generation prompt.
+    """
+    result: Dict[str, Any] = {}
+    specs = (
+        ("about_me_targets", "A"), ("interest_targets", "I"),
+        ("soft_skill_targets", "S"), ("technical_targets", "T"),
+    )
+    normalized_jd = " ".join(str(jd_text or "").split()).casefold()
+    for key, prefix in specs:
+        clean = []
+        raw_items = parsed.get(key, []) if isinstance(parsed, Mapping) else []
+        if not isinstance(raw_items, list):
+            raw_items = []
+        for item in raw_items:
+            if not isinstance(item, Mapping):
+                continue
+            quote = " ".join(str(item.get("quote") or "").split())
+            if len(quote) < 4 or quote.casefold() not in normalized_jd:
+                continue
+            clean.append({
+                "id": f"{prefix}{len(clean) + 1}",
+                "quote": quote,
+                "why": " ".join(str(item.get("why") or "").split()),
+            })
+        result[key] = clean
+    return result
 
-TARGET ROLE: {app['job_title']} at {app['company']}
-FIT SCORE: {app['fit_score']} ({app['fit_decision']})
 
-MATCHED JD REQUIREMENTS:
-{json.dumps(app.get('matched_requirements', []), indent=2, ensure_ascii=False)}
+def merge_cover_alignment_blueprint(
+    existing: Mapping[str, Any], additions: Mapping[str, Any], jd_text: str,
+) -> Dict[str, Any]:
+    """Merge a completeness-audit result and re-normalize exact JD quotes."""
+    combined: Dict[str, list[dict[str, Any]]] = {}
+    for key in ("about_me_targets", "interest_targets", "soft_skill_targets", "technical_targets"):
+        rows: list[dict[str, Any]] = []
+        for source in (existing, additions):
+            values = source.get(key, []) if isinstance(source, Mapping) else []
+            if not isinstance(values, list):
+                continue
+            for item in values:
+                if isinstance(item, Mapping):
+                    rows.append({
+                        "quote": item.get("quote", ""),
+                        "why": item.get("why", ""),
+                    })
+        combined[key] = rows
+    return normalize_cover_alignment_blueprint(combined, jd_text)
 
-KNOWN GAPS (do not hide these with invented experience):
-{json.dumps(app.get('missing_or_weak_requirements', []), indent=2, ensure_ascii=False)}
 
-RISK FLAGS RAISED BY THE FIT ANALYSIS (address honestly or stay silent, never contradict):
-{json.dumps(app['risk_flags'], indent=2, ensure_ascii=False)}
-
-{GROUNDING_RULES}
-9. State the candidate's actual level plainly. If the evidence is academic,
-   the letter must read as a capable new graduate, not a seasoned practitioner.
-10. Company facts may be used only from the SOURCED COMPANY CONTEXT below.
-    For every paragraph that uses a company fact, set "uses_company_context"
-    true and copy one or more matching URLs exactly into "company_source_urls".
-11. Company facts are not candidate evidence: they never replace a real
-    source_asset_id for a paragraph about the candidate.
-12. If the company context is empty, do not claim familiarity beyond the JD.
-13. Spend effort on relevance, not invention: for every candidate-evidence
-    paragraph cite one exact JD phrase and one exact phrase from its asset.
-14. When company context is present, include at least one genuinely
-    company-specific paragraph with a cited source URL, a concrete sourced
-    insight, and an honest explanation of how an approved candidate asset
-    connects to it. That paragraph must cite a real candidate asset. Do not
-    invent a company initiative, culture, product, or experience merely to
-    sound tailored.
-
-SOURCED COMPANY CONTEXT (may be empty):
-{json.dumps(company_context, indent=2, ensure_ascii=False)}
-
-APPROVED ASSETS:
-{catalog}
-
-Return ONLY valid JSON:
-{{
-  "paragraphs": [
-    {{
-      "text": "one paragraph, 2-4 sentences",
-      "source_asset_id": "<uuid copied exactly from an ASSET block>",
-      "purpose": "evidence | motivation",
-      "jd_requirement_quote": "exact JD phrase for this paragraph",
-      "candidate_evidence_quote": "exact phrase from cited ASSET",
-      "uses_company_context": false,
-      "company_source_urls": ["<exact URL from SOURCED COMPANY CONTEXT, or omit when unused>"],
-      "company_insight": "specific source-backed company fact, empty when unused",
-      "company_evidence_quote": "exact phrase from SOURCED COMPANY CONTEXT supporting company_insight, empty when unused",
-      "why_company_fit": "honest explanation linking company insight, JD and one approved candidate asset, empty when unused"
-    }}
-  ],
-  "not_supported": ["claims deliberately left out"],
-  "self_check": "one sentence confirming no unsupported experience is implied"
-}}
-
-Write only the substantive evidence/motivation paragraphs (two to four total).
-The renderer adds the deterministic greeting, application sentence, and closing;
-do not emit an opening or closing paragraph. Every paragraph must cite a real
-candidate asset id.
-Write a strong, specific application narrative, but never turn academic/project
-work into employment or manufacture a company insight. A less flashy letter
-with literal evidence is better than a polished false claim.
-"""
-
+def build_cover_letter_prompt(
+    app: Dict[str, Any], catalog: str, alignment_blueprint: Optional[Mapping[str, Any]] = None,
+) -> str:
+    """Compatibility wrapper around the sentence-classified cover prompt."""
+    return build_cover_letter_tailoring_prompt(
+        app=app, asset_catalog=catalog, alignment_blueprint=alignment_blueprint or {},
+    )
 
 def build_short_answer_prompt(app: Dict[str, Any], catalog: str, questions: List[str]) -> str:
     return f"""You are JobOS Short Answer Agent V1.
@@ -519,14 +439,32 @@ def validate_and_render(
     jd_text: str = "",
     company: str = "",
     job_title: str = "",
+    experience_baselines: Optional[Mapping[int, Mapping[str, Any]]] = None,
+    experience_source_asset_ids: Optional[set[str]] = None,
+    matched_requirement_ids: Optional[set[str]] = None,
+    resume_coverage_target_percent: int = 0,
+    resume_total_material_requirement_count: int = 0,
+    cover_alignment_blueprint: Optional[Mapping[str, Any]] = None,
 ) -> Tuple[str, List[str], Dict[str, Any], List[str]]:
     """Drop any claim citing an unknown asset. Returns
     (content, asset_ids_used, evidence_map, dropped)."""
     dropped: List[str] = []
     used: List[str] = []
     lines: List[str] = []
-    evidence: Dict[str, Any] = {"doc_type": doc_type, "claims": []}
+    evidence: Dict[str, Any] = {"doc_type": doc_type, "claims": [], "warnings": []}
     valid_company_urls = valid_company_urls or set()
+    matched_requirement_ids = set(matched_requirement_ids or set())
+    experience_source_asset_ids = (
+        set(experience_source_asset_ids) if experience_source_asset_ids is not None else None
+    )
+    covered_requirement_ids: set[str] = set()
+
+    def requirement_ids(item: Mapping[str, Any]) -> list[str]:
+        raw = item.get("matched_requirement_ids") or item.get("alignment_ids") or []
+        if not isinstance(raw, list):
+            return []
+        clean = [str(value).strip() for value in raw if str(value).strip()]
+        return [value for value in clean if not matched_requirement_ids or value in matched_requirement_ids]
 
     def check(src: Optional[str], text: str, allow_none: bool = False) -> bool:
         if allow_none and (src in (None, "", "none")):
@@ -537,7 +475,60 @@ def validate_and_render(
         return True
 
     if doc_type == "resume":
-        project_bullets, skill_lines, project_subtitles = [], [], []
+        experience_bullets, project_bullets, skill_lines, project_subtitles = [], [], [], []
+        seen_experience_slots: set[int] = set()
+        for item in parsed.get("experience_updates", []):
+            try:
+                slot = int(item.get("slot"))
+            except (TypeError, ValueError):
+                continue
+            if slot in seen_experience_slots or slot not in (experience_baselines or {}):
+                continue
+            text, src = (item.get("text") or "").strip(), item.get("source_asset_id")
+            if not text:
+                continue
+            if src in (None, "", "none"):
+                src = None
+            elif not check(src, text):
+                continue
+            change = {
+                "slot": slot, "claim": text,
+                "header_context": item.get("header_context", ""),
+                "previous_bullet": item.get("previous_bullet", ""),
+                "jd_requirement_quote": item.get("jd_requirement_quote", ""),
+                "experience_evidence_quote": item.get("experience_evidence_quote", ""),
+                "word_change_rationale": item.get("word_change_rationale"),
+                "why_better": item.get("why_better", ""),
+            }
+            audit_problems = validate_experience_bullet_change(
+                change, baselines=experience_baselines or {}, jd_text=jd_text,
+            )
+            if audit_problems:
+                dropped.append(f"{text[:70]}... (experience bullet audit: {'; '.join(audit_problems)})")
+                continue
+            req_ids = requirement_ids(item)
+            if matched_requirement_ids and not req_ids:
+                evidence["warnings"].append(
+                    f"Experience slot {slot} is JD-aligned but has no supportable requirement ID; kept it without counting it toward resume coverage."
+                )
+            seen_experience_slots.add(slot)
+            covered_requirement_ids.update(req_ids)
+            lines.append(f"- {text}")
+            if src:
+                used.append(src)
+            claim = {
+                "claim": text, "source_asset_id": src, "kind": "resume_experience_bullet_change",
+                "slot": slot, "header_context": normalize_experience(item.get("header_context")),
+                "previous_bullet": normalize_experience(item.get("previous_bullet")),
+                "jd_requirement_quote": normalize_experience(item.get("jd_requirement_quote")),
+                "experience_evidence_quote": normalize_experience(item.get("experience_evidence_quote")),
+                "matched_requirement_ids": req_ids,
+                "word_change_rationale": item.get("word_change_rationale"),
+                "why_better": normalize_experience(item.get("why_better")),
+            }
+            evidence["claims"].append(claim)
+            experience_bullets.append({"slot": slot, "text": text, **claim})
+
         raw_bullets = parsed.get("project_updates", parsed.get("project_bullets", parsed.get("bullets", [])))
         seen_project_slots: set[int] = set()
         for position, b in enumerate(raw_bullets[:12], start=1):
@@ -574,7 +565,12 @@ def validate_and_render(
             if audit_problems:
                 dropped.append(f"{text[:70]}... (project bullet audit: {'; '.join(audit_problems)})")
                 continue
+            req_ids = requirement_ids(b)
+            if matched_requirement_ids and not req_ids:
+                dropped.append(f"{text[:70]}... (project rewrite has no valid matched_requirement_ids)")
+                continue
             seen_project_slots.add(slot)
+            covered_requirement_ids.update(req_ids)
             lines.append(f"- {text}")
             used.append(src)
             claim = {
@@ -587,6 +583,7 @@ def validate_and_render(
                 "word_change_rationale": b.get("word_change_rationale"),
                 "why_better": normalize_bullet(b.get("why_better")),
                 "evidence_boundary": b.get("evidence_boundary", ""),
+                "matched_requirement_ids": req_ids,
             }
             evidence["claims"].append(claim)
             project_bullets.append({"slot": slot, "text": text, **claim})
@@ -596,11 +593,33 @@ def validate_and_render(
             text = f"{category}: {values}"
             if not category or not values or not check(src, text):
                 continue
+            req_ids = requirement_ids(item)
+            jd_quote = normalize_bullet(item.get("jd_requirement_quote"))
+            evidence_quote = normalize_bullet(item.get("skill_evidence_quote"))
+            if matched_requirement_ids:
+                if not req_ids:
+                    dropped.append(f"{text[:70]}... (skill line has no valid matched_requirement_ids)")
+                    continue
+                if len(jd_quote) < 8 or jd_quote.casefold() not in jd_text.casefold():
+                    dropped.append(f"{text[:70]}... (skill line lacks an exact JD quote)")
+                    continue
+                if len(evidence_quote) < 8:
+                    dropped.append(f"{text[:70]}... (skill line lacks an exact user-evidence quote)")
+                    continue
+            covered_requirement_ids.update(req_ids)
             lines.append(f"- {text}")
             used.append(src)
-            claim = {"claim": text, "source_asset_id": src, "kind": "skill_line"}
+            claim = {
+                "claim": text, "source_asset_id": src, "kind": "resume_skill_line",
+                "matched_requirement_ids": req_ids, "jd_requirement_quote": jd_quote,
+                "skill_evidence_quote": evidence_quote,
+            }
             evidence["claims"].append(claim)
-            skill_lines.append({"category": category, "items": values, "source_asset_id": src})
+            skill_lines.append({
+                "category": category, "items": values, "source_asset_id": src,
+                "matched_requirement_ids": req_ids, "jd_requirement_quote": jd_quote,
+                "skill_evidence_quote": evidence_quote,
+            })
         seen_subtitle_slots: set[int] = set()
         for item in parsed.get("project_subtitle_updates", [])[:6]:
             try:
@@ -629,7 +648,12 @@ def validate_and_render(
             if audit_problems:
                 dropped.append(f"{text[:70]}... (project subtitle audit: {'; '.join(audit_problems)})")
                 continue
+            req_ids = requirement_ids(item)
+            if matched_requirement_ids and not req_ids:
+                dropped.append(f"{text[:70]}... (project subtitle has no valid matched_requirement_ids)")
+                continue
             seen_subtitle_slots.add(slot)
+            covered_requirement_ids.update(req_ids)
             used.append(src)
             lines.append(f"- [Project subtitle slot {slot}] {text}")
             claim = {
@@ -639,75 +663,291 @@ def validate_and_render(
                 "project_evidence_quote": normalize_subtitle(item.get("project_evidence_quote")),
                 "word_change_rationale": item.get("word_change_rationale"),
                 "why_better": normalize_subtitle(item.get("why_better")),
+                "matched_requirement_ids": req_ids,
             }
             evidence["claims"].append(claim)
             project_subtitles.append({"slot": slot, "text": text, **claim})
         evidence["resume_template"] = {
+            "experience_bullets": experience_bullets,
             "project_bullets": project_bullets, "skill_lines": skill_lines,
             "project_subtitles": project_subtitles,
         }
+        supportable_count = len(matched_requirement_ids)
+        total_material_count = max(int(resume_total_material_requirement_count or 0), supportable_count)
+        truthful_ceiling_percent = (
+            100.0 if total_material_count == 0
+            else round(100.0 * supportable_count / total_material_count, 1)
+        )
+        overall_coverage_percent = (
+            100.0 if total_material_count == 0
+            else round(100.0 * len(covered_requirement_ids) / total_material_count, 1)
+        )
+        required_covered_count = 0
+        if resume_coverage_target_percent and total_material_count:
+            required_covered_count = min(
+                supportable_count,
+                math.ceil(resume_coverage_target_percent * total_material_count / 100.0),
+            )
+        target_met = (
+            not resume_coverage_target_percent
+            or len(covered_requirement_ids) >= required_covered_count
+        )
+        evidence["jd_alignment"] = {
+            "target_percent": int(resume_coverage_target_percent or 0),
+            "total_material_requirement_count": total_material_count,
+            "supportable_requirement_ids": sorted(matched_requirement_ids),
+            "covered_requirement_ids": sorted(covered_requirement_ids),
+            "supportable_requirement_count": supportable_count,
+            "covered_requirement_count": len(covered_requirement_ids),
+            "required_supportable_covered_count": required_covered_count,
+            "truthful_coverage_ceiling_percent": truthful_ceiling_percent,
+            "target_reachable_truthfully": (
+                truthful_ceiling_percent >= resume_coverage_target_percent
+                if resume_coverage_target_percent else True
+            ),
+            "coverage_percent": overall_coverage_percent,
+            "target_met": target_met,
+            "gate_passed": True,
+            "non_blocking": True,
+            "policy": (
+                "80% is an optimization target over all material JD requirements, not a hard gate. "
+                "Missing information lowers specificity/coverage; safe edits and baseline content survive."
+            ),
+        }
+        if not target_met:
+            evidence["warnings"].append(
+                f"Resume JD coverage {overall_coverage_percent:.1f}% is below the {resume_coverage_target_percent}% target; "
+                f"kept safe content instead of fabricating missing information."
+            )
+        if not lines and not dropped:
+            # Sparse information must not brick the document pipeline. Safety or
+            # binding violations still fail closed rather than being hidden by a
+            # baseline fallback. The fixed renderer preserves every slot unchanged.
+            baseline_note = "Resume template preserved; no safe JD-specific edits were available from current information."
+            lines.append(f"- {baseline_note}")
+            evidence["claims"].append({
+                "claim": baseline_note, "source_asset_id": None,
+                "kind": "resume_structure", "purpose": "baseline_preserved",
+            })
+            evidence["warnings"].append("No safe resume rewrites survived; preserved the existing resume template.")
 
     elif doc_type == "cover_letter":
+        blueprint = dict(cover_alignment_blueprint or {})
+        target_by_id: Dict[str, Dict[str, Any]] = {}
+        for key in ("about_me_targets", "interest_targets", "soft_skill_targets", "technical_targets"):
+            for item in blueprint.get(key, []) or []:
+                if isinstance(item, Mapping) and item.get("id"):
+                    target_by_id[str(item["id"])] = dict(item)
+        available_positioning_ids = {
+            target_id for target_id in target_by_id
+            if target_id.startswith(("A", "I", "S"))
+        }
+        selected_positioning_ids: set[str] = set()
+        covered_positioning_ids: set[str] = set()
         company_specific_count = 0
-        for p in parsed.get("paragraphs", []):
-            text, src = (p.get("text") or "").strip(), p.get("source_asset_id")
-            if not text:
-                continue
-            requested_urls = p.get("company_source_urls") or []
-            if not isinstance(requested_urls, list):
-                requested_urls = []
-            company_urls = [url for url in requested_urls if isinstance(url, str)]
-            invalid_urls = [url for url in company_urls if url not in valid_company_urls]
-            uses_company_context = bool(p.get("uses_company_context")) or bool(company_urls)
-            if invalid_urls:
-                dropped.append(f"{text[:70]}... (cited unknown company URL)")
-                continue
-            if not check(src, text):
-                continue
-            if uses_company_context and not company_urls:
-                dropped.append(f"{text[:70]}... (company claim has no source URL)")
-                continue
-            if uses_company_context and src not in valid_asset_ids:
-                dropped.append(f"{text[:70]}... (company-specific paragraph must cite a candidate asset)")
-                continue
-            jd_quote = (p.get("jd_requirement_quote") or "").strip()
-            evidence_quote = (p.get("candidate_evidence_quote") or "").strip()
-            if src in valid_asset_ids and (len(jd_quote) < 8 or jd_quote.casefold() not in jd_text.casefold()):
-                dropped.append(f"{text[:70]}... (candidate paragraph lacks an exact JD requirement quote)")
-                continue
-            if src in valid_asset_ids and len(evidence_quote) < 8:
-                dropped.append(f"{text[:70]}... (candidate paragraph lacks an exact asset evidence quote)")
-                continue
-            company_insight = (p.get("company_insight") or "").strip()
-            company_evidence_quote = (p.get("company_evidence_quote") or "").strip()
-            why_company_fit = (p.get("why_company_fit") or "").strip()
-            if uses_company_context and (len(company_insight) < 12 or len(company_evidence_quote) < 8 or len(why_company_fit) < 24):
-                dropped.append(f"{text[:70]}... (company-specific paragraph needs source quote, insight and fit reason)")
-                continue
-            lines.append(text)
-            if src in valid_asset_ids:
+        has_sentence_schema = any(
+            isinstance(p, Mapping) and isinstance(p.get("sentences"), list)
+            for p in parsed.get("paragraphs", [])
+        )
+
+        if has_sentence_schema:
+            allowed_kinds = {
+                "about_me_positioning", "role_interest", "soft_skill_positioning",
+                "technical_evidence", "company_interest",
+            }
+            prefix_by_kind = {
+                "about_me_positioning": "A", "role_interest": "I",
+                "soft_skill_positioning": "S", "technical_evidence": "T",
+                "company_interest": "I",
+            }
+            for paragraph in parsed.get("paragraphs", [])[:4]:
+                if not isinstance(paragraph, Mapping):
+                    continue
+                accepted_sentences: list[str] = []
+                for sentence in paragraph.get("sentences", [])[:4]:
+                    if not isinstance(sentence, Mapping):
+                        continue
+                    text = " ".join(str(sentence.get("text") or "").split())
+                    kind = str(sentence.get("kind") or "").strip()
+                    if not text or kind not in allowed_kinds:
+                        continue
+                    raw_ids = sentence.get("alignment_ids") or []
+                    alignment_ids = [str(value).strip() for value in raw_ids if str(value).strip()] if isinstance(raw_ids, list) else []
+                    jd_quote = " ".join(str(sentence.get("jd_requirement_quote") or "").split())
+                    expected_prefix = prefix_by_kind[kind]
+                    valid_ids = [
+                        target_id for target_id in alignment_ids
+                        if target_id in target_by_id and target_id.startswith(expected_prefix)
+                        and normalize_bullet(target_by_id[target_id].get("quote")) == normalize_bullet(jd_quote)
+                    ]
+                    if alignment_ids and not valid_ids:
+                        dropped.append(f"{text[:70]}... (alignment id/quote does not match validated JD blueprint)")
+                        continue
+                    if kind != "company_interest":
+                        if len(jd_quote) < 4 or jd_quote.casefold() not in jd_text.casefold():
+                            dropped.append(f"{text[:70]}... (positioning/evidence sentence lacks exact JD quote)")
+                            continue
+                    src = sentence.get("source_asset_id")
+                    candidate_quote = " ".join(str(sentence.get("candidate_evidence_quote") or "").split())
+                    requested_urls = sentence.get("company_source_urls") or []
+                    company_urls = [url for url in requested_urls if isinstance(url, str)] if isinstance(requested_urls, list) else []
+                    invalid_urls = [url for url in company_urls if url not in valid_company_urls]
+                    uses_company_context = bool(sentence.get("uses_company_context")) or bool(company_urls)
+                    company_insight = " ".join(str(sentence.get("company_insight") or "").split())
+                    company_evidence_quote = " ".join(str(sentence.get("company_evidence_quote") or "").split())
+
+                    if kind == "technical_evidence":
+                        if not check(src, text):
+                            continue
+                        if len(candidate_quote) < 8:
+                            dropped.append(f"{text[:70]}... (technical sentence lacks exact approved user-evidence quote)")
+                            continue
+                        if uses_company_context:
+                            dropped.append(f"{text[:70]}... (technical sentence may not mix company-context claims)")
+                            continue
+                        used.append(src)
+                        evidence["claims"].append({
+                            "claim": text, "source_asset_id": src, "kind": "cover_letter_evidence",
+                            "purpose": "technical_evidence", "alignment_ids": valid_ids,
+                            "jd_requirement_quote": jd_quote,
+                            "candidate_evidence_quote": candidate_quote,
+                            "uses_company_context": False, "company_source_urls": [],
+                        })
+                    elif kind == "company_interest":
+                        if src not in (None, "", "none"):
+                            dropped.append(f"{text[:70]}... (company-interest sentence must not use a candidate asset as proof of interest)")
+                            continue
+                        if not company_urls or invalid_urls:
+                            dropped.append(f"{text[:70]}... (company-interest sentence lacks known company source URL)")
+                            continue
+                        if len(company_insight) < 8 or len(company_evidence_quote) < 8:
+                            dropped.append(f"{text[:70]}... (company-interest sentence lacks sourced company insight/evidence quote)")
+                            continue
+                        company_specific_count += 1
+                        evidence["claims"].append({
+                            "claim": text, "source_asset_id": None, "kind": "cover_letter_company_interest",
+                            "purpose": "company_interest", "alignment_ids": valid_ids,
+                            "jd_requirement_quote": jd_quote,
+                            "uses_company_context": True, "company_source_urls": company_urls,
+                            "company_insight": company_insight,
+                            "company_evidence_quote": company_evidence_quote,
+                        })
+                    else:
+                        if src not in (None, "", "none") or uses_company_context:
+                            dropped.append(f"{text[:70]}... (subjective positioning must remain uncited and separate from factual/company claims)")
+                            continue
+                        if len(jd_quote) < 4 or jd_quote.casefold() not in jd_text.casefold():
+                            dropped.append(f"{text[:70]}... (positioning sentence lacks an exact JD quote)")
+                            continue
+                        # A/I/S are intentionally selected, not exhaustive. If the
+                        # optional blueprint failed to parse, an exact JD quote can
+                        # still support safe subjective positioning without an ID.
+                        if alignment_ids and not valid_ids:
+                            dropped.append(f"{text[:70]}... (positioning alignment id/quote does not match the candidate pool)")
+                            continue
+                        evidence["claims"].append({
+                            "claim": text, "source_asset_id": None, "kind": "cover_letter_positioning",
+                            "positioning_kind": kind, "alignment_ids": valid_ids,
+                            "jd_requirement_quote": jd_quote,
+                            "uses_company_context": False, "company_source_urls": [],
+                        })
+                        selected_positioning_ids.update(
+                            target_id for target_id in valid_ids if target_id.startswith(("A", "I", "S"))
+                        )
+                    covered_positioning_ids.update(
+                        target_id for target_id in valid_ids if target_id.startswith(("A", "I", "S"))
+                    )
+                    accepted_sentences.append(text)
+                if accepted_sentences:
+                    lines.append(" ".join(accepted_sentences))
+
+            coverage = 100.0 if not selected_positioning_ids else round(
+                100.0 * len(covered_positioning_ids & selected_positioning_ids) / len(selected_positioning_ids), 1
+            )
+            evidence["cover_alignment"] = {
+                "target_percent": COVER_POSITIONING_TARGET_PERCENT,
+                "available_positioning_ids": sorted(available_positioning_ids),
+                "selected_positioning_ids": sorted(selected_positioning_ids),
+                "covered_positioning_ids": sorted(covered_positioning_ids & selected_positioning_ids),
+                "coverage_percent": coverage,
+                "gate_passed": True,
+                "non_blocking": True,
+                "selection_policy": "select only a few A/I/S themes that best fit the user background; exhaustive JD A/I/S coverage is not required",
+                "technical_policy": "technical/factual candidate claims require approved user assets; A/I/S positioning may be uncited subjective intent/working style",
+                "blueprint": blueprint,
+            }
+            if valid_company_urls and not company_specific_count:
+                evidence["warnings"].append(
+                    "Company research was available but no safe sourced company-interest sentence was used; continued without it."
+                )
+        else:
+            # Legacy validation path retained for old stored/test payloads. New
+            # generation always uses the sentence-classified schema above.
+            for p in parsed.get("paragraphs", []):
+                text, src = (p.get("text") or "").strip(), p.get("source_asset_id")
+                if not text:
+                    continue
+                requested_urls = p.get("company_source_urls") or []
+                if not isinstance(requested_urls, list):
+                    requested_urls = []
+                company_urls = [url for url in requested_urls if isinstance(url, str)]
+                invalid_urls = [url for url in company_urls if url not in valid_company_urls]
+                uses_company_context = bool(p.get("uses_company_context")) or bool(company_urls)
+                if invalid_urls:
+                    dropped.append(f"{text[:70]}... (cited unknown company URL)")
+                    continue
+                if not check(src, text):
+                    continue
+                if uses_company_context and not company_urls:
+                    dropped.append(f"{text[:70]}... (company claim has no source URL)")
+                    continue
+                if uses_company_context and src not in valid_asset_ids:
+                    dropped.append(f"{text[:70]}... (company-specific paragraph must cite a candidate asset)")
+                    continue
+                jd_quote = (p.get("jd_requirement_quote") or "").strip()
+                evidence_quote = (p.get("candidate_evidence_quote") or "").strip()
+                if src in valid_asset_ids and (len(jd_quote) < 8 or jd_quote.casefold() not in jd_text.casefold()):
+                    dropped.append(f"{text[:70]}... (candidate paragraph lacks an exact JD requirement quote)")
+                    continue
+                if src in valid_asset_ids and len(evidence_quote) < 8:
+                    dropped.append(f"{text[:70]}... (candidate paragraph lacks an exact asset evidence quote)")
+                    continue
+                company_insight = (p.get("company_insight") or "").strip()
+                company_evidence_quote = (p.get("company_evidence_quote") or "").strip()
+                why_company_fit = (p.get("why_company_fit") or "").strip()
+                if uses_company_context and (len(company_insight) < 12 or len(company_evidence_quote) < 8 or len(why_company_fit) < 24):
+                    dropped.append(f"{text[:70]}... (company-specific paragraph needs source quote, insight and fit reason)")
+                    continue
+                lines.append(text)
                 used.append(src)
-            if uses_company_context:
-                company_specific_count += 1
-            evidence["claims"].append({
-                "claim": text,
-                "source_asset_id": src,
-                "kind": "cover_letter_evidence" if src in valid_asset_ids else "cover_letter_structure",
-                "purpose": p.get("purpose", ""),
-                "jd_requirement_quote": jd_quote,
-                "candidate_evidence_quote": evidence_quote,
-                "uses_company_context": uses_company_context,
-                "company_source_urls": company_urls,
-                "company_insight": company_insight,
-                "company_evidence_quote": company_evidence_quote,
-                "why_company_fit": why_company_fit,
-            })
-        if valid_company_urls and not company_specific_count:
-            dropped.append("Cover letter has company research sources but no verified company-specific paragraph.")
-            lines, used, evidence["claims"] = [], [], []
-        if lines and company.strip() and job_title.strip():
+                if uses_company_context:
+                    company_specific_count += 1
+                evidence["claims"].append({
+                    "claim": text, "source_asset_id": src, "kind": "cover_letter_evidence",
+                    "purpose": p.get("purpose", ""), "jd_requirement_quote": jd_quote,
+                    "candidate_evidence_quote": evidence_quote,
+                    "uses_company_context": uses_company_context, "company_source_urls": company_urls,
+                    "company_insight": company_insight, "company_evidence_quote": company_evidence_quote,
+                    "why_company_fit": why_company_fit,
+                })
+            if valid_company_urls and not company_specific_count:
+                evidence["warnings"].append(
+                    "Company research was available but no verified company-specific paragraph survived; continued without it."
+                )
+
+        if company.strip() and job_title.strip():
             opening = f"I am applying for the {job_title.strip()} position at {company.strip()}."
             closing = "Thank you for considering my application."
+            if not lines:
+                fallback = "I would welcome the opportunity to contribute in this role and learn more about the team's priorities."
+                lines = [fallback]
+                evidence["claims"].append({
+                    "claim": fallback, "source_asset_id": None,
+                    "kind": "cover_letter_structure", "purpose": "sparse_information_fallback",
+                })
+                evidence["warnings"].append(
+                    "Cover-letter information was sparse; emitted a conservative subjective fallback instead of failing."
+                )
             lines = [opening, *lines, closing]
             evidence["claims"] = [
                 {"claim": opening, "source_asset_id": None,
@@ -913,18 +1153,22 @@ def main() -> int:
 
             assets = fetch_source_assets(cur, app["role_family"])
             if not assets:
-                print("ERROR: no approved profile assets. Approve assets before generating.")
-                return 1
+                print("WARNING: no approved profile assets; generating only safe JD/role positioning or baseline-preserving output.")
 
             valid_ids = {a["profile_asset_id"] for a in assets}
+            resume_experience_asset_ids = {
+                a["profile_asset_id"] for a in assets if a.get("asset_type") == "source_document_asset"
+            }
             resume_project_assets = fixed_project_asset_ids(assets)
             resume_subtitle_baselines: dict[int, str] = {}
             resume_bullet_baselines: dict[int, str] = {}
+            resume_experience_baselines: dict[int, dict[str, Any]] = {}
             if args.doc_type == "resume":
                 try:
                     resume_subtitle_baselines = load_template_subtitle_baselines()
                     resume_bullet_baselines = load_template_bullet_baselines()
-                except (ResumeHeaderAuditError, ResumeBulletAuditError) as exc:
+                    resume_experience_baselines = load_template_experience_baselines()
+                except (ResumeHeaderAuditError, ResumeBulletAuditError, ResumeExperienceAuditError) as exc:
                     print(f"ERROR: resume auditing needs the fixed Word template: {exc}")
                     return 1
             valid_company_urls = set((app.get("company_context") or {}).get("sources") or [])
@@ -936,13 +1180,40 @@ def main() -> int:
             }[args.doc_type]
             catalog = render_asset_catalog(assets, field=field)
 
+            cover_alignment_blueprint: dict[str, Any] = {}
+            alignment_prompt = ""
+            alignment_raw = ""
+            alignment_audit_prompt = ""
+            alignment_audit_raw = ""
             if args.doc_type == "resume":
                 prompt = build_resume_prompt(
                     app, catalog, args.max_bullets, resume_project_assets, resume_subtitle_baselines,
-                    resume_bullet_baselines,
+                    resume_bullet_baselines, resume_experience_baselines,
                 )
             elif args.doc_type == "cover_letter":
-                prompt = build_cover_letter_prompt(app, catalog)
+                alignment_prompt = build_cover_alignment_blueprint_prompt(app=app)
+                try:
+                    alignment_raw = ollama_generate(
+                        model=args.model, prompt=alignment_prompt, ollama_url=args.ollama_url,
+                        timeout=args.timeout, temperature=0.0, num_ctx=args.ctx,
+                    )
+                    cover_alignment_blueprint = normalize_cover_alignment_blueprint(
+                        extract_json_object(alignment_raw), app["jd_text"]
+                    )
+                    alignment_audit_prompt = build_cover_alignment_audit_prompt(
+                        app=app, alignment_blueprint=cover_alignment_blueprint
+                    )
+                    alignment_audit_raw = ollama_generate(
+                        model=args.model, prompt=alignment_audit_prompt, ollama_url=args.ollama_url,
+                        timeout=args.timeout, temperature=0.0, num_ctx=args.ctx,
+                    )
+                    cover_alignment_blueprint = merge_cover_alignment_blueprint(
+                        cover_alignment_blueprint, extract_json_object(alignment_audit_raw), app["jd_text"]
+                    )
+                except (ValueError, json.JSONDecodeError) as exc:
+                    print(f"WARNING: cover-letter alignment candidate extraction was not parseable: {exc}; continuing without a blueprint.")
+                    cover_alignment_blueprint = {}
+                prompt = build_cover_letter_prompt(app, catalog, cover_alignment_blueprint)
             else:
                 prompt = build_short_answer_prompt(app, catalog, args.question)
 
@@ -974,7 +1245,26 @@ def main() -> int:
                 doc_type=args.doc_type,
             )
 
-            parsed = extract_json_object(raw)
+            try:
+                parsed = extract_json_object(raw)
+            except (ValueError, json.JSONDecodeError) as exc:
+                print(f"WARNING: generated JSON was not parseable: {exc}; using a conservative fallback payload.")
+                if args.doc_type == "short_answers":
+                    parsed = {"answers": [
+                        {"question": q, "answerable": False, "text": "", "source_asset_id": "none",
+                         "missing_information": "Not enough reliable information was available to answer safely."}
+                        for q in args.question
+                    ], "not_supported": [], "self_check": "fallback: needs user input"}
+                else:
+                    parsed = {"experience_updates": [], "project_updates": [], "skill_lines_ranked": [],
+                              "project_subtitle_updates": [], "paragraphs": [], "not_supported": [],
+                              "self_check": "fallback: preserved safe baseline/minimal positioning"}
+            resume_coverage = material_requirement_summary(app) if args.doc_type == "resume" else {
+                "supportable": [], "total_material_requirements": 0
+            }
+            resume_requirement_ids = {
+                item["id"] for item in resume_coverage["supportable"]
+            } if args.doc_type == "resume" else set()
             content, used, evidence, dropped = validate_and_render(
                 args.doc_type, parsed, valid_ids, valid_company_urls,
                 resume_project_assets if args.doc_type == "resume" else None,
@@ -984,6 +1274,14 @@ def main() -> int:
                 app["jd_text"],
                 app["company"] if args.doc_type == "cover_letter" else "",
                 app["job_title"] if args.doc_type == "cover_letter" else "",
+                experience_baselines=resume_experience_baselines if args.doc_type == "resume" else None,
+                experience_source_asset_ids=(resume_experience_asset_ids if args.doc_type == "resume" else None),
+                matched_requirement_ids=resume_requirement_ids,
+                resume_coverage_target_percent=(RESUME_TARGET_COVERAGE_PERCENT if args.doc_type == "resume" else 0),
+                resume_total_material_requirement_count=(
+                    resume_coverage["total_material_requirements"] if args.doc_type == "resume" else 0
+                ),
+                cover_alignment_blueprint=cover_alignment_blueprint if args.doc_type == "cover_letter" else None,
             )
 
             print("===== GENERATED =====")
@@ -1024,6 +1322,13 @@ def main() -> int:
                     "approved_asset_count": len(assets),
                     "company_context_source_count": len(valid_company_urls),
                     "questions": args.question,
+                    "resume_target_coverage_percent": (RESUME_TARGET_COVERAGE_PERCENT if args.doc_type == "resume" else None),
+                    "cover_positioning_target_percent": (COVER_POSITIONING_TARGET_PERCENT if args.doc_type == "cover_letter" else None),
+                    "cover_alignment_blueprint": cover_alignment_blueprint,
+                    "alignment_prompt_tokens": estimate_tokens(alignment_prompt) if alignment_prompt else 0,
+                    "alignment_output_tokens": estimate_tokens(alignment_raw) if alignment_raw else 0,
+                    "alignment_audit_prompt_tokens": estimate_tokens(alignment_audit_prompt) if alignment_audit_prompt else 0,
+                    "alignment_audit_output_tokens": estimate_tokens(alignment_audit_raw) if alignment_audit_raw else 0,
                 },
                 output_json=evidence, raw_output=raw, prompt=prompt,
             )

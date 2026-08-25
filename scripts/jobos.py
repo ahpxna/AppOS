@@ -65,9 +65,11 @@ def doctor(*, check_browser: bool) -> int:
             mark(results, "Autofill action journal", bool(cur.fetchone()[0]))
             cur.execute("SELECT to_regclass('public.human_review_items') IS NOT NULL")
             mark(results, "Human Review Hub", bool(cur.fetchone()[0]))
-            cur.execute("SELECT count(*) FROM browser_tasks WHERE execution_state = 'needs_reconciliation'")
+            cur.execute("""SELECT
+                           (SELECT count(*) FROM browser_tasks WHERE execution_state = 'needs_reconciliation') +
+                           (SELECT count(*) FROM privileged_action_executions WHERE status = 'needs_reconciliation')""")
             unresolved = int(cur.fetchone()[0])
-            mark(results, "No unresolved autofill task", unresolved == 0, f"{unresolved} unresolved")
+            mark(results, "No unresolved browser action", unresolved == 0, f"{unresolved} unresolved")
             cur.execute("SELECT count(*) FROM immigration_profiles WHERE profile_key = 'primary' AND user_confirmed_at IS NOT NULL")
             mark(results, "Immigration profile confirmed", int(cur.fetchone()[0]) == 1)
     except Exception as exc:
@@ -122,6 +124,7 @@ def autofill_prepare(application_id: str, *, create: bool, yes: bool) -> int:
     from services.autofill.form_inspector_v1 import inspect_nodes, inspect_question_groups
     from services.common.immigration_semantics import classify_immigration_question
     from services.common.question_memory import normalize_question
+    from services.common.autofill_action_scope import build_exact_action_scope
     with psycopg.connect(database_dsn(), autocommit=False) as conn, conn.cursor() as cur:
         cur.execute(
             """SELECT company, job_title, coalesce(ats_type, 'unknown'),
@@ -190,24 +193,57 @@ def autofill_prepare(application_id: str, *, create: bool, yes: bool) -> int:
                               f"ATS capability does not permit {action.action}.", action.question_label)
             for action in actions
         ]
-        writes = [item for item in actions if item.action in {"fill", "select", "check", "upload"}]
+        writes = [item for item in actions if item.action in {"fill", "select", "check"}]
+        upload_actions = [item for item in actions if item.action == "upload"]
         pauses = [item.question_label or item.reason for item in actions if item.action == "pause"]
-        action_scope = {
-            "profile_keys": sorted({item.profile_key for item in writes if item.profile_key and not item.profile_key.startswith("documents.")}),
-            "document_types": sorted({item.profile_key.removeprefix("documents.") for item in writes if item.profile_key and item.profile_key.startswith("documents.")}),
-            "sensitive_classes": sorted({kind.value for item in writes if item.question_label
-                                         for kind in [classify_immigration_question(item.question_label)] if kind is not None}),
-            "remembered_questions": sorted({normalize_question(item.question_label) for item in writes
-                                            if item.profile_key is None and item.question_label and classify_immigration_question(item.question_label) is None}),
-        }
+        action_scope = build_exact_action_scope(writes)
+        # Human-facing summary keys remain useful, but authorization is the
+        # exact action list in build_exact_action_scope().
+        action_scope["sensitive_classes"] = sorted({kind.value for item in writes if item.question_label
+                                                    for kind in [classify_immigration_question(item.question_label)] if kind is not None})
+        action_scope["remembered_questions"] = sorted({normalize_question(item.question_label) for item in writes
+                                                       if item.profile_key is None and item.question_label and classify_immigration_question(item.question_label) is None})
+        upload_packages = []
+        for item in upload_actions:
+            doc_type = str(item.profile_key or "").removeprefix("documents.")
+            if doc_type not in {"resume", "cover_letter"}:
+                continue
+            pointer_cols = ("approved_resume_id", "approved_resume_artifact_id") if doc_type == "resume" else ("approved_cover_letter_id", "approved_cover_letter_artifact_id")
+            cur.execute(
+                f"""SELECT gd.id::text, gda.id::text, gda.file_path, gda.filename, gda.sha256,
+                           gd.source_jd_hash, a.jd_hash
+                      FROM applications a
+                      JOIN generated_documents gd ON gd.id = a.{pointer_cols[0]}
+                      JOIN generated_document_artifacts gda ON gda.id = a.{pointer_cols[1]}
+                     WHERE a.id=%s AND gd.application_id=a.id AND gda.application_id=a.id
+                       AND gda.generated_document_id=gd.id AND gd.doc_type=%s
+                       AND gd.qa_status='pass' AND gd.approved=true;""",
+                (application_id, doc_type),
+            )
+            bound = cur.fetchone()
+            if not bound or not bound[5] or str(bound[5]) != str(bound[6]):
+                pauses.append(f"{item.question_label or doc_type}: approved document is stale against the current JD")
+                continue
+            upload_packages.append({
+                "target_id": target.target_id, "expected_url": canonical_url,
+                "expected_page_fingerprint": fingerprint, "expected_origin": _origin(canonical_url),
+                "field_ref": item.ref, "field_label": item.question_label or "",
+                "document_type": doc_type, "generated_document_id": bound[0], "artifact_id": bound[1],
+                "file_path": bound[2], "filename": bound[3], "sha256": bound[4],
+                "source_jd_hash": str(bound[5]), "application_jd_hash": str(bound[6]),
+                "review_context": {"screenshot_path": "NaN", "upload": {"field": item.question_label or item.ref, "document_type": doc_type, "filename": bound[3], "sha256": bound[4]}},
+            })
         summary = {
             "company": application[0], "role": application[1], "application_id": application_id,
             "pinned_target_id": target.target_id, "page_url": canonical_url,
             "page_fingerprint": fingerprint, "resume_artifact": document[3], "resume_artifact_sha256": document[4],
             "will_write": len(writes),
-            "write_actions": [{"action": item.action, "field": item.question_label, "profile_key": item.profile_key,
+            "write_actions": [{"action": item.action, "field": item.question_label, "ref": item.ref, "profile_key": item.profile_key,
                                "value": item.value, "source": "confirmed_immigration" if item.question_label and classify_immigration_question(item.question_label) else "approved_profile"}
                               for item in writes],
+            "separate_upload_approvals": [{"field": pkg["field_label"], "ref": pkg["field_ref"],
+                                            "document_type": pkg["document_type"], "filename": pkg["filename"],
+                                            "sha256": pkg["sha256"]} for pkg in upload_packages],
             "action_scope": action_scope, "will_pause": pauses,
             "submit": "telegram_human_approval_required",
         }
@@ -250,7 +286,7 @@ def autofill_prepare(application_id: str, *, create: bool, yes: bool) -> int:
             json.dumps({
                 "write_actions": summary["write_actions"],
                 "will_pause": summary["will_pause"],
-                "uploads": [item for item in summary["write_actions"] if item.get("action") == "upload"],
+                "uploads": summary["separate_upload_approvals"],
                 "pinned_target_id": summary["pinned_target_id"],
                 "page_url": summary["page_url"],
                 "page_fingerprint": summary["page_fingerprint"],
@@ -263,9 +299,26 @@ def autofill_prepare(application_id: str, *, create: bool, yes: bool) -> int:
         if document[2]:
             command.extend(("--artifact-id", document[2]))
         # Commit no DB work in this read phase. The approval service owns its
-        # own transaction and token lifecycle.
+        # own transaction and token lifecycle. Child upload capabilities are
+        # materialized only after the parent approval creation succeeds.
+        pending_upload_packages = list(upload_packages)
         conn.rollback()
-    return subprocess.call(command, cwd=ROOT)
+    rc = subprocess.call(command, cwd=ROOT)
+    if rc == 0 and pending_upload_packages:
+        from services.application_actions.action_request_v1 import create_privileged_request
+        with psycopg.connect(database_dsn(), autocommit=False) as upload_conn, upload_conn.cursor() as upload_cur:
+            created_uploads = []
+            for package in pending_upload_packages:
+                rid = create_privileged_request(
+                    upload_cur, application_id=application_id, action_type="privileged_upload_document",
+                    payload=package,
+                    summary=f"Upload exact approved {package['document_type']} {package['filename']!r} to field {package['field_label'] or package['field_ref']!r}.",
+                    requested_by="autofill-prepare",
+                )
+                created_uploads.append(rid)
+            upload_conn.commit()
+        print(json.dumps({"separate_upload_approval_requests": created_uploads}, indent=2))
+    return rc
 
 
 def status() -> int:
@@ -280,7 +333,10 @@ def status() -> int:
         cur.execute("SELECT status, count(*) FROM browser_tasks GROUP BY 1 ORDER BY 1;")
         browser_tasks = {str(task_status): count for task_status, count in cur.fetchall()}
         cur.execute("SELECT count(*) FROM browser_tasks WHERE execution_state = 'needs_reconciliation';")
-        reconciliation = int(cur.fetchone()[0])
+        autofill_reconciliation = int(cur.fetchone()[0])
+        cur.execute("SELECT count(*) FROM privileged_action_executions WHERE status = 'needs_reconciliation';")
+        privileged_reconciliation = int(cur.fetchone()[0])
+        reconciliation = autofill_reconciliation + privileged_reconciliation
         cur.execute("SELECT coalesce(status, 'unknown'), count(*) FROM application_attempts GROUP BY 1 ORDER BY 1;")
         attempts = {str(attempt_status): count for attempt_status, count in cur.fetchall()}
         cur.execute("SELECT count(*) FROM human_review_items WHERE status IN ('pending','needs_revision');")
@@ -288,7 +344,10 @@ def status() -> int:
     print(json.dumps({
         "applications_by_status": applications, "applications_by_source": sources,
         "browser_tasks": browser_tasks, "attempts": attempts, "pending_human_reviews": pending_reviews,
-        "needs_reconciliation": reconciliation, "submit": "telegram_human_approval_then_privileged_executor",
+        "needs_reconciliation": reconciliation,
+        "autofill_needs_reconciliation": autofill_reconciliation,
+        "privileged_needs_reconciliation": privileged_reconciliation,
+        "submit": "telegram_human_approval_then_privileged_executor",
     }, indent=2))
     return 0
 

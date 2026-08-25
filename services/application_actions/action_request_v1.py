@@ -22,6 +22,7 @@ PRIVILEGED_TYPES = {
     "privileged_login_employer_account",
     "privileged_use_email_verification",
     "privileged_accept_terms",
+    "privileged_upload_document",
     "privileged_advance_application_step",
     "privileged_auth_manual_retry",
     "privileged_mfa_retry",

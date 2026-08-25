@@ -64,9 +64,9 @@ BUCKETS = {
     "05_guidance_not_truth": "05_guidance_not_truth",
 }
 REQUIRED_IMPORTS = ("psycopg", "pypdf", "docx", "pglast")
-GENERIC_EVIDENCE_VERSION = "profile_evidence_unit_builder_qwen_v1_2026_04_27"
+GENERIC_EVIDENCE_VERSION = "profile_evidence_unit_builder_qwen_v2_2026_08_25"
 STRUCTURED_EVIDENCE_VERSION = "structured_evidence_unit_builder_qwen_v2_2026_04_27"
-GENERIC_ASSET_VERSION = "profile_asset_synthesizer_qwen_v1_2026_04_27"
+GENERIC_ASSET_VERSION = "profile_asset_synthesizer_qwen_v2_2026_08_25"
 STRUCTURED_ASSET_VERSION = "structured_tool_workflow_asset_synthesizer_qwen_v1_2026_04_27"
 
 

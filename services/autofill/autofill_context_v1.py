@@ -97,6 +97,30 @@ def load_autofill_context(
             raise AutofillContextError("Approved upload artifact has an unsupported document type or filename.")
         profile["documents"][str(doc_type)] = str(path)
 
+    # Materialize every *currently approved* application document for planning.
+    # These paths are not authorized by the autofill capability: uploads are
+    # executed only through a separate privileged_upload_document request.
+    cur.execute(
+        """SELECT gd.doc_type, gda.file_path, gda.filename, gda.sha256
+             FROM applications a
+             JOIN generated_document_artifacts gda
+               ON gda.id IN (a.approved_resume_artifact_id, a.approved_cover_letter_artifact_id)
+             JOIN generated_documents gd ON gd.id = gda.generated_document_id
+            WHERE a.id = %s AND gda.application_id = a.id AND gd.application_id = a.id
+              AND gd.qa_status = 'pass' AND gd.approved = true;""",
+        (application_id,),
+    )
+    root = data_root.resolve()
+    for doc_type, file_path, filename, digest in cur.fetchall():
+        if str(doc_type) not in {"resume", "cover_letter"}:
+            continue
+        path = Path(str(file_path)).expanduser().resolve()
+        if not path.is_file() or root not in path.parents or path.name != str(filename):
+            raise AutofillContextError(f"Current approved {doc_type} artifact is missing or outside managed data.")
+        if hashlib.sha256(path.read_bytes()).hexdigest() != str(digest):
+            raise AutofillContextError(f"Current approved {doc_type} artifact bytes changed.")
+        profile["documents"][str(doc_type)] = str(path)
+
     cur.execute(
         """SELECT current_work_authorization, requires_sponsorship_to_start,
                   requires_future_sponsorship, us_citizen, us_person,

@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -243,6 +244,45 @@ def detect_page_state(url: str, snapshot: dict[str, Any], nodes: list[dict[str, 
     return "unknown", {"reason": "page state could not be classified"}
 
 
+def _application_step(cur, application_id: str, *, for_update: bool = False) -> str:
+    cur.execute(f"SELECT current_step FROM applications WHERE id=%s{' FOR UPDATE' if for_update else ''};", (application_id,))
+    row = cur.fetchone()
+    if not row:
+        raise PrivilegedActionError("application not found")
+    return str(row[0] or "")
+
+
+def _require_application_step(cur, application_id: str, required: str) -> None:
+    current = _application_step(cur, application_id)
+    if current != required:
+        raise PrivilegedActionError(f"application must be at {required!r}; current_step is {current!r}")
+
+
+def _transition_application_step(cur, *, application_id: str, to_step: str, actor: str,
+                                 reason: str, detail: dict[str, Any] | None = None,
+                                 status: str | None = None) -> bool:
+    current = _application_step(cur, application_id, for_update=True)
+    if current == to_step:
+        return False
+    cur.execute("SELECT 1 FROM pipeline_transitions WHERE from_step=%s AND to_step=%s;", (current, to_step))
+    if not cur.fetchone():
+        raise PrivilegedActionError(f"illegal pipeline transition {current!r} -> {to_step!r}")
+    if status is None:
+        cur.execute("UPDATE applications SET current_step=%s, updated_at=now() WHERE id=%s AND current_step=%s;",
+                    (to_step, application_id, current))
+    else:
+        cur.execute("UPDATE applications SET current_step=%s, status=%s, updated_at=now() WHERE id=%s AND current_step=%s;",
+                    (to_step, status, application_id, current))
+    if cur.rowcount != 1:
+        raise PrivilegedActionError("application pipeline state changed concurrently")
+    cur.execute(
+        """INSERT INTO pipeline_events(application_id, from_step, to_step, actor, reason, detail_json)
+           VALUES (%s,%s,%s,%s,%s,%s);""",
+        (application_id, current, to_step, actor, reason, Jsonb(detail or {})),
+    )
+    return True
+
+
 def _update_auth_session(cur, *, application_id: str, url: str, fingerprint: str,
                          state: str, platform: str, detail: dict[str, Any]) -> None:
     cur.execute(
@@ -264,7 +304,14 @@ def _update_auth_session(cur, *, application_id: str, url: str, fingerprint: str
         "authenticated": "application_form_ready",
     }
     if state in step_map:
-        cur.execute("UPDATE applications SET current_step=%s, updated_at=now() WHERE id=%s;", (step_map[state], application_id))
+        target_step = step_map[state]
+        current = _application_step(cur, application_id)
+        if current != target_step:
+            _transition_application_step(
+                cur, application_id=application_id, to_step=target_step, actor="privileged-auth-state",
+                reason=f"Observed employer auth/browser state: {state}.",
+                detail={"url": url, "page_fingerprint": fingerprint, "platform": platform, "state": state},
+            )
     if platform != "custom":
         cur.execute("SELECT 1 FROM ats_capabilities WHERE ats_type=%s;", (platform,))
         if cur.fetchone():
@@ -272,16 +319,33 @@ def _update_auth_session(cur, *, application_id: str, url: str, fingerprint: str
 
 
 def _document_bindings(cur, application_id: str) -> dict[str, Any]:
+    """Return current pointer-bound documents, including their JD provenance."""
     cur.execute(
-        """SELECT gda.artifact_type, gda.file_path, gda.filename, gda.sha256
+        """SELECT gd.doc_type, gd.id::text, gda.id::text, gda.file_path, gda.filename, gda.sha256,
+                  gd.source_jd_hash, a.jd_hash
              FROM applications a
              JOIN generated_document_artifacts gda
                ON gda.id IN (a.approved_resume_artifact_id, a.approved_cover_letter_artifact_id)
-            WHERE a.id=%s;""",
+             JOIN generated_documents gd ON gd.id = gda.generated_document_id
+            WHERE a.id=%s AND gda.application_id=a.id AND gd.application_id=a.id
+              AND ((gd.doc_type='resume' AND gd.id=a.approved_resume_id AND gda.id=a.approved_resume_artifact_id)
+                OR (gd.doc_type='cover_letter' AND gd.id=a.approved_cover_letter_id AND gda.id=a.approved_cover_letter_artifact_id));""",
         (application_id,),
     )
-    return {str(kind): {"file_path": path, "filename": filename, "sha256": sha}
-            for kind, path, filename, sha in cur.fetchall()}
+    return {str(kind): {"generated_document_id": doc_id, "artifact_id": artifact_id,
+                        "file_path": path, "filename": filename, "sha256": sha,
+                        "source_jd_hash": str(source_jd or ""), "application_jd_hash": str(app_jd or "")}
+            for kind, doc_id, artifact_id, path, filename, sha, source_jd, app_jd in cur.fetchall()}
+
+
+def _document_bindings_still_current(cur, application_id: str, approved: dict[str, Any]) -> bool:
+    current = _document_bindings(cur, application_id)
+    if current != approved:
+        return False
+    for item in current.values():
+        if not item.get("source_jd_hash") or item.get("source_jd_hash") != item.get("application_jd_hash"):
+            return False
+    return _document_hashes_still_match(current)
 
 
 def _consent_items(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -338,6 +402,7 @@ def prepare(cur, *, application_id: str, action: str, candidate_id: str | None =
                                "review_context": {"screenshot_path": screenshot or "NaN"}}
     summary = action
     if action == "begin_application":
+        _require_application_step(cur, application_id, "docs_verified")
         cur.execute("SELECT job_url FROM applications WHERE id=%s;", (application_id,))
         source_row = cur.fetchone()
         source_job_url = str(source_row[0] or "") if source_row else ""
@@ -350,7 +415,7 @@ def prepare(cur, *, application_id: str, action: str, candidate_id: str | None =
         atype = "privileged_begin_application"
     elif action == "trust_external_domain":
         payload.update({"domain": (urlsplit(url).hostname or "").casefold()})
-        summary = f"Trust employer application domain {_origin(url)} for this application."
+        summary = f"Trust employer application domain {_origin(url)} globally for JobOS browser writes."
         atype = "privileged_trust_external_domain"
     elif action in {"create_employer_account", "login_employer_account"}:
         account_payload, _email = _account_action_payload(cur, nodes, url, action=action)
@@ -364,6 +429,7 @@ def prepare(cur, *, application_id: str, action: str, candidate_id: str | None =
         payload["consent_items"] = items
         atype = "privileged_accept_terms"; summary = f"Accept {len(items)} exact employer consent/terms control(s)."
     elif action == "advance_application_step":
+        _require_application_step(cur, application_id, "application_ready")
         control = _find_exact_control(nodes, ADVANCE_LABELS)
         field_digest, fields, blockers = _field_state(nodes)
         payload.update({"control_ref": control["ref"], "control_label": control["label"],
@@ -379,34 +445,40 @@ def prepare(cur, *, application_id: str, action: str, candidate_id: str | None =
     elif action == "checkpoint_retry":
         atype = "privileged_checkpoint_retry"; summary = "Re-snapshot after you manually complete the CAPTCHA/bot/risk checkpoint."
     elif action == "submit_application":
+        _require_application_step(cur, application_id, "application_ready")
         control = _find_exact_control(nodes, SUBMIT_LABELS)
         field_digest, fields, blockers = _field_state(nodes)
+        document_bindings = _document_bindings(cur, application_id)
+        if not isinstance(document_bindings.get("resume"), dict):
+            raise PrivilegedActionError("final Submit requires the current approved resume artifact pointer")
+        if not _document_bindings_still_current(cur, application_id, document_bindings):
+            raise PrivilegedActionError("approved resume/cover letter is stale against current pointers or JD")
         payload.update({"control_ref": control["ref"], "control_label": control["label"],
                         "field_state_sha256": field_digest, "required_blockers": blockers,
                         "review_context": {"screenshot_path": screenshot or "NaN", "write_actions": fields,
                                            "will_pause": blockers},
-                        "document_bindings": _document_bindings(cur, application_id)})
+                        "document_bindings": document_bindings})
         atype = "privileged_submit_application"; summary = f"FINAL SUBMIT: click exact {control['label']!r} only after fresh revalidation."
     elif action == "use_email_verification":
         if not candidate_id:
             raise PrivilegedActionError("--candidate-id is required")
-        cur.execute("""SELECT gmail_message_id, sender, subject, received_at, verification_kind, secret_sha256, secret_context_json
+        cur.execute("""SELECT gmail_account, gmail_message_id, sender, subject, received_at, verification_kind, secret_sha256, secret_context_json
                        FROM email_verification_candidates WHERE id=%s AND application_id=%s AND status IN ('discovered','approved');""",
                     (candidate_id, application_id))
         row = cur.fetchone()
         if not row:
             raise PrivilegedActionError("verification candidate unavailable")
-        field = _find_input(nodes, ("code", "verification", "otp", "one-time")) if row[4] == "numeric_code" else None
+        field = _find_input(nodes, ("code", "verification", "otp", "one-time")) if row[5] == "numeric_code" else None
         button = None
-        if row[4] == "numeric_code":
+        if row[5] == "numeric_code":
             try: button = _find_exact_control(nodes, VERIFY_LABELS)
             except PrivilegedActionError: button = None
-        payload.update({"candidate_id": candidate_id, "gmail_message_id": row[0], "sender": row[1] or "NaN",
-                        "subject": row[2] or "NaN", "received_at": row[3].isoformat() if row[3] else "NaN",
-                        "verification_kind": row[4], "secret_sha256": row[5], "secret_context": row[6] or {},
+        payload.update({"candidate_id": candidate_id, "gmail_account": row[0], "gmail_message_id": row[1], "sender": row[2] or "NaN",
+                        "subject": row[3] or "NaN", "received_at": row[4].isoformat() if row[4] else "NaN",
+                        "verification_kind": row[5], "secret_sha256": row[6], "secret_context": row[7] or {},
                         "field_ref": str(field.get('ref')) if field else "NaN",
                         "control_ref": button["ref"] if button else "NaN", "control_label": button["label"] if button else "NaN"})
-        atype = "privileged_use_email_verification"; summary = f"Use exact Gmail verification {row[4]} after Telegram approval; secret stays out of DB/Telegram."
+        atype = "privileged_use_email_verification"; summary = f"Use exact Gmail verification {row[5]} from mailbox {row[0]} after Telegram approval; secret stays out of DB/Telegram."
     else:
         raise PrivilegedActionError(f"unsupported prepare action: {action}")
     return create_privileged_request(cur, application_id=application_id, action_type=atype,
@@ -549,32 +621,13 @@ def _after_navigation(cur, transport: OpenClawTransport, application_id: str, so
     _update_auth_session(cur, application_id=application_id, url=url, fingerprint=fp,
                          state=state, platform=platform, detail={**detail, "target_id": target_id})
 
-    # A human must trust a newly discovered employer origin before JobOS may
-    # create any follow-up capability that can write/authenticate on it. The
-    # approved Apply/email navigation may *observe* the destination, but trust
-    # is a separate one-shot gate. After trust is approved, that executor takes
-    # a fresh snapshot and enqueues the next auth/form gate.
-    if not _host_is_allowed(cur, url):
-        host = (urlsplit(url).hostname or "").casefold()
-        if host:
-            create_privileged_request(
-                cur, application_id=application_id, action_type="privileged_trust_external_domain",
-                payload={"target_id": target_id, "expected_url": canonical_page_url(url),
-                         "expected_page_fingerprint": fp, "expected_origin": _origin(url), "domain": host,
-                         "review_context": {"screenshot_path": _capture_review_screenshot(transport, application_id, "trust-domain", target_id) or "NaN"}},
-                summary=f"Trust newly discovered employer application domain {host}.",
-                requested_by="application-handoff",
-            )
-        return {"target_id": target_id, "url": url, "platform": platform, "state": state,
-                "detail": detail, "followup": "trust_domain_required",
-                "snapshot_sha256": _snapshot_text_sha256(snap), "page_fingerprint": fp,
-                "consent_items": _consent_items(nodes)}
-
-    _enqueue_state_followup(cur, transport, application_id=application_id, target_id=target_id,
-                            url=url, fingerprint=fp, nodes=nodes, state=state)
+    # Do not package the next approval in the same transaction as an external
+    # browser effect.  Return enough evidence for a post-commit best-effort
+    # materializer instead.
+    followup = "trust_domain_required" if not _host_is_allowed(cur, url) else "state_gate"
     return {"target_id": target_id, "url": url, "platform": platform, "state": state, "detail": detail,
-            "snapshot_sha256": _snapshot_text_sha256(snap), "page_fingerprint": fp,
-            "consent_items": _consent_items(nodes)}
+            "followup": followup, "snapshot_sha256": _snapshot_text_sha256(snap),
+            "page_fingerprint": fp, "consent_items": _consent_items(nodes)}
 
 
 def _document_hashes_still_match(bindings: dict[str, Any]) -> bool:
@@ -590,10 +643,96 @@ def _document_hashes_still_match(bindings: dict[str, Any]) -> bool:
     return True
 
 
-def _confirmation(snapshot: dict[str, Any], url: str) -> bool:
-    text = f"{url}\n{snapshot.get('snapshot') or ''}".casefold()
-    return any(marker in text for marker in ("application submitted", "thank you for applying", "thank you for your application",
-                                              "we received your application", "application has been submitted", "submission successful"))
+def _confirmation(*, before_snapshot: dict[str, Any], before_url: str,
+                  after_snapshot: dict[str, Any], after_url: str, submit_ref: str) -> bool:
+    """Require multiple independent post-submit signals.
+
+    Static instructional text containing words such as "application submitted"
+    is not confirmation.  A marker must newly appear (or a known confirmation
+    route must be reached) and the exact Submit control must disappear.
+    """
+    markers = ("application submitted", "thank you for applying", "thank you for your application",
+               "we received your application", "application has been submitted", "submission successful")
+    before_text = f"{before_url}\n{before_snapshot.get('snapshot') or ''}".casefold()
+    after_text = f"{after_url}\n{after_snapshot.get('snapshot') or ''}".casefold()
+    newly_appeared = any(marker in after_text and marker not in before_text for marker in markers)
+    route_changed = canonical_page_url(after_url) != canonical_page_url(before_url)
+    route_hint = any(token in urlsplit(after_url).path.casefold() for token in ("confirm", "thank", "submitted", "success", "complete"))
+    after_nodes = parse_snapshot(after_snapshot)
+    submit_still_present = any(str(node.get("ref") or "") == str(submit_ref) for node in after_nodes)
+    if submit_still_present:
+        return False
+    snapshot_changed = _snapshot_text_sha256(after_snapshot) != _snapshot_text_sha256(before_snapshot)
+    return (newly_appeared and (route_changed or snapshot_changed)) or (route_changed and route_hint)
+
+
+def _upload_effect_verified(*, before_snapshot: dict[str, Any], after_snapshot: dict[str, Any],
+                            field_ref: str, filename: str) -> bool:
+    before_text = str(before_snapshot.get("snapshot") or "")
+    after_text = str(after_snapshot.get("snapshot") or "")
+    node = next((n for n in parse_snapshot(after_snapshot) if str(n.get("ref") or "") == field_ref), None)
+    if node and str(node.get("value") or "").strip():
+        return True
+    name = str(filename or "").casefold()
+    return bool(name and name in after_text.casefold() and name not in before_text.casefold())
+
+
+def materialize_application_ready_gate(cur, application_id: str) -> str | None:
+    """Freshly inspect application_ready and create exactly one next human gate."""
+    _require_application_step(cur, application_id, "application_ready")
+    transport = _transport()
+    target_id, url, _snapshot_payload, nodes, _fingerprint = _base_binding(transport)
+    _require_trusted_target(cur, url)
+    pending_consents = [item for item in _consent_items(nodes) if item.get("selected") is not True]
+    if pending_consents:
+        return prepare(cur, application_id=application_id, action="accept_terms")
+    submit_matches = [c for c in _clickables(nodes) if c["label"].strip().casefold() in SUBMIT_LABELS]
+    advance_matches = [c for c in _clickables(nodes) if c["label"].strip().casefold() in ADVANCE_LABELS]
+    if len(submit_matches) == 1 and not advance_matches:
+        return prepare(cur, application_id=application_id, action="submit_application")
+    if len(advance_matches) == 1 and not submit_matches:
+        return prepare(cur, application_id=application_id, action="advance_application_step")
+    return None
+
+
+def _post_commit_followup(conn, application_id: str, result: dict[str, Any]) -> dict[str, Any] | None:
+    """Best-effort packaging after the external effect is already durable."""
+    state = str(result.get("state") or "")
+    target_id = str(result.get("target_id") or "")
+    if state == "application_form_ready":
+        command = [sys.executable, str(ROOT / "scripts" / "jobos.py"), "autofill", "prepare",
+                   "--application-id", application_id, "--create", "--yes"]
+        proc = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, timeout=150)
+        return {"kind": "autofill_prepare", "ok": proc.returncode == 0,
+                "detail": (proc.stdout or proc.stderr or "")[-1200:]}
+    if not target_id:
+        return None
+    transport = _transport()
+    url, _snap, nodes, fp = _snapshot(transport, target_id)
+    with conn.cursor() as cur:
+        if result.get("followup") == "trust_domain_required" or not _host_is_allowed(cur, url):
+            host = (urlsplit(url).hostname or "").casefold()
+            if not host:
+                return None
+            rid = create_privileged_request(
+                cur, application_id=application_id, action_type="privileged_trust_external_domain",
+                payload={"target_id": target_id, "expected_url": canonical_page_url(url),
+                         "expected_page_fingerprint": fp, "expected_origin": _origin(url), "domain": host,
+                         "review_context": {"screenshot_path": _capture_review_screenshot(transport, application_id, "trust-domain", target_id) or "NaN"}},
+                summary=f"Trust newly discovered employer application domain {host} globally for JobOS browser writes.",
+                requested_by="application-handoff",
+            )
+            conn.commit()
+            return {"kind": "trust_domain", "approval_request_id": rid}
+        before_count = 0
+        cur.execute("SELECT count(*) FROM approval_requests WHERE application_id=%s AND status='pending';", (application_id,))
+        before_count = int(cur.fetchone()[0])
+        _enqueue_state_followup(cur, transport, application_id=application_id, target_id=target_id,
+                                url=url, fingerprint=fp, nodes=nodes, state=state)
+        cur.execute("SELECT count(*) FROM approval_requests WHERE application_id=%s AND status='pending';", (application_id,))
+        after_count = int(cur.fetchone()[0])
+        conn.commit()
+        return {"kind": "state_gate", "created": after_count > before_count, "state": state}
 
 
 def execute_one(conn, request_id: str) -> dict[str, Any]:
@@ -625,19 +764,19 @@ def execute_one(conn, request_id: str) -> dict[str, Any]:
                 domain = str(payload.get("domain") or "").casefold()
                 if payload.get("trust_source") == "gmail_magic_link":
                     cur.execute(
-                        """SELECT gmail_message_id, verification_kind, secret_sha256, secret_context_json
+                        """SELECT gmail_account, gmail_message_id, verification_kind, secret_sha256, secret_context_json
                              FROM email_verification_candidates
                             WHERE id=%s AND application_id=%s AND status IN ('discovered','approved');""",
                         (payload.get("candidate_id"), app_id),
                     )
                     cand = cur.fetchone()
-                    if not cand or cand[1] != "magic_link":
+                    if not cand or cand[2] != "magic_link":
                         raise PrivilegedActionError("email magic-link trust candidate is unavailable")
-                    if str(cand[2]) != str(payload.get("secret_sha256") or ""):
+                    if str(cand[3]) != str(payload.get("secret_sha256") or "") or str(cand[0]) != str(payload.get("gmail_account") or cand[0]):
                         raise PrivilegedActionError("email magic-link trust hash changed")
                     secret = refetch_secret({
-                        "gmail_message_id": cand[0], "verification_kind": cand[1],
-                        "secret_sha256": cand[2], "secret_context": cand[3] or {},
+                        "gmail_account": cand[0], "gmail_message_id": cand[1], "verification_kind": cand[2],
+                        "secret_sha256": cand[3], "secret_context": cand[4] or {},
                     })
                     observed_domain = (urlsplit(secret).hostname or "").casefold()
                     if not domain or domain != observed_domain:
@@ -663,9 +802,9 @@ def execute_one(conn, request_id: str) -> dict[str, Any]:
                     state, detail = detect_page_state(live_url, live_snap, live_nodes)
                     _update_auth_session(cur, application_id=app_id, url=live_url, fingerprint=live_fp,
                                          state=state, platform=platform, detail={**detail, "target_id": str(payload.get("target_id") or "")})
-                    _enqueue_state_followup(cur, transport, application_id=app_id, target_id=str(payload.get("target_id") or ""),
-                                            url=live_url, fingerprint=live_fp, nodes=live_nodes, state=state)
-                    result = {"trusted_domain": domain, "state": state, "platform": platform}
+                    result = {"trusted_domain": domain, "target_id": str(payload.get("target_id") or ""),
+                              "url": live_url, "page_fingerprint": live_fp, "state": state,
+                              "platform": platform, "followup": "state_gate"}
             elif atype in {"privileged_auth_manual_retry", "privileged_mfa_retry", "privileged_checkpoint_retry"}:
                 # Retry capabilities are intentionally read-only: after the human
                 # handles MFA/checkpoint, JobOS only takes a fresh snapshot and
@@ -675,9 +814,8 @@ def execute_one(conn, request_id: str) -> dict[str, Any]:
                 snap = transport.snapshot(target_id); nodes = parse_snapshot(snap); fp = page_fingerprint(snap, page_url=url)
                 platform = detect_platform(url, snap); state, detail = detect_page_state(url, snap, nodes)
                 _update_auth_session(cur, application_id=app_id, url=url, fingerprint=fp, state=state, platform=platform, detail={**detail, "target_id": target_id})
-                _enqueue_state_followup(cur, transport, application_id=app_id, target_id=target_id,
-                                        url=url, fingerprint=fp, nodes=nodes, state=state)
-                result = {"target_id": target_id, "url": url, "state": state, "platform": platform}
+                result = {"target_id": target_id, "url": url, "page_fingerprint": fp,
+                          "state": state, "platform": platform, "followup": "state_gate"}
             else:
                 url, snap, nodes, fp = _revalidate(transport, payload)
                 target_id = str(payload["target_id"])
@@ -685,7 +823,14 @@ def execute_one(conn, request_id: str) -> dict[str, Any]:
                     _require_trusted_target(cur, url)
                 before_tabs = transport._tabs()
                 if atype == "privileged_begin_application":
+                    _require_application_step(cur, app_id, "docs_verified")
                     io_started = True; _click(transport, target_id, str(payload["control_ref"]))
+                    _transition_application_step(
+                        cur, application_id=app_id, to_step="application_entrypoint_ready",
+                        actor="privileged-action-executor",
+                        reason="Human-approved application entrypoint was opened.",
+                        detail={"approval_request_id": request_id, "target_id": target_id},
+                    )
                     result = _after_navigation(cur, transport, app_id, target_id, before_tabs)
                     if not _observable_page_change(before_target=target_id, before_url=url, before_snapshot=snap, after=result):
                         raise PrivilegedActionError("Apply handoff click produced no observable navigation or modal change")
@@ -713,6 +858,7 @@ def execute_one(conn, request_id: str) -> dict[str, Any]:
                         raise PrivilegedActionError("approved consent controls were not observably accepted after browser I/O")
                     result["consent_items"] = payload.get("consent_items") or []
                 elif atype == "privileged_advance_application_step":
+                    _require_application_step(cur, app_id, "application_ready")
                     if payload.get("required_blockers"):
                         raise PrivilegedActionError("required form blockers existed in the approved wizard-step package")
                     current_digest, _fields, blockers = _field_state(nodes)
@@ -723,15 +869,19 @@ def execute_one(conn, request_id: str) -> dict[str, Any]:
                     if not _observable_page_change(before_target=target_id, before_url=url, before_snapshot=snap, after=result):
                         raise PrivilegedActionError("application wizard step click produced no observable page change")
                 elif atype == "privileged_use_email_verification":
-                    cur.execute("""SELECT gmail_message_id, verification_kind, secret_sha256, secret_context_json
+                    cur.execute("""SELECT gmail_account, gmail_message_id, verification_kind, secret_sha256, secret_context_json
                                    FROM email_verification_candidates WHERE id=%s AND application_id=%s AND status IN ('approved','discovered');""",
                                 (payload.get("candidate_id"), app_id))
                     cand = cur.fetchone()
                     if not cand:
                         raise PrivilegedActionError("verification candidate unavailable")
-                    secret = refetch_secret({"gmail_message_id": cand[0], "verification_kind": cand[1],
-                                              "secret_sha256": cand[2], "secret_context": cand[3] or {}})
-                    if cand[1] == "numeric_code":
+                    if str(cand[0]) != str(payload.get("gmail_account") or "") or str(cand[1]) != str(payload.get("gmail_message_id") or ""):
+                        raise PrivilegedActionError("verification candidate mailbox/message binding changed after approval")
+                    if str(cand[3]) != str(payload.get("secret_sha256") or "") or str(cand[2]) != str(payload.get("verification_kind") or ""):
+                        raise PrivilegedActionError("verification candidate kind/hash changed after approval")
+                    secret = refetch_secret({"gmail_account": cand[0], "gmail_message_id": cand[1], "verification_kind": cand[2],
+                                              "secret_sha256": cand[3], "secret_context": cand[4] or {}})
+                    if cand[2] == "numeric_code":
                         ref = str(payload.get("field_ref") or "")
                         if not ref or ref == "NaN": raise PrivilegedActionError("verification code field was not bound")
                         io_started = True; _fill(transport, target_id, ref, secret)
@@ -745,7 +895,41 @@ def execute_one(conn, request_id: str) -> dict[str, Any]:
                     if not _observable_page_change(before_target=target_id, before_url=url, before_snapshot=snap, after=result):
                         raise PrivilegedActionError("email verification browser I/O produced no observable page change")
                     cur.execute("UPDATE email_verification_candidates SET status='consumed', consumed_at=now() WHERE id=%s;", (payload.get("candidate_id"),))
+                elif atype == "privileged_upload_document":
+                    doc_type = str(payload.get("document_type") or "")
+                    current = _document_bindings(cur, app_id).get(doc_type)
+                    approved = {key: payload.get(key) for key in (
+                        "generated_document_id", "artifact_id", "file_path", "filename", "sha256",
+                        "source_jd_hash", "application_jd_hash"
+                    )}
+                    if not current or current != approved:
+                        raise PrivilegedActionError("approved upload document pointer/JD binding changed")
+                    if approved.get("source_jd_hash") != approved.get("application_jd_hash"):
+                        raise PrivilegedActionError("approved upload document is stale against the current JD")
+                    path = Path(str(approved.get("file_path") or "")).expanduser().resolve()
+                    if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != str(approved.get("sha256") or ""):
+                        raise PrivilegedActionError("approved upload artifact bytes changed or are missing")
+                    field_ref = str(payload.get("field_ref") or "")
+                    field_label = " ".join(str(payload.get("field_label") or "").casefold().split())
+                    live_field = next((n for n in nodes if str(n.get("ref") or "") == field_ref), None)
+                    if not live_field or (field_label and " ".join(str(live_field.get("label") or "").casefold().split()) != field_label):
+                        raise PrivilegedActionError("approved upload field identity changed")
+                    upload_transport = OpenClawTransport(
+                        binary=resolve_openclaw_binary(required=True),
+                        profile=os.getenv("JOBOS_BROWSER_PROFILE", "remote"), timeout=90,
+                        approved_upload_hashes={str(path): str(approved["sha256"])},
+                    )
+                    io_started = True
+                    upload_transport.execute(target_id, {"action": "upload", "target": field_ref, "value": str(path)})
+                    time.sleep(0.8)
+                    observed = upload_transport.snapshot(target_id)
+                    if not _upload_effect_verified(before_snapshot=snap, after_snapshot=observed,
+                                                   field_ref=field_ref, filename=str(approved.get("filename") or "")):
+                        raise PrivilegedActionError("document upload occurred but the exact field effect could not be verified")
+                    result = {"uploaded": True, "document_type": doc_type, "artifact_id": approved.get("artifact_id"),
+                              "filename": approved.get("filename"), "target_id": target_id, "field_ref": field_ref}
                 elif atype == "privileged_submit_application":
+                    _require_application_step(cur, app_id, "application_ready")
                     if payload.get("required_blockers"):
                         raise PrivilegedActionError("required form blockers existed in the approved review package")
                     current_digest, _fields, blockers = _field_state(nodes)
@@ -754,15 +938,21 @@ def execute_one(conn, request_id: str) -> dict[str, Any]:
                     bindings = payload.get("document_bindings") or {}
                     if not isinstance(bindings.get("resume"), dict):
                         raise PrivilegedActionError("final Submit requires an exact approved resume artifact binding")
-                    if not _document_hashes_still_match(bindings):
-                        raise PrivilegedActionError("approved resume/cover artifact changed or is missing")
+                    if not _document_bindings_still_current(cur, app_id, bindings):
+                        raise PrivilegedActionError("approved resume/cover artifact pointer, JD provenance, or bytes changed")
                     io_started = True; _click(transport, target_id, str(payload["control_ref"]))
                     time.sleep(2.0)
                     observed_url = transport.current_url(target_id)
                     observed = transport.snapshot(target_id)
-                    if not _confirmation(observed, observed_url):
+                    if not _confirmation(before_snapshot=snap, before_url=url, after_snapshot=observed,
+                                         after_url=observed_url, submit_ref=str(payload["control_ref"])):
                         raise PrivilegedActionError("Submit was clicked but confirmation is uncertain; reconcile manually before any retry")
-                    cur.execute("UPDATE applications SET current_step='submitted', status='submitted', submitted_at=now(), updated_at=now() WHERE id=%s;", (app_id,))
+                    _transition_application_step(
+                        cur, application_id=app_id, to_step="submitted", actor="privileged-action-executor",
+                        reason="Final Submit produced multi-signal confirmation.",
+                        detail={"approval_request_id": request_id, "confirmation_url": observed_url}, status="submitted",
+                    )
+                    cur.execute("UPDATE applications SET submitted_at=coalesce(submitted_at, now()), updated_at=now() WHERE id=%s;", (app_id,))
                     result = {"submitted": True, "confirmation_url": observed_url}
                 else:
                     raise PrivilegedActionError(f"unimplemented privileged type: {atype}")
@@ -773,7 +963,17 @@ def execute_one(conn, request_id: str) -> dict[str, Any]:
             cur.execute("""INSERT INTO application_events(application_id,event_type,event_source,event_payload)
                            VALUES (%s,'privileged_action_completed','privileged-action-executor',%s);""",
                         (app_id, Jsonb({"approval_request_id": request_id, "action_type": atype, "result": result})))
-        conn.commit(); return {"ok": True, "request_id": request_id, "action_type": atype, "result": result}
+        conn.commit()
+        followup = None
+        try:
+            if isinstance(result, dict) and result.get("state"):
+                followup = _post_commit_followup(conn, app_id, result)
+        except Exception as followup_exc:
+            # External effect + execution record are already durable. Follow-up
+            # packaging may fail softly and must never turn success into replay.
+            followup = {"ok": False, "error": str(followup_exc)[:1000]}
+        return {"ok": True, "request_id": request_id, "action_type": atype,
+                "result": result, "followup": followup}
     except Exception as exc:
         conn.rollback()
         with conn.cursor() as cur:

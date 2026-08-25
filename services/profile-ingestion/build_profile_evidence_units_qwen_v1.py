@@ -22,7 +22,7 @@ DSN = database_dsn()
 
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
 MODEL = get_model("profile_evidence_unit")
-VERSION = "profile_evidence_unit_builder_qwen_v1_2026_04_27"
+VERSION = "profile_evidence_unit_builder_qwen_v2_2026_08_25"
 
 
 SYSTEM_PROMPT = """You are the Profile Evidence Unit Builder inside a job-application operating system.
@@ -33,6 +33,8 @@ Do NOT write resume bullets.
 Do NOT create final profile assets.
 Do NOT flatten the document into generic skill lists.
 Do NOT invent facts, grades, publication venues, awards, employment, certifications, or completed results.
+Explicit employment/internship facts in an official resume ARE user evidence: preserve employer, job title, dates, responsibilities, tools, and outcomes only when they are literally supported by the provided section text.
+Never upgrade internship/course/research work into a different employment relationship.
 Do NOT treat source papers or guidance as user truth.
 Use only the provided document metadata and sections.
 
@@ -48,7 +50,7 @@ Return JSON only:
   "evidence_units": [
     {
       "section_index": 1,
-      "evidence_type": "identity|education|coursework|project_scope|methodology|result|tool_workflow|technical_skill|strategic_analysis|communication|leadership|resume_phrase|career_positioning|limitation|warning",
+      "evidence_type": "identity|education|employment_experience|coursework|project_scope|methodology|result|tool_workflow|technical_skill|strategic_analysis|communication|leadership|resume_phrase|career_positioning|limitation|warning",
       "evidence_title": "specific title",
       "direct_quote": "short exact supporting quote from source text, if available",
       "evidence_summary": "source-grounded summary",
@@ -133,7 +135,7 @@ def clamp_float(value: Any, default: float = 0.80) -> float:
 
 def normalize_unit(unit: Dict[str, Any]) -> Dict[str, Any]:
     allowed_types = {
-        "identity", "education", "coursework", "project_scope", "methodology", "result",
+        "identity", "education", "employment_experience", "coursework", "project_scope", "methodology", "result",
         "tool_workflow", "technical_skill", "strategic_analysis", "communication",
         "leadership", "resume_phrase", "career_positioning", "limitation", "warning",
     }
@@ -157,6 +159,30 @@ def normalize_unit(unit: Dict[str, Any]) -> Dict[str, Any]:
         "source_confidence": clamp_float(unit.get("source_confidence"), 0.80),
         "grounding_confidence": clamp_float(unit.get("grounding_confidence"), 0.80),
     }
+
+
+def validate_unit_source_grounding(
+    unit: Dict[str, Any], section_by_index: Dict[int, Dict[str, Any]]
+) -> tuple[bool, str]:
+    """Require literal source anchoring for quotations and all employment evidence.
+
+    The LLM may summarize other evidence types, but a direct_quote can never be
+    synthetic. Employment evidence is stricter because downstream resume agents
+    are allowed to rewrite experience bullets from it.
+    """
+    section = section_by_index.get(int(unit.get("section_index") or 0))
+    if not section:
+        return False, "unknown_section_index"
+
+    quote = str(unit.get("direct_quote") or "").strip()
+    source = str(section.get("section_text") or "")
+    if quote and quote not in source:
+        return False, "direct_quote_not_verbatim_in_source_section"
+
+    if unit.get("evidence_type") == "employment_experience" and not quote:
+        return False, "employment_experience_requires_verbatim_direct_quote"
+
+    return True, "ok"
 
 
 def fetch_docs(cur, limit: int, document_type: Optional[str]):
@@ -300,10 +326,19 @@ def build_prompt(doc_row, sections: List[Dict[str, Any]]) -> str:
         ],
     }
 
+    employment_rule = (
+        " This is an official resume: emit employment_experience units for explicit "
+        "jobs/internships and preserve employer, job title, dates, responsibilities, "
+        "tools, and outcomes exactly within source support. Every employment_experience "
+        "unit MUST contain a verbatim direct_quote from its source section that includes "
+        "the job/employer/title context plus the supported responsibility/result whenever "
+        "that context is present in the same source section."
+        if document_type == "official_resume" else ""
+    )
     return (
         "Build high-signal profile evidence units from this mapped document. "
-        "Use only this source. Preserve evidence boundaries. JSON only.\n\n"
-        + json.dumps(payload, ensure_ascii=False, indent=2)
+        "Use only this source. Preserve evidence boundaries." + employment_rule +
+        " JSON only.\n\n" + json.dumps(payload, ensure_ascii=False, indent=2)
     )
 
 
@@ -455,6 +490,10 @@ def main() -> int:
                     for raw_unit in units_raw[:8]:
                         unit = normalize_unit(raw_unit)
                         if not unit["evidence_summary"]:
+                            continue
+                        grounded, reason = validate_unit_source_grounding(unit, section_by_index)
+                        if not grounded:
+                            print(f"Skipped evidence unit: {reason} | {unit['evidence_title']}")
                             continue
                         insert_evidence_unit(cur, doc, section_by_index, unit, args.model)
                         doc_inserted += 1

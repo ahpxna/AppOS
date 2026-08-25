@@ -379,8 +379,9 @@ def ensure_application_ready_review(cur, application_id: str) -> str | None:
                          payload_json = EXCLUDED.payload_json, updated_at = now()
            RETURNING id::text;""",
         (bundle_id, application_id,
-         f"{company} — {role}. Documents and autofill review are complete. Open the pinned browser tab, inspect the final form, and submit manually.",
-         Jsonb({"submit": "human_only", "browser_action_authorized": False})),
+         f"{company} — {role}. Autofill review is complete, but the next browser gate could not be classified automatically. Approve this item only to prepare a fresh bound Next/Consent/Submit approval; it does not perform the browser action.",
+         Jsonb({"submit": "separate_privileged_gate", "browser_action_authorized": False,
+                "approve_semantics": "prepare_next_gate_only"})),
     )
     return str(cur.fetchone()[0])
 
@@ -414,6 +415,123 @@ def ensure_reconciliation_review(cur, browser_task_id: str) -> str | None:
          Jsonb({"error": error or "unknown", "browser_task_id": browser_task_id})),
     )
     return str(cur.fetchone()[0])
+
+
+def ensure_privileged_reconciliation_review(cur, execution_id: str) -> str | None:
+    """Materialize uncertain privileged browser I/O as a first-class Human Review item."""
+    cur.execute(
+        """SELECT pae.application_id::text, pae.approval_request_id::text, pae.action_type,
+                  pae.error_message, pae.expected_url, pae.observed_url,
+                  pae.expected_page_fingerprint, pae.observed_page_fingerprint,
+                  a.company, a.job_title
+             FROM privileged_action_executions pae
+             JOIN applications a ON a.id = pae.application_id
+            WHERE pae.id = %s AND pae.status = 'needs_reconciliation';""",
+        (execution_id,),
+    )
+    row = cur.fetchone()
+    if not row:
+        return None
+    (app_id, approval_request_id, action_type, error, expected_url, observed_url,
+     expected_fp, observed_fp, company, role) = row
+    source_sha = _sha256_text(f"privileged|{execution_id}|{approval_request_id}|{action_type}")
+    cur.execute(
+        """SELECT id::text FROM human_review_items
+             WHERE application_id = %s AND item_type = 'reconciliation_required'
+               AND source_sha256 = %s AND status IN ('pending','needs_revision')
+             ORDER BY created_at DESC LIMIT 1;""",
+        (app_id, source_sha),
+    )
+    existing = cur.fetchone()
+    if existing:
+        return str(existing[0])
+    bundle_id = ensure_bundle(cur, app_id, kind="reconciliation")
+    cur.execute(
+        """INSERT INTO human_review_items(
+               review_bundle_id, application_id, item_type, status, title, summary_text,
+               source_sha256, priority, payload_json)
+           VALUES (%s, %s, 'reconciliation_required', 'pending',
+                   'Privileged action reconciliation required', %s, %s, 'urgent', %s)
+           RETURNING id::text;""",
+        (bundle_id, app_id,
+         f"{company} — {role}. {action_type} may have had an external effect. Confirm occurred or not occurred; never replay this approval automatically.",
+         source_sha, Jsonb({
+             "privileged_execution_id": execution_id,
+             "approval_request_id": approval_request_id,
+             "action_type": action_type,
+             "error": error or "unknown",
+             "expected_url": expected_url,
+             "observed_url": observed_url,
+             "expected_page_fingerprint": expected_fp,
+             "observed_page_fingerprint": observed_fp,
+             "allowed_outcomes": ["occurred", "not_occurred"],
+         })),
+    )
+    return str(cur.fetchone()[0])
+
+
+def ensure_runtime_question_review(cur, *, application_id: str, browser_task_id: str,
+                                   question: str, reason: str = "", profile_key: str | None = None) -> str | None:
+    """Turn an unknown runtime ATS question into an answerable Human Review item."""
+    from services.common.question_memory import normalize_question
+    from services.common.immigration_semantics import legal_question_pause_reason
+    question = (question or "").strip()
+    normalized = normalize_question(question)
+    if not normalized or legal_question_pause_reason(question):
+        return None
+    cur.execute("SELECT company, job_title FROM applications WHERE id = %s;", (application_id,))
+    app = cur.fetchone()
+    if not app:
+        return None
+    source_sha = _sha256_text(f"runtime|{application_id}|{browser_task_id}|{normalized}")
+    bundle_id = ensure_bundle(cur, application_id)
+    cur.execute(
+        """INSERT INTO human_review_items(
+               review_bundle_id, application_id, item_type, status, title, summary_text,
+               source_sha256, priority, payload_json)
+           VALUES (%s, %s, 'question_required', 'pending', %s, %s, %s, 'high', %s)
+           ON CONFLICT (application_id, source_sha256)
+             WHERE source_sha256 IS NOT NULL AND item_type = 'question_required'
+               AND status IN ('pending','needs_revision')
+           DO UPDATE SET title = EXCLUDED.title, summary_text = EXCLUDED.summary_text,
+                         payload_json = EXCLUDED.payload_json, updated_at = now()
+           RETURNING id::text;""",
+        (bundle_id, application_id, f"Answer required: {question[:110]}",
+         f"{app[0]} — {app[1]}. {reason or 'This question appeared only at runtime and has no approved answer.'}",
+         source_sha, Jsonb({
+             "question": question,
+             "question_normalized": normalized,
+             "missing_information": reason,
+             "browser_task_id": browser_task_id,
+             "profile_key": profile_key,
+             "source": "runtime_autofill_pause",
+         })),
+    )
+    return str(cur.fetchone()[0])
+
+
+def sync_runtime_questions(cur) -> int:
+    cur.execute(
+        """SELECT id::text, application_id::text, result_json
+             FROM browser_tasks
+            WHERE task_type = 'fill_application_form' AND status = 'completed'
+              AND jsonb_typeof(coalesce(result_json, '{}'::jsonb)->'paused_fields') = 'array';"""
+    )
+    count = 0
+    for task_id, app_id, result in cur.fetchall():
+        for paused in (result or {}).get("paused_fields") or []:
+            if not isinstance(paused, dict):
+                continue
+            question = str(paused.get("question") or "").strip()
+            if not question:
+                continue
+            if ensure_runtime_question_review(
+                cur, application_id=app_id, browser_task_id=task_id, question=question,
+                reason=str(paused.get("reason") or "").strip(),
+                profile_key=str(paused.get("profile_key") or "").strip() or None,
+            ):
+                count += 1
+    return count
 
 
 def ensure_question_review(cur, *, application_id: str, document_id: str,
@@ -563,6 +681,14 @@ def reconcile_materialized_review_state(cur) -> None:
     )
     cur.execute(
         """UPDATE human_review_items h SET status = 'resolved', updated_at = now()
+             FROM privileged_action_executions pae
+            WHERE h.item_type = 'reconciliation_required'
+              AND h.status IN ('pending','needs_revision')
+              AND h.payload_json->>'privileged_execution_id' = pae.id::text
+              AND pae.status <> 'needs_reconciliation';"""
+    )
+    cur.execute(
+        """UPDATE human_review_items h SET status = 'resolved', updated_at = now()
              FROM applications a
             WHERE h.application_id = a.id AND h.item_type = 'application_ready'
               AND h.status = 'pending' AND a.current_step IN ('submitted','abandoned');"""
@@ -587,7 +713,7 @@ def sync_inbox(cur) -> dict[str, int]:
     for (doc_id,) in cur.fetchall():
         if ensure_document_review(cur, doc_id):
             counts["documents"] += 1
-    counts["questions"] = sync_missing_questions(cur)
+    counts["questions"] = sync_missing_questions(cur) + sync_runtime_questions(cur)
     cur.execute("""SELECT id::text FROM approval_requests
                     WHERE status = 'pending' AND application_id IS NOT NULL
                       AND token_expires_at > now();""")
@@ -602,6 +728,10 @@ def sync_inbox(cur) -> dict[str, int]:
     cur.execute("SELECT id::text FROM browser_tasks WHERE execution_state = 'needs_reconciliation';")
     for (task_id,) in cur.fetchall():
         if ensure_reconciliation_review(cur, task_id):
+            counts["reconciliation"] += 1
+    cur.execute("SELECT id::text FROM privileged_action_executions WHERE status = 'needs_reconciliation';")
+    for (execution_id,) in cur.fetchall():
+        if ensure_privileged_reconciliation_review(cur, execution_id):
             counts["reconciliation"] += 1
     cur.execute("SELECT id::text FROM applications WHERE current_step = 'application_ready';")
     for (app_id,) in cur.fetchall():
@@ -655,7 +785,7 @@ def decide_item(conn, item_id: str, *, decision: str, actor: str, note: str = ""
         cur.execute(
             """SELECT id::text, item_type, status, application_id::text,
                       generated_document_id::text, approval_request_id::text,
-                      browser_task_id::text, source_sha256, reviewed_artifact_id::text
+                      browser_task_id::text, source_sha256, reviewed_artifact_id::text, payload_json
                  FROM human_review_items WHERE id = %s FOR UPDATE;""",
             (item_id,),
         )
@@ -664,7 +794,11 @@ def decide_item(conn, item_id: str, *, decision: str, actor: str, note: str = ""
             raise ReviewError("Review item not found.")
         if row[3] != seed[0]:
             raise ReviewError("Review item application binding changed concurrently.")
-        _id, item_type, status, app_id, document_id, approval_id, browser_task_id, source_sha, reviewed_artifact_id = row
+        (_id, item_type, status, app_id, document_id, approval_id, browser_task_id,
+         source_sha, reviewed_artifact_id, item_payload) = row
+        capability_result: dict[str, Any] | None = None
+        materialized_approval_id: str | None = None
+        reconciliation_outcome: str | None = None
         if status not in {"pending", "needs_revision"}:
             raise ReviewError(f"Review item is already {status}.")
 
@@ -727,10 +861,10 @@ def decide_item(conn, item_id: str, *, decision: str, actor: str, note: str = ""
             if decision == "revise":
                 note = (note + " Review requested revision; issue a fresh bound approval.").strip()
             from services.approval.approval_service_v1 import decide_request_by_id
-            result = decide_request_by_id(conn, approval_id, decision=capability_decision,
-                                          note=note, actor=actor, commit=False)
-            if not result.get("ok"):
-                raise ReviewError(result.get("error") or "Approval request decision failed.")
+            capability_result = decide_request_by_id(conn, approval_id, decision=capability_decision,
+                                                     note=note, actor=actor, commit=False)
+            if not capability_result.get("ok"):
+                raise ReviewError(capability_result.get("error") or "Approval request decision failed.")
 
         elif item_type == "autofill_review":
             if decision == "approve":
@@ -740,7 +874,7 @@ def decide_item(conn, item_id: str, *, decision: str, actor: str, note: str = ""
                     raise ReviewError("Only a fully completed deterministic autofill may be approved.")
                 current_sha = _sha256_text(json.dumps(task[2] or {}, sort_keys=True, separators=(",", ":"), default=str))
                 if source_sha and current_sha != source_sha:
-                    raise ReviewError("Autofill result changed after screenshot review was created.")
+                    raise ReviewError("Autofill result changed after the review item was created.")
                 cur.execute(
                     """SELECT file_path, sha256 FROM human_review_artifacts
                          WHERE review_item_id = %s AND artifact_kind = 'autofill_screenshot'
@@ -748,11 +882,13 @@ def decide_item(conn, item_id: str, *, decision: str, actor: str, note: str = ""
                     (item_id,),
                 )
                 screenshot = cur.fetchone()
-                if not screenshot:
-                    raise ReviewError("A verified post-autofill screenshot is required before approval.")
-                screenshot_path = Path(screenshot[0]).expanduser()
-                if not screenshot_path.is_file() or _sha256_file(screenshot_path) != screenshot[1]:
-                    raise ReviewError("Autofill screenshot is missing or changed; capture a fresh review artifact.")
+                # Screenshot capture is best-effort. A missing screenshot must not
+                # invalidate an otherwise durable, deterministic browser completion.
+                # If a screenshot exists, however, its exact bytes remain review-bound.
+                if screenshot:
+                    screenshot_path = Path(screenshot[0]).expanduser()
+                    if not screenshot_path.is_file() or _sha256_file(screenshot_path) != screenshot[1]:
+                        raise ReviewError("Autofill screenshot artifact changed after review creation; capture a fresh artifact or remove the stale binding.")
                 cur.execute("UPDATE applications SET current_step = 'application_ready', updated_at = now() WHERE id = %s AND current_step = 'form_filled';", (app_id,))
                 transitioned = cur.rowcount == 1
                 if not transitioned:
@@ -762,25 +898,97 @@ def decide_item(conn, item_id: str, *, decision: str, actor: str, note: str = ""
                 cur.execute(
                     """INSERT INTO pipeline_events(application_id, from_step, to_step, actor, reason, detail_json)
                        VALUES (%s, 'form_filled', 'application_ready', %s,
-                               'Human reviewed post-autofill screenshot; final submit remains human-only.', %s);""",
-                    (app_id, actor, Jsonb({"review_item_id": item_id, "browser_task_id": browser_task_id})),
+                               'Human approved deterministic post-autofill state; every subsequent browser action requires a separate privileged approval.', %s);""",
+                    (app_id, actor, Jsonb({"review_item_id": item_id, "browser_task_id": browser_task_id,
+                                          "screenshot_present": bool(screenshot)})),
                 )
-                ensure_application_ready_review(cur, app_id)
+                from services.application_actions.privileged_action_v1 import materialize_application_ready_gate
+                try:
+                    materialized_approval_id = materialize_application_ready_gate(cur, app_id)
+                except Exception as exc:
+                    # Classification/package failure is not permission to submit. Keep
+                    # application_ready visible so the user can retry gate preparation.
+                    cur.execute(
+                        """INSERT INTO application_events(application_id, event_type, event_source, event_payload)
+                           VALUES (%s, 'application_ready_gate_materialization_failed', 'human_review_hub', %s);""",
+                        (app_id, Jsonb({"review_item_id": item_id, "error": str(exc)[:1000]})),
+                    )
+                if materialized_approval_id:
+                    ensure_approval_review(cur, materialized_approval_id)
+                else:
+                    ensure_application_ready_review(cur, app_id)
 
         elif item_type == "question_required":
             raise ReviewError("Question items require an explicit answer; use the answer command.")
 
         elif item_type == "reconciliation_required":
-            cur.execute("SELECT execution_state FROM browser_tasks WHERE id = %s;", (browser_task_id,))
-            task = cur.fetchone()
-            if task and task[0] == "needs_reconciliation":
-                raise ReviewError(
-                    "Underlying task still needs reconciliation; close it with autofill_reconcile_v1 first. "
-                    "Reject/revise cannot dismiss an uncertain browser side effect."
+            privileged_execution_id = str((item_payload or {}).get("privileged_execution_id") or "").strip()
+            if privileged_execution_id:
+                if decision == "revise":
+                    raise ReviewError("Privileged reconciliation has exactly two outcomes: occurred or not_occurred.")
+                cur.execute(
+                    """SELECT status, action_type, approval_request_id::text, result_json
+                         FROM privileged_action_executions
+                        WHERE id = %s AND application_id = %s FOR UPDATE;""",
+                    (privileged_execution_id, app_id),
                 )
+                execution = cur.fetchone()
+                if not execution or execution[0] != "needs_reconciliation":
+                    raise ReviewError("Privileged execution is no longer awaiting reconciliation; sync the inbox.")
+                action_type = execution[1]
+                reconciliation_outcome = "occurred" if decision == "approve" else "not_occurred"
+                reconciled_result = dict(execution[3] or {})
+                reconciled_result.update({"reconciliation": reconciliation_outcome,
+                                          "reconciled_by": actor, "review_item_id": item_id})
+                new_execution_status = "completed" if reconciliation_outcome == "occurred" else "failed"
+                cur.execute(
+                    """UPDATE privileged_action_executions
+                          SET status = %s, result_json = %s, error_message = NULL, finished_at = now()
+                        WHERE id = %s;""",
+                    (new_execution_status, Jsonb(reconciled_result), privileged_execution_id),
+                )
+                if reconciliation_outcome == "occurred" and action_type == "privileged_submit_application":
+                    from services.application_actions.privileged_action_v1 import _transition_application_step
+                    _transition_application_step(
+                        cur, app_id, "submitted", actor="privileged-reconciliation",
+                        reason="Human confirmed the uncertain final Submit browser effect occurred.",
+                        detail={"privileged_execution_id": privileged_execution_id, "review_item_id": item_id},
+                        status="submitted",
+                    )
+                    cur.execute("UPDATE applications SET submitted_at = coalesce(submitted_at, now()) WHERE id = %s;", (app_id,))
+                cur.execute(
+                    """INSERT INTO application_events(application_id, event_type, event_source, event_payload)
+                       VALUES (%s, 'privileged_action_reconciled', 'human_review_hub', %s);""",
+                    (app_id, Jsonb({"privileged_execution_id": privileged_execution_id,
+                                    "action_type": action_type, "outcome": reconciliation_outcome,
+                                    "actor": actor})),
+                )
+            else:
+                cur.execute("SELECT execution_state FROM browser_tasks WHERE id = %s;", (browser_task_id,))
+                task = cur.fetchone()
+                if task and task[0] == "needs_reconciliation":
+                    raise ReviewError(
+                        "Underlying autofill task still needs reconciliation; close it with autofill_reconcile_v1 first. "
+                        "Reject/revise cannot dismiss an uncertain browser side effect."
+                    )
 
         elif item_type == "application_ready":
-            raise ReviewError("Final submission is human-only in the real browser. This review item has no remote approval action.")
+            if decision == "approve":
+                from services.application_actions.privileged_action_v1 import materialize_application_ready_gate
+                materialized_approval_id = materialize_application_ready_gate(cur, app_id)
+                if not materialized_approval_id:
+                    raise ReviewError("The fresh page has no single unambiguous Next/Consent/Submit gate. Inspect the pinned browser page before trying again.")
+                ensure_approval_review(cur, materialized_approval_id)
+                note = (note + " Prepared a fresh exact-bound browser approval; no browser action executed.").strip()
+            elif decision == "reject":
+                from services.application_actions.privileged_action_v1 import _transition_application_step
+                _transition_application_step(
+                    cur, app_id, "abandoned", actor=actor,
+                    reason="Human declined to continue from application_ready.",
+                    detail={"review_item_id": item_id}, status="abandoned",
+                )
+            else:
+                note = (note + " Keep application_ready pending for manual inspection and fresh gate preparation.").strip()
 
         new_status = {"approve": "approved", "reject": "rejected", "revise": "needs_revision"}[review_decision]
         cur.execute(
@@ -798,7 +1006,16 @@ def decide_item(conn, item_id: str, *, decision: str, actor: str, note: str = ""
                 WHERE id = (SELECT review_bundle_id FROM human_review_items WHERE id = %s);""",
             (item_id,),
         )
-    return {"ok": True, "review_item_id": item_id, "status": new_status, "decision": review_decision}
+    response = {"ok": True, "review_item_id": item_id, "status": new_status, "decision": review_decision,
+                "application_id": app_id, "item_type": item_type}
+    if capability_result:
+        response["approval_request_id"] = approval_id
+        response["approval_type"] = capability_result.get("type")
+    if materialized_approval_id:
+        response["materialized_approval_request_id"] = materialized_approval_id
+    if reconciliation_outcome:
+        response["reconciliation_outcome"] = reconciliation_outcome
+    return response
 
 
 def main() -> int:

@@ -77,6 +77,7 @@ from services.autofill.autofill_context_v1 import AutofillContextError, load_aut
 from services.common.openclaw_runtime import resolve_openclaw_binary
 from services.common.immigration_semantics import classify_immigration_question
 from services.common.question_memory import normalize_question
+from services.common.autofill_action_scope import action_is_exactly_approved
 
 
 load_repo_env()
@@ -749,19 +750,13 @@ def require_current_input_hash(binding: Dict[str, Any], current_hash: str) -> No
 
 
 def action_is_in_approved_scope(action, scope: Dict[str, Any]) -> bool:
-    """Do not let a dynamic ATS reveal an unreviewed extra write."""
-    if action.action not in {"fill", "select", "check", "upload"}:
-        return True
-    key = action.profile_key or ""
-    if key.startswith("documents."):
-        return key.removeprefix("documents.") in set(scope.get("document_types") or [])
-    if key:
-        return key in set(scope.get("profile_keys") or [])
-    question = action.question_label or ""
-    semantic = classify_immigration_question(question)
-    if semantic is not None:
-        return semantic.value in set(scope.get("sensitive_classes") or [])
-    return normalize_question(question) in set(scope.get("remembered_questions") or [])
+    """Authorize only the exact human-reviewed write tuple.
+
+    Dynamic fields revealed after approval are never covered by a profile-key
+    wildcard. A changed ref/label/value needs a fresh capability. Uploads use
+    ``privileged_upload_document`` and are always refused here.
+    """
+    return action_is_exactly_approved(action, scope)
 
 
 def _durable_connection():
@@ -1443,6 +1438,9 @@ def handle_fill_application_form(cur, task) -> Dict[str, Any]:
         "failed_refs": list(result.failed_refs), "executed_refs": list(result.executed_refs),
         "pinned_target_id": result.target_id,
         "paused": [action.question_label or action.reason for action in latest_actions if action.action == "pause"],
+        "paused_fields": [{"question": action.question_label or "", "reason": action.reason,
+                           "profile_key": action.profile_key}
+                          for action in latest_actions if action.action == "pause"],
         "approval_consumed": execution_started,
         "approval_closed_without_write": not execution_started,
         "screenshot_path": screenshot_path,

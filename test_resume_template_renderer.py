@@ -18,6 +18,10 @@ def make_template(path: Path) -> None:
     doc = Document()
     doc.add_paragraph("CANDIDATE NAME | github.com/ahpxna")
     doc.add_paragraph("EDUCATION")
+    doc.add_paragraph("PROFESSIONAL EXPERIENCE")
+    doc.add_paragraph("Security Intern | Example Co | Jan 2025 - May 2025")
+    doc.add_paragraph("Investigated security alerts and documented findings.", style="List Paragraph")
+    doc.add_paragraph("Automated a recurring reporting task with Python.", style="List Paragraph")
     doc.add_paragraph("PROJECTS")
     for number in range(6):
         doc.add_paragraph(f"Project {number + 1} — original subtitle {number + 1} | GitHub\tJan 2026")
@@ -37,6 +41,7 @@ def test_renderer_only_rewrites_fixed_project_and_skill_slots(tmp_path):
     make_template(template)
     renderer.render_docx(
         template=template, output=output,
+        experience_bullets=[{"slot": 1, "text": "Investigated security alerts and documented actionable findings."}],
         project_bullets=[{"slot": 1, "text": "Built validated security lab evidence."}],
         skill_lines=[{"category": "Security", "items": "PKI/TLS, OpenSSL"}],
         project_subtitles=[{"slot": 1, "text": "JD-relevant verified subtitle"}],
@@ -44,11 +49,12 @@ def test_renderer_only_rewrites_fixed_project_and_skill_slots(tmp_path):
     paragraphs = Document(output).paragraphs
     texts = [paragraph.text for paragraph in paragraphs]
     assert texts[0] == "CANDIDATE NAME | github.com/ahpxna"
-    assert texts[1] == "EDUCATION"
-    assert texts[3] == "Project 1 — JD-relevant verified subtitle | GitHub\tJan 2026"
-    assert texts[4] == "Built validated security lab evidence."
-    assert texts[5] == ""
-    assert texts[7] == ""
+    assert "PROFESSIONAL EXPERIENCE" in texts
+    assert "Security Intern | Example Co | Jan 2025 - May 2025" in texts
+    assert "Investigated security alerts and documented actionable findings." in texts
+    project_header = texts.index("Project 1 — JD-relevant verified subtitle | GitHub\tJan 2026")
+    assert texts[project_header + 1] == "Built validated security lab evidence."
+    assert texts[project_header + 2] == ""
     assert texts[-5] == "Security: PKI/TLS, OpenSSL"
     assert texts[-1] == "Programming: original items"
 
@@ -88,3 +94,16 @@ def test_renderer_requires_primary_before_secondary_and_enforces_each_budget(tmp
         assert "200" in str(exc)
     else:
         raise AssertionError("Primary project bullet must fit its fixed two-line budget")
+
+
+def test_renderer_never_changes_experience_job_header(tmp_path):
+    template, output = tmp_path / "template.docx", tmp_path / "resume.docx"
+    make_template(template)
+    renderer.render_docx(
+        template=template, output=output,
+        experience_bullets=[{"slot": 2, "text": "Automated recurring reporting with Python for clearer review workflows."}],
+        project_bullets=[], skill_lines=[], project_subtitles=[],
+    )
+    texts = [p.text for p in Document(output).paragraphs]
+    assert "Security Intern | Example Co | Jan 2025 - May 2025" in texts
+    assert "Automated recurring reporting with Python for clearer review workflows." in texts

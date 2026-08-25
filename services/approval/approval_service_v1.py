@@ -341,8 +341,13 @@ def cmd_create(conn, args) -> int:
                 artifact = (fetch_artifact_binding(cur, args.application_id, args.document_id, args.artifact_id)
                             if args.artifact_id else None)
                 action_scope = json.loads(args.autofill_action_scope_json or "{}")
-                if not isinstance(action_scope, dict) or not isinstance(action_scope.get("profile_keys"), list):
-                    raise RuntimeError("--autofill-action-scope-json must contain profile_keys from jobos autofill prepare.")
+                if (not isinstance(action_scope, dict) or int(action_scope.get("version") or 0) != 2
+                        or not isinstance(action_scope.get("actions"), list)):
+                    raise RuntimeError("--autofill-action-scope-json must contain exact version=2 actions from jobos autofill prepare.")
+                for item in action_scope["actions"]:
+                    if (not isinstance(item, dict) or item.get("action") not in {"fill", "select", "check"}
+                            or not item.get("ref") or not item.get("value_sha256")):
+                        raise RuntimeError("autofill action scope contains a non-exact or upload action; prepare a fresh plan.")
                 input_hash = current_autofill_input_hash(
                     cur,
                     application_id=args.application_id,

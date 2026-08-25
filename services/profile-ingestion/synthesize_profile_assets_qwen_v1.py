@@ -26,7 +26,8 @@ DSN = database_dsn()
 
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
 DEFAULT_MODEL = _model_config.get_model("profile_asset_synthesizer")
-VERSION = "profile_asset_synthesizer_qwen_v1_2026_04_27"
+VERSION = "profile_asset_synthesizer_qwen_v2_2026_08_25"
+EVIDENCE_VERSION = "profile_evidence_unit_builder_qwen_v2_2026_08_25"
 
 
 SYSTEM_PROMPT = """You are the Profile Asset Synthesizer inside a job-application operating system.
@@ -36,6 +37,7 @@ Your job is to synthesize rich, job-oriented profile assets from source-grounded
 Do NOT write final resume output.
 Do NOT approve the asset.
 Do NOT invent claims, employment, certifications, publication venues, grades, awards, completed empirical results, or production deployment.
+Exception to the word "employment": explicit employment/internship facts already present in employment_experience evidence from an official resume are user truth and MAY be preserved exactly. Never invent or upgrade employer, title, dates, scope, tools, metrics, or employment type.
 Do NOT flatten the evidence into "User has skill X".
 Preserve methodology, scope, tools, limitations, role relevance, and do-not-overclaim boundaries.
 
@@ -46,7 +48,7 @@ Return JSON only:
   "assets": [
     {
       "asset_title": "specific career asset title",
-      "asset_type": "project_asset|course_competency_asset|research_asset|tool_workflow_asset|academic_record_asset|academic_trajectory_asset|strategic_asset",
+      "asset_type": "project_asset|course_competency_asset|research_asset|tool_workflow_asset|academic_record_asset|academic_trajectory_asset|source_document_asset|strategic_asset",
       "canonical_narrative": "rich source-preserving narrative",
       "job_oriented_summary": "how this asset should be used for job applications",
       "resume_bullet_bank": ["safe draft bullet or phrase", "another safe draft bullet or phrase"],
@@ -69,6 +71,7 @@ Return JSON only:
   ]
 }
 
+For official_resume documents, produce one source_document_asset and make resume_bullet_bank preserve the strongest employment_experience source evidence. Employer, job title, dates, and employment type are immutable facts; bullet wording may later be tailored only within this evidence.
 Return 1-2 assets per document. Prefer one strong asset unless the evidence clearly supports two distinct assets.
 """
 
@@ -167,6 +170,36 @@ def normalize_asset(asset: Dict[str, Any], fallback_type: str) -> Dict[str, Any]
     }
 
 
+def employment_evidence_units(evidence_units: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [e for e in evidence_units if e.get("evidence_type") == "employment_experience"]
+
+
+def attach_official_resume_source_quotes(
+    asset: Dict[str, Any], document_type: str, evidence_units: List[Dict[str, Any]]
+) -> Dict[str, Any]:
+    """Append immutable, verbatim employment anchors to the resume-facing catalog.
+
+    This is intentionally deterministic rather than model-authored. The document
+    generator can paraphrase a bullet for JD relevance, but its evidence quote
+    must ultimately come from text copied verbatim out of the user's resume.
+    """
+    if document_type != "official_resume":
+        return asset
+    quotes = []
+    for e in employment_evidence_units(evidence_units):
+        quote = str(e.get("direct_quote") or "").strip()
+        if quote and quote not in quotes:
+            quotes.append(quote)
+    if not quotes:
+        return asset
+    anchors = "\n".join(f"- {q}" for q in quotes)
+    existing = str(asset.get("resume_bullet_bank") or "").strip()
+    asset["resume_bullet_bank"] = (
+        (existing + "\n\n") if existing else ""
+    ) + "VERBATIM EMPLOYMENT SOURCE QUOTES (authoritative):\n" + anchors
+    return asset
+
+
 def validate_asset_basic(asset: Dict[str, Any], doc_row, evidence_units: List[Dict[str, Any]]) -> tuple[bool, str]:
     (
         doc_id,
@@ -211,17 +244,27 @@ def validate_asset_basic(asset: Dict[str, Any], doc_row, evidence_units: List[Di
         "award-winning",
         "certified ",
         "certification earned",
-        "professional experience",
         "production deployment",
         "production-ready",
         "enterprise-grade",
-        "employed as",
-        "worked professionally as",
     ]
-
     for term in forbidden_terms:
         if term in all_text:
             return False, f"forbidden_external_or_overclaim_term:{term}"
+
+    employment_markers = ("professional experience", "employed as", "worked professionally as")
+    if any(term in all_text for term in employment_markers):
+        if document_type != "official_resume":
+            return False, "employment_language_requires_official_resume"
+        if not employment_evidence_units(evidence_units):
+            return False, "employment_language_requires_employment_evidence"
+
+    if document_type == "official_resume" and employment_evidence_units(evidence_units):
+        bank = str(asset.get("resume_bullet_bank") or "")
+        quotes = [str(e.get("direct_quote") or "").strip() for e in employment_evidence_units(evidence_units)]
+        quotes = [q for q in quotes if q]
+        if not quotes or not any(q in bank for q in quotes):
+            return False, "official_resume_asset_missing_verbatim_employment_anchor"
 
     return True, "ok"
 
@@ -233,6 +276,7 @@ def fallback_asset_type(document_type: str) -> str:
         "cross_portfolio_mapping": "tool_workflow_asset",
         "official_transcript": "academic_record_asset",
         "course_profile": "course_competency_asset",
+        "official_resume": "source_document_asset",
     }
     return mapping.get(document_type, "strategic_asset")
 
@@ -244,9 +288,10 @@ def fetch_docs(cur, limit: int, document_type: Optional[str], force: bool):
           SELECT 1
           FROM profile_evidence_units peu
           WHERE peu.profile_document_id = pd.id
-            AND peu.builder_version = 'profile_evidence_unit_builder_qwen_v1_2026_04_27'
+            AND peu.builder_version = %s
         )"""
     ]
+    params.append(EVIDENCE_VERSION)
 
     if document_type:
         where.append("pd.document_type = %s")
@@ -326,24 +371,25 @@ def fetch_evidence_units(cur, document_id, max_units: int):
         LEFT JOIN raw_files rf ON rf.id = peu.raw_file_id
         LEFT JOIN profile_document_sections pds ON pds.id = peu.profile_document_section_id
         WHERE peu.profile_document_id = %s
-          AND peu.builder_version = 'profile_evidence_unit_builder_qwen_v1_2026_04_27'
+          AND peu.builder_version = %s
           AND peu.status = 'draft'
         ORDER BY
           CASE peu.evidence_type
-            WHEN 'project_scope' THEN 1
-            WHEN 'methodology' THEN 2
-            WHEN 'result' THEN 3
-            WHEN 'tool_workflow' THEN 4
-            WHEN 'technical_skill' THEN 5
-            WHEN 'career_positioning' THEN 6
-            WHEN 'limitation' THEN 7
-            WHEN 'warning' THEN 8
-            ELSE 9
+            WHEN 'employment_experience' THEN 1
+            WHEN 'project_scope' THEN 2
+            WHEN 'methodology' THEN 3
+            WHEN 'result' THEN 4
+            WHEN 'tool_workflow' THEN 5
+            WHEN 'technical_skill' THEN 6
+            WHEN 'career_positioning' THEN 7
+            WHEN 'limitation' THEN 8
+            WHEN 'warning' THEN 9
+            ELSE 10
           END,
           peu.created_at ASC
         LIMIT %s
         """,
-        (document_id, max_units),
+        (document_id, EVIDENCE_VERSION, max_units),
     )
 
     keys = [
@@ -410,24 +456,49 @@ def build_prompt(doc_row, evidence_units: List[Dict[str, Any]]) -> str:
         ],
     }
 
+    resume_rule = (
+        " This is the user's official resume. Preserve explicit employment facts as truth, "
+        "and place source-grounded employment material into resume_bullet_bank. Do not alter "
+        "employer, job title, dates, location, or employment type. Bullet language may be "
+        "job-oriented only within supplied evidence."
+        if document_type == "official_resume" else ""
+    )
     return (
         "Synthesize draft profile asset(s) from these evidence units. "
-        "Use only the evidence provided. Preserve limits. JSON only.\n\n"
-        + json.dumps(payload, ensure_ascii=False, indent=2)
+        "Use only the evidence provided. Preserve limits." + resume_rule +
+        " JSON only.\n\n" + json.dumps(payload, ensure_ascii=False, indent=2)
     )
 
 
-def delete_existing_draft_assets(cur, raw_file_id):
-    cur.execute(
-        """
-        SELECT id
-        FROM profile_assets
-        WHERE created_from_raw_file_id = %s
-          AND compiler_version = %s
-          AND status = 'draft'
-        """,
-        (raw_file_id, VERSION),
-    )
+def delete_existing_draft_assets(cur, raw_file_id, *, include_superseded: bool = False):
+    """Remove only unapproved generated drafts for this source.
+
+    A compiler-version bump intentionally creates a new review item. Old generic
+    drafts would otherwise keep ``jobos_profile_ready`` blocked forever. Approved
+    assets are never deleted or silently downgraded here.
+    """
+    if include_superseded:
+        cur.execute(
+            """
+            SELECT id
+            FROM profile_assets
+            WHERE created_from_raw_file_id = %s
+              AND source_strategy = 'evidence_unit_asset_synthesis'
+              AND status IN ('draft','needs_review','pending_review')
+            """,
+            (raw_file_id,),
+        )
+    else:
+        cur.execute(
+            """
+            SELECT id
+            FROM profile_assets
+            WHERE created_from_raw_file_id = %s
+              AND compiler_version = %s
+              AND status IN ('draft','needs_review','pending_review')
+            """,
+            (raw_file_id, VERSION),
+        )
     ids = [r[0] for r in cur.fetchall()]
     if not ids:
         return
@@ -617,8 +688,9 @@ def main() -> int:
 
                 cur.execute("SAVEPOINT asset_synth_sp")
                 try:
-                    if args.force:
-                        delete_existing_draft_assets(cur, raw_file_id)
+                    # A new compiler contract supersedes old unapproved generic
+                    # drafts for the same source. Approved assets remain untouched.
+                    delete_existing_draft_assets(cur, raw_file_id, include_superseded=True)
 
                     prompt = build_prompt(doc, evidence_units)
                     result = call_ollama_json(prompt, args.model)
@@ -630,6 +702,7 @@ def main() -> int:
                     doc_assets = 0
                     for raw_asset in assets_raw[:max(1, min(args.max_assets_per_doc, 2))]:
                         asset = normalize_asset(raw_asset, fallback_type)
+                        asset = attach_official_resume_source_quotes(asset, doc_type, evidence_units)
                         if not asset["canonical_narrative"]:
                             continue
                         ok, reason = validate_asset_basic(asset, doc, evidence_units)

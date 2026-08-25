@@ -1,11 +1,11 @@
 """Render a verified resume into the fixed one-page Word/PDF template.
 
-Only the twelve existing project-bullet slots, five existing skill rows, and
-the audited subtitle between a fixed project name and its GitHub link may
-change. The header identity, dates, links, education, experience,
-certifications, page geometry, and every style remain from the supplied Word
-template. The renderer refuses to silently shrink text or accept a multi-page
-PDF.
+Only existing experience-bullet paragraphs, the twelve project-bullet slots,
+five skill rows, and the audited subtitle between a fixed project name and its
+GitHub link may change. Experience employer/job-title/date/header text remains
+immutable, as do identity, links, education, certifications, page geometry,
+and every style. The renderer refuses to silently shrink text or accept a
+multi-page PDF.
 """
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ from typing import Any
 
 from docx import Document
 from services.common.resume_project_header_audit import HEADER_SLOTS, subtitle_bounds
+from services.common.resume_experience_bullet_audit import experience_bullet_indices
 
 
 PROJECTS_HEADING = "PROJECTS"
@@ -131,8 +132,9 @@ def protected_snapshot(document) -> dict[str, Any]:
     """Capture all text and hyperlink targets outside permitted text slots."""
     paragraphs = document.paragraphs
     bullets, skills = _slot_indices(paragraphs)
+    experience = experience_bullet_indices(paragraphs)
     headers = _header_indices(paragraphs)
-    editable = set(bullets + skills + headers)
+    editable = set(experience + bullets + skills + headers)
     hyperlinks = sorted(
         rel.target_ref for rel in document.part.rels.values()
         if rel.reltype.endswith("/hyperlink")
@@ -150,20 +152,27 @@ def validate_template_contract(template: Path) -> dict[str, int]:
         raise ResumeTemplateError(f"Resume template not found: {template}")
     document = Document(template)
     bullets, skills = _slot_indices(document.paragraphs)
+    experience = experience_bullet_indices(document.paragraphs)
     headers = _header_indices(document.paragraphs)
     # Exercise all format-sensitive invariants without writing a copy.
     protected_snapshot(document)
-    return {"project_bullet_slots": len(bullets), "skill_slots": len(skills), "project_headers": len(headers)}
+    return {
+        "experience_bullet_slots": len(experience),
+        "project_bullet_slots": len(bullets), "skill_slots": len(skills),
+        "project_headers": len(headers),
+    }
 
 
 def render_docx(*, template: Path, output: Path, project_bullets: list[dict[str, Any]],
-                skill_lines: list[dict[str, str]], project_subtitles: list[dict[str, Any]] | None = None) -> None:
-    """Copy the template and alter only fixed bullet/skill slots in place."""
+                skill_lines: list[dict[str, str]], project_subtitles: list[dict[str, Any]] | None = None,
+                experience_bullets: list[dict[str, Any]] | None = None) -> None:
+    """Copy the template and alter only audited experience/project/skill slots."""
     if len(project_bullets) > MAX_PROJECT_BULLETS:
         raise ResumeTemplateError(f"Template has {MAX_PROJECT_BULLETS} project-bullet slots.")
     if len(skill_lines) > MAX_SKILL_LINES:
         raise ResumeTemplateError(f"Template has {MAX_SKILL_LINES} skill-category rows.")
     project_subtitles = project_subtitles or []
+    experience_bullets = experience_bullets or []
     if len(project_subtitles) > len(HEADER_SLOTS):
         raise ResumeTemplateError(f"Template has {len(HEADER_SLOTS)} editable project subtitles.")
     if not template.is_file():
@@ -172,11 +181,31 @@ def render_docx(*, template: Path, output: Path, project_bullets: list[dict[str,
     shutil.copy2(template, output)
     document = Document(output)
     immutable = protected_snapshot(document)
+    experience_indices = experience_bullet_indices(document.paragraphs)
     bullet_indices, skill_indices = _slot_indices(document.paragraphs)
     header_indices = _header_indices(document.paragraphs)
+    experience_slots = [document.paragraphs[index] for index in experience_indices]
     bullet_slots = [document.paragraphs[index] for index in bullet_indices]
     skill_slots = [document.paragraphs[index] for index in skill_indices]
     header_slots = dict(zip(HEADER_SLOTS, (document.paragraphs[index] for index in header_indices)))
+    seen_experience_slots: set[int] = set()
+    for item in experience_bullets:
+        try:
+            slot_number = int(item.get("slot"))
+        except (TypeError, ValueError) as exc:
+            raise ResumeTemplateError("Every experience update needs an integer fixed slot.") from exc
+        if not 1 <= slot_number <= len(experience_slots) or slot_number in seen_experience_slots:
+            raise ResumeTemplateError("Experience updates must use unique existing experience-bullet slots.")
+        compact = " ".join(str(item.get("text") or "").split())
+        baseline = " ".join(experience_slots[slot_number - 1].text.split())
+        limit = min(220, max(len(baseline) + 40, int(len(baseline) * 1.35)))
+        if not compact or len(compact) > limit:
+            raise ResumeTemplateError(
+                f"Experience slot {slot_number} text must be 1..{limit} characters to preserve the fixed layout."
+            )
+        seen_experience_slots.add(slot_number)
+        _replace_plain(experience_slots[slot_number - 1], compact)
+
     seen_slots: set[int] = set()
     requested_slots: list[int] = []
     for item in project_bullets:
@@ -235,7 +264,7 @@ def render_docx(*, template: Path, output: Path, project_bullets: list[dict[str,
     document.save(output)
     if protected_snapshot(Document(output)) != immutable:
         raise ResumeTemplateError(
-            "Template integrity check failed: a protected name/contact/project-heading/hyperlink field changed."
+            "Template integrity check failed: a protected identity/experience-header/project-heading/hyperlink field changed."
         )
 
 
