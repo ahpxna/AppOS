@@ -3,6 +3,15 @@
 import pytest
 
 from services.common import llm_gateway
+from services.common import llm_cost_accounting_v1 as cost_accounting
+
+
+@pytest.fixture
+def no_cost_db(monkeypatch):
+    reservation = cost_accounting.Reservation("00000000-0000-0000-0000-000000000001", 0, "unit", "test")
+    monkeypatch.setattr(cost_accounting, "reserve_paid_call", lambda **_kwargs: reservation)
+    monkeypatch.setattr(cost_accounting, "settle_paid_call", lambda *_args, **_kwargs: 0)
+    monkeypatch.setattr(cost_accounting, "mark_paid_call_uncertain", lambda *_args, **_kwargs: None)
 
 
 def test_resolve_config_uses_local_backend_by_default(monkeypatch):
@@ -18,7 +27,7 @@ def test_resolve_config_uses_local_backend_by_default(monkeypatch):
     assert config.api_key is None
 
 
-def test_role_api_override_uses_openai_compatible_transport(monkeypatch):
+def test_role_api_override_uses_openai_compatible_transport(monkeypatch, no_cost_db):
     monkeypatch.setenv("JOBOS_LLM_BACKEND", "ollama")
     monkeypatch.setenv("JOBOS_DOCGEN_LLM_BACKEND", "api")
     monkeypatch.setenv("JOBOS_DOCGEN_LLM_API_BASE", "https://api.example.test/v1")
@@ -47,6 +56,7 @@ def test_role_api_override_uses_openai_compatible_transport(monkeypatch):
                 "messages": [{"role": "user", "content": "return json"}],
                 "temperature": 0.2,
                 "response_format": {"type": "json_object"},
+                "max_tokens": 4096,
             },
             9,
             "unit-test-token",
@@ -54,7 +64,7 @@ def test_role_api_override_uses_openai_compatible_transport(monkeypatch):
     ]
 
 
-def test_embeddings_use_api_backend_and_preserve_input_order(monkeypatch):
+def test_embeddings_use_api_backend_and_preserve_input_order(monkeypatch, no_cost_db):
     monkeypatch.setenv("JOBOS_LLM_BACKEND", "api")
     monkeypatch.setenv("JOBOS_LLM_API_BASE", "https://embed.example.test")
     monkeypatch.setenv("JOBOS_LLM_API_KEY", "unit-test-token")
@@ -73,7 +83,7 @@ def test_embeddings_use_api_backend_and_preserve_input_order(monkeypatch):
     assert calls[0][1]["input"] == ["first", "second"]
 
 
-def test_deepseek_style_keeps_its_documented_base_url_shape(monkeypatch):
+def test_deepseek_style_keeps_its_documented_base_url_shape(monkeypatch, no_cost_db):
     monkeypatch.setenv("JOBOS_LLM_BACKEND", "api")
     monkeypatch.setenv("JOBOS_LLM_API_STYLE", "deepseek")
     monkeypatch.setenv("JOBOS_LLM_API_BASE", "https://api.deepseek.example")

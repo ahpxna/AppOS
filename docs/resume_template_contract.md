@@ -78,9 +78,14 @@ every substantive changed term. The bullet verifier rejects new tools, results,
 responsibilities, or experience not confirmed by that project asset. A project
 without a real JD match is omitted rather than creatively reframed.
 
-The DOCX is the working artifact. The renderer copies it for each verified
-application and changes only fixed text runs in the 12 project-bullet slots and
-five skill rows; Word retains the template's direct run/paragraph formatting.
-The user opens the resulting file in Word and chooses Print/Save as PDF. This
-avoids LibreOffice pagination drift. The renderer rejects more than 12 project
-bullets or five skill rows and never shrinks font/spacing.
+The structured QA payload is interpreted by one canonical artifact renderer. It copies
+the fixed DOCX template and applies only audited sparse edits to existing experience,
+project, subtitle, and skill slots. Empty edit lists preserve the baseline template; they
+are valid when no evidence-backed JD-specific rewrite is justified.
+
+JobOS then exports that DOCX through its configured deterministic LibreOffice renderer,
+validates that the PDF is exactly one page, and treats **those PDF bytes as canonical**.
+Human Review shows that exact PDF, records its SHA-256, and later browser upload reuses
+the same file/SHA. Microsoft Word may still be used for manual inspection, but a PDF
+printed/saved by Word is a different artifact and is not authorized until separately
+reviewed and rebound. This removes the previous Word-vs-LibreOffice dual source of truth.

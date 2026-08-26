@@ -24,14 +24,23 @@ def mark(results: list[tuple[str, bool, str]], name: str, ok: bool, detail: str 
     results.append((name, ok, detail))
 
 
-def doctor(*, check_browser: bool, strict: bool = False, require_autofill: bool = False) -> int:
+def _latest_migration_contract() -> tuple[str, str, str]:
+    migrations = sorted((ROOT / "db" / "migrations").glob("*.sql"), key=lambda path: path.name)
+    if not migrations:
+        raise RuntimeError("No SQL migrations are present.")
+    latest = migrations[-1]
+    prefix = latest.name.split("_", 1)[0]
+    return latest.name, prefix, hashlib.sha256(latest.read_bytes()).hexdigest()
+
+
+def doctor(*, check_browser: bool, strict: bool = False, require_autofill: bool = False, profile: str = "production") -> int:
     """Report readiness without invoking a model, mutating data, or opening a tab."""
     load_repo_env()
     results: list[tuple[str, bool, str]] = []
     mark(results, "Python 3.11+", sys.version_info >= (3, 11), sys.version.split()[0])
     env_path = ROOT / ".env"
     mark(results, "Environment", env_path.is_file(), str(env_path) if env_path.is_file() else "run bootstrap")
-    template = ROOT / "data" / "resume-template" / "VU PHAN AN NGUYEN-official_For_all.docx"
+    template = Path(os.getenv("JOBOS_RESUME_TEMPLATE_PATH", str(ROOT / "data" / "resume-template" / "VU PHAN AN NGUYEN-official_For_all.docx"))).expanduser()
     mark(results, "Resume template", template.is_file(), str(template))
     upload_root = Path(os.getenv("JOBOS_OPENCLAW_UPLOADS_DIR", "/tmp/openclaw/uploads"))
     upload_parent = upload_root.parent
@@ -54,11 +63,21 @@ def doctor(*, check_browser: bool, strict: bool = False, require_autofill: bool 
     mark(results, "Telegram approval channel", tg, "configured" if tg else "set Telegram bot + allowed user id")
 
     try:
+        latest_migration, latest_number, latest_checksum = _latest_migration_contract()
+    except Exception as exc:
+        latest_migration, latest_number, latest_checksum = "unknown", "?", ""
+        mark(results, "Migration files", False, str(exc))
+    migration_check_name = f"Migrations through {latest_number}"
+
+    try:
         import psycopg
         with psycopg.connect(database_dsn(), connect_timeout=5) as conn, conn.cursor() as cur:
             mark(results, "PostgreSQL", True)
-            cur.execute("SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE migration_id = '075_action_required_review_handoff.sql')")
-            mark(results, "Migrations through 075", bool(cur.fetchone()[0]))
+            cur.execute("SELECT checksum_sha256 FROM schema_migrations WHERE migration_id=%s", (latest_migration,))
+            migration_row = cur.fetchone()
+            migration_ok = bool(migration_row and str(migration_row[0]) == latest_checksum)
+            mark(results, migration_check_name, migration_ok,
+                 latest_migration if migration_ok else f"missing/checksum drift: {latest_migration}")
             cur.execute("SELECT to_regclass('public.privileged_action_executions') IS NOT NULL")
             mark(results, "Human Approval Bus", bool(cur.fetchone()[0]))
             cur.execute("SELECT to_regclass('public.autofill_action_journal') IS NOT NULL")
@@ -74,7 +93,7 @@ def doctor(*, check_browser: bool, strict: bool = False, require_autofill: bool 
             mark(results, "Immigration profile confirmed", int(cur.fetchone()[0]) == 1)
     except Exception as exc:
         mark(results, "PostgreSQL", False, str(exc)[:180])
-        mark(results, "Migrations through 075", False, "PostgreSQL unavailable")
+        mark(results, migration_check_name, False, "PostgreSQL unavailable")
 
     if check_browser:
         # Health only: it validates gateway/CDP availability but does not list
@@ -89,7 +108,7 @@ def doctor(*, check_browser: bool, strict: bool = False, require_autofill: bool 
     for name, ok, detail in results:
         print(f"{'✓' if ok else '⚠'} {name}" + (f" — {detail}" if detail else ""))
     checks = {name: ok for name, ok, _ in results}
-    core = all(checks.get(name, False) for name in ("Python 3.11+", "Environment", "PostgreSQL", "Migrations through 075"))
+    core = all(checks.get(name, False) for name in ("Python 3.11+", "Environment", "PostgreSQL", migration_check_name))
     document_ready = core and checks.get("Resume template", False)
     form_fill_ready = core and all(checks.get(name, False) for name in (
         "Autofill action journal", "No unresolved browser action", "Immigration profile confirmed",
@@ -111,11 +130,20 @@ def doctor(*, check_browser: bool, strict: bool = False, require_autofill: bool 
     for label, ok in readiness.items():
         print(f"{label}: {'YES' if ok else 'NO'}")
     print("SUBMIT: TELEGRAM HUMAN APPROVAL + PRIVILEGED ONE-SHOT EXECUTOR ONLY")
+    profile_targets = {
+        "core": core,
+        "documents": document_ready,
+        "browser": form_fill_ready and (checks.get("Gateway and CDP health", False) if check_browser else True),
+        "production": all(readiness.values()) and (checks.get("Gateway and CDP health", False) if check_browser else True),
+    }
+    if profile not in profile_targets:
+        raise RuntimeError(f"Unknown doctor profile: {profile}")
+    print(f"DOCTOR PROFILE: {profile}")
     if strict:
-        return 0 if all(readiness.values()) else 1
+        return 0 if profile_targets[profile] else 1
     if require_autofill:
         return 0 if form_fill_ready else 1
-    return 0 if core else 1
+    return 0 if profile_targets[profile] else 1
 
 
 def _origin(url: str) -> str:
@@ -383,6 +411,8 @@ def status() -> int:
     with psycopg.connect(database_dsn(), autocommit=True) as conn, conn.cursor() as cur:
         cur.execute("SELECT coalesce(status, 'unknown'), count(*) FROM applications GROUP BY 1 ORDER BY 1;")
         applications = {str(status): count for status, count in cur.fetchall()}
+        cur.execute("SELECT coalesce(current_step, 'unknown'), count(*) FROM applications GROUP BY 1 ORDER BY 1;")
+        steps = {str(step): count for step, count in cur.fetchall()}
         cur.execute("SELECT coalesce(source, 'unknown'), count(*) FROM applications GROUP BY 1 ORDER BY 2 DESC;")
         sources = {str(source): count for source, count in cur.fetchall()}
         cur.execute("SELECT status, count(*) FROM browser_tasks GROUP BY 1 ORDER BY 1;")
@@ -396,12 +426,33 @@ def status() -> int:
         attempts = {str(attempt_status): count for attempt_status, count in cur.fetchall()}
         cur.execute("SELECT count(*) FROM human_review_items WHERE status IN ('pending','needs_revision');")
         pending_reviews = int(cur.fetchone()[0])
+        cur.execute(
+            """SELECT a.id::text,a.company,a.job_title,a.current_step,
+                      extract(epoch from (now()-a.updated_at))::bigint AS age_seconds,
+                      a.processing_run_id::text,a.processing_lease_expires_at,a.last_error,
+                      CASE
+                        WHEN a.current_step='docs_verified' THEN 'human: approve reviewed resume / bind OPEN APPLY'
+                        WHEN a.current_step IN ('needs_account_auth','needs_email_verification','needs_mfa','needs_human_checkpoint') THEN 'human/review: complete current auth gate'
+                        WHEN a.current_step='application_form_ready' THEN 'review: prepare exact autofill'
+                        WHEN a.current_step='awaiting_approval' THEN 'human: decide exact autofill/upload approvals'
+                        WHEN a.current_step='autofill_executing' THEN 'worker lease active; do not replay'
+                        WHEN a.current_step='application_ready' THEN 'human: prepare next/submit gate'
+                        ELSE 'orchestrator/worker' END AS next_action
+                 FROM applications a
+                WHERE a.status NOT IN ('submitted','abandoned')
+                ORDER BY a.updated_at ASC LIMIT 30;"""
+        )
+        active = [{"application_id":r[0],"company":r[1],"job_title":r[2],"current_step":r[3],
+                   "age_seconds":int(r[4] or 0),"processing_run_id":r[5],
+                   "processing_lease_expires_at":str(r[6]) if r[6] else None,
+                   "last_error":r[7],"next_action":r[8]} for r in cur.fetchall()]
     print(json.dumps({
-        "applications_by_status": applications, "applications_by_source": sources,
+        "applications_by_status": applications, "applications_by_step": steps, "applications_by_source": sources,
         "browser_tasks": browser_tasks, "attempts": attempts, "pending_human_reviews": pending_reviews,
         "needs_reconciliation": reconciliation,
         "autofill_needs_reconciliation": autofill_reconciliation,
         "privileged_needs_reconciliation": privileged_reconciliation,
+        "active_work": active,
         "submit": "telegram_human_approval_then_privileged_executor",
     }, indent=2))
     return 0
@@ -494,7 +545,8 @@ def main() -> int:
     commands = parser.add_subparsers(dest="command", required=True)
     doctor_parser = commands.add_parser("doctor", help="Read-only readiness and safety checks.")
     doctor_parser.add_argument("--check-browser", action="store_true", help="Also probe gateway and CDP health; never opens a page.")
-    doctor_parser.add_argument("--strict", action="store_true", help="Exit non-zero unless every readiness lane is ready.")
+    doctor_parser.add_argument("--strict", action="store_true", help="Exit non-zero unless the selected readiness profile is ready.")
+    doctor_parser.add_argument("--profile", choices=("core","documents","browser","production"), default="production", help="Readiness lane to enforce; production includes optional operational channels.")
     doctor_parser.add_argument("--require-autofill", action="store_true", help="Exit non-zero unless deterministic form-fill readiness is ready.")
     autofill_parser = commands.add_parser("autofill", help="Prepare a deterministic, approval-bound form session.")
     autofill_subcommands = autofill_parser.add_subparsers(dest="autofill_command", required=True)
@@ -562,7 +614,7 @@ def main() -> int:
 
     args = parser.parse_args()
     if args.command == "doctor":
-        return doctor(check_browser=args.check_browser, strict=args.strict, require_autofill=args.require_autofill)
+        return doctor(check_browser=args.check_browser, strict=args.strict, require_autofill=args.require_autofill, profile=args.profile)
     if args.command == "status":
         return status()
     if args.command == "saved":

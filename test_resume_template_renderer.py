@@ -54,10 +54,20 @@ def test_renderer_only_rewrites_fixed_project_and_skill_slots(tmp_path):
     assert "Investigated security alerts and documented actionable findings." in texts
     project_header = texts.index("Project 1 — JD-relevant verified subtitle | GitHub\tJan 2026")
     assert texts[project_header + 1] == "Built validated security lab evidence."
-    assert texts[project_header + 2] == ""
+    assert texts[project_header + 2] == "original bullet 2"
     assert texts[-5] == "Security: PKI/TLS, OpenSSL"
     assert texts[-1] == "Programming: original items"
 
+
+
+def test_renderer_preserves_baseline_when_no_tailoring_is_safe(tmp_path):
+    template, output = tmp_path / "template.docx", tmp_path / "baseline.docx"
+    make_template(template)
+    renderer.render_docx(template=template, output=output, experience_bullets=[], project_bullets=[], skill_lines=[], project_subtitles=[])
+    texts = [paragraph.text for paragraph in Document(output).paragraphs]
+    assert "Investigated security alerts and documented findings." in texts
+    assert "original bullet 1" in texts
+    assert "original bullet 12" in texts
 
 def test_renderer_refuses_more_content_than_the_one_page_slot_budget(tmp_path):
     template = tmp_path / "template.docx"

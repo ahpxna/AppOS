@@ -8,22 +8,12 @@ from __future__ import annotations
 import importlib.util
 import os
 from pathlib import Path
-import sys
-import types
 
 from docx import Document
+from tests.psycopg_stub_utils import install_if_missing, restore
 
 os.environ.setdefault("JOBOS_DB_PASSWORD", "unit-test")
-
-if "psycopg" not in sys.modules:
-    psycopg = types.ModuleType("psycopg")
-    psycopg.connect = lambda *_a, **_k: None
-    psycopg_types = types.ModuleType("psycopg.types")
-    psycopg_json = types.ModuleType("psycopg.types.json")
-    psycopg_json.Jsonb = lambda value: value
-    sys.modules["psycopg"] = psycopg
-    sys.modules["psycopg.types"] = psycopg_types
-    sys.modules["psycopg.types.json"] = psycopg_json
+_psycopg_saved = install_if_missing()
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -39,6 +29,7 @@ def _load(name: str, relative: str):
 docgen = _load("jobos_tailoring_acceptance_docgen", "services/document-generation/generate_documents_v1.py")
 verifier = _load("jobos_tailoring_acceptance_verify", "services/document-generation/verify_document_truth_v1.py")
 renderer = _load("jobos_tailoring_acceptance_renderer", "services/document-generation/resume_template_renderer.py")
+restore(_psycopg_saved)
 
 JD = (
     "Investigate security alerts. Automate reporting with Python. "

@@ -479,6 +479,33 @@ def _restore_autofill_ready_after_terminal_parent(cur, *, application_id: str, p
         )
 
 
+def _reject_email_candidate_for_denied_request(cur, *, application_id: str | None,
+                                               atype: str, payload: dict[str, object]) -> None:
+    """Persist a human denial so Gmail watcher cannot rematerialize the same secret.
+
+    Both direct USE EMAIL denial and denial of a Gmail magic-link trust gate are
+    durable candidate rejections. Employer-domain trust unrelated to Gmail is
+    unaffected.
+    """
+    if not application_id or not isinstance(payload, dict):
+        return
+    candidate_id = str(payload.get("candidate_id") or "")
+    if not candidate_id:
+        return
+    is_use = atype == "privileged_use_email_verification"
+    is_magic_trust = (atype == "privileged_trust_external_domain"
+                      and str(payload.get("trust_source") or "") == "gmail_magic_link")
+    if not (is_use or is_magic_trust):
+        return
+    cur.execute(
+        """UPDATE email_verification_candidates
+              SET status='rejected'
+            WHERE id=%s AND application_id=%s
+              AND status IN ('discovered','approved');""",
+        (candidate_id, application_id),
+    )
+
+
 # ---------------------------------------------------------------- create
 
 def cmd_create(conn, args) -> int:
@@ -868,6 +895,12 @@ def redeem(conn, token: str, *, decision: str, note: str, actor: str) -> int:
             print("  Request changed state concurrently. Nothing done.")
             return 1
 
+        if new_status == "denied":
+            _reject_email_candidate_for_denied_request(
+                cur, application_id=application_id, atype=atype,
+                payload=payload_request["payload_json"] if isinstance(payload_request.get("payload_json"), dict) else {},
+            )
+
         autofill_queued = False
         if application_id and new_status == "denied" and atype == "autofill_form":
             parent_payload = payload_request["payload_json"] if isinstance(payload_request.get("payload_json"), dict) else {}
@@ -959,6 +992,11 @@ def decide_request_by_id(conn, request_id: str, *, decision: str, note: str,
         )
         if cur.rowcount != 1:
             return {"ok": False, "error": "Approval request changed state concurrently."}
+        if new_status == "denied":
+            _reject_email_candidate_for_denied_request(
+                cur, application_id=application_id, atype=atype,
+                payload=request["payload_json"] if isinstance(request.get("payload_json"), dict) else {},
+            )
         autofill_queued = False
         if application_id and new_status == "denied" and atype == "autofill_form":
             parent_payload = request["payload_json"] if isinstance(request.get("payload_json"), dict) else {}

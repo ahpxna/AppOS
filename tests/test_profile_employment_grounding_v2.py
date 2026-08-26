@@ -4,21 +4,11 @@ from __future__ import annotations
 import importlib.util
 import os
 from pathlib import Path
-import sys
-import types
+
+from tests.psycopg_stub_utils import install_if_missing, restore
 
 os.environ.setdefault("JOBOS_DB_PASSWORD", "unit-test")
-
-if "psycopg" not in sys.modules:
-    psycopg = types.ModuleType("psycopg")
-    psycopg.connect = lambda *_a, **_k: None
-    sys.modules["psycopg"] = psycopg
-if "psycopg.types" not in sys.modules:
-    sys.modules["psycopg.types"] = types.ModuleType("psycopg.types")
-if "psycopg.types.json" not in sys.modules:
-    psycopg_json = types.ModuleType("psycopg.types.json")
-    psycopg_json.Jsonb = lambda value: value
-    sys.modules["psycopg.types.json"] = psycopg_json
+_psycopg_saved = install_if_missing()
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -39,6 +29,7 @@ synth = _load(
     "jobos_profile_asset_employment_test",
     "services/profile-ingestion/synthesize_profile_assets_qwen_v1.py",
 )
+restore(_psycopg_saved)
 
 
 def _employment_unit(quote: str = "Investigated security alerts and documented findings.") -> dict:
@@ -146,7 +137,9 @@ def test_official_resume_prompts_treat_titles_as_immutable_but_bullets_as_tailor
 
 
 def test_profile_ready_versions_force_new_grounding_contract_to_be_rebuilt():
-    for relative in ("scripts/jobos_profile_ready.py", "jobos_profile_ready.py"):
-        text = (ROOT / relative).read_text(encoding="utf-8")
-        assert 'GENERIC_EVIDENCE_VERSION = "profile_evidence_unit_builder_qwen_v2_2026_08_25"' in text
-        assert 'GENERIC_ASSET_VERSION = "profile_asset_synthesizer_qwen_v2_2026_08_25"' in text
+    canonical = (ROOT / "scripts/jobos_profile_ready.py").read_text(encoding="utf-8")
+    shim = (ROOT / "jobos_profile_ready.py").read_text(encoding="utf-8")
+    assert 'GENERIC_EVIDENCE_VERSION = "profile_evidence_unit_builder_qwen_v2_2026_08_25"' in canonical
+    assert 'scripts/jobos_profile_ready.py' in shim
+    assert 'GENERIC_ASSET_VERSION = "profile_asset_synthesizer_qwen_v2_2026_08_25"' in canonical
+    assert 'runpy.run_path' in shim

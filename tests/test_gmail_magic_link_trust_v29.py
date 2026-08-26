@@ -31,15 +31,18 @@ def test_watcher_binds_magic_link_secret_context_into_trust_approval(monkeypatch
             if "status='rejected'" in self.sql:
                 return []
             return []
+        def fetchone(self):
+            if "JOIN application_auth_sessions" in self.sql and self.rows:
+                r = self.rows[0]
+                return ("needs_email_verification", "needs_email_verification", r[1], r[2])
+            return None
         def __enter__(self): return self
         def __exit__(self, *_a): return False
 
     class Conn:
-        def __init__(self): self.calls = 0
-        def cursor(self):
-            self.calls += 1
-            return Cur([row] if self.calls == 1 else [])
+        def cursor(self): return Cur([row])
         def commit(self): return None
+        def rollback(self): return None
 
     captured = []
     monkeypatch.setattr(watcher, "discover_verification", lambda **_k: candidate)

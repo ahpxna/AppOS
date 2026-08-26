@@ -8,19 +8,11 @@ import os
 from pathlib import Path
 import sys
 
-import importlib.util
 import psycopg
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
-RENDERER_PATH = ROOT / "services" / "document-generation" / "resume_template_renderer.py"
-RENDERER_SPEC = importlib.util.spec_from_file_location("jobos_resume_template_renderer", RENDERER_PATH)
-if RENDERER_SPEC is None or RENDERER_SPEC.loader is None:
-    raise RuntimeError(f"Cannot load resume renderer: {RENDERER_PATH}")
-renderer = importlib.util.module_from_spec(RENDERER_SPEC)
-RENDERER_SPEC.loader.exec_module(renderer)
-render_docx = renderer.render_docx
-ResumeTemplateError = renderer.ResumeTemplateError
+from services.common.canonical_resume_artifact_v1 import render_canonical_resume, ResumeTemplateError
 from services.common.config import database_dsn
 
 DSN = database_dsn()
@@ -63,25 +55,19 @@ def main() -> int:
     with psycopg.connect(DSN, autocommit=True) as conn:
         with conn.cursor() as cur:
             document_id, tailoring = load_tailoring(cur, args.application_id)
-    experience = tailoring.get("experience_bullets", [])
-    bullets = tailoring.get("project_bullets", [])
-    skills = tailoring.get("skill_lines", [])
-    subtitles = tailoring.get("project_subtitles", [])
-    if not bullets:
-        raise SystemExit("Verified resume has no template project bullets; regenerate it with the current generator.")
     destination = args.output_dir or OUTPUT_ROOT / args.application_id / document_id
-    docx_path = destination / "resume.docx"
     try:
-        render_docx(
-            template=args.template.expanduser(), output=docx_path, project_bullets=bullets,
-            skill_lines=skills, project_subtitles=subtitles, experience_bullets=experience,
+        docx_path, pdf_path = render_canonical_resume(
+            template=args.template, output_dir=destination, tailoring=tailoring
         )
     except ResumeTemplateError as exc:
         raise SystemExit(f"Resume export blocked: {exc}") from exc
+    # This utility still registers the editable DOCX for backwards-compatible
+    # local use. Human Review registers/binds the canonical PDF separately.
     with psycopg.connect(DSN, autocommit=True) as conn:
         with conn.cursor() as cur:
             register_artifact(cur, args.application_id, document_id, docx_path)
-    print(f"DOCX: {docx_path}\nNext: open this file in Word and Print/Save as PDF after review.")
+    print(f"DOCX: {docx_path}\nCANONICAL PDF: {pdf_path}\nHuman approval/upload must use the canonical PDF bytes.")
     return 0
 
 

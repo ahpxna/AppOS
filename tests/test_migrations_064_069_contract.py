@@ -96,11 +96,11 @@ def test_069_adds_aggregate_resume_freshness_views():
     assert "stale_approved_project_assets" in text
 
 
-def test_jobos_doctor_requires_latest_075_migration():
+def test_jobos_doctor_requires_latest_migration_dynamically():
     source = (ROOT / "scripts" / "jobos.py").read_text(encoding="utf-8")
-    assert "075_action_required_review_handoff.sql" in source
-    assert "Migrations through 075" in source
-    assert (ROOT / "db" / "migrations" / "075_action_required_review_handoff.sql").is_file()
+    assert "def _latest_migration_contract" in source
+    assert "migration_check_name = f\"Migrations through {latest_number}\"" in source
+    assert (ROOT / "db" / "migrations" / "076_workflow_integrity_orchestrator_leases_and_callback_binding.sql").is_file()
     assert "Migrations through 074" not in source
 
 

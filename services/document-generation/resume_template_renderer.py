@@ -235,11 +235,10 @@ def render_docx(*, template: Path, output: Path, project_bullets: list[dict[str,
             kind = "primary (two-line)" if slot_number % 2 else "secondary (one-line)"
             raise ResumeTemplateError(f"Slot {slot_number} is {kind}; its text must be 1..{limit} characters.")
         validated_updates.append((slot_number, compact))
-    # A generated resume must not inherit irrelevant bullets from the generic
-    # template.  Clearing text is permitted; headings, dates, links and list
-    # paragraph formatting remain intact for every project block.
-    for bullet in bullet_slots:
-        _replace_plain(bullet, "")
+    # Project updates are sparse edits against the audited fixed-template
+    # baseline.  An empty list means the verifier intentionally kept the
+    # baseline because no evidence-backed rewrite was justified.  Preserve
+    # untouched slots; only exact requested slots may change.
     for slot_number, compact in validated_updates:
         _replace_plain(bullet_slots[slot_number - 1], compact)
     subtitle_slots: set[int] = set()

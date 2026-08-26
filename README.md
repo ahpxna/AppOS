@@ -86,6 +86,21 @@ kiểm tra checksum; nó không chạy lại SQL seed/update. Không cần `psql
 PATH. DB cũ tạo trước migration ledger phải được adopt có chủ đích, xem
 [docs/ubuntu_bootstrap.md](docs/ubuntu_bootstrap.md).
 
+### Readiness profiles và daily status
+
+```bash
+python scripts/jobos.py doctor --profile core --strict
+python scripts/jobos.py doctor --profile documents --strict
+python scripts/jobos.py doctor --profile browser --strict
+python scripts/jobos.py doctor --profile production --strict
+python scripts/jobos.py status
+```
+
+`doctor` đọc migration mới nhất + checksum động và tôn trọng
+`JOBOS_RESUME_TEMPLATE_PATH`. `status` hiển thị application theo `current_step`,
+lease/owner, age, last error và next action thay vì buộc operator suy luận từ
+raw task counts. CI/core verification không phụ thuộc Telegram/Gmail production.
+
 ## 5. Cài Python dependencies
 
 ```bash
@@ -94,8 +109,9 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-File `requirements.txt` ở root chỉ gộp 4 file `services/*/requirements.txt`
-lại — không cần cài từng cái riêng.
+File `requirements.txt` ở root là install path Python được hỗ trợ: nó gộp các
+service requirements đang dùng cùng migration/test/runtime tools, nên không cần
+cài từng service riêng. Không coi một `pip freeze` ngẫu nhiên từ máy dev là lockfile.
 
 ### Binary hệ thống cho OCR (poppler, tesseract)
 
@@ -339,8 +355,10 @@ python services/document-generation/render_verified_resume_v1.py \
   --application-id APPLICATION_UUID
 ```
 
-Mở DOCX này trong Word và dùng Print/Save as PDF sau khi review. JobOS không tự
-in PDF từ LibreOffice, vì cùng một DOCX có thể paginate khác Word/macOS. Xem
+Command này tạo cả working DOCX và **canonical JobOS PDF** bằng cùng fixed-template
+renderer mà Human Review dùng. Human approval bind SHA-256 của canonical PDF và browser
+upload lại đúng các bytes đó. Word Print/Save as PDF chỉ là bản xem/chỉnh thủ công ngoài
+authorization path; nếu muốn dùng PDF từ Word phải đưa nó qua review/binding mới. Xem
 `docs/resume_template_contract.md`.
 
 Resume rules are enforced, not just prompted: only the six pre-approved project
@@ -497,9 +515,10 @@ python services/interview-prep/interview_prep_v1.py --apply
 ```
 
 Không truyền `--apply` = dry-run mặc định (in ra prep notes rồi rollback,
-không ghi gì). Có cost-gate best-effort trước mỗi lần gọi LLM (mirror cách
-orchestrator check `cost_controller_v1.py`) — nếu vượt ngân sách sẽ skip
-interview đó và in lý do, không crash cả batch.
+không ghi gì). Mọi LLM call đi qua `services/common/llm_gateway.py`: local calls
+được ledger ở $0 best-effort; paid API calls phải atomically reserve hard daily
+USD budget trước network I/O rồi settle provider/model/token usage sau response.
+Unpriced paid models fail closed thay vì báo giả $0.
 
 ## Ghi chú Windows
 

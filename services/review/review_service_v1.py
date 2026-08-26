@@ -389,10 +389,14 @@ def ensure_application_ready_review(cur, application_id: str) -> str | None:
 def ensure_action_required_review(cur, *, application_id: str, action_kind: str,
                                   title: str, summary: str, payload: dict[str, Any] | None = None,
                                   priority: str = "high") -> str | None:
-    """Materialize a non-executable refocus/binding handoff.
+    """Materialize an immutable non-executable refocus/binding handoff.
 
-    Approving this item only performs a fresh read-only bind and creates the
-    separate exact privileged approval. It never performs browser I/O itself.
+    The source hash is the human-visible decision identity. If the underlying
+    candidate/context changes, the old active item is expired and a new review
+    row is created; Telegram buttons for the old row can never authorize the
+    replacement payload. A prior explicit rejection suppresses that exact
+    source, while approved/resolved/expired items may rematerialize when the
+    authoritative workflow still needs the handoff.
     """
     action_kind = str(action_kind or "").strip()
     if not action_kind:
@@ -400,24 +404,47 @@ def ensure_action_required_review(cur, *, application_id: str, action_kind: str,
     body = dict(payload or {})
     body["action_kind"] = action_kind
     source_sha = _sha256_text(json.dumps(body, sort_keys=True, separators=(",", ":"), default=str))
+
+    # Review lock order is application -> item. It also serializes concurrent
+    # materializers for the same application/action kind.
+    cur.execute("SELECT 1 FROM applications WHERE id=%s FOR UPDATE;", (application_id,))
+    if not cur.fetchone():
+        raise ReviewError("application for action_required review no longer exists")
+    cur.execute(
+        """SELECT id::text, source_sha256 FROM human_review_items
+             WHERE application_id=%s AND item_type='action_required'
+               AND payload_json->>'action_kind'=%s
+               AND status IN ('pending','needs_revision')
+             ORDER BY created_at DESC LIMIT 1 FOR UPDATE;""",
+        (application_id, action_kind),
+    )
+    active = cur.fetchone()
+    if active and str(active[1] or "") == source_sha:
+        return str(active[0])
+    if active:
+        cur.execute(
+            """UPDATE human_review_items SET status='expired', updated_at=now(),
+                      decision_note=COALESCE(decision_note,'Superseded by a new exact handoff source.')
+                  WHERE id=%s AND status IN ('pending','needs_revision');""",
+            (active[0],),
+        )
+
+    # Only an explicit human rejection suppresses the exact same source.
     cur.execute(
         """SELECT 1 FROM human_review_items
-             WHERE application_id=%s AND item_type='action_required' AND source_sha256=%s
-               AND status IN ('approved','rejected','resolved','expired') LIMIT 1;""",
+             WHERE application_id=%s AND item_type='action_required'
+               AND source_sha256=%s AND status='rejected' LIMIT 1;""",
         (application_id, source_sha),
     )
     if cur.fetchone():
         return None
+
     bundle_id = ensure_bundle(cur, application_id)
     cur.execute(
         """INSERT INTO human_review_items(
                review_bundle_id, application_id, item_type, status, title, summary_text,
                source_sha256, priority, payload_json)
            VALUES (%s,%s,'action_required','pending',%s,%s,%s,%s,%s)
-           ON CONFLICT (application_id, (payload_json->>'action_kind'))
-             WHERE item_type='action_required' AND status IN ('pending','needs_revision')
-           DO UPDATE SET title=EXCLUDED.title, summary_text=EXCLUDED.summary_text,
-                         payload_json=EXCLUDED.payload_json, priority=EXCLUDED.priority, updated_at=now()
            RETURNING id::text;""",
         (bundle_id, application_id, title, summary, source_sha, priority, Jsonb(body)),
     )
@@ -446,6 +473,42 @@ def sync_action_required(cur) -> int:
             summary=(f"{company} — {role}. Resume approval is complete. Open or focus the exact stored job page, "
                      "then approve this handoff to create a fresh OPEN APPLY approval. No browser click occurs here."),
             payload={"job_url": str(job_url or ""), "resume_id": resume_id, "resume_artifact_id": artifact_id},
+            priority="high",
+        ):
+            count += 1
+    return count
+
+
+def sync_workflow_followup_required(cur) -> int:
+    """Surface a durable retry handoff when post-commit gate packaging was lost."""
+    count = 0
+    cur.execute(
+        """SELECT a.id::text, a.current_step, a.company, a.job_title,
+                  s.current_url, s.page_fingerprint, s.detail_json
+             FROM applications a
+             LEFT JOIN application_auth_sessions s ON s.application_id=a.id
+            WHERE a.current_step IN ('needs_account_auth','needs_mfa','needs_human_checkpoint','application_form_ready')
+              AND a.status NOT IN ('submitted','abandoned')
+              AND NOT EXISTS (
+                    SELECT 1 FROM approval_requests ar
+                     WHERE ar.application_id=a.id AND ar.status IN ('pending','approved','executing')
+                       AND ar.token_expires_at>now())
+              AND NOT EXISTS (
+                    SELECT 1 FROM browser_tasks bt
+                     WHERE bt.application_id=a.id AND bt.status IN ('queued','running')
+                       AND bt.task_type='fill_application_form')
+            ORDER BY a.updated_at DESC;"""
+    )
+    for app_id, state, company, role, url, fp, detail in cur.fetchall():
+        target_id = str((detail or {}).get("target_id") or "")
+        if ensure_action_required_review(
+            cur, application_id=app_id, action_kind="workflow_followup_required",
+            title="Refocus the current application page and retry the next gate",
+            summary=(f"{company} — {role} is durably at {state}, but no live next-gate capability exists. "
+                     "Refocus the exact employer page and approve this handoff. JobOS will fresh-snapshot it and "
+                     "materialize the next auth/autofill gate without replaying the prior browser action."),
+            payload={"expected_step": state, "target_id": target_id,
+                     "expected_url": str(url or ""), "expected_page_fingerprint": str(fp or "")},
             priority="high",
         ):
             count += 1
@@ -789,6 +852,8 @@ def reconcile_materialized_review_state(cur) -> None:
                      AND a.current_step <> 'docs_verified')
                  OR (h.payload_json->>'action_kind' LIKE 'email_verification_%'
                      AND a.current_step <> 'needs_email_verification')
+                 OR (h.payload_json->>'action_kind'='workflow_followup_required'
+                     AND a.current_step <> h.payload_json->>'expected_step')
               );"""
     )
     cur.execute(
@@ -799,7 +864,9 @@ def reconcile_materialized_review_state(cur) -> None:
               AND ((h.payload_json->>'action_kind'='open_apply_binding_required'
                     AND ar.type='privileged_begin_application')
                 OR (h.payload_json->>'action_kind' LIKE 'email_verification_%'
-                    AND ar.type='privileged_use_email_verification'))
+                    AND ar.type='privileged_use_email_verification'
+                    AND COALESCE(h.payload_json->>'candidate_id','') <> ''
+                    AND ar.payload_json->>'candidate_id' = h.payload_json->>'candidate_id'))
               AND ar.status IN ('pending','approved','executing');"""
     )
 
@@ -825,6 +892,7 @@ def sync_inbox(cur) -> dict[str, int]:
             counts["documents"] += 1
     counts["questions"] = sync_missing_questions(cur) + sync_runtime_questions(cur)
     counts["action_required"] += sync_action_required(cur)
+    counts["action_required"] += sync_workflow_followup_required(cur)
     cur.execute("""SELECT id::text FROM approval_requests
                     WHERE status = 'pending' AND application_id IS NOT NULL
                       AND token_expires_at > now();""")
@@ -912,6 +980,7 @@ def decide_item(conn, item_id: str, *, decision: str, actor: str, note: str = ""
         materialized_approval_ids: list[str] = []
         reconciliation_outcome: str | None = None
         reconciliation_observed_result: dict[str, Any] | None = None
+        workflow_followup_result: dict[str, Any] | None = None
         if status not in {"pending", "needs_revision"}:
             raise ReviewError(f"Review item is already {status}.")
 
@@ -1187,6 +1256,34 @@ def decide_item(conn, item_id: str, *, decision: str, actor: str, note: str = ""
                             materialized_approval_id = prepare_privileged(
                                 cur, application_id=app_id, action="use_email_verification", candidate_id=candidate_id
                             )
+                    elif action_kind == "workflow_followup_required":
+                        expected_step = str(payload.get("expected_step") or "")
+                        cur.execute("SELECT current_step FROM applications WHERE id=%s;", (app_id,))
+                        current = cur.fetchone()
+                        if not current or str(current[0]) != expected_step:
+                            raise ReviewError("workflow state changed; sync a fresh next-gate handoff")
+                        from services.application_actions.privileged_action_v1 import _transport, _snapshot, detect_page_state
+                        target_id = str(payload.get("target_id") or "")
+                        transport = _transport()
+                        if not target_id:
+                            # This review item is explicitly a non-executable REFOCUS/BIND handoff.
+                            # The human has just approved using the currently focused employer page,
+                            # so it is safe to fresh-bind focus here; no browser write occurs.
+                            focused = transport.resolve_target()
+                            target_id = str(focused.target_id or "")
+                        if not target_id:
+                            raise ReviewError("no exact browser target is available after refocus")
+                        live_url, live_snap, live_nodes, live_fp = _snapshot(transport, target_id)
+                        live_state, live_detail = detect_page_state(live_url, live_snap, live_nodes)
+                        if live_state != expected_step:
+                            raise ReviewError(
+                                f"live page classifies as {live_state!r}, not authoritative {expected_step!r}; resync auth state first"
+                            )
+                        workflow_followup_result = {
+                            "target_id": target_id, "url": live_url, "state": live_state,
+                            "detail": live_detail, "page_fingerprint": live_fp, "followup": "state_gate",
+                        }
+                        note = (note + " Fresh page snapshot captured; next gate will be materialized after this review decision commits.").strip()
                     else:
                         raise ReviewError(f"unsupported action-required kind: {action_kind}")
                 except ReviewError:
@@ -1195,8 +1292,9 @@ def decide_item(conn, item_id: str, *, decision: str, actor: str, note: str = ""
                     raise ReviewError(
                         f"Fresh browser binding is not ready yet: {str(exc)[:500]}. Refocus the exact page and retry this review item."
                     ) from exc
-                ensure_approval_review(cur, materialized_approval_id)
-                note = (note + " Fresh exact-bound privileged approval prepared separately; this handoff performed no browser I/O.").strip()
+                if materialized_approval_id:
+                    ensure_approval_review(cur, materialized_approval_id)
+                    note = (note + " Fresh exact-bound privileged approval prepared separately; this handoff performed no browser I/O.").strip()
             elif decision == "reject":
                 if candidate_id and action_kind.startswith("email_verification_"):
                     cur.execute(
@@ -1261,6 +1359,8 @@ def decide_item(conn, item_id: str, *, decision: str, actor: str, note: str = ""
         response["reconciliation_outcome"] = reconciliation_outcome
     if reconciliation_observed_result:
         response["reconciliation_observed_result"] = reconciliation_observed_result
+    if workflow_followup_result:
+        response["post_commit_followup_result"] = workflow_followup_result
     return response
 
 
@@ -1301,12 +1401,13 @@ def main() -> int:
         out = decide_item(conn, args.item_id, decision=args.command, actor=args.actor, note=args.note)
         conn.commit()
         observed = out.get("reconciliation_observed_result") or {}
-        if observed.get("state") and observed.get("state") != "submitted":
+        followup_source = out.get("post_commit_followup_result") or observed
+        if followup_source.get("state") and followup_source.get("state") != "submitted":
             try:
                 from services.application_actions.privileged_action_v1 import _post_commit_followup
-                out["reconciliation_followup"] = _post_commit_followup(conn, out["application_id"], observed)
+                out["post_commit_followup"] = _post_commit_followup(conn, out["application_id"], followup_source)
             except Exception as exc:
-                out["reconciliation_followup"] = {"ok": False, "error": str(exc)[:1000]}
+                out["post_commit_followup"] = {"ok": False, "error": str(exc)[:1000]}
         print(json.dumps(out, indent=2)); return 0
 
 

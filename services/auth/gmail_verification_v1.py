@@ -201,6 +201,12 @@ def _sender_subject(message: Any) -> tuple[str, str]:
     return sender, subject
 
 
+GENERIC_ATS_HOST_LABELS = {
+    "jobs", "job", "careers", "career", "apply", "boards", "board", "ats",
+    "recruit", "recruiting", "hiring", "candidate", "candidates", "work",
+}
+
+
 def _relevance_score(message: Any, *, employer_domain: str | None) -> int:
     sender, subject = _sender_subject(message)
     text = f"{sender}\n{subject}\n{_all_text(message)}".casefold()
@@ -214,10 +220,11 @@ def _relevance_score(message: Any, *, employer_domain: str | None) -> int:
         company_token = host_token.split(".")[0]
         if host_token and host_token in text:
             score += 8
-        elif len(company_token) >= 4 and company_token in text:
-            # Short host prefixes (for example "hr" or "id") are too weak to
-            # establish employer-bound verification evidence. Keep those mails
-            # in the generic ambiguity lane instead of making them executable.
+        elif (len(company_token) >= 4 and company_token not in GENERIC_ATS_HOST_LABELS
+              and company_token in text):
+            # Short or infrastructure labels (jobs/careers/apply/boards) do not
+            # identify the employer on shared ATS domains. Keep those emails in
+            # the human ambiguity lane unless stronger sender/domain evidence exists.
             score += 5
         elif any(word in text for word in ("candidate account", "verify your email", "verification code")):
             # Soft fallback for branded ATS mail, but rank it below employer-matched mail.

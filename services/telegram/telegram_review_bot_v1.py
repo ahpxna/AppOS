@@ -85,59 +85,63 @@ def discover_ids(token: str) -> list[dict[str, int | str]]:
     return result
 
 
-def _callback_token(cur, item_id: str, action: str, allowed_user_id: int, ttl_hours: int = 24) -> str:
+def _callback_token(cur, item_id: str, action: str, allowed_user_id: int,
+                    ttl_hours: int = 24, *, context_sha256: str | None = None) -> str:
     raw = secrets.token_urlsafe(18)
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    cur.execute("SELECT source_sha256 FROM human_review_items WHERE id=%s;", (item_id,))
+    row = cur.fetchone()
+    source_sha256 = str(row[0]) if row and row[0] else None
     cur.execute(
         """INSERT INTO telegram_callback_tokens(
-               review_item_id, token_sha256, action, allowed_user_id, expires_at)
-           VALUES (%s, %s, %s, %s, now() + make_interval(hours => %s));""",
-        (item_id, digest, action, allowed_user_id, ttl_hours),
+               review_item_id, token_sha256, action, allowed_user_id, expires_at,
+               source_sha256, context_sha256)
+           VALUES (%s, %s, %s, %s, now() + make_interval(hours => %s), %s, %s);""",
+        (item_id, digest, action, allowed_user_id, ttl_hours, source_sha256, context_sha256),
     )
     return raw
 
 
 def _keyboard(cur, item_id: str, allowed_user_id: int, item_type: str,
-              payload: dict[str, Any]) -> str | None:
+              payload: dict[str, Any], *, context_sha256: str | None = None) -> str | None:
+    def tok(action: str) -> str:
+        return _callback_token(cur, item_id, action, allowed_user_id, context_sha256=context_sha256)
+
     if item_type == "question_required":
         return None
     if item_type == "autofill_review" and payload.get("execution_state") != "completed":
-        revise = _callback_token(cur, item_id, "revise", allowed_user_id)
-        reject = _callback_token(cur, item_id, "reject", allowed_user_id)
+        revise, reject = tok("revise"), tok("reject")
         return json.dumps({"inline_keyboard": [[
             {"text": "📝 Review / prepare again", "callback_data": f"rv:{revise}"},
             {"text": "❌ Reject", "callback_data": f"rv:{reject}"},
         ]]}, separators=(",", ":"))
     if item_type == "document_review" and payload.get("qa_status") != "pass":
-        revise = _callback_token(cur, item_id, "revise", allowed_user_id)
-        reject = _callback_token(cur, item_id, "reject", allowed_user_id)
+        revise, reject = tok("revise"), tok("reject")
         return json.dumps({"inline_keyboard": [[
             {"text": "📝 Revise / regenerate", "callback_data": f"rv:{revise}"},
             {"text": "❌ Reject", "callback_data": f"rv:{reject}"},
         ]]}, separators=(",", ":"))
     if item_type == "reconciliation_required" and payload.get("privileged_execution_id"):
-        occurred = _callback_token(cur, item_id, "approve", allowed_user_id)
-        not_occurred = _callback_token(cur, item_id, "reject", allowed_user_id)
+        occurred, not_occurred = tok("approve"), tok("reject")
         return json.dumps({"inline_keyboard": [[
             {"text": "✅ OCCURRED", "callback_data": f"rv:{occurred}"},
             {"text": "⭕ NOT OCCURRED", "callback_data": f"rv:{not_occurred}"},
         ]]}, separators=(",", ":"))
     if item_type == "action_required":
         action_kind = str(payload.get("action_kind") or "")
-        approve = _callback_token(cur, item_id, "approve", allowed_user_id)
-        reject = _callback_token(cur, item_id, "reject", allowed_user_id)
+        approve, reject = tok("approve"), tok("reject")
         label = {
             "open_apply_binding_required": "🔗 BIND OPEN APPLY",
             "email_verification_binding_required": "🔗 BIND OTP PAGE",
             "email_verification_candidate_ambiguity": "✅ CONFIRM EMAIL + BIND",
+            "workflow_followup_required": "🔁 RETRY NEXT GATE",
         }.get(action_kind, "🔗 PREPARE NEXT GATE")
         return json.dumps({"inline_keyboard": [[
             {"text": label, "callback_data": f"rv:{approve}"},
             {"text": "❌ DISMISS", "callback_data": f"rv:{reject}"},
         ]]}, separators=(",", ":"))
     if item_type == "application_ready":
-        prepare_gate = _callback_token(cur, item_id, "approve", allowed_user_id)
-        reject = _callback_token(cur, item_id, "reject", allowed_user_id)
+        prepare_gate, reject = tok("approve"), tok("reject")
         return json.dumps({"inline_keyboard": [[
             {"text": "🔎 PREPARE NEXT GATE", "callback_data": f"rv:{prepare_gate}"},
             {"text": "❌ ABANDON", "callback_data": f"rv:{reject}"},
@@ -159,14 +163,13 @@ def _keyboard(cur, item_id: str, allowed_user_id: int, item_type: str,
         "privileged_checkpoint_retry": "🔁 RETRY AFTER I FINISH",
         "privileged_submit_application": "✅ APPROVE SUBMIT",
     }
-    approve = _callback_token(cur, item_id, "approve", allowed_user_id)
-    reject = _callback_token(cur, item_id, "reject", allowed_user_id)
+    approve, reject = tok("approve"), tok("reject")
     if approval_type in {"privileged_auth_manual_retry", "privileged_mfa_retry", "privileged_checkpoint_retry"}:
         return json.dumps({"inline_keyboard": [[
             {"text": approve_labels[approval_type], "callback_data": f"rv:{approve}"},
             {"text": "❌ CANCEL", "callback_data": f"rv:{reject}"},
         ]]}, separators=(",", ":"))
-    revise = _callback_token(cur, item_id, "revise", allowed_user_id)
+    revise = tok("revise")
     return json.dumps({"inline_keyboard": [
         [{"text": approve_labels.get(approval_type, "✅ Approve"), "callback_data": f"rv:{approve}"}],
         [{"text": "📝 Revise", "callback_data": f"rv:{revise}"},
@@ -365,7 +368,7 @@ def dispatch_pending(conn, token: str, allowed_user_id: int, chat_id: int, *, li
             # Create/refresh opaque callbacks and commit them before network I/O.
             # Thus a delivered button never depends on a later batch commit, and
             # an expired callback forces a fresh summary even when context is unchanged.
-            keyboard = _keyboard(cur, item_id, allowed_user_id, row[1], row[7] or {})
+            keyboard = _keyboard(cur, item_id, allowed_user_id, row[1], row[7] or {}, context_sha256=context_sha)
             conn.commit()
 
             for artifact in review_artifacts(cur, item_id):
@@ -428,7 +431,7 @@ def handle_callback(conn, token: str, allowed_user_id: int, callback: dict[str, 
     with conn.cursor() as cur:
         cur.execute(
             """SELECT id::text, review_item_id::text, action, allowed_user_id,
-                      expires_at, used_at
+                      expires_at, used_at, source_sha256, context_sha256
                  FROM telegram_callback_tokens WHERE token_sha256 = %s FOR UPDATE;""",
             (digest,),
         )
@@ -445,6 +448,33 @@ def handle_callback(conn, token: str, allowed_user_id: int, callback: dict[str, 
                                                      "text": "Button expired", "show_alert": "true"})
             return
         item_id, action = row[1], row[2]
+        cur.execute("SELECT source_sha256 FROM human_review_items WHERE id=%s;", (item_id,))
+        current_item = cur.fetchone()
+        current_source = str(current_item[0]) if current_item and current_item[0] else None
+        token_source = str(row[6]) if row[6] else None
+        if token_source != current_source:
+            cur.execute("UPDATE telegram_callback_tokens SET used_at=now() WHERE id=%s;", (row[0],))
+            conn.commit()
+            api(token, "answerCallbackQuery", data={"callback_query_id": callback_id,
+                                                     "text": "Review content changed; use the newest message",
+                                                     "show_alert": "true"})
+            return
+        token_context = str(row[7]) if row[7] else None
+        if token_context:
+            cur.execute(
+                """SELECT context_sha256 FROM telegram_review_deliveries
+                     WHERE review_item_id=%s AND delivery_kind='summary' AND status='sent'
+                       AND context_sha256 IS NOT NULL
+                     ORDER BY delivered_at DESC, id DESC LIMIT 1;""", (item_id,)
+            )
+            latest = cur.fetchone()
+            if latest and str(latest[0]) != token_context:
+                cur.execute("UPDATE telegram_callback_tokens SET used_at=now() WHERE id=%s;", (row[0],))
+                conn.commit()
+                api(token, "answerCallbackQuery", data={"callback_query_id": callback_id,
+                                                         "text": "Approval context changed; use the newest message",
+                                                         "show_alert": "true"})
+                return
     approval_request_id = ""
     try:
         result = decide_item(conn, item_id, decision=action,
@@ -455,14 +485,15 @@ def handle_callback(conn, token: str, allowed_user_id: int, callback: dict[str, 
         conn.commit()
         execution_result = None
         observed_reconciliation = result.get("reconciliation_observed_result") or {}
-        if observed_reconciliation.get("state") and observed_reconciliation.get("state") != "submitted":
+        followup_source = result.get("post_commit_followup_result") or observed_reconciliation
+        if followup_source.get("state") and followup_source.get("state") != "submitted":
             try:
                 from services.application_actions.privileged_action_v1 import _post_commit_followup
-                result["reconciliation_followup"] = _post_commit_followup(
-                    conn, result["application_id"], observed_reconciliation
+                result["post_commit_followup"] = _post_commit_followup(
+                    conn, result["application_id"], followup_source
                 )
             except Exception as followup_exc:
-                result["reconciliation_followup"] = {"ok": False, "error": str(followup_exc)[:1000]}
+                result["post_commit_followup"] = {"ok": False, "error": str(followup_exc)[:1000]}
         approval_type = str(result.get("approval_type") or "")
         approval_request_id = str(result.get("approval_request_id") or "")
         if (action == "approve" and approval_type.startswith("privileged_") and approval_request_id

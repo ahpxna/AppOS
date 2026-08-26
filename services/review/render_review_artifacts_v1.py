@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import importlib.util
 import os
 import re
 import sys
@@ -29,12 +28,7 @@ load_repo_env()
 DSN = database_dsn()
 OUTPUT_ROOT = Path(os.getenv("JOBOS_REVIEW_ARTIFACT_DIR", ROOT / "data/review-artifacts"))
 TEMPLATE = Path(os.getenv("JOBOS_RESUME_TEMPLATE_PATH", ROOT / "data/resume-template/VU PHAN AN NGUYEN-official_For_all.docx"))
-RENDERER_PATH = ROOT / "services" / "document-generation" / "resume_template_renderer.py"
-SPEC = importlib.util.spec_from_file_location("jobos_review_resume_renderer", RENDERER_PATH)
-if SPEC is None or SPEC.loader is None:
-    raise RuntimeError(f"Cannot load resume renderer: {RENDERER_PATH}")
-renderer = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(renderer)
+from services.common.canonical_resume_artifact_v1 import render_canonical_resume
 
 
 class ReviewArtifactError(RuntimeError):
@@ -97,16 +91,9 @@ def render_document_pdf(cur, document_id: str) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     if doc_type == "resume":
         tailoring = (evidence_map or {}).get("resume_template") or {}
-        bullets = tailoring.get("project_bullets", [])
-        skills = tailoring.get("skill_lines", [])
-        subtitles = tailoring.get("project_subtitles", [])
-        if not bullets:
-            raise ReviewArtifactError("QA-passed resume has no fixed-template project bullets.")
-        docx = out_dir / "resume.docx"
-        renderer.render_docx(template=TEMPLATE.expanduser(), output=docx,
-                             project_bullets=bullets, skill_lines=skills,
-                             project_subtitles=subtitles)
-        pdf = renderer.export_pdf(docx, out_dir)
+        _docx, pdf = render_canonical_resume(
+            template=TEMPLATE, output_dir=out_dir, tailoring=tailoring
+        )
     else:
         pdf = out_dir / "cover_letter.pdf"
         _plain_cover_letter_pdf(content or "", pdf)

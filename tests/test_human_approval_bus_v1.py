@@ -17,6 +17,11 @@ class SavepointCursor:
     def execute(self, sql, params=None):
         self.sql.append(" ".join(str(sql).split()))
 
+    def fetchone(self):
+        if self.sql and "SELECT source_sha256 FROM human_review_items" in self.sql[-1]:
+            return ("source-sha",)
+        return None
+
 
 def test_soft_fail_db_section_uses_savepoint_and_returns_nan():
     from services.review import approval_context_v1 as ctx

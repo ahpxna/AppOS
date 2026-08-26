@@ -58,7 +58,7 @@ def test_action_required_handoff_is_migrated_and_non_executable():
     assert "OTP found — refocus the verification page" in watcher
 
 
-def test_doctor_requires_action_required_migration_075():
+def test_doctor_requires_latest_migration_dynamically():
     source = (ROOT / "scripts/jobos.py").read_text(encoding="utf-8")
-    assert "075_action_required_review_handoff.sql" in source
-    assert "Migrations through 075" in source
+    assert "def _latest_migration_contract" in source
+    assert "migration_check_name = f\"Migrations through {latest_number}\"" in source

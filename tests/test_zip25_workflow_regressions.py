@@ -55,8 +55,12 @@ def test_telegram_no_screenshot_still_allows_autofill_approval_and_new_gates():
     from services.telegram import telegram_review_bot_v1 as tg
 
     class Cur:
-        def execute(self, *args, **kwargs):
-            pass
+        def __init__(self): self.last_sql = ""
+        def execute(self, sql, *args, **kwargs): self.last_sql = str(sql)
+        def fetchone(self):
+            if "source_sha256" in self.last_sql:
+                return ("source-sha",)
+            return None
 
     cur = Cur()
     autofill = tg._keyboard(cur, "r1", 7, "autofill_review", {"execution_state": "completed"})

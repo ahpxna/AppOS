@@ -1,8 +1,8 @@
 # job-apply-os -- top-level requirements aggregator.
 #
-# Every service under services/*/ has its own requirements.txt (they're
-# independently deployable). This file just pulls all of them together so
-# a fresh clone can do one install instead of four:
+# Services with external Python dependencies keep local requirements files.
+# This file aggregates the supported runtime/developer dependency set so
+# a fresh clone can do one install instead of installing each service separately:
 #
 #   python -m venv .venv
 #   source .venv/bin/activate        # Windows/WSL: same command inside WSL bash
@@ -15,6 +15,8 @@
 -r services/discovery/requirements.txt
 -r services/browser-controller/requirements.txt
 -r services/document-generation/requirements.txt
+-r services/review/requirements.txt
+-r services/telegram/requirements.txt
 -r services/profile-ingestion/requirements.txt
 
 # Developer/runtime tools referenced by README and the local services.

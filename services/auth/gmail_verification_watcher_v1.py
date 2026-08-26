@@ -65,6 +65,21 @@ def process_pending(conn, *, max_results: int = 10) -> int:
         if not candidate:
             continue
         with conn.cursor() as cur:
+            # Gmail/network I/O happens outside a DB transaction. Revalidate the
+            # authoritative application/auth need before persisting or creating
+            # any capability from the earlier snapshot.
+            cur.execute(
+                """SELECT a.current_step, s.auth_state, s.account_email, s.employer_origin
+                     FROM applications a JOIN application_auth_sessions s ON s.application_id=a.id
+                    WHERE a.id=%s FOR UPDATE;""", (app_id,)
+            )
+            live = cur.fetchone()
+            if (not live or str(live[0]) != "needs_email_verification"
+                    or str(live[1]) != "needs_email_verification"
+                    or str(live[2] or "").casefold() != str(recipient or "").casefold()
+                    or str(live[3] or "") != str(origin or "")):
+                conn.rollback()
+                continue
             candidate_id = persist_candidate(cur, application_id=app_id, candidate=candidate)
             relevance = str(candidate.get("relevance") or "")
             if relevance and relevance != "employer_match" and origin:

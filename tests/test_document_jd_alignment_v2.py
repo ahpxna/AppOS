@@ -5,22 +5,12 @@ import importlib.util
 import json
 import os
 from pathlib import Path
-import sys
-import types
 
 from docx import Document
+from tests.psycopg_stub_utils import install_if_missing, restore
 
 os.environ.setdefault("JOBOS_DB_PASSWORD", "unit-test")
-
-if "psycopg" not in sys.modules:
-    psycopg = types.ModuleType("psycopg")
-    psycopg.connect = lambda *_a, **_k: None
-    psycopg_types = types.ModuleType("psycopg.types")
-    psycopg_json = types.ModuleType("psycopg.types.json")
-    psycopg_json.Jsonb = lambda value: value
-    sys.modules["psycopg"] = psycopg
-    sys.modules["psycopg.types"] = psycopg_types
-    sys.modules["psycopg.types.json"] = psycopg_json
+_psycopg_saved = install_if_missing()
 
 ROOT = Path(__file__).resolve().parents[1]
 GEN = ROOT / "services" / "document-generation" / "generate_documents_v1.py"
@@ -28,6 +18,7 @@ SPEC = importlib.util.spec_from_file_location("jobos_docgen_alignment_test", GEN
 docgen = importlib.util.module_from_spec(SPEC)
 assert SPEC and SPEC.loader
 SPEC.loader.exec_module(docgen)
+restore(_psycopg_saved)
 
 from services.common.document_prompt_templates_v1 import (
     build_cover_alignment_blueprint_prompt,

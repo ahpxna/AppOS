@@ -1,22 +1,13 @@
 from pathlib import Path
-import sys
-import types
 
 import pytest
 
-try:
-    from psycopg.types.json import Jsonb as _Jsonb  # noqa: F401
-except ModuleNotFoundError:
-    psycopg = types.ModuleType("psycopg")
-    psycopg_types = types.ModuleType("psycopg.types")
-    psycopg_json = types.ModuleType("psycopg.types.json")
-    psycopg_json.Jsonb = lambda value: value
-    sys.modules.setdefault("psycopg", psycopg)
-    sys.modules.setdefault("psycopg.types", psycopg_types)
-    sys.modules.setdefault("psycopg.types.json", psycopg_json)
+from tests.psycopg_stub_utils import install_if_missing, restore
 
+_psycopg_saved = install_if_missing()
 from services.discovery.linkedin_discovery_v1 import LinkedInDiscoveryError, normalize_jobs, validate_saved_request
 from services.autofill.autofill_executor_v1 import OpenClawTransport
+restore(_psycopg_saved)
 
 
 def test_saved_request_is_bounded():

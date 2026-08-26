@@ -33,6 +33,7 @@ import json
 import os
 import re
 import secrets
+import uuid
 import subprocess
 import sys
 from typing import Any, Dict, List, Optional
@@ -61,6 +62,8 @@ MARKET_INTELLIGENCE_SCRIPT = os.path.join(
 )
 
 FIT_REVIEW_TTL_HOURS = 48  # long on purpose: a human sleeps (see architecture review)
+ORCHESTRATOR_LEASE_SECONDS = int(os.getenv("JOBOS_ORCHESTRATOR_LEASE_SECONDS", "7200"))
+_ACTIVE_PROCESSING_RUN_ID: str | None = None
 
 
 # ---------------------------------------------------------------- transitions
@@ -77,6 +80,16 @@ def transition(
     if not row:
         raise RuntimeError(f"Application not found: {application_id}")
     from_step = row[0]
+
+    if _ACTIVE_PROCESSING_RUN_ID is not None:
+        cur.execute(
+            """SELECT processing_run_id::text, processing_step, processing_lease_expires_at > now()
+                 FROM applications WHERE id=%s;""", (application_id,)
+        )
+        claim = cur.fetchone()
+        if (not claim or str(claim[0] or "") != _ACTIVE_PROCESSING_RUN_ID
+                or str(claim[1] or "") != str(from_step) or not bool(claim[2])):
+            raise RuntimeError("Orchestrator processing lease changed/expired before state completion; refusing stale completion.")
 
     if from_step == to_step:
         return
@@ -97,10 +110,25 @@ def transition(
             "The orchestrator may not perform it."
         )
 
-    cur.execute(
-        "UPDATE applications SET current_step = %s, updated_at = now() WHERE id = %s;",
-        (to_step, application_id),
-    )
+    if _ACTIVE_PROCESSING_RUN_ID is not None:
+        cur.execute(
+            """UPDATE applications
+                  SET current_step=%s, updated_at=now()
+                WHERE id=%s AND current_step=%s
+                  AND processing_run_id=%s::uuid
+                  AND processing_step=%s
+                  AND processing_lease_expires_at>now();""",
+            (to_step, application_id, from_step, _ACTIVE_PROCESSING_RUN_ID, from_step),
+        )
+    else:
+        cur.execute(
+            "UPDATE applications SET current_step=%s, updated_at=now() WHERE id=%s AND current_step=%s;",
+            (to_step, application_id, from_step),
+        )
+    if cur.rowcount != 1:
+        raise RuntimeError(
+            f"Application state/processing ownership changed during {from_step!r} -> {to_step!r}; refusing stale completion."
+        )
     cur.execute(
         """
         INSERT INTO pipeline_events
@@ -249,7 +277,7 @@ TRANSIENT_MARKERS = (
 def run_step(script: str, args: List[str]) -> tuple[bool, str, bool]:
     """Run a legacy script path from the repository root."""
     proc = subprocess.run(
-        [PYTHON, script, *args], cwd=REPO_ROOT, capture_output=True, text=True, timeout=1800
+        [PYTHON, script, *args], cwd=REPO_ROOT, env=_subprocess_env(args), capture_output=True, text=True, timeout=1800
     )
     out = (proc.stdout or "") + (proc.stderr or "")
     ok = proc.returncode == 0
@@ -260,7 +288,7 @@ def run_step(script: str, args: List[str]) -> tuple[bool, str, bool]:
 def run_module(module: str, args: List[str]) -> tuple[bool, str, bool]:
     """Run internal package entrypoints with import semantics intact."""
     proc = subprocess.run(
-        [PYTHON, "-m", module, *args], cwd=REPO_ROOT, capture_output=True, text=True, timeout=1800
+        [PYTHON, "-m", module, *args], cwd=REPO_ROOT, env=_subprocess_env(args), capture_output=True, text=True, timeout=1800
     )
     out = (proc.stdout or "") + (proc.stderr or "")
     ok = proc.returncode == 0
@@ -600,8 +628,17 @@ def advance_one(cur, application_id: str, *, apply: bool) -> None:
         if cover_row:
             cok, cout, ctransient = run_step(VERIFY_SCRIPT, ["--document-id", cover_row[0], "--apply"])
             if not cok and ctransient:
-                record_failure(cur, application_id, step, cout, transient=True)
-                return
+                # Cover letter is supplemental. A transient verifier outage may
+                # leave it unavailable for this application, but must not hold
+                # the primary reviewed resume at docs_generated.
+                cur.execute(
+                    """INSERT INTO pipeline_events(application_id,from_step,to_step,actor,reason,detail_json)
+                       VALUES (%s,%s,%s,'cover-letter-verifier',%s,%s);""",
+                    (application_id, step, step,
+                     "Supplemental cover-letter verification deferred; primary resume proceeds.",
+                     Jsonb({"output": cout[-1500:]})),
+                )
+                print("    cover letter QA: transient failure; omitted/deferred without blocking resume")
 
         cur.execute(
             """
@@ -634,6 +671,45 @@ def advance_one(cur, application_id: str, *, apply: bool) -> None:
     else:
         print(f"    no automated action defined for step {step!r}")
 
+
+# ---------------------------------------------------------------- durable orchestration claim
+
+def claim_application(cur, application_id: str) -> tuple[str, str] | None:
+    run_id = str(uuid.uuid4())
+    cur.execute(
+        """UPDATE applications a
+              SET processing_run_id=%s::uuid, processing_step=a.current_step,
+                  processing_started_at=now(),
+                  processing_lease_expires_at=now()+make_interval(secs => %s)
+            FROM pipeline_steps ps
+           WHERE a.id=%s AND ps.step=a.current_step
+             AND ps.is_terminal=false AND ps.requires_human=false
+             AND (a.processing_run_id IS NULL OR a.processing_lease_expires_at <= now())
+        RETURNING a.current_step;""",
+        (run_id, ORCHESTRATOR_LEASE_SECONDS, application_id),
+    )
+    row = cur.fetchone()
+    return (run_id, str(row[0])) if row else None
+
+
+def release_application_claim(cur, application_id: str, run_id: str) -> None:
+    cur.execute(
+        """UPDATE applications
+              SET processing_run_id=NULL, processing_step=NULL, processing_started_at=NULL,
+                  processing_lease_expires_at=NULL
+            WHERE id=%s AND processing_run_id=%s::uuid;""",
+        (application_id, run_id),
+    )
+
+
+def _subprocess_env(args: List[str]) -> dict[str, str]:
+    env = os.environ.copy()
+    if "--application-id" in args:
+        try:
+            env["JOBOS_APPLICATION_ID"] = str(args[args.index("--application-id") + 1])
+        except (ValueError, IndexError):
+            pass
+    return env
 
 # ---------------------------------------------------------------- commands
 
@@ -691,6 +767,7 @@ def cmd_filter(conn, args) -> int:
 
 
 def cmd_advance(conn, args) -> int:
+    global _ACTIVE_PROCESSING_RUN_ID
     with conn.cursor() as cur:
         if args.application_id:
             ids = [args.application_id]
@@ -700,6 +777,7 @@ def cmd_advance(conn, args) -> int:
                 SELECT a.id::text FROM applications a
                 JOIN pipeline_steps ps ON ps.step = a.current_step
                 WHERE ps.is_terminal = false AND ps.requires_human = false
+                  AND (a.processing_run_id IS NULL OR a.processing_lease_expires_at <= now())
                 ORDER BY ps.sort_order, a.updated_at;
                 """
             )
@@ -710,13 +788,32 @@ def cmd_advance(conn, args) -> int:
             return 0
 
         for app_id in ids:
+            run_id: str | None = None
             try:
-                advance_one(cur, app_id, apply=args.apply)
                 if args.apply:
+                    claimed = claim_application(cur, app_id)
+                    if not claimed:
+                        conn.rollback()
+                        print(f"  {app_id}: already claimed, terminal, or waiting on a human; skipped")
+                        continue
+                    run_id, _claimed_step = claimed
+                    conn.commit()  # claim is durable before any long external work
+                    _ACTIVE_PROCESSING_RUN_ID = run_id
+                advance_one(cur, app_id, apply=args.apply)
+                if args.apply and run_id:
+                    release_application_claim(cur, app_id, run_id)
                     conn.commit()
             except Exception as e:
                 conn.rollback()
+                if args.apply and run_id:
+                    try:
+                        release_application_claim(cur, app_id, run_id)
+                        conn.commit()
+                    except Exception:
+                        conn.rollback()
                 print(f"    error: {type(e).__name__}: {e}")
+            finally:
+                _ACTIVE_PROCESSING_RUN_ID = None
 
         if not args.apply:
             conn.rollback()

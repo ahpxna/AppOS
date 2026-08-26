@@ -14,8 +14,10 @@ Design notes:
   An unpriced model reports zero spend and is flagged, rather than silently
   guessing a number that would under-report the bill.
 
-  Backfill reads component_runs, which every component already writes. There
-  is no separate instrumentation to forget to add.
+  Since migration 076, every gateway LLM call writes cost_ledger directly and
+  paid calls reserve the hard daily budget before network I/O. ``backfill`` is
+  retained only for legacy component_runs created before that migration, so it
+  cannot double-charge directly-accounted calls.
 
 Usage:
   python services/cost/cost_controller_v1.py backfill --apply
@@ -54,6 +56,14 @@ def ensure_today_budget(cur) -> None:
         VALUES (CURRENT_DATE, 2.00, 20, 50)
         ON CONFLICT (date) DO NOTHING;
         """
+    )
+    cur.execute(
+        """UPDATE daily_budgets d
+              SET current_cost_usd = GREATEST(
+                    COALESCE(d.current_cost_usd,0),
+                    COALESCE((SELECT SUM(estimated_cost_usd) FROM cost_ledger
+                               WHERE created_at::date=CURRENT_DATE),0))
+            WHERE d.date=CURRENT_DATE;"""
     )
 
 
@@ -97,6 +107,10 @@ def cmd_backfill(conn, args) -> int:
             FROM component_runs cr
             LEFT JOIN cost_ledger cl ON cl.component_run_id = cr.id
             WHERE cl.id IS NULL
+              AND cr.created_at < COALESCE(
+                    (SELECT applied_at FROM schema_migrations
+                      WHERE migration_id='076_workflow_integrity_orchestrator_leases_and_callback_binding.sql'),
+                    'infinity'::timestamptz)
             ORDER BY cr.created_at;
             """
         )
@@ -164,9 +178,12 @@ def cmd_report(conn, args) -> int:
             """
         )
         max_usd, max_jobs, max_tasks, cur_jobs, cur_tasks = cur.fetchone()
+        cur.execute("SELECT current_cost_usd FROM daily_budgets WHERE date=CURRENT_DATE;")
+        reserved_or_settled = Decimal(cur.fetchone()[0] or 0)
 
         print(f"\n--- TODAY ---")
-        print(f"  spent:         ${spent:.4f} / ${max_usd:.2f}")
+        print(f"  ledger spend:  ${spent:.4f} / ${max_usd:.2f}")
+        print(f"  hard budget:   ${reserved_or_settled:.4f} reserved/settled")
         print(f"  calls:         {calls}  (local {local_calls}, paid {paid_calls})")
         print(f"  tokens:        {in_tok} in, {out_tok} out")
         print(f"  full pipeline: {cur_jobs} / {max_jobs}")
@@ -223,16 +240,17 @@ def cmd_check(conn, args) -> int:
         conn.commit()
 
         cur.execute("SELECT spent_usd FROM v_cost_today;")
-        spent = Decimal(cur.fetchone()[0] or 0)
+        ledger_spent = Decimal(cur.fetchone()[0] or 0)
 
         cur.execute(
             """
             SELECT max_cost_usd, max_jobs_full_pipeline, max_browser_tasks,
-                   current_jobs_full_pipeline, current_browser_tasks
+                   current_jobs_full_pipeline, current_browser_tasks, current_cost_usd
             FROM daily_budgets WHERE date = CURRENT_DATE;
             """
         )
-        max_usd, max_jobs, max_tasks, cur_jobs, cur_tasks = cur.fetchone()
+        max_usd, max_jobs, max_tasks, cur_jobs, cur_tasks, current_cost = cur.fetchone()
+        spent = max(ledger_spent, Decimal(current_cost or 0))
 
         reasons = []
         if max_usd is not None and spent >= Decimal(max_usd):
