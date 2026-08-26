@@ -405,10 +405,27 @@ def autofill_prepare(application_id: str, *, create: bool, yes: bool) -> int:
 
 
 def status() -> int:
-    """Print the product-level pipeline state without invoking a worker or model."""
+    """Print runtime + pipeline state even when one subsystem is down."""
     import psycopg
     load_repo_env()
-    with psycopg.connect(database_dsn(), autocommit=True) as conn, conn.cursor() as cur:
+    runtime = {"running": False}
+    try:
+        runtime_path = ROOT / ".jobos" / "run" / "runtime.json"
+        if runtime_path.is_file():
+            runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
+            runtime["running"] = True
+    except Exception:
+        runtime = {"running": False, "status": "unavailable"}
+    try:
+        conn_ctx = psycopg.connect(database_dsn(), autocommit=True)
+    except Exception as exc:
+        print(json.dumps({
+            "runtime": runtime,
+            "database": {"ready": False, "error": str(exc)[:500]},
+            "daily_control_surface": "Telegram /start",
+        }, indent=2))
+        return 1
+    with conn_ctx as conn, conn.cursor() as cur:
         cur.execute("SELECT coalesce(status, 'unknown'), count(*) FROM applications GROUP BY 1 ORDER BY 1;")
         applications = {str(status): count for status, count in cur.fetchall()}
         cur.execute("SELECT coalesce(current_step, 'unknown'), count(*) FROM applications GROUP BY 1 ORDER BY 1;")
@@ -447,12 +464,14 @@ def status() -> int:
                    "processing_lease_expires_at":str(r[6]) if r[6] else None,
                    "last_error":r[7],"next_action":r[8]} for r in cur.fetchall()]
     print(json.dumps({
+        "runtime": runtime,
         "applications_by_status": applications, "applications_by_step": steps, "applications_by_source": sources,
         "browser_tasks": browser_tasks, "attempts": attempts, "pending_human_reviews": pending_reviews,
         "needs_reconciliation": reconciliation,
         "autofill_needs_reconciliation": autofill_reconciliation,
         "privileged_needs_reconciliation": privileged_reconciliation,
         "active_work": active,
+        "daily_control_surface": "Telegram /start",
         "submit": "telegram_human_approval_then_privileged_executor",
     }, indent=2))
     return 0
@@ -540,9 +559,16 @@ def gmail_watch_command(*, once: bool = False, wake_listen: bool = False,
         argv.extend(("--wake-listen", "--wake-host", wake_host, "--wake-port", str(wake_port)))
     return subprocess.call(argv, cwd=ROOT)
 
+def runtime_supervisor_command(command: str) -> int:
+    load_repo_env()
+    return subprocess.call([sys.executable, str(ROOT / "scripts" / "jobos_runtime_supervisor.py"), command], cwd=ROOT)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="JobOS operator commands.")
     commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("start", help="Start the configured JobOS workers behind one local supervisor.")
+    commands.add_parser("stop", help="Stop the local JobOS worker supervisor cleanly.")
     doctor_parser = commands.add_parser("doctor", help="Read-only readiness and safety checks.")
     doctor_parser.add_argument("--check-browser", action="store_true", help="Also probe gateway and CDP health; never opens a page.")
     doctor_parser.add_argument("--strict", action="store_true", help="Exit non-zero unless the selected readiness profile is ready.")
@@ -613,6 +639,8 @@ def main() -> int:
     gw.add_argument("--interval-seconds", type=int, default=10); gw.add_argument("--max-results", type=int, default=10)
 
     args = parser.parse_args()
+    if args.command in {"start", "stop"}:
+        return runtime_supervisor_command(args.command)
     if args.command == "doctor":
         return doctor(check_browser=args.check_browser, strict=args.strict, require_autofill=args.require_autofill, profile=args.profile)
     if args.command == "status":

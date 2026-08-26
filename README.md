@@ -528,3 +528,29 @@ Unpriced paid models fail closed thay vì báo giả $0.
 - `00_check_main_user_env.sh` và `01_debug_docker.sh` (ở root repo) là
   script debug riêng cho máy Mac ban đầu (dùng `sw_vers`, `lsof` kiểu
   macOS) — không cần cho setup, có thể bỏ qua trên Windows/WSL.
+
+## Daily-use mode: one inbox, no IDs or routine CLI
+
+After initial configuration/migrations, daily operation is intentionally reduced to:
+
+```bash
+python scripts/jobos.py start
+python scripts/jobos.py status
+python scripts/jobos.py stop
+```
+
+`start` keeps the safe orchestrator, privileged-action worker, browser worker, and configured Telegram/Gmail workers alive behind one local supervisor. The normal human control surface is Telegram `/start`, not the CLI.
+
+The Telegram surface uses progressive disclosure:
+
+- one dashboard shows active jobs, work needing attention, reconciliation count, and recent intake;
+- low-risk exact review items can be approved with one **Approve N safe** gesture;
+- irreversible Submit, legal consent, login/account creation, domain trust, MFA/email verification, reconciliation, and other security/judgment actions are never hidden inside the safe batch;
+- normal cards show only company/role, match/status, the decision, and 2-4 familiar actions;
+- **Review** opens the exact PDF/screenshot/JD/context and verified resume-change diff;
+- **Later** snoozes the card without changing its underlying approval;
+- known Yes/No or configured salary questions get one-tap choices; **Other** lets the user reply naturally without a review ID or command;
+- login/MFA/checkpoint pages are re-observed read-only on the exact bound browser target, so JobOS can continue automatically after the human completes the browser step;
+- transient safe mechanics are retried by workers; uncertain browser side effects remain reconciliation-only and are never replayed automatically.
+
+The CLI remains available for debugging, admin, and recovery, but a normal application should not require copying IDs or running per-application commands.

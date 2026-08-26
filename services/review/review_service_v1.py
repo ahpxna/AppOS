@@ -257,7 +257,7 @@ def ensure_document_review(cur, document_id: str) -> str | None:
 def ensure_approval_review(cur, approval_request_id: str) -> str | None:
     cur.execute(
         """SELECT ar.application_id::text, ar.type, ar.status, ar.summary_text,
-                  ar.token_expires_at, a.company, a.job_title
+                  ar.token_expires_at, a.company, a.job_title, ar.payload_json
              FROM approval_requests ar LEFT JOIN applications a ON a.id = ar.application_id
             WHERE ar.id = %s AND ar.status = 'pending'
               AND ar.token_expires_at > now();""",
@@ -266,21 +266,32 @@ def ensure_approval_review(cur, approval_request_id: str) -> str | None:
     row = cur.fetchone()
     if not row or not row[0]:
         return None
-    app_id, approval_type, _status, summary, expires, company, role = row
+    app_id, approval_type, _status, summary, expires, company, role, approval_payload = row
     bundle_id = ensure_bundle(cur, app_id)
+    review_payload = {
+        "approval_type": approval_type,
+        "expires_at": expires.isoformat() if expires else None,
+        "delegated_to_autofill": bool((approval_payload or {}).get("delegated_to_autofill")),
+        "parent_approval_request_id": (approval_payload or {}).get("parent_approval_request_id"),
+    }
+    source_sha = _sha256_text(json.dumps({
+        "approval_request_id": approval_request_id,
+        "approval_type": approval_type,
+        "payload": approval_payload or {},
+    }, sort_keys=True, separators=(",", ":"), default=str))
     cur.execute(
         """INSERT INTO human_review_items(
                review_bundle_id, application_id, item_type, approval_request_id,
-               title, summary_text, priority, payload_json)
-           VALUES (%s, %s, 'approval_request', %s, %s, %s, 'urgent', %s)
+               title, summary_text, priority, payload_json, source_sha256)
+           VALUES (%s, %s, 'approval_request', %s, %s, %s, 'urgent', %s, %s)
            ON CONFLICT (approval_request_id)
              WHERE approval_request_id IS NOT NULL AND item_type = 'approval_request' AND status = 'pending'
            DO UPDATE SET title = EXCLUDED.title, summary_text = EXCLUDED.summary_text,
-                         payload_json = EXCLUDED.payload_json, updated_at = now()
+                         payload_json = EXCLUDED.payload_json, source_sha256 = EXCLUDED.source_sha256,
+                         updated_at = now()
            RETURNING id::text;""",
         (bundle_id, app_id, approval_request_id, f"Approval required: {approval_type}",
-         summary or f"{company or ''} — {role or ''}",
-         Jsonb({"approval_type": approval_type, "expires_at": expires.isoformat() if expires else None})),
+         summary or f"{company or ''} — {role or ''}", Jsonb(review_payload), source_sha),
     )
     return str(cur.fetchone()[0])
 
@@ -931,6 +942,92 @@ def list_inbox(cur) -> list[dict[str, Any]]:
          "job_title": r[8], "created_at": r[9].isoformat() if r[9] else None}
         for r in cur.fetchall()
     ]
+
+
+def safe_batch_review_items(cur, *, limit: int = 20) -> list[dict[str, Any]]:
+    """Return exact currently-actionable items eligible for one-tap safe approval.
+
+    Classification is presentation policy only; every child review item still
+    goes through decide_item(), preserving its exact hashes/capabilities.
+    """
+    from services.review.ux_policy_v1 import is_batch_safe_item
+    cur.execute(
+        """SELECT v.review_item_id::text, v.application_id::text, v.item_type,
+                  v.payload_json, h.source_sha256, v.company, v.job_title
+             FROM v_human_review_inbox v
+             JOIN human_review_items h ON h.id = v.review_item_id
+            ORDER BY CASE v.priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 ELSE 2 END,
+                     v.created_at
+            LIMIT %s;""",
+        (max(1, min(int(limit), 100)),),
+    )
+    result = []
+    for item_id, app_id, item_type, payload, source_sha, company, role in cur.fetchall():
+        payload = dict(payload or {})
+        if not is_batch_safe_item(item_type=str(item_type), payload=payload):
+            continue
+        result.append({
+            "item_id": str(item_id), "application_id": str(app_id),
+            "item_type": str(item_type), "payload": payload,
+            "source_sha256": str(source_sha or ""),
+            "company": company or "", "job_title": role or "",
+        })
+    return result
+
+
+def snooze_review_item(conn, item_id: str, *, actor: str, hours: int = 6) -> dict[str, Any]:
+    """Temporarily hide a review card without changing its underlying decision."""
+    hours = max(1, min(int(hours), 72))
+    with conn.cursor() as cur:
+        cur.execute(
+            """UPDATE human_review_items
+                  SET snoozed_until=now() + make_interval(hours => %s), updated_at=now(),
+                      decision_note=coalesce(decision_note,'') || %s
+                WHERE id=%s AND status IN ('pending','needs_revision')
+                RETURNING application_id::text, snoozed_until;""",
+            (hours, f"\nSnoozed by {actor} for {hours}h.", item_id),
+        )
+        row = cur.fetchone()
+        if not row:
+            raise ReviewError("Review item is no longer actionable.")
+    return {"ok": True, "review_item_id": item_id, "application_id": row[0],
+            "snoozed_until": row[1].isoformat() if row[1] else None}
+
+
+def question_quick_choices(cur, item_id: str) -> list[str]:
+    """Return conservative configured one-tap answers for a question item."""
+    from services.review.ux_policy_v1 import quick_question_choices
+    cur.execute(
+        """SELECT h.payload_json
+             FROM human_review_items h
+            WHERE h.id=%s AND h.item_type='question_required'
+              AND h.status IN ('pending','needs_revision');""", (item_id,)
+    )
+    row = cur.fetchone()
+    if not row:
+        return []
+    question = str((row[0] or {}).get("question") or "")
+    # Discovery salary_floor is a user-owned configured number; use it only as
+    # a convenience suggestion, never as an automatic answer.
+    cur.execute("SELECT salary_floor FROM job_search_preferences WHERE profile_key='primary';")
+    pref = cur.fetchone()
+    salary_target = pref[0] if pref else None
+    return quick_question_choices(question, salary_target=salary_target)
+
+
+def document_change_summary(cur, item_id: str) -> list[str]:
+    """Expose structured resume changes used by the canonical renderer."""
+    from services.review.ux_policy_v1 import resume_change_lines
+    cur.execute(
+        """SELECT gd.doc_type, gd.evidence_map
+             FROM human_review_items h
+             JOIN generated_documents gd ON gd.id=h.generated_document_id
+            WHERE h.id=%s AND h.item_type='document_review';""", (item_id,)
+    )
+    row = cur.fetchone()
+    if not row or row[0] != 'resume':
+        return []
+    return resume_change_lines(dict(row[1] or {}))
 
 
 def review_artifacts(cur, item_id: str) -> list[dict[str, Any]]:
