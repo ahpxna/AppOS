@@ -73,20 +73,15 @@ def _host_is_allowed(cur, url: str, *, application_id: str | None = None, purpos
            for row in cur.fetchall()):
         return True
     if application_id:
-        if purpose:
-            cur.execute(
-                """SELECT 1 FROM application_scoped_domain_trusts
-                     WHERE application_id=%s AND domain=%s AND purpose=%s
-                       AND enabled=true AND expires_at>now() LIMIT 1;""",
-                (application_id, host, purpose),
-            )
-        else:
-            cur.execute(
-                """SELECT 1 FROM application_scoped_domain_trusts
-                     WHERE application_id=%s AND domain=%s
-                       AND enabled=true AND expires_at>now() LIMIT 1;""",
-                (application_id, host),
-            )
+        # Scoped human trust is purpose-bound. An email magic-link grant must
+        # not become permission for ordinary employer navigation/autofill.
+        scoped_purpose = purpose or "employer_handoff"
+        cur.execute(
+            """SELECT 1 FROM application_scoped_domain_trusts
+                 WHERE application_id=%s AND domain=%s AND purpose=%s
+                   AND enabled=true AND expires_at>now() LIMIT 1;""",
+            (application_id, host, scoped_purpose),
+        )
         return cur.fetchone() is not None
     return False
 
@@ -743,7 +738,25 @@ def _select_after_navigation_target(transport: OpenClawTransport, source_target:
     if not new_tabs:
         return source_target, []
     if len(new_tabs) == 1:
-        return transport._stable_id(new_tabs[0]), []
+        candidate_id = transport._stable_id(new_tabs[0])
+        # A popup is not automatically the application result. Prefer a
+        # source target that visibly navigated to a classified page; otherwise
+        # retain the historical single-new-tab fallback for a genuine handoff.
+        source_before = next((t for t in before_tabs if transport._stable_id(t) == source_target), {})
+        source_after = next((t for t in after_tabs if transport._stable_id(t) == source_target), {})
+        source_changed = bool(
+            source_before.get("url") and source_after.get("url")
+            and canonical_page_url(str(source_before.get("url")))
+                != canonical_page_url(str(source_after.get("url")))
+        )
+        try:
+            candidate_url, candidate_snap, candidate_nodes, _candidate_fp = _snapshot(transport, candidate_id)
+            candidate_state, _candidate_detail = detect_page_state(candidate_url, candidate_snap, candidate_nodes)
+        except Exception:
+            candidate_state = "unknown"
+        if source_changed and candidate_state == "unknown":
+            return source_target, []
+        return candidate_id, []
 
     opener_matches = [t for t in new_tabs if str(t.get("openerId") or "") == str(source_target)]
     if len(opener_matches) == 1:

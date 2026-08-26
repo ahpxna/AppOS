@@ -691,6 +691,10 @@ def cmd_create(conn, args) -> int:
             VALUES (%s, %s, %s, 'pending', %s, %s,
                     now() + make_interval(mins => %s), %s, %s, %s, %s,
                     %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
+            ON CONFLICT (idempotency_key)
+              WHERE idempotency_key IS NOT NULL
+                AND status IN ('pending', 'approved', 'executing')
+            DO NOTHING
             RETURNING id::text, token_expires_at;
             """,
             (
@@ -704,7 +708,25 @@ def cmd_create(conn, args) -> int:
                 Jsonb(payload.get("autofill_action_scope") or {}),
             ),
         )
-        request_id, expires = cur.fetchone()
+        inserted = cur.fetchone()
+        if inserted is None:
+            cur.execute(
+                """SELECT id::text, status, summary_text, token_expires_at
+                     FROM approval_requests
+                    WHERE idempotency_key=%s
+                      AND status IN ('pending','approved','executing')
+                    ORDER BY created_at DESC LIMIT 1;""",
+                (idempotency_key,),
+            )
+            winner = cur.fetchone()
+            if not winner:
+                raise RuntimeError("approval materialization raced without a reusable winner")
+            conn.commit()
+            print(f"\n  existing request: {winner[0]}")
+            print(f"  status:          {winner[1]}")
+            print(f"  summary:         {winner[2]}")
+            return 0
+        request_id, expires = inserted
         log_event(cur, request_id, "created", args.requested_by,
                   {"type": args.type, "ttl_minutes": args.ttl_minutes})
 
@@ -848,7 +870,7 @@ def redeem(conn, token: str, *, decision: str, note: str, actor: str) -> int:
 
         autofill_queued = False
         if application_id and new_status == "denied" and atype == "autofill_form":
-            parent_payload = request["payload_json"] if isinstance(request.get("payload_json"), dict) else {}
+            parent_payload = payload_request["payload_json"] if isinstance(payload_request.get("payload_json"), dict) else {}
             _restore_autofill_ready_after_terminal_parent(
                 cur, application_id=application_id,
                 plan_key=str(parent_payload.get("autofill_plan_key") or ""),

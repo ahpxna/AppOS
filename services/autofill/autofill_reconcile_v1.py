@@ -121,9 +121,11 @@ def close(cur, task_id: str) -> None:
         )
         if cur.fetchone() is not None:
             cur.execute(
-                """INSERT INTO pipeline_events(application_id, event_type, from_step, to_step, detail_json)
-                   VALUES (%s, 'autofill_reconciliation_closed', 'autofill_executing',
-                           'application_form_ready',
+                """INSERT INTO pipeline_events(
+                           application_id, from_step, to_step, actor, reason, detail_json)
+                   VALUES (%s, 'autofill_executing', 'application_form_ready',
+                           'autofill-reconciliation',
+                           'Human closed uncertain autofill reconciliation; a fresh approval is required.',
                            '{"replay": false, "fresh_approval_required": true}'::jsonb)""",
                 (application_id,),
             )

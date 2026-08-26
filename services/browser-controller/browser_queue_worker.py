@@ -305,6 +305,15 @@ def reap_expired_leases(cur) -> int:
     )
     exhausted_rows = cur.fetchall()
     for (task_id,) in exhausted_rows:
+        cur.execute("SELECT application_id::text, approval_request_id::text FROM browser_tasks WHERE id=%s;", (task_id,))
+        task_row = cur.fetchone()
+        if task_row:
+            application_id, approval_request_id = task_row
+            _expire_bound_pre_io_approval(
+                cur, {"id": str(task_id), "application_id": str(application_id or ""),
+                      "approval_request_id": str(approval_request_id or "")},
+                "Autofill task exhausted before browser I/O.",
+            )
         cur.execute(
             """UPDATE application_attempts
                   SET status = 'failed', finished_at = COALESCE(finished_at, now()),
@@ -402,6 +411,16 @@ def _expire_bound_pre_io_approval(cur, task: Dict[str, Any], reason: str) -> Non
     if not approval_id:
         return
     cur.execute(
+        """SELECT EXISTS (SELECT 1 FROM autofill_action_journal WHERE browser_task_id=%s)
+            FROM approval_requests
+            WHERE id=%s AND application_id=%s
+            FOR UPDATE;""",
+        (task["id"], approval_id, task.get("application_id")),
+    )
+    row = cur.fetchone()
+    if not row or row[0]:
+        return
+    cur.execute(
         """
         UPDATE approval_requests
         SET status = 'expired', executing_task_id = NULL,
@@ -412,6 +431,28 @@ def _expire_bound_pre_io_approval(cur, task: Dict[str, Any], reason: str) -> Non
           AND (executing_task_id IS NULL OR executing_task_id = %s);
         """,
         (reason[:500], approval_id, task.get("application_id"), task["id"]),
+    )
+    cur.execute(
+        """UPDATE approval_requests
+              SET status='expired', executing_task_id=NULL,
+                  action_note=COALESCE(action_note,%s)
+            WHERE application_id=%s AND type='privileged_upload_document'
+              AND payload_json->>'parent_approval_request_id'=%s
+              AND payload_json->>'delegated_to_autofill'='true'
+              AND status IN ('pending','approved','executing')
+              AND consumed_at IS NULL;""",
+        ("Parent autofill capability closed before browser I/O; delegated child is not executable.",
+         task.get("application_id"), str(approval_id)),
+    )
+    cur.execute(
+        """UPDATE applications SET current_step='application_form_ready', updated_at=now()
+            WHERE id=%s AND current_step='awaiting_approval'
+              AND NOT EXISTS (
+                  SELECT 1 FROM approval_requests ar
+                   WHERE ar.application_id=applications.id AND ar.type='autofill_form'
+                     AND ar.status IN ('pending','approved','executing')
+                     AND ar.token_expires_at > now());""",
+        (task.get("application_id"),),
     )
 
 def dead_letter_exhausted(cur) -> int:
@@ -442,7 +483,7 @@ def dead_letter_exhausted(cur) -> int:
             AND lease_expires_at < now()
             AND execution_state = 'not_started'
             AND retry_count >= max_retries
-          RETURNING id, task_type, application_id, input_json,
+            RETURNING id, task_type, application_id, approval_request_id, input_json,
                     error_message, retry_count, screenshot_url
         )
         INSERT INTO dead_letter_tasks (
@@ -452,10 +493,24 @@ def dead_letter_exhausted(cur) -> int:
         SELECT id, task_type, application_id, input_json,
                error_message, retry_count, screenshot_url, now()
         FROM dead
-        RETURNING id;
+        RETURNING original_task_id;
         """
     )
-    return len(cur.fetchall())
+    dead_rows = [row[0] for row in cur.fetchall()]
+    for task_id in dead_rows:
+        # dead_letter_exhausted only selects not_started tasks, so there is no
+        # journal and it is safe to retire the bound parent/children together.
+        cur.execute("SELECT application_id::text, approval_request_id::text FROM browser_tasks WHERE id=%s;", (task_id,))
+        task_row = cur.fetchone()
+        if not task_row:
+            continue
+        application_id, approval_request_id = task_row
+        _expire_bound_pre_io_approval(
+            cur, {"id": str(task_id), "application_id": str(application_id or ""),
+                  "approval_request_id": str(approval_request_id or "")},
+            "Browser task dead-lettered before browser I/O.",
+        )
+    return len(dead_rows)
 
 
 def claim_next_task(cur) -> Optional[Dict[str, Any]]:
@@ -956,8 +1011,11 @@ def durable_begin_execution(task: Dict[str, Any], binding: Dict[str, Any], targe
         cur.execute(
             """UPDATE applications SET current_step='autofill_executing', updated_at=now()
                  WHERE id=%s AND current_step=%s
+                   AND coalesce(job_url,'')=%s AND coalesce(jd_hash,'')=%s
                  RETURNING id;""",
-            (task["application_id"], expected_step),
+            (task["application_id"], expected_step,
+             str(binding.get("application_job_url") or ""),
+             str(binding.get("application_jd_hash") or "")),
         )
         if cur.fetchone() is None:
             raise PermanentTaskError("Application lifecycle changed before browser I/O; refusing the write.")
@@ -1162,8 +1220,10 @@ def durable_finish_execution(task: Dict[str, Any], binding: Dict[str, Any], resu
                 """UPDATE applications
                       SET current_step='form_filled', updated_at=now()
                     WHERE id=%s AND current_step='autofill_executing'
+                      AND coalesce(job_url,'')=%s AND coalesce(jd_hash,'')=%s
                     RETURNING id;""",
-                (task["application_id"],),
+                (task["application_id"], str(binding.get("application_job_url") or ""),
+                 str(binding.get("application_jd_hash") or "")),
             )
             if cur.fetchone() is None:
                 reconcile_reason = (
@@ -1179,13 +1239,16 @@ def durable_finish_execution(task: Dict[str, Any], binding: Dict[str, Any], resu
                     (task["application_id"], WORKER_ID, Jsonb({"browser_task_id": task["id"]})),
                 )
         else:
-            # Verified partial progress is not an unknown side effect. Release
-            # the execution fence back to the reviewable state; the old task
-            # remains terminal and can never replay.
+            # Partial progress crossed the browser-I/O boundary. If the
+            # application fence was lost concurrently, preserve the same
+            # reconciliation invariant as the completed path; never leave a
+            # partially-written task looking retryable.
             cur.execute(
                 """UPDATE applications SET current_step='awaiting_approval', updated_at=now()
-                     WHERE id=%s AND current_step='autofill_executing';""",
-                (task["application_id"],),
+                     WHERE id=%s AND current_step='autofill_executing'
+                       AND coalesce(job_url,'')=%s AND coalesce(jd_hash,'')=%s;""",
+                (task["application_id"], str(binding.get("application_job_url") or ""),
+                 str(binding.get("application_jd_hash") or "")),
             )
             if cur.rowcount == 1:
                 cur.execute(
@@ -1193,6 +1256,11 @@ def durable_finish_execution(task: Dict[str, Any], binding: Dict[str, Any], resu
                        VALUES (%s,'autofill_executing','awaiting_approval',%s,
                                'Deterministic autofill ended partial; old capability is terminal and a fresh plan is required.',%s);""",
                     (task["application_id"], WORKER_ID, Jsonb({"browser_task_id": task["id"]})),
+                )
+            else:
+                reconcile_reason = (
+                    "Application lifecycle changed after partial deterministic browser I/O; "
+                    "browser effects require reconciliation and are not replayable."
                 )
 
         terminal_task_state = "needs_reconciliation" if reconcile_reason else execution_state
@@ -1311,7 +1379,8 @@ def load_allowed_domains(cur) -> list:
     return [r[0].lower() for r in cur.fetchall()]
 
 
-def check_domain(cur, url: str, *, application_id: str | None = None) -> None:
+def check_domain(cur, url: str, *, application_id: str | None = None,
+                 purpose: str | None = None) -> None:
     """The domain whitelist existed in the schema (allowed_domains,
     migration 038) and was enforced inside autofill_agent_v1.py, but this
     worker -- the actual single chokepoint where every browser task
@@ -1325,11 +1394,13 @@ def check_domain(cur, url: str, *, application_id: str | None = None) -> None:
         if host == domain or host.endswith("." + domain):
             return
     if application_id and host:
+        scoped_purpose = purpose or "employer_handoff"
         cur.execute(
             """SELECT 1 FROM application_scoped_domain_trusts
-                 WHERE application_id=%s AND domain=%s AND enabled=true AND expires_at>now()
+                 WHERE application_id=%s AND domain=%s AND purpose=%s
+                   AND enabled=true AND expires_at>now()
                  LIMIT 1;""",
-            (application_id, host),
+            (application_id, host, scoped_purpose),
         )
         if cur.fetchone() is not None:
             return
@@ -1970,6 +2041,11 @@ def process_one(conn) -> bool:
     except PermanentTaskError as e:
         conn.rollback()
         with conn.cursor() as cur:
+            if task["task_type"] == "fill_application_form":
+                # Preflight failures happen before handle_fill_application_form
+                # can enter its local cleanup guard.  Close only if the durable
+                # journal proves that no browser write crossed the boundary.
+                _expire_bound_pre_io_approval(cur, task, f"Preflight refused: {e}")
             fail_task(cur, task["id"], str(e))
             update_saved_sync_failure(cur, task, "failed", str(e))
         conn.commit()

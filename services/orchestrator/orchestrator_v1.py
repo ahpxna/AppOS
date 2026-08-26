@@ -587,6 +587,22 @@ def advance_one(cur, application_id: str, *, apply: bool) -> None:
         # A non-zero exit with qa_status='fail' is a real verdict, not a crash,
         # so only transient failures short-circuit here.
 
+        # Cover letters have their own grounding/positioning verifier.  Keep
+        # this lane independent from resume QA, but do not leave a generated
+        # cover letter permanently unreviewed when it exists.
+        cur.execute(
+            """SELECT id::text FROM generated_documents
+                 WHERE application_id = %s AND doc_type = 'cover_letter'
+                 ORDER BY version DESC, created_at DESC LIMIT 1;""",
+            (application_id,),
+        )
+        cover_row = cur.fetchone()
+        if cover_row:
+            cok, cout, ctransient = run_step(VERIFY_SCRIPT, ["--document-id", cover_row[0], "--apply"])
+            if not cok and ctransient:
+                record_failure(cur, application_id, step, cout, transient=True)
+                return
+
         cur.execute(
             """
             SELECT id::text, qa_status, revision_round
@@ -603,8 +619,6 @@ def advance_one(cur, application_id: str, *, apply: bool) -> None:
         if qa == "pass":
             transition(cur, application_id=application_id, to_step="docs_verified",
                        actor="truth_quality_checker", reason="All claims supported.")
-            transition(cur, application_id=application_id, to_step="awaiting_approval",
-                       actor="orchestrator", reason="Queued for human approval.")
         elif qa is None and rround > 0:
             # The verifier stripped ungrounded claims and produced a revision.
             # It is queued for QA; verify it on the next pass.

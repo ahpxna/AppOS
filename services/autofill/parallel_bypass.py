@@ -242,6 +242,7 @@ def _fake_mouse_routine(ws_url: str, regimes_file_path: str, stop_event: threadi
       the existing FakeMouse behavior for employer-site autofill instead of
       accidentally disabling it as the earlier LinkedIn-only guard did.
     """
+    tabs: list[dict] = []
     try:
         tabs = _cdp_tabs(ws_url)
         seed = _seed_target(tabs, ws_url)
