@@ -280,21 +280,16 @@ def test_gmail_watcher_releases_read_transaction_before_network(monkeypatch):
     assert conn.commits == 1
 
 
-def test_frozen_fake_mouse_helper_refuses_ambiguous_linkedin_tabs(monkeypatch):
+def test_frozen_fake_mouse_helper_accepts_multiple_linkedin_tabs_without_touching_other_sites():
     from services.autofill import parallel_bypass
 
-    class Resp:
-        def raise_for_status(self):
-            pass
+    tabs = [
+        {"type": "page", "url": "https://www.linkedin.com/jobs/search/", "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/a"},
+        {"type": "page", "url": "https://www.linkedin.com/jobs/view/1", "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/b"},
+        {"type": "page", "url": "https://ats.example/app", "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/c"},
+    ]
 
-        def json(self):
-            return [
-                {"type": "page", "url": "https://www.linkedin.com/jobs/search/", "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/a"},
-                {"type": "page", "url": "https://www.linkedin.com/jobs/view/1", "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/b"},
-            ]
-
-    monkeypatch.setattr(parallel_bypass.requests, "get", lambda *_a, **_k: Resp())
-    with pytest.raises(RuntimeError, match="ambiguous"):
-        parallel_bypass._validate_unique_linkedin_ws_target(
-            "ws://127.0.0.1:9222/devtools/page/a", "https://www.linkedin.com/jobs/search/"
-        )
+    assert parallel_bypass._linkedin_page_targets(tabs) == [
+        ("ws://127.0.0.1:9222/devtools/page/a", "https://www.linkedin.com/jobs/search/"),
+        ("ws://127.0.0.1:9222/devtools/page/b", "https://www.linkedin.com/jobs/view/1"),
+    ]
