@@ -105,3 +105,31 @@ def test_upload_only_application_page_is_still_form_ready():
         "https://ats.example/apply", _snap("Upload Resume"), nodes
     )
     assert state == "application_form_ready"
+
+
+def test_authenticator_experience_question_is_not_an_mfa_gate():
+    nodes = [
+        {"ref": "fn", "role": "textbox", "label": "First name"},
+        {"ref": "q", "role": "radio", "label": "Have you used an authenticator app at work?"},
+        {"ref": "submit", "role": "button", "label": "Submit application"},
+    ]
+    state, _ = detect_page_state(
+        "https://ats.example/apply",
+        _snap("Application question: Have you used an authenticator app at work?"),
+        nodes,
+    )
+    assert state == "application_form_ready"
+
+
+def test_email_verification_experience_question_is_not_an_email_gate():
+    nodes = [
+        {"ref": "fn", "role": "textbox", "label": "First name"},
+        {"ref": "q", "role": "textbox", "label": "Describe your email verification experience"},
+        {"ref": "submit", "role": "button", "label": "Submit application"},
+    ]
+    state, _ = detect_page_state(
+        "https://ats.example/apply",
+        _snap("Describe your email verification experience"),
+        nodes,
+    )
+    assert state == "application_form_ready"

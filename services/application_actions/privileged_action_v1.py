@@ -286,20 +286,46 @@ def detect_page_state(url: str, snapshot: dict[str, Any], nodes: list[dict[str, 
     if _active_checkpoint_evidence(text, nodes):
         return "needs_human_checkpoint", {"reason": "active human checkpoint detected"}
 
+    # Authentication evidence is intentionally structural. Application
+    # questions such as "Describe your email verification experience" or
+    # "Have you used an authenticator app?" are never an auth gate merely
+    # because their labels contain a keyword.
+    def gate_code_field() -> dict[str, Any] | None:
+        exact_markers = ("verification code", "one-time code", "one time code", "security code", "otp")
+        for node in inputs:
+            label = " ".join(str(node.get("label") or "").casefold().split())
+            autocomplete = str(node.get("autocomplete") or "").casefold()
+            input_type = str(node.get("type") or "").casefold()
+            if autocomplete == "one-time-code":
+                return node
+            if any(marker in label for marker in exact_markers) and input_type in {"", "text", "number", "tel"}:
+                return node
+        return None
+
     # Prose alone must not override an active application form. Verification
-    # gates need a code/control signal or a dedicated non-form verification page.
-    code_field = _find_input(nodes, ("code", "verification", "otp", "one-time"))
+    # gates need a dedicated non-form page plus a code-control signal.
+    code_field = gate_code_field()
     email_verify = ("verify your email", "email verification", "code sent to your email",
                     "code sent to email", "check your email")
     email_path = any(token in (urlsplit(url).path or "").casefold() for token in ("verify", "verification", "confirm-email"))
-    if any(marker in text for marker in email_verify) and (code_field is not None or not app_form):
+    email_context = any(marker in text for marker in email_verify) or email_path
+    # A dedicated email-verification page can initially expose only the
+    # instruction copy while its code control is still rendering.  That copy
+    # is sufficiently specific outside an application form; a form question
+    # with the same words remains form-ready because of the guard above.
+    explicit_email_workflow = any(marker in text for marker in (
+        "check your email for a verification code", "verify your email", "code sent to your email",
+        "code sent to email",
+    ))
+    if not app_form and email_context and (code_field is not None or explicit_email_workflow):
         return "needs_email_verification", {"field_ref": str(code_field.get("ref")) if code_field else "NaN"}
 
     strong_mfa = ("authenticator", "security key", "passkey", "push notification", "approve the sign-in")
-    strong_control_mfa = any(marker in _node_text(nodes) for marker in strong_mfa)
+    clickable_text = " ".join(str(item.get("label") or "") for item in _clickables(nodes)).casefold()
+    strong_control_mfa = any(marker in clickable_text for marker in strong_mfa)
     sms_mfa = any(marker in text for marker in ("sms code", "texted you", "sent you a text")) and code_field is not None
     dedicated_mfa_page = (not app_form) and any(marker in text for marker in strong_mfa)
-    if strong_control_mfa or sms_mfa or dedicated_mfa_page:
+    if not app_form and (strong_control_mfa or sms_mfa or dedicated_mfa_page):
         return "needs_mfa", {"reason": "non-email MFA detected"}
 
     password = _find_input(nodes, ("password",))
@@ -498,6 +524,15 @@ def prepare(cur, *, application_id: str, action: str, candidate_id: str | None =
     summary = action
     if action == "begin_application":
         _require_application_step(cur, application_id, "docs_verified")
+        approved_documents = _document_bindings(cur, application_id)
+        if not isinstance(approved_documents.get("resume"), dict):
+            raise PrivilegedActionError(
+                "OPEN APPLY requires the exact QA-passed resume PDF to be human-approved first"
+            )
+        if not _document_bindings_still_current(cur, application_id, approved_documents):
+            raise PrivilegedActionError(
+                "approved resume artifact changed or is stale against the current job description"
+            )
         cur.execute("SELECT job_url FROM applications WHERE id=%s;", (application_id,))
         source_row = cur.fetchone()
         source_job_url = str(source_row[0] or "") if source_row else ""
@@ -731,40 +766,23 @@ def _consent_effect_verified(approved: list[dict[str, Any]], observed: list[dict
 
 def _select_after_navigation_target(transport: OpenClawTransport, source_target: str,
                                     before_tabs: list[dict[str, Any]]) -> tuple[str | None, list[dict[str, str]]]:
-    """Choose the resulting page by opener/evidence; never silently fall back when several new tabs exist."""
+    """Choose one resulting page from source-after plus all new targets.
+
+    A click may navigate the source *and* open unrelated popups.  Cardinality
+    or openerId alone is not authority, so a visibly changed source target is
+    scored alongside every newly-created page.  Ties remain human choices.
+    """
     after_tabs = transport._tabs()
     before_ids = {transport._stable_id(t) for t in before_tabs}
     new_tabs = [t for t in after_tabs if transport._stable_id(t) and transport._stable_id(t) not in before_ids]
-    if not new_tabs:
-        return source_target, []
-    if len(new_tabs) == 1:
-        candidate_id = transport._stable_id(new_tabs[0])
-        # A popup is not automatically the application result. Prefer a
-        # source target that visibly navigated to a classified page; otherwise
-        # retain the historical single-new-tab fallback for a genuine handoff.
-        source_before = next((t for t in before_tabs if transport._stable_id(t) == source_target), {})
-        source_after = next((t for t in after_tabs if transport._stable_id(t) == source_target), {})
-        source_changed = bool(
-            source_before.get("url") and source_after.get("url")
-            and canonical_page_url(str(source_before.get("url")))
-                != canonical_page_url(str(source_after.get("url")))
-        )
-        try:
-            candidate_url, candidate_snap, candidate_nodes, _candidate_fp = _snapshot(transport, candidate_id)
-            candidate_state, _candidate_detail = detect_page_state(candidate_url, candidate_snap, candidate_nodes)
-        except Exception:
-            candidate_state = "unknown"
-        if source_changed and candidate_state == "unknown":
-            return source_target, []
-        return candidate_id, []
+    source_before = next((t for t in before_tabs if transport._stable_id(t) == source_target), {})
+    source_after = next((t for t in after_tabs if transport._stable_id(t) == source_target), {})
+    candidate_tabs: list[tuple[dict[str, Any], bool]] = [(tab, False) for tab in new_tabs]
+    if source_after:
+        candidate_tabs.append((source_after, True))
 
-    opener_matches = [t for t in new_tabs if str(t.get("openerId") or "") == str(source_target)]
-    if len(opener_matches) == 1:
-        return transport._stable_id(opener_matches[0]), []
-
-    candidates: list[dict[str, str]] = []
-    plausible: list[str] = []
-    for tab in new_tabs:
+    candidates: list[dict[str, Any]] = []
+    for tab, is_source in candidate_tabs:
         tid = transport._stable_id(tab)
         if not tid:
             continue
@@ -773,12 +791,35 @@ def _select_after_navigation_target(transport: OpenClawTransport, source_target:
             state, _detail = detect_page_state(url, snap, nodes)
         except Exception:
             continue
-        candidates.append({"target_id": tid, "url": canonical_page_url(url), "page_fingerprint": fp, "state": state})
+        changed_source = False
+        if is_source and source_before.get("url"):
+            try:
+                changed_source = canonical_page_url(str(source_before["url"])) != canonical_page_url(url)
+            except ValueError:
+                changed_source = False
+        score = 0
         if state != "unknown":
-            plausible.append(tid)
-    if len(plausible) == 1:
-        return plausible[0], []
-    return None, candidates
+            score += 50
+        if changed_source:
+            score += 100
+        if not is_source and str(tab.get("openerId") or "") == str(source_target):
+            score += 20
+        candidates.append({"target_id": tid, "url": canonical_page_url(url), "page_fingerprint": fp,
+                           "state": state, "score": score, "source_changed": changed_source})
+
+    plausible = [item for item in candidates if int(item["score"]) >= 50]
+    if plausible:
+        best = max(int(item["score"]) for item in plausible)
+        winners = [item for item in plausible if int(item["score"]) == best]
+        if len(winners) == 1:
+            return str(winners[0]["target_id"]), []
+        return None, [{key: str(item[key]) for key in ("target_id", "url", "page_fingerprint", "state")}
+                      for item in candidates]
+
+    if not new_tabs:
+        return source_target, []
+    return None, [{key: str(item[key]) for key in ("target_id", "url", "page_fingerprint", "state")}
+                  for item in candidates]
 
 
 def _after_navigation(cur, transport: OpenClawTransport, application_id: str, source_target: str,
@@ -813,7 +854,8 @@ def _after_navigation(cur, transport: OpenClawTransport, application_id: str, so
 
 
 def _reconciliation_target_snapshot(transport: OpenClawTransport, payload: dict[str, Any], *,
-                                    require_exact_page: bool = False) -> tuple[str, str, dict[str, Any], list[dict[str, Any]], str]:
+                                    require_exact_page: bool = False,
+                                    allow_handoff_discovery: bool = False) -> tuple[str, str, dict[str, Any], list[dict[str, Any]], str]:
     """Resolve reconciliation evidence from the approval-bound target, never browser focus."""
     target_id = str(payload.get("target_id") or "")
     if target_id:
@@ -827,32 +869,63 @@ def _reconciliation_target_snapshot(transport: OpenClawTransport, payload: dict[
                 expected_fp = str(payload.get("expected_page_fingerprint") or "")
                 if expected_fp and fp != expected_fp:
                     raise PrivilegedActionError("reconciliation target page fingerprint changed")
-            return target_id, url, snap, nodes, fp
+            # For an uncertain Apply click, the original LinkedIn/source tab
+            # can remain alive and unchanged while a new ATS target opens.
+            # Do not let the surviving source create a reconciliation dead-end.
+            if not allow_handoff_discovery or canonical_page_url(url) != canonical_page_url(str(payload.get("expected_url") or "")):
+                return target_id, url, snap, nodes, fp
         except Exception as exc:
             exact_error = exc
     else:
         exact_error = PrivilegedActionError("approval has no exact target id")
 
-    # Never fall back to the currently focused tab.  Recovery is allowed only
-    # when one unique live page still matches the approval's bound URL+origin.
+    # Never fall back to the currently focused tab. For ordinary actions,
+    # recovery is allowed only when one unique live page matches the original
+    # bound URL+origin. Apply handoffs instead enumerate other live pages and
+    # require one unique, semantically plausible resulting target.
     expected_url = str(payload.get("expected_url") or "")
     expected_origin = str(payload.get("expected_origin") or "")
     candidates: list[tuple[str, str, dict[str, Any], list[dict[str, Any]], str]] = []
+    handoff_candidates: list[tuple[int, str, str, dict[str, Any], list[dict[str, Any]], str]] = []
     try:
         for tab in transport._tabs():
             tid = transport._stable_id(tab)
             raw_url = str(tab.get("url") or "")
-            if not tid or not raw_url:
+            if not tid or not raw_url or tid == target_id:
                 continue
             try:
-                if canonical_page_url(raw_url) != canonical_page_url(expected_url) or _origin(raw_url) != expected_origin:
-                    continue
                 url, snap, nodes, fp = _snapshot(transport, tid)
-                candidates.append((tid, url, snap, nodes, fp))
+                if allow_handoff_discovery:
+                    if canonical_page_url(url) == canonical_page_url(expected_url):
+                        continue
+                    state, _detail = detect_page_state(url, snap, nodes)
+                    if state == "unknown":
+                        continue
+                    score = 50
+                    if str(tab.get("openerId") or "") == str(target_id):
+                        score += 20
+                    if _origin(url) != expected_origin:
+                        score += 10
+                    handoff_candidates.append((score, tid, url, snap, nodes, fp))
+                elif canonical_page_url(raw_url) == canonical_page_url(expected_url) and _origin(raw_url) == expected_origin:
+                    candidates.append((tid, url, snap, nodes, fp))
             except Exception:
                 continue
     except Exception:
         candidates = []
+        handoff_candidates = []
+    if allow_handoff_discovery:
+        if handoff_candidates:
+            best = max(item[0] for item in handoff_candidates)
+            winners = [item for item in handoff_candidates if item[0] == best]
+            if len(winners) == 1:
+                _score, tid, url, snap, nodes, fp = winners[0]
+                return tid, url, snap, nodes, fp
+        details = [f"{item[1]}:{canonical_page_url(item[2])}" for item in handoff_candidates]
+        raise PrivilegedActionError(
+            "cannot safely recover a unique resulting Apply target without using browser focus; "
+            f"exact source remained unchanged; plausible targets={details}"
+        )
     if len(candidates) == 1:
         return candidates[0]
     raise PrivilegedActionError(
@@ -908,12 +981,14 @@ def reconcile_observed_privileged_effect(cur, *, application_id: str, approval_r
     if action_type not in recoverable:
         return {"followup": "none", "note": "No browser state reconstruction is required for this action type."}
 
-    observed_target, url, snap, nodes, fp = _reconciliation_target_snapshot(transport, payload)
+    observed_target, url, snap, nodes, fp = _reconciliation_target_snapshot(
+        transport, payload, allow_handoff_discovery=(action_type == "privileged_begin_application"),
+    )
     # For a navigation handoff, an unchanged source page is not evidence that
     # the external effect occurred. Leave reconciliation open rather than using
     # an arbitrary focused employer tab.
     if action_type == "privileged_begin_application" and canonical_page_url(url) == canonical_page_url(str(payload.get("expected_url") or "")):
-        raise PrivilegedActionError("Apply handoff is not observable on the exact bound target; choose/refocus the resulting application tab")
+        raise PrivilegedActionError("Apply handoff is not observable on a resulting browser target")
 
     trusted = _host_is_allowed(cur, url, application_id=application_id)
     if action_type not in {"privileged_begin_application", "privileged_use_email_verification"} and not trusted:

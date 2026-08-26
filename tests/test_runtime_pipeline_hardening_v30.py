@@ -147,6 +147,134 @@ def test_multiple_new_tabs_become_human_ambiguity(monkeypatch):
     assert {item["target_id"] for item in candidates} == {"ats", "help"}
 
 
+def test_changed_source_beats_new_auth_popup(monkeypatch):
+    from services.application_actions import privileged_action_v1 as action
+
+    before = [{"id": "source", "type": "page", "url": "https://linkedin.example/job/1"}]
+    after = [
+        {"id": "source", "type": "page", "url": "https://ats.example/apply/1"},
+        {"id": "popup", "type": "page", "url": "https://idp.example/login", "openerId": "source"},
+    ]
+
+    class Transport:
+        def _tabs(self): return after
+        def _stable_id(self, tab): return tab.get("id")
+
+    monkeypatch.setattr(action, "_snapshot", lambda _t, tid: (
+        next(t["url"] for t in after if t["id"] == tid), {"snapshot": tid}, [], tid * 8,
+    ))
+    monkeypatch.setattr(action, "detect_page_state", lambda url, *_a: (
+        "application_form_ready" if "ats.example" in url else "needs_account_auth", {}
+    ))
+    target, candidates = action._select_after_navigation_target(Transport(), "source", before)
+    assert target == "source"
+    assert candidates == []
+
+
+def test_single_unclassified_popup_is_not_accepted_as_apply_target(monkeypatch):
+    from services.application_actions import privileged_action_v1 as action
+
+    before = [{"id": "source", "type": "page", "url": "https://linkedin.example/job/1"}]
+    after = before + [{"id": "popup", "type": "page", "url": "https://help.example/article", "openerId": "source"}]
+
+    class Transport:
+        def _tabs(self): return after
+        def _stable_id(self, tab): return tab.get("id")
+
+    monkeypatch.setattr(action, "_snapshot", lambda _t, tid: (
+        next(t["url"] for t in after if t["id"] == tid), {"snapshot": tid}, [], tid * 8,
+    ))
+    monkeypatch.setattr(action, "detect_page_state", lambda *_a: ("unknown", {}))
+    target, candidates = action._select_after_navigation_target(Transport(), "source", before)
+    assert target is None
+    assert candidates[0]["target_id"] == "popup"
+
+
+def test_changed_source_beats_multiple_new_popups(monkeypatch):
+    from services.application_actions import privileged_action_v1 as action
+
+    before = [{"id": "source", "type": "page", "url": "https://linkedin.example/job/1"}]
+    after = [
+        {"id": "source", "type": "page", "url": "https://ats.example/apply/1"},
+        {"id": "login", "type": "page", "url": "https://idp.example/login", "openerId": "source"},
+        {"id": "help", "type": "page", "url": "https://help.example/article"},
+    ]
+
+    class Transport:
+        def _tabs(self): return after
+        def _stable_id(self, tab): return tab.get("id")
+
+    monkeypatch.setattr(action, "_snapshot", lambda _t, tid: (
+        next(t["url"] for t in after if t["id"] == tid), {"snapshot": tid}, [], tid * 8,
+    ))
+    monkeypatch.setattr(action, "detect_page_state", lambda url, *_a: (
+        "application_form_ready" if "ats.example" in url else "needs_account_auth", {}
+    ))
+    target, candidates = action._select_after_navigation_target(Transport(), "source", before)
+    assert target == "source"
+    assert candidates == []
+
+
+def test_reconciliation_discovers_unique_ats_handoff_without_browser_focus(monkeypatch):
+    from services.application_actions import privileged_action_v1 as action
+
+    tabs = [
+        {"id": "source", "type": "page", "url": "https://linkedin.example/job/1"},
+        {"id": "ats", "type": "page", "url": "https://ats.example/apply/1", "openerId": "source"},
+    ]
+
+    class Transport:
+        def resolve_target(self):
+            raise AssertionError("reconciliation must never use browser focus")
+        def _tabs(self): return tabs
+        def _stable_id(self, tab): return tab.get("id")
+
+    monkeypatch.setattr(action, "_snapshot", lambda _t, tid: (
+        next(t["url"] for t in tabs if t["id"] == tid), {"snapshot": tid}, [], tid * 8,
+    ))
+    monkeypatch.setattr(action, "detect_page_state", lambda url, *_a: (
+        "application_form_ready" if "ats.example" in url else "unknown", {}
+    ))
+    result = action._reconciliation_target_snapshot(
+        Transport(),
+        {"target_id": "source", "expected_url": "https://linkedin.example/job/1", "expected_origin": "https://linkedin.example"},
+        allow_handoff_discovery=True,
+    )
+    assert result[0] == "ats"
+    assert result[1] == "https://ats.example/apply/1"
+
+
+def test_reconciliation_refuses_ambiguous_ats_handoff(monkeypatch):
+    from services.application_actions import privileged_action_v1 as action
+
+    tabs = [
+        {"id": "source", "type": "page", "url": "https://linkedin.example/job/1"},
+        {"id": "ats-a", "type": "page", "url": "https://ats-a.example/apply", "openerId": "source"},
+        {"id": "ats-b", "type": "page", "url": "https://ats-b.example/apply", "openerId": "source"},
+    ]
+
+    class Transport:
+        def _tabs(self): return tabs
+        def _stable_id(self, tab): return tab.get("id")
+
+    monkeypatch.setattr(action, "_snapshot", lambda _t, tid: (
+        next(t["url"] for t in tabs if t["id"] == tid), {"snapshot": tid}, [], tid * 8,
+    ))
+    monkeypatch.setattr(action, "detect_page_state", lambda url, *_a: (
+        "application_form_ready" if "ats-" in url else "unknown", {}
+    ))
+    try:
+        action._reconciliation_target_snapshot(
+            Transport(),
+            {"target_id": "source", "expected_url": "https://linkedin.example/job/1", "expected_origin": "https://linkedin.example"},
+            allow_handoff_discovery=True,
+        )
+    except action.PrivilegedActionError as exc:
+        assert "unique resulting Apply target" in str(exc)
+    else:
+        raise AssertionError("ambiguous handoff must remain in reconciliation")
+
+
 def test_security_check_application_question_is_not_checkpoint():
     from services.application_actions.privileged_action_v1 import detect_page_state
     nodes = [
