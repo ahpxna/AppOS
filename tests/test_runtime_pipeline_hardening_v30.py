@@ -96,8 +96,8 @@ def test_reconciliation_uses_bound_target_not_focused_tab(monkeypatch):
         def __init__(self): self.sql = ""
         def execute(self, sql, params=None): self.sql = " ".join(sql.split())
         def fetchone(self):
-            if "SELECT payload_json" in self.sql:
-                return ({"target_id": "A", "expected_url": "https://ats.example/app/a", "expected_origin": "https://ats.example"},)
+            if "FROM approval_requests ar" in self.sql:
+                return ({"target_id": "A", "expected_url": "https://ats.example/app/a", "expected_origin": "https://ats.example"}, {})
             return None
 
     class Transport:
@@ -238,7 +238,7 @@ def test_reconciliation_discovers_unique_ats_handoff_without_browser_focus(monke
     result = action._reconciliation_target_snapshot(
         Transport(),
         {"target_id": "source", "expected_url": "https://linkedin.example/job/1", "expected_origin": "https://linkedin.example"},
-        allow_handoff_discovery=True,
+        allow_handoff_discovery=True, pre_io_target_ids={"source"},
     )
     assert result[0] == "ats"
     assert result[1] == "https://ats.example/apply/1"
@@ -267,7 +267,7 @@ def test_reconciliation_refuses_ambiguous_ats_handoff(monkeypatch):
         action._reconciliation_target_snapshot(
             Transport(),
             {"target_id": "source", "expected_url": "https://linkedin.example/job/1", "expected_origin": "https://linkedin.example"},
-            allow_handoff_discovery=True,
+            allow_handoff_discovery=True, pre_io_target_ids={"source"},
         )
     except action.PrivilegedActionError as exc:
         assert "unique resulting Apply target" in str(exc)

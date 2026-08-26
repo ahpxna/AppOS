@@ -23,9 +23,14 @@ def test_watcher_binds_magic_link_secret_context_into_trust_approval(monkeypatch
     )
 
     class Cur:
-        def __init__(self, rows=None): self.rows = rows or []
-        def execute(self, *_a, **_k): return None
-        def fetchall(self): return list(self.rows)
+        def __init__(self, rows=None): self.rows = rows or []; self.sql = ""
+        def execute(self, sql, *_a, **_k): self.sql = " ".join(str(sql).split())
+        def fetchall(self):
+            if "FROM application_auth_sessions" in self.sql:
+                return list(self.rows)
+            if "status='rejected'" in self.sql:
+                return []
+            return []
         def __enter__(self): return self
         def __exit__(self, *_a): return False
 

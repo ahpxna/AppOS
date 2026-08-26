@@ -214,7 +214,10 @@ def _relevance_score(message: Any, *, employer_domain: str | None) -> int:
         company_token = host_token.split(".")[0]
         if host_token and host_token in text:
             score += 8
-        elif company_token and company_token in text:
+        elif len(company_token) >= 4 and company_token in text:
+            # Short host prefixes (for example "hr" or "id") are too weak to
+            # establish employer-bound verification evidence. Keep those mails
+            # in the generic ambiguity lane instead of making them executable.
             score += 5
         elif any(word in text for word in ("candidate account", "verify your email", "verification code")):
             # Soft fallback for branded ATS mail, but rank it below employer-matched mail.
@@ -222,6 +225,16 @@ def _relevance_score(message: Any, *, employer_domain: str | None) -> int:
         else:
             return -1
     return score
+
+
+def _relevance_tier(message: Any, *, employer_domain: str | None) -> str:
+    """Separate employer-bound evidence from generic verification-looking mail."""
+    score = _relevance_score(message, employer_domain=employer_domain)
+    if score < 0:
+        return "irrelevant"
+    if employer_domain and score >= 7:
+        return "employer_match"
+    return "generic_verification"
 
 
 def _relevant(message: Any, *, employer_domain: str | None) -> bool:
@@ -259,12 +272,16 @@ def _extract_magic_link(message: Any) -> str | None:
 
 
 def discover_verification(*, recipient: str, requested_at: datetime,
-                          employer_origin: str | None, max_results: int = 10) -> dict[str, Any] | None:
+                          employer_origin: str | None, max_results: int = 10,
+                          exclude_message_ids: set[str] | None = None) -> dict[str, Any] | None:
     if requested_at.tzinfo is None:
         requested_at = requested_at.replace(tzinfo=timezone.utc)
     requested_utc = requested_at.astimezone(timezone.utc)
-    ranked: list[tuple[int, datetime, str, Any]] = []
+    ranked: list[tuple[int, datetime, str, Any, str]] = []
+    excluded = {str(item) for item in (exclude_message_ids or set())}
     for message_id in search_candidate_ids(recipient=recipient, requested_at=requested_utc, max_results=max_results):
+        if str(message_id) in excluded:
+            continue
         sanitized = read_message(message_id, sanitized=True)
         msg_time = _timestamp(sanitized)
         # Missing/ambiguous time is not enough evidence for automatic selection.
@@ -272,19 +289,22 @@ def discover_verification(*, recipient: str, requested_at: datetime,
         if msg_time is None or msg_time < requested_utc:
             continue
         score = _relevance_score(sanitized, employer_domain=employer_origin)
-        if score < 0:
+        tier = _relevance_tier(sanitized, employer_domain=employer_origin)
+        if score < 0 or tier == "irrelevant":
             continue
-        ranked.append((score, msg_time, message_id, sanitized))
+        ranked.append((score, msg_time, message_id, sanitized, tier))
 
     ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
-    for _score, msg_time, message_id, sanitized in ranked:
+    for _score, msg_time, message_id, sanitized, relevance_tier in ranked:
         sender, subject = _sender_subject(sanitized)
         code = _extract_numeric_code(sanitized)
         if code:
             return {"message_id": message_id, "sender": sender, "subject": subject,
-                    "received_at": msg_time, "kind": "numeric_code",
+                    "received_at": msg_time, "kind": "numeric_code", "relevance": relevance_tier,
+                    "relevance_score": _score,
                     "secret_sha256": hashlib.sha256(code.encode()).hexdigest(),
-                    "secret_context": {"kind": "numeric_code", "digits": len(code)}}
+                    "secret_context": {"kind": "numeric_code", "digits": len(code),
+                                       "relevance_tier": relevance_tier}}
         # Only full-read a sanitized candidate that already passed recipient,
         # time and relevance ranking. Plaintext link is never persisted.
         full = read_message(message_id, sanitized=False)
@@ -295,11 +315,13 @@ def discover_verification(*, recipient: str, requested_at: datetime,
         if link:
             parsed = urlsplit(link)
             return {"message_id": message_id, "sender": sender, "subject": subject,
-                    "received_at": full_time, "kind": "magic_link",
+                    "received_at": full_time, "kind": "magic_link", "relevance": relevance_tier,
+                    "relevance_score": _score,
                     "secret_sha256": hashlib.sha256(link.encode()).hexdigest(),
                     "secret_context": {"kind": "magic_link",
                                        "link_origin": f"{parsed.scheme.casefold()}://{parsed.netloc.casefold()}",
-                                       "link_path": parsed.path or "/"}}
+                                       "link_path": parsed.path or "/",
+                                       "relevance_tier": relevance_tier}}
     return None
 
 

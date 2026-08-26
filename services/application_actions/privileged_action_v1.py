@@ -443,6 +443,23 @@ def _document_bindings_still_current(cur, application_id: str, approved: dict[st
     return _document_hashes_still_match({kind: current[kind] for kind in keys})
 
 
+def _submission_document_bindings(cur, application_id: str) -> dict[str, Any]:
+    """Bind only the primary resume to Final Submit authority.
+
+    Supplemental cover letters are authorized/uploaded through their own exact
+    delegated capability. A stale/missing supplemental artifact must not block
+    the rest of an otherwise valid application at OPEN APPLY or Final Submit.
+    """
+    current = _document_bindings(cur, application_id)
+    resume = current.get("resume")
+    if not isinstance(resume, dict):
+        raise PrivilegedActionError("final Submit requires the current approved resume artifact pointer")
+    approved = {"resume": resume}
+    if not _document_bindings_still_current(cur, application_id, approved, required_types={"resume"}):
+        raise PrivilegedActionError("approved resume artifact changed, is stale against the current JD, or its bytes are missing")
+    return approved
+
+
 def _consent_items(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Return only controls that can actually express legal consent.
 
@@ -576,11 +593,7 @@ def prepare(cur, *, application_id: str, action: str, candidate_id: str | None =
         _require_application_step(cur, application_id, "application_ready")
         control = _find_exact_control(nodes, SUBMIT_LABELS)
         field_digest, fields, blockers = _field_state(nodes)
-        document_bindings = _document_bindings(cur, application_id)
-        if not isinstance(document_bindings.get("resume"), dict):
-            raise PrivilegedActionError("final Submit requires the current approved resume artifact pointer")
-        if not _document_bindings_still_current(cur, application_id, document_bindings):
-            raise PrivilegedActionError("approved resume/cover letter is stale against current pointers or JD")
+        document_bindings = _submission_document_bindings(cur, application_id)
         payload.update({"control_ref": control["ref"], "control_label": control["label"],
                         "field_state_sha256": field_digest, "required_blockers": blockers,
                         "review_context": {"screenshot_path": screenshot or "NaN", "write_actions": fields,
@@ -603,6 +616,15 @@ def prepare(cur, *, application_id: str, action: str, candidate_id: str | None =
         field = _verification_code_field(nodes) if row[5] == "numeric_code" else None
         if row[5] == "numeric_code" and field is None:
             raise PrivilegedActionError("email verification code field could not be structurally exact-bound")
+        if row[5] == "magic_link":
+            secret_context = dict(row[7] or {})
+            link_origin = str(secret_context.get("link_origin") or "")
+            if not link_origin:
+                raise PrivilegedActionError("email magic-link candidate is missing its exact link origin")
+            if not _host_is_allowed(cur, link_origin, application_id=application_id, purpose="gmail_magic_link"):
+                raise PrivilegedActionError(
+                    "email magic-link domain is not trusted for this application; approve the separate Gmail magic-link trust gate first"
+                )
         button = None
         if row[5] == "numeric_code":
             try: button = _find_exact_control(nodes, VERIFY_LABELS)
@@ -1142,11 +1164,7 @@ def _prepare_exact_application_ready_control(cur, *, application_id: str, action
                            "ambiguity_choice": {"action": action, "ref": live["ref"], "label": live["label"]}},
     }
     if action == "submit_application":
-        document_bindings = _document_bindings(cur, application_id)
-        if not isinstance(document_bindings.get("resume"), dict):
-            raise PrivilegedActionError("final Submit requires the current approved resume artifact pointer")
-        if not _document_bindings_still_current(cur, application_id, document_bindings):
-            raise PrivilegedActionError("approved resume/cover letter is stale against current pointers or JD")
+        document_bindings = _submission_document_bindings(cur, application_id)
         payload["document_bindings"] = document_bindings
         atype = "privileged_submit_application"
         summary = f"AMBIGUITY CHOICE — FINAL SUBMIT: exact control {live['label']!r}."
@@ -1463,15 +1481,46 @@ def execute_one(conn, request_id: str) -> dict[str, Any]:
                         cur.execute("UPDATE application_auth_sessions SET account_email=%s, updated_at=now() WHERE application_id=%s;",
                                     (payload.get("account_email"), app_id))
                 elif atype == "privileged_accept_terms":
-                    for item in payload.get("consent_items") or []:
-                        if item.get("selected") is not True:
-                            io_started = True; _click(transport, target_id, str(item["ref"]))
-                    result = _after_navigation(cur, transport, app_id, target_id, before_tabs)
-                    changed = _observable_page_change(before_target=target_id, before_url=url, before_snapshot=snap, after=result)
-                    if not _consent_effect_verified(payload.get("consent_items") or [], result.get("consent_items") or [],
-                                                    page_changed=changed, observed_state=str(result.get("state") or "")):
-                        raise PrivilegedActionError("approved consent controls were not observably accepted after browser I/O")
-                    result["consent_items"] = payload.get("consent_items") or []
+                    approved_consents = list(payload.get("consent_items") or [])
+                    toggle_items = [item for item in approved_consents
+                                    if str(item.get("role") or "").casefold() in {"checkbox", "radio"}
+                                    and item.get("selected") is not True]
+                    button_items = [item for item in approved_consents
+                                    if str(item.get("role") or "").casefold() == "button"
+                                    and item.get("selected") is not True]
+                    if len(button_items) > 1:
+                        raise PrivilegedActionError("multiple affirmative consent buttons are ambiguous; prepare an exact human choice")
+
+                    # Verify checkable legal consent immediately after each click.
+                    # If a later affirmative button navigates away, the now-gone
+                    # checkbox must not retroactively make a valid consent look
+                    # uncertain and force unnecessary reconciliation.
+                    for item in toggle_items:
+                        io_started = True
+                        _click(transport, target_id, str(item["ref"]))
+                        time.sleep(0.2)
+                        live_toggle_snapshot = transport.snapshot(target_id)
+                        live_toggle_items = _consent_items(parse_snapshot(live_toggle_snapshot))
+                        if not _consent_effect_verified([item], live_toggle_items,
+                                                        page_changed=False, observed_state=""):
+                            raise PrivilegedActionError(
+                                f"approved consent toggle {item.get('label') or item.get('ref')!r} did not become selected"
+                            )
+
+                    if button_items:
+                        button = button_items[0]
+                        io_started = True
+                        _click(transport, target_id, str(button["ref"]))
+                        result = _after_navigation(cur, transport, app_id, target_id, before_tabs)
+                        changed = _observable_page_change(before_target=target_id, before_url=url,
+                                                          before_snapshot=snap, after=result)
+                        if not _consent_effect_verified([button], result.get("consent_items") or [],
+                                                        page_changed=changed,
+                                                        observed_state=str(result.get("state") or "")):
+                            raise PrivilegedActionError("affirmative consent button effect was not observably verified")
+                    else:
+                        result = _after_navigation(cur, transport, app_id, target_id, before_tabs)
+                    result["consent_items"] = approved_consents
                 elif atype == "privileged_advance_application_step":
                     _require_application_step(cur, app_id, "application_ready")
                     if payload.get("required_blockers"):
@@ -1555,8 +1604,8 @@ def execute_one(conn, request_id: str) -> dict[str, Any]:
                     bindings = payload.get("document_bindings") or {}
                     if not isinstance(bindings.get("resume"), dict):
                         raise PrivilegedActionError("final Submit requires an exact approved resume artifact binding")
-                    if not _document_bindings_still_current(cur, app_id, bindings):
-                        raise PrivilegedActionError("approved resume/cover artifact pointer, JD provenance, or bytes changed")
+                    if not _document_bindings_still_current(cur, app_id, bindings, required_types={"resume"}):
+                        raise PrivilegedActionError("approved resume artifact pointer, JD provenance, or bytes changed")
                     io_started = True; _click(transport, target_id, str(payload["control_ref"]))
                     time.sleep(2.0)
                     observed_url = transport.current_url(target_id)

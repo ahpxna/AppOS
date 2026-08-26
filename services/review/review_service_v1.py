@@ -386,6 +386,72 @@ def ensure_application_ready_review(cur, application_id: str) -> str | None:
     return str(cur.fetchone()[0])
 
 
+def ensure_action_required_review(cur, *, application_id: str, action_kind: str,
+                                  title: str, summary: str, payload: dict[str, Any] | None = None,
+                                  priority: str = "high") -> str | None:
+    """Materialize a non-executable refocus/binding handoff.
+
+    Approving this item only performs a fresh read-only bind and creates the
+    separate exact privileged approval. It never performs browser I/O itself.
+    """
+    action_kind = str(action_kind or "").strip()
+    if not action_kind:
+        raise ReviewError("action_required item is missing action_kind")
+    body = dict(payload or {})
+    body["action_kind"] = action_kind
+    source_sha = _sha256_text(json.dumps(body, sort_keys=True, separators=(",", ":"), default=str))
+    cur.execute(
+        """SELECT 1 FROM human_review_items
+             WHERE application_id=%s AND item_type='action_required' AND source_sha256=%s
+               AND status IN ('approved','rejected','resolved','expired') LIMIT 1;""",
+        (application_id, source_sha),
+    )
+    if cur.fetchone():
+        return None
+    bundle_id = ensure_bundle(cur, application_id)
+    cur.execute(
+        """INSERT INTO human_review_items(
+               review_bundle_id, application_id, item_type, status, title, summary_text,
+               source_sha256, priority, payload_json)
+           VALUES (%s,%s,'action_required','pending',%s,%s,%s,%s,%s)
+           ON CONFLICT (application_id, (payload_json->>'action_kind'))
+             WHERE item_type='action_required' AND status IN ('pending','needs_revision')
+           DO UPDATE SET title=EXCLUDED.title, summary_text=EXCLUDED.summary_text,
+                         payload_json=EXCLUDED.payload_json, priority=EXCLUDED.priority, updated_at=now()
+           RETURNING id::text;""",
+        (bundle_id, application_id, title, summary, source_sha, priority, Jsonb(body)),
+    )
+    return str(cur.fetchone()[0])
+
+
+def sync_action_required(cur) -> int:
+    """Self-heal workflow handoffs that require the user to refocus a browser page."""
+    count = 0
+    cur.execute(
+        """SELECT a.id::text, a.job_url, a.company, a.job_title,
+                  a.approved_resume_id::text, a.approved_resume_artifact_id::text
+             FROM applications a
+            WHERE a.current_step='docs_verified' AND a.status NOT IN ('submitted','abandoned')
+              AND a.approved_resume_id IS NOT NULL AND a.approved_resume_artifact_id IS NOT NULL
+              AND NOT EXISTS (
+                    SELECT 1 FROM approval_requests ar
+                     WHERE ar.application_id=a.id AND ar.type='privileged_begin_application'
+                       AND ar.status IN ('pending','approved','executing') AND ar.token_expires_at>now())
+            ORDER BY a.updated_at DESC;"""
+    )
+    for app_id, job_url, company, role, resume_id, artifact_id in cur.fetchall():
+        if ensure_action_required_review(
+            cur, application_id=app_id, action_kind="open_apply_binding_required",
+            title="Open/focus the job page to prepare Apply",
+            summary=(f"{company} — {role}. Resume approval is complete. Open or focus the exact stored job page, "
+                     "then approve this handoff to create a fresh OPEN APPLY approval. No browser click occurs here."),
+            payload={"job_url": str(job_url or ""), "resume_id": resume_id, "resume_artifact_id": artifact_id},
+            priority="high",
+        ):
+            count += 1
+    return count
+
+
 def ensure_reconciliation_review(cur, browser_task_id: str) -> str | None:
     cur.execute(
         """SELECT bt.application_id::text, bt.error_message, a.company, a.job_title
@@ -713,12 +779,36 @@ def reconcile_materialized_review_state(cur) -> None:
             WHERE h.application_id = a.id AND h.item_type = 'application_ready'
               AND h.status = 'pending' AND a.current_step IN ('submitted','abandoned');"""
     )
+    cur.execute(
+        """UPDATE human_review_items h SET status='resolved', updated_at=now()
+             FROM applications a
+            WHERE h.application_id=a.id AND h.item_type='action_required'
+              AND h.status IN ('pending','needs_revision')
+              AND (
+                    (h.payload_json->>'action_kind'='open_apply_binding_required'
+                     AND a.current_step <> 'docs_verified')
+                 OR (h.payload_json->>'action_kind' LIKE 'email_verification_%'
+                     AND a.current_step <> 'needs_email_verification')
+              );"""
+    )
+    cur.execute(
+        """UPDATE human_review_items h SET status='resolved', updated_at=now()
+             FROM approval_requests ar
+            WHERE h.application_id=ar.application_id AND h.item_type='action_required'
+              AND h.status IN ('pending','needs_revision')
+              AND ((h.payload_json->>'action_kind'='open_apply_binding_required'
+                    AND ar.type='privileged_begin_application')
+                OR (h.payload_json->>'action_kind' LIKE 'email_verification_%'
+                    AND ar.type='privileged_use_email_verification'))
+              AND ar.status IN ('pending','approved','executing');"""
+    )
 
 
 def sync_inbox(cur) -> dict[str, int]:
     reconcile_materialized_review_state(cur)
     counts = {"documents": 0, "questions": 0, "approvals": 0,
-              "autofill": 0, "reconciliation": 0, "application_ready": 0}
+              "autofill": 0, "reconciliation": 0, "application_ready": 0,
+              "action_required": 0}
     # Only the newest version in each application/document slot is actionable.
     # Historical versions remain auditable but must never create concurrent
     # Telegram/CLI decisions or violate the active-slot invariant.
@@ -734,6 +824,7 @@ def sync_inbox(cur) -> dict[str, int]:
         if ensure_document_review(cur, doc_id):
             counts["documents"] += 1
     counts["questions"] = sync_missing_questions(cur) + sync_runtime_questions(cur)
+    counts["action_required"] += sync_action_required(cur)
     cur.execute("""SELECT id::text FROM approval_requests
                     WHERE status = 'pending' AND application_id IS NOT NULL
                       AND token_expires_at > now();""")
@@ -863,6 +954,17 @@ def decide_item(conn, item_id: str, *, decision: str, actor: str, note: str = ""
                     cur.execute("""UPDATE applications SET approved_resume_id = %s,
                                   approved_resume_artifact_id = %s WHERE id = %s;""",
                                 (document_id, artifact[3], app_id))
+                    cur.execute("SELECT job_url, company, job_title FROM applications WHERE id=%s;", (app_id,))
+                    app_handoff = cur.fetchone() or ("", "Unknown company", "Unknown role")
+                    ensure_action_required_review(
+                        cur, application_id=app_id, action_kind="open_apply_binding_required",
+                        title="Open/focus the job page to prepare Apply",
+                        summary=(f"{app_handoff[1]} — {app_handoff[2]}. Resume approval is complete. Open or focus "
+                                 "the exact stored job page, then approve this handoff to create a fresh OPEN APPLY "
+                                 "approval. No browser click occurs here."),
+                        payload={"job_url": str(app_handoff[0] or ""), "resume_id": document_id,
+                                 "resume_artifact_id": artifact[3]}, priority="high",
+                    )
                 elif doc_type == "cover_letter":
                     cur.execute("""UPDATE applications SET approved_cover_letter_id = %s,
                                   approved_cover_letter_artifact_id = %s WHERE id = %s;""",
@@ -999,6 +1101,111 @@ def decide_item(conn, item_id: str, *, decision: str, actor: str, note: str = ""
                         "Underlying autofill task still needs reconciliation; close it with autofill_reconcile_v1 first. "
                         "Reject/revise cannot dismiss an uncertain browser side effect."
                     )
+
+        elif item_type == "action_required":
+            payload = dict(item_payload or {})
+            action_kind = str(payload.get("action_kind") or "")
+            candidate_id = str(payload.get("candidate_id") or "")
+            if decision == "approve":
+                try:
+                    from services.application_actions.privileged_action_v1 import prepare as prepare_privileged
+                    if action_kind == "open_apply_binding_required":
+                        materialized_approval_id = prepare_privileged(
+                            cur, application_id=app_id, action="begin_application"
+                        )
+                    elif action_kind in {"email_verification_binding_required",
+                                         "email_verification_candidate_ambiguity"}:
+                        if not candidate_id:
+                            raise ReviewError("email-verification handoff is missing candidate_id")
+
+                        # A generic/ambiguous magic-link email has two independent
+                        # authorities: trust the exact link domain, then use the
+                        # exact verification candidate. Never package USE EMAIL
+                        # first and let it fail later because link trust is absent.
+                        cur.execute(
+                            """SELECT gmail_account, gmail_message_id, sender, subject, verification_kind,
+                                      secret_sha256, secret_context_json
+                                 FROM email_verification_candidates
+                                WHERE id=%s AND application_id=%s
+                                  AND status IN ('discovered','approved');""",
+                            (candidate_id, app_id),
+                        )
+                        email_candidate = cur.fetchone()
+                        if not email_candidate:
+                            raise ReviewError("email-verification candidate is no longer available")
+
+                        if str(email_candidate[4]) == "magic_link":
+                            from urllib.parse import urlsplit
+                            from services.application_actions.action_request_v1 import create_privileged_request
+                            from services.application_actions.privileged_action_v1 import _host_is_allowed
+
+                            secret_context = dict(email_candidate[6] or {})
+                            link_origin = str(secret_context.get("link_origin") or "")
+                            link_host = (urlsplit(link_origin).hostname or "").casefold()
+                            if not link_origin or not link_host:
+                                raise ReviewError("magic-link candidate is missing its exact link origin")
+                            if not _host_is_allowed(
+                                cur, link_origin, application_id=app_id, purpose="gmail_magic_link"
+                            ):
+                                materialized_approval_id = create_privileged_request(
+                                    cur, application_id=app_id, action_type="privileged_trust_external_domain",
+                                    payload={
+                                        "domain": link_host, "expected_origin": link_origin,
+                                        "trust_source": "gmail_magic_link", "candidate_id": candidate_id,
+                                        "gmail_account": email_candidate[0],
+                                        "gmail_message_id": email_candidate[1],
+                                        "verification_kind": email_candidate[4],
+                                        "secret_sha256": email_candidate[5],
+                                        "secret_context": secret_context,
+                                        "review_context": {"screenshot_path": "NaN"},
+                                    },
+                                    summary=(f"Trust email-verification link domain {link_host} before JobOS opens "
+                                             "the exact approved magic link."),
+                                    requested_by="human-review-handoff",
+                                )
+                                ensure_approval_review(cur, materialized_approval_id)
+                                ensure_action_required_review(
+                                    cur, application_id=app_id,
+                                    action_kind="email_verification_binding_required",
+                                    title="Magic link trust pending — then bind verification",
+                                    summary=("Approve the separate magic-link domain trust first. Then open/refocus the "
+                                             "employer verification page and approve this handoff to create a fresh exact "
+                                             "USE EMAIL VERIFICATION approval. No secret is stored in this review item."),
+                                    payload={
+                                        "candidate_id": candidate_id,
+                                        "gmail_message_id": email_candidate[1],
+                                        "verification_kind": email_candidate[4],
+                                    },
+                                    priority="urgent",
+                                )
+                                note = (note + " Separate Gmail magic-link trust was materialized first; USE EMAIL remains gated until that trust exists.").strip()
+                            else:
+                                materialized_approval_id = prepare_privileged(
+                                    cur, application_id=app_id, action="use_email_verification", candidate_id=candidate_id
+                                )
+                        else:
+                            materialized_approval_id = prepare_privileged(
+                                cur, application_id=app_id, action="use_email_verification", candidate_id=candidate_id
+                            )
+                    else:
+                        raise ReviewError(f"unsupported action-required kind: {action_kind}")
+                except ReviewError:
+                    raise
+                except Exception as exc:
+                    raise ReviewError(
+                        f"Fresh browser binding is not ready yet: {str(exc)[:500]}. Refocus the exact page and retry this review item."
+                    ) from exc
+                ensure_approval_review(cur, materialized_approval_id)
+                note = (note + " Fresh exact-bound privileged approval prepared separately; this handoff performed no browser I/O.").strip()
+            elif decision == "reject":
+                if candidate_id and action_kind.startswith("email_verification_"):
+                    cur.execute(
+                        "UPDATE email_verification_candidates SET status='rejected' WHERE id=%s AND application_id=%s AND status IN ('discovered','approved');",
+                        (candidate_id, app_id),
+                    )
+                note = (note + " Handoff dismissed; no browser action executed.").strip()
+            else:
+                note = (note + " Refocus/fix the browser context, then retry this handoff.").strip()
 
         elif item_type == "application_ready":
             if decision == "approve":

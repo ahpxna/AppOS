@@ -96,12 +96,12 @@ def test_069_adds_aggregate_resume_freshness_views():
     assert "stale_approved_project_assets" in text
 
 
-def test_jobos_doctor_requires_latest_074_migration():
+def test_jobos_doctor_requires_latest_075_migration():
     source = (ROOT / "scripts" / "jobos.py").read_text(encoding="utf-8")
-    assert "074_checkpoint_account_auth_recovery.sql" in source
-    assert "Migrations through 074" in source
-    assert (ROOT / "db" / "migrations" / "074_checkpoint_account_auth_recovery.sql").is_file()
-    assert "Migrations through 073" not in source
+    assert "075_action_required_review_handoff.sql" in source
+    assert "Migrations through 075" in source
+    assert (ROOT / "db" / "migrations" / "075_action_required_review_handoff.sql").is_file()
+    assert "Migrations through 074" not in source
 
 
 def test_070_document_only_assets_are_resume_eligible():

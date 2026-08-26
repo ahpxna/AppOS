@@ -191,24 +191,33 @@ def test_reconciliation_begin_application_reconstructs_from_fresh_browser_state(
             pass
 
         def fetchone(self):
-            return ({"target_id": "old", "expected_url": "https://jobs.example/role"},)
+            return ({"target_id": "old", "expected_url": "https://jobs.example/role",
+                     "expected_origin": "https://jobs.example"},
+                    {"pre_io_targets": [{"target_id": "old", "url": "https://jobs.example/role"}]})
 
-    class Focused:
-        target_id = "new"
+    tabs = [
+        {"id": "old", "type": "page", "url": "https://jobs.example/role"},
+        {"id": "new", "type": "page", "url": "https://ats.example/app", "openerId": "old"},
+    ]
 
     class Transport:
+        def _tabs(self): return tabs
+        def _stable_id(self, tab): return tab.get("id")
         def resolve_target(self):
-            return Focused()
+            raise AssertionError("reconciliation must not use browser focus")
 
     monkeypatch.setattr(action, "_transport", lambda: Transport())
-    monkeypatch.setattr(action, "_snapshot", lambda _t, _id: (
-        "https://ats.example/app", {"snapshot": "form"}, [], "fp2",
+    monkeypatch.setattr(action, "_snapshot", lambda _t, tid: (
+        "https://jobs.example/role" if tid == "old" else "https://ats.example/app",
+        {"snapshot": "source" if tid == "old" else "form"}, [], "fp-old" if tid == "old" else "fp-new",
     ))
     monkeypatch.setattr(action, "_application_step", lambda *_a, **_k: "docs_verified")
     transitions = []
     monkeypatch.setattr(action, "_transition_application_step", lambda _cur, **kw: transitions.append(kw) or True)
     monkeypatch.setattr(action, "detect_platform", lambda *_a: "custom")
-    monkeypatch.setattr(action, "detect_page_state", lambda *_a: ("application_form_ready", {"input_count": 3}))
+    monkeypatch.setattr(action, "detect_page_state", lambda url, *_a: (
+        "application_form_ready" if "ats.example" in url else "unknown", {"input_count": 3}
+    ))
     updates = []
     monkeypatch.setattr(action, "_update_auth_session", lambda _cur, **kw: updates.append(kw))
     monkeypatch.setattr(action, "_host_is_allowed", lambda *_a, **_k: True)
@@ -216,10 +225,10 @@ def test_reconciliation_begin_application_reconstructs_from_fresh_browser_state(
     result = action.reconcile_observed_privileged_effect(
         Cur(), application_id="app", approval_request_id="approval", action_type="privileged_begin_application"
     )
-    assert transitions[0]["to_step"] == "application_entrypoint_ready"
-    assert updates[0]["state"] == "application_form_ready"
+    assert result["target_id"] == "new"
     assert result["state"] == "application_form_ready"
-    assert result["followup"] == "state_gate"
+    assert transitions and transitions[0]["to_step"] == "application_entrypoint_ready"
+    assert updates and updates[0]["url"] == "https://ats.example/app"
 
 
 def test_capsolver_processing_has_hard_deadline(monkeypatch):
@@ -252,27 +261,22 @@ def test_gmail_watcher_releases_read_transaction_before_network(monkeypatch):
     now = datetime.now(timezone.utc)
 
     class Cur:
-        def execute(self, _sql, _params=None):
-            pass
-
+        def __init__(self): self.sql = ""
+        def execute(self, sql, _params=None): self.sql = " ".join(sql.split())
         def fetchall(self):
-            return [("app", "candidate@example.com", "https://example.com", "https://example.com/verify", "fp", {"target_id": "t"}, now)]
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            return False
+            if "FROM application_auth_sessions" in self.sql:
+                return [("app", "candidate@example.com", "https://example.com",
+                         "https://example.com/verify", "fp", {"target_id": "t"}, now)]
+            if "status='rejected'" in self.sql:
+                return []
+            return []
+        def __enter__(self): return self
+        def __exit__(self, *_args): return False
 
     class Conn:
-        def __init__(self):
-            self.commits = 0
-
-        def cursor(self):
-            return Cur()
-
-        def commit(self):
-            self.commits += 1
+        def __init__(self): self.commits = 0
+        def cursor(self): return Cur()
+        def commit(self): self.commits += 1
 
     conn = Conn()
 

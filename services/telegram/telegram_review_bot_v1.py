@@ -122,6 +122,19 @@ def _keyboard(cur, item_id: str, allowed_user_id: int, item_type: str,
             {"text": "✅ OCCURRED", "callback_data": f"rv:{occurred}"},
             {"text": "⭕ NOT OCCURRED", "callback_data": f"rv:{not_occurred}"},
         ]]}, separators=(",", ":"))
+    if item_type == "action_required":
+        action_kind = str(payload.get("action_kind") or "")
+        approve = _callback_token(cur, item_id, "approve", allowed_user_id)
+        reject = _callback_token(cur, item_id, "reject", allowed_user_id)
+        label = {
+            "open_apply_binding_required": "🔗 BIND OPEN APPLY",
+            "email_verification_binding_required": "🔗 BIND OTP PAGE",
+            "email_verification_candidate_ambiguity": "✅ CONFIRM EMAIL + BIND",
+        }.get(action_kind, "🔗 PREPARE NEXT GATE")
+        return json.dumps({"inline_keyboard": [[
+            {"text": label, "callback_data": f"rv:{approve}"},
+            {"text": "❌ DISMISS", "callback_data": f"rv:{reject}"},
+        ]]}, separators=(",", ":"))
     if item_type == "application_ready":
         prepare_gate = _callback_token(cur, item_id, "approve", allowed_user_id)
         reject = _callback_token(cur, item_id, "reject", allowed_user_id)

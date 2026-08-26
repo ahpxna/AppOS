@@ -24,7 +24,9 @@ from psycopg.types.json import Jsonb
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 from services.application_actions.action_request_v1 import create_privileged_request
-from services.application_actions.privileged_action_v1 import VERIFY_LABELS, _find_exact_control, _find_input, _host_is_allowed, _snapshot, _transport
+from services.application_actions.privileged_action_v1 import (
+    VERIFY_LABELS, _find_exact_control, _host_is_allowed, _snapshot, _transport, _verification_code_field,
+)
 from services.auth.gmail_verification_v1 import discover_verification, gmail_account, persist_candidate
 from services.common.config import database_dsn
 
@@ -46,17 +48,49 @@ def process_pending(conn, *, max_results: int = 10) -> int:
                 ORDER BY s.updated_at LIMIT 20;"""
         )
         rows = cur.fetchall()
+        cur.execute(
+            "SELECT application_id::text, gmail_message_id FROM email_verification_candidates WHERE status='rejected';"
+        )
+        rejected_by_app: dict[str, set[str]] = {}
+        for rejected_app_id, message_id in cur.fetchall():
+            rejected_by_app.setdefault(str(rejected_app_id), set()).add(str(message_id))
     # Release the read transaction before bounded Gmail/network calls so an idle
     # mailbox can never leave PostgreSQL idle-in-transaction while we sleep.
     conn.commit()
     for app_id, recipient, origin, current_url, stored_fp, detail, updated_at in rows:
         requested_at = updated_at - timedelta(minutes=2)
         candidate = discover_verification(recipient=recipient, requested_at=requested_at,
-                                          employer_origin=origin, max_results=max_results)
+                                          employer_origin=origin, max_results=max_results,
+                                          exclude_message_ids=rejected_by_app.get(str(app_id), set()))
         if not candidate:
             continue
         with conn.cursor() as cur:
             candidate_id = persist_candidate(cur, application_id=app_id, candidate=candidate)
+            relevance = str(candidate.get("relevance") or "")
+            if relevance and relevance != "employer_match" and origin:
+                from services.review.review_service_v1 import ensure_action_required_review
+                cur.execute(
+                    """INSERT INTO application_events(application_id,event_type,event_source,event_payload)
+                       VALUES (%s,'email_verification_candidate_ambiguous','gmail-verification-watcher',%s);""",
+                    (app_id, Jsonb({"candidate_id": candidate_id, "gmail_message_id": candidate["message_id"],
+                                    "sender": candidate.get("sender") or "NaN",
+                                    "subject": candidate.get("subject") or "NaN",
+                                    "relevance": candidate.get("relevance") or "generic_verification"})),
+                )
+                ensure_action_required_review(
+                    cur, application_id=app_id, action_kind="email_verification_candidate_ambiguity",
+                    title="Confirm which verification email belongs to this application",
+                    summary=(f"A generic verification email was found from {candidate.get('sender') or 'unknown sender'} "
+                             f"with subject {candidate.get('subject') or 'unknown'!r}, but it is not strongly employer-bound. "
+                             "Refocus the employer verification page and approve this handoff only if this email is the intended one. "
+                             "The secret remains hash-only until the separate exact browser approval."),
+                    payload={"candidate_id": candidate_id, "gmail_message_id": candidate["message_id"],
+                             "sender": candidate.get("sender") or "NaN", "subject": candidate.get("subject") or "NaN"},
+                    priority="urgent",
+                )
+                conn.commit()
+                created += 1
+                continue
             target_id = str((detail or {}).get("target_id") or "")
             field_ref = control_ref = control_label = "NaN"
             expected_url, expected_fp = current_url, stored_fp
@@ -66,7 +100,7 @@ def process_pending(conn, *, max_results: int = 10) -> int:
                     live_url, _snap, nodes, live_fp = _snapshot(transport, target_id)
                     expected_url, expected_fp = live_url, live_fp
                     if candidate["kind"] == "numeric_code":
-                        field = _find_input(nodes, ("code", "verification", "otp", "one-time"))
+                        field = _verification_code_field(nodes)
                         if field:
                             field_ref = str(field.get("ref"))
                         try:
@@ -90,6 +124,8 @@ def process_pending(conn, *, max_results: int = 10) -> int:
                     })),
                 )
                 if target_id and expected_url and expected_fp:
+                    # Preserve the existing exact-target AUTH RETRY feature when a
+                    # target exists but its code control is not yet bindable.
                     create_privileged_request(
                         cur, application_id=app_id, action_type="privileged_auth_manual_retry",
                         payload={"target_id": target_id, "expected_url": expected_url,
@@ -100,6 +136,21 @@ def process_pending(conn, *, max_results: int = 10) -> int:
                         requested_by="gmail-verification-watcher",
                     )
                     created += 1
+                else:
+                    # No CDP target exists, so an executable privileged approval
+                    # would be guaranteed to fail. Surface a non-executable review
+                    # item that fresh-binds only after the user refocuses the page.
+                    from services.review.review_service_v1 import ensure_action_required_review
+                    if ensure_action_required_review(
+                        cur, application_id=app_id, action_kind="email_verification_binding_required",
+                        title="OTP found — refocus the verification page",
+                        summary=("An employer OTP was found, but no browser target/input can be exact-bound. "
+                                 "Open or refocus the employer verification page, then approve this handoff to create "
+                                 "a separate exact USE EMAIL VERIFICATION approval. The OTP remains hash-only."),
+                        payload={"candidate_id": candidate_id, "gmail_message_id": candidate["message_id"],
+                                 "verification_kind": candidate["kind"]}, priority="urgent",
+                    ):
+                        created += 1
                 conn.commit()
                 continue
 

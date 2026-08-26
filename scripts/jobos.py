@@ -57,8 +57,8 @@ def doctor(*, check_browser: bool, strict: bool = False, require_autofill: bool 
         import psycopg
         with psycopg.connect(database_dsn(), connect_timeout=5) as conn, conn.cursor() as cur:
             mark(results, "PostgreSQL", True)
-            cur.execute("SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE migration_id = '074_checkpoint_account_auth_recovery.sql')")
-            mark(results, "Migrations through 074", bool(cur.fetchone()[0]))
+            cur.execute("SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE migration_id = '075_action_required_review_handoff.sql')")
+            mark(results, "Migrations through 075", bool(cur.fetchone()[0]))
             cur.execute("SELECT to_regclass('public.privileged_action_executions') IS NOT NULL")
             mark(results, "Human Approval Bus", bool(cur.fetchone()[0]))
             cur.execute("SELECT to_regclass('public.autofill_action_journal') IS NOT NULL")
@@ -74,7 +74,7 @@ def doctor(*, check_browser: bool, strict: bool = False, require_autofill: bool 
             mark(results, "Immigration profile confirmed", int(cur.fetchone()[0]) == 1)
     except Exception as exc:
         mark(results, "PostgreSQL", False, str(exc)[:180])
-        mark(results, "Migrations through 074", False, "PostgreSQL unavailable")
+        mark(results, "Migrations through 075", False, "PostgreSQL unavailable")
 
     if check_browser:
         # Health only: it validates gateway/CDP availability but does not list
@@ -89,7 +89,7 @@ def doctor(*, check_browser: bool, strict: bool = False, require_autofill: bool 
     for name, ok, detail in results:
         print(f"{'✓' if ok else '⚠'} {name}" + (f" — {detail}" if detail else ""))
     checks = {name: ok for name, ok, _ in results}
-    core = all(checks.get(name, False) for name in ("Python 3.11+", "Environment", "PostgreSQL", "Migrations through 074"))
+    core = all(checks.get(name, False) for name in ("Python 3.11+", "Environment", "PostgreSQL", "Migrations through 075"))
     document_ready = core and checks.get("Resume template", False)
     form_fill_ready = core and all(checks.get(name, False) for name in (
         "Autofill action journal", "No unresolved browser action", "Immigration profile confirmed",

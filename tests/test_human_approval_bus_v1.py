@@ -303,6 +303,7 @@ def test_privileged_executor_fences_unverified_post_io_effects():
     assert "Apply handoff click produced no observable navigation or modal change" in execution
     assert "employer account action produced no observable browser change" in execution
     assert "application wizard step click produced no observable page change" in execution
-    assert "approved consent controls were not observably accepted after browser I/O" in execution
+    assert "approved consent toggle" in execution
+    assert "affirmative consent button effect was not observably verified" in execution
     assert "email verification browser I/O produced no observable page change" in execution
     assert 'state = "needs_reconciliation" if io_started else "failed"' in execution
