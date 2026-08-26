@@ -77,6 +77,47 @@ def _focus_or_open_exact_job_page(job_url: str) -> str:
     return str(target.target_id)
 
 
+def focus_bound_application_page(cur, application_id: str, *, browser_task_id: str | None = None) -> str:
+    """Focus the exact dedicated-browser target already bound to an app.
+
+    This is a read-only UX handoff for manual login/MFA/checkpoint/sensitive
+    answers.  It refuses missing or changed targets and never opens a phone or
+    arbitrary default-browser URL.
+    """
+    from services.application_actions.privileged_action_v1 import _transport
+    from services.autofill.autofill_executor_v1 import TransportError
+    cur.execute(
+        """SELECT current_url, detail_json FROM application_auth_sessions
+             WHERE application_id=%s;""",
+        (application_id,),
+    )
+    row = cur.fetchone()
+    expected_url, detail = (str(row[0] or ""), dict(row[1] or {})) if row else ("", {})
+    target_id = str(detail.get("target_id") or "")
+    if not target_id and browser_task_id:
+        cur.execute(
+            """SELECT pinned_target_id FROM browser_tasks
+                 WHERE id=%s AND application_id=%s;""",
+            (browser_task_id, application_id),
+        )
+        task = cur.fetchone()
+        target_id = str(task[0] or "") if task else ""
+    if not target_id:
+        raise ReviewError("JobOS has no exact browser target to focus for this application.")
+    try:
+        target = _transport().focus(target_id)
+    except TransportError as exc:
+        raise ReviewError(f"The exact JobOS browser page is unavailable: {exc}") from exc
+    from services.common.autofill_identity import canonical_page_url
+    if expected_url:
+        try:
+            if canonical_page_url(target.url) != canonical_page_url(expected_url):
+                raise ReviewError("The bound browser page changed; refresh the application handoff before continuing.")
+        except ValueError as exc:
+            raise ReviewError("The bound browser page has no valid HTTP(S) URL.") from exc
+    return target_id
+
+
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -482,15 +523,18 @@ def ensure_action_required_review(cur, *, application_id: str, action_kind: str,
             (active[0],),
         )
 
-    # Only an explicit human rejection suppresses the exact same source.
-    cur.execute(
-        """SELECT 1 FROM human_review_items
-             WHERE application_id=%s AND item_type='action_required'
-               AND source_sha256=%s AND status='rejected' LIMIT 1;""",
-        (application_id, source_sha),
-    )
-    if cur.fetchone():
-        return None
+    # A rejected email candidate is a durable human decision about that exact
+    # mail.  Refocus/retry handoffs are different: rejecting one cannot make a
+    # still-required authoritative application state disappear forever.
+    if action_kind.startswith("email_verification_"):
+        cur.execute(
+            """SELECT 1 FROM human_review_items
+                 WHERE application_id=%s AND item_type='action_required'
+                   AND source_sha256=%s AND status='rejected' LIMIT 1;""",
+            (application_id, source_sha),
+        )
+        if cur.fetchone():
+            return None
 
     bundle_id = ensure_bundle(cur, application_id)
     cur.execute(
@@ -656,15 +700,50 @@ def ensure_runtime_question_review(cur, *, application_id: str, browser_task_id:
                                    question: str, reason: str = "", profile_key: str | None = None) -> str | None:
     """Turn an unknown runtime ATS question into an answerable Human Review item."""
     from services.common.question_memory import normalize_question
-    from services.common.immigration_semantics import legal_question_pause_reason
+    from services.common.immigration_semantics import classify_immigration_question, legal_question_pause_reason
     question = (question or "").strip()
     normalized = normalize_question(question)
-    if not normalized or legal_question_pause_reason(question):
+    if not normalized:
         return None
     cur.execute("SELECT company, job_title FROM applications WHERE id = %s;", (application_id,))
     app = cur.fetchone()
     if not app:
         return None
+    question_class = classify_immigration_question(question)
+    if question_class is not None:
+        source_sha = _sha256_text(f"runtime-sensitive|{application_id}|{browser_task_id}|{normalized}|{question_class.value}")
+        cur.execute(
+            """SELECT id::text FROM human_review_items
+                 WHERE application_id=%s AND item_type='sensitive_question_required'
+                   AND source_sha256=%s AND status IN ('pending','needs_revision')
+                 ORDER BY created_at DESC LIMIT 1;""",
+            (application_id, source_sha),
+        )
+        existing = cur.fetchone()
+        if existing:
+            return str(existing[0])
+        bundle_id = ensure_bundle(cur, application_id)
+        # This card intentionally does not save generic question memory or
+        # execute a browser fill.  It makes the exact legal wording visible in
+        # the single inbox and directs the candidate to answer it manually on
+        # the bound JobOS form.
+        cur.execute(
+            """INSERT INTO human_review_items(
+                   review_bundle_id,application_id,item_type,status,browser_task_id,
+                   title,summary_text,source_sha256,priority,payload_json)
+               VALUES (%s,%s,'sensitive_question_required','pending',%s,%s,%s,%s,'urgent',%s)
+               RETURNING id::text;""",
+            (bundle_id, application_id, browser_task_id,
+             f"Sensitive answer required: {question[:110]}",
+             f"{app[0]} — {app[1]}. {legal_question_pause_reason(question)}",
+             source_sha, Jsonb({
+                 "question": question, "question_normalized": normalized,
+                 "question_class": question_class.value, "browser_task_id": browser_task_id,
+                 "source": "runtime_sensitive_autofill_pause",
+                 "manual_only": True,
+             })),
+        )
+        return str(cur.fetchone()[0])
     source_sha = _sha256_text(f"runtime|{application_id}|{browser_task_id}|{normalized}")
     bundle_id = ensure_bundle(cur, application_id)
     cur.execute(
@@ -1042,6 +1121,23 @@ def snooze_review_item(conn, item_id: str, *, actor: str, hours: int = 6) -> dic
         row = cur.fetchone()
         if not row:
             raise ReviewError("Review item is no longer actionable.")
+        # Later is an explicit user intent. Retire every live single-item
+        # callback and any pending free-text capture so an old Telegram card
+        # cannot approve an item the user just postponed.
+        cur.execute(
+            "UPDATE telegram_callback_tokens SET used_at=now() WHERE review_item_id=%s AND used_at IS NULL;",
+            (item_id,),
+        )
+        cur.execute(
+            """UPDATE telegram_control_surface_state
+                  SET pending_question_review_item_id=NULL,
+                      pending_question_source_sha256=NULL,
+                      pending_question_expires_at=NULL,
+                      pending_question_prompt_message_id=NULL,
+                      updated_at=now()
+                WHERE pending_question_review_item_id=%s;""",
+            (item_id,),
+        )
     return {"ok": True, "review_item_id": item_id, "application_id": row[0],
             "snoozed_until": row[1].isoformat() if row[1] else None}
 
@@ -1268,6 +1364,23 @@ def decide_item(conn, item_id: str, *, decision: str, actor: str, note: str = ""
         elif item_type == "question_required":
             raise ReviewError("Question items require an explicit answer; use the answer command.")
 
+        elif item_type == "sensitive_question_required":
+            if decision != "approve":
+                raise ReviewError("Sensitive legal questions cannot be dismissed. Use Later or answer the exact question manually in the JobOS browser.")
+            # This is a candidate acknowledgement of the exact wording, not
+            # permission to store/reuse a legal answer or write the page.  The
+            # item remains fully auditable and a fresh browser plan is required
+            # after the candidate completes the form manually.
+            cur.execute(
+                """INSERT INTO application_events(application_id,event_type,event_source,event_payload)
+                   VALUES (%s,'sensitive_question_manual_handoff','human_review_hub',%s);""",
+                (app_id, Jsonb({"review_item_id": item_id,
+                                "question_class": str((item_payload or {}).get("question_class") or ""),
+                                "browser_task_id": browser_task_id,
+                                "actor": actor})),
+            )
+            note = (note + " Candidate acknowledged the exact sensitive question; no answer was stored or autofilled. Complete it manually in the focused JobOS form, then prepare a fresh plan.").strip()
+
         elif item_type == "reconciliation_required":
             privileged_execution_id = str((item_payload or {}).get("privileged_execution_id") or "").strip()
             if privileged_execution_id:
@@ -1470,6 +1583,8 @@ def decide_item(conn, item_id: str, *, decision: str, actor: str, note: str = ""
                         "UPDATE email_verification_candidates SET status='rejected' WHERE id=%s AND application_id=%s AND status IN ('discovered','approved');",
                         (candidate_id, app_id),
                     )
+                elif not action_kind.startswith("email_verification_"):
+                    raise ReviewError("This handoff is still required by the application state. Use Later to postpone it; it cannot be dismissed permanently.")
                 note = (note + " Handoff dismissed; no browser action executed.").strip()
             else:
                 note = (note + " Refocus/fix the browser context, then retry this handoff.").strip()

@@ -409,11 +409,27 @@ def status() -> int:
     import psycopg
     load_repo_env()
     runtime = {"running": False}
+
+    def pid_alive(value: object) -> bool:
+        try:
+            os.kill(int(value), 0)
+            return True
+        except (TypeError, ValueError, OSError):
+            return False
     try:
         runtime_path = ROOT / ".jobos" / "run" / "runtime.json"
         if runtime_path.is_file():
             runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
-            runtime["running"] = True
+            pid_path = ROOT / ".jobos" / "run" / "supervisor.pid"
+            pid = None
+            try:
+                pid = int(pid_path.read_text(encoding="utf-8").strip())
+            except Exception:
+                pid = runtime.get("supervisor_pid")
+            runtime["supervisor_pid"] = pid
+            runtime["running"] = pid_alive(pid)
+            if not runtime["running"]:
+                runtime["status"] = "stale_runtime_state"
     except Exception:
         runtime = {"running": False, "status": "unavailable"}
     try:

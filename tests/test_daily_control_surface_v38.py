@@ -56,7 +56,8 @@ def test_telegram_daily_ux_has_dashboard_batch_details_and_natural_reply():
     assert "Approve {len(safe)} safe" in source
     assert "Review next" in source
     assert "def _send_review_details" in source
-    assert "Reply to JobOS with the answer only. No ID or command needed." in source
+    assert "Reply directly to this message with your answer" in source
+    assert '"force_reply": True' in source
     assert "One-tap safe batch approval" in source
     assert "Daily-use card: short, decision-first, no internal IDs." in source
 

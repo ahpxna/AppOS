@@ -8,6 +8,8 @@ materializes the next human gate.
 """
 from __future__ import annotations
 
+import argparse
+import time
 from typing import Any
 
 from services.application_actions.privileged_action_v1 import (
@@ -100,3 +102,32 @@ def observe_once(conn, *, limit: int = 20) -> list[dict[str, Any]]:
         changed.append({"application_id": application_id, "from_step": expected_step,
                         "state": live_state, "url": live_url, "followup": followup})
     return changed
+
+
+def main() -> int:
+    """Run observation independently from Telegram long-poll cadence."""
+    parser = argparse.ArgumentParser(description="Read-only JobOS auth/browser state watcher")
+    parser.add_argument("--poll-seconds", type=int, default=5)
+    parser.add_argument("--once", action="store_true")
+    args = parser.parse_args()
+    from services.common.config import database_dsn, load_repo_env
+    import psycopg
+
+    load_repo_env()
+    interval = max(1, min(int(args.poll_seconds), 60))
+    with psycopg.connect(database_dsn(), autocommit=False) as conn:
+        while True:
+            try:
+                changed = observe_once(conn)
+                if changed:
+                    print(f"Observed {len(changed)} auth/checkpoint transition(s).")
+            except Exception as exc:
+                conn.rollback()
+                print(f"Browser state watcher soft-fail: {exc}")
+            if args.once:
+                return 0
+            time.sleep(interval)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -121,7 +121,9 @@ def _keyboard(cur, item_id: str, allowed_user_id: int, item_type: str,
 
     def render(rows: list[list[dict[str, str]]]) -> str:
         if open_url.startswith(("https://", "http://")):
-            rows.append([{"text": "🌐 Open page", "url": open_url}])
+            # This is deliberately secondary: Telegram opens URLs on the
+            # device, not necessarily in JobOS's dedicated browser.
+            rows.append([{"text": "↗ View URL on this device", "url": open_url}])
         return json.dumps({"inline_keyboard": rows}, separators=(",", ":"))
 
     if item_type == "question_required":
@@ -133,6 +135,16 @@ def _keyboard(cur, item_id: str, allowed_user_id: int, item_type: str,
         rows.append([{"text": "✏️ Other", "callback_data": f"rv:{other}"},
                      {"text": "👀 Review", "callback_data": f"rv:{details}"},
                      {"text": "⏭ Later", "callback_data": f"rv:{later}"}])
+        return render(rows)
+
+    if item_type == "sensitive_question_required":
+        focus, confirm = tok("focus_browser"), tok("sensitive_confirm")
+        rows = [
+            [{"text": "🌐 Focus JobOS form", "callback_data": f"rv:{focus}"}],
+            [{"text": "✅ I will answer this exact question", "callback_data": f"rv:{confirm}"}],
+            [{"text": "👀 Review", "callback_data": f"rv:{details}"},
+             {"text": "⏭ Later", "callback_data": f"rv:{later}"}],
+        ]
         return render(rows)
 
     if item_type == "autofill_review" and payload.get("execution_state") != "completed":
@@ -185,9 +197,10 @@ def _keyboard(cur, item_id: str, allowed_user_id: int, item_type: str,
         rows = [
             [{"text": label, "callback_data": f"rv:{approve}"}],
             [{"text": "👀 Review", "callback_data": f"rv:{details}"},
-             {"text": "⏭ Later", "callback_data": f"rv:{later}"},
-             {"text": "❌ Dismiss", "callback_data": f"rv:{reject}"}],
+             {"text": "⏭ Later", "callback_data": f"rv:{later}"}],
         ]
+        if action_kind.startswith("email_verification_"):
+            rows[-1].append({"text": "❌ Reject email", "callback_data": f"rv:{reject}"})
         return render(rows)
 
     if item_type == "application_ready":
@@ -219,8 +232,10 @@ def _keyboard(cur, item_id: str, allowed_user_id: int, item_type: str,
         "autofill_form": "✅ Autofill",
     }
     approve, reject = tok("approve"), tok("reject")
-    if approval_type in {"privileged_auth_manual_retry", "privileged_mfa_retry", "privileged_checkpoint_retry"}:
+    if approval_type in {"privileged_login_employer_account", "privileged_auth_manual_retry", "privileged_mfa_retry", "privileged_checkpoint_retry"}:
+        focus = tok("focus_browser")
         rows = [
+            [{"text": "🌐 Focus JobOS page", "callback_data": f"rv:{focus}"}],
             [{"text": approve_labels[approval_type], "callback_data": f"rv:{approve}"}],
             [{"text": "👀 Review", "callback_data": f"rv:{details}"},
              {"text": "⏭ Later", "callback_data": f"rv:{later}"},
@@ -281,6 +296,12 @@ def _message_text(row: tuple[Any, ...], envelope: dict[str, Any] | None = None,
         lines.extend(["", f"❓ {payload.get('question') or title}"])
         if payload.get("missing_information"):
             lines.append(str(payload.get("missing_information")))
+    elif item_type == "sensitive_question_required":
+        # Keep legal/immigration answers out of Telegram.  The card exposes
+        # only the exact employer question and focuses the dedicated JobOS
+        # browser so the candidate can attest there.
+        lines.extend(["", f"⚖️ {payload.get('question') or title}"])
+        lines.append("Answer this exact employer wording manually in the focused JobOS form.")
     elif item_type == "reconciliation_required":
         lines.extend(["", "⚠️ Browser outcome is uncertain.", "JobOS will not replay it automatically."])
     else:
@@ -633,11 +654,12 @@ def _approve_safe_batch(conn, *, items: list[dict[str, Any]], actor: str) -> lis
     with conn.cursor() as cur:
         for expected in wanted:
             cur.execute(
-                """SELECT application_id::text,item_type,status,source_sha256,payload_json
+                """SELECT application_id::text,item_type,status,source_sha256,payload_json,
+                          snoozed_until IS NULL OR snoozed_until <= now()
                      FROM human_review_items WHERE id=%s;""", (expected.get("item_id"),)
             )
             row = cur.fetchone()
-            if not row or row[2] not in {"pending", "needs_revision"}:
+            if not row or row[2] not in {"pending", "needs_revision"} or not bool(row[5]):
                 raise ReviewError("Safe batch changed; refresh the inbox before approving.")
             if str(row[0]) != str(expected.get("application_id") or ""):
                 raise ReviewError("Safe batch application binding changed.")
@@ -801,6 +823,31 @@ def _save_offset(cur, offset: int) -> None:
     )
 
 
+def _clear_pending_question(cur, chat_id: int, *, item_id: str | None = None) -> None:
+    """Remove a natural-reply capture after any alternate terminal action."""
+    if item_id:
+        cur.execute(
+            """UPDATE telegram_control_surface_state
+                  SET pending_question_review_item_id=NULL,
+                      pending_question_source_sha256=NULL,
+                      pending_question_expires_at=NULL,
+                      pending_question_prompt_message_id=NULL,
+                      updated_at=now()
+                WHERE chat_id=%s AND pending_question_review_item_id=%s;""",
+            (chat_id, item_id),
+        )
+    else:
+        cur.execute(
+            """UPDATE telegram_control_surface_state
+                  SET pending_question_review_item_id=NULL,
+                      pending_question_source_sha256=NULL,
+                      pending_question_expires_at=NULL,
+                      pending_question_prompt_message_id=NULL,
+                      updated_at=now() WHERE chat_id=%s;""",
+            (chat_id,),
+        )
+
+
 def handle_callback(conn, token: str, allowed_user_id: int, callback: dict[str, Any]) -> None:
     callback_id = str(callback.get("id") or "")
     sender_id = int((callback.get("from") or {}).get("id") or 0)
@@ -878,7 +925,7 @@ def handle_callback(conn, token: str, allowed_user_id: int, callback: dict[str, 
         try:
             snooze_review_item(conn, item_id, actor=f"telegram:{sender_id}", hours=6)
             with conn.cursor() as cur:
-                cur.execute("UPDATE telegram_callback_tokens SET used_at=now() WHERE id=%s;", (row[0],))
+                _clear_pending_question(cur, chat_id, item_id=item_id)
             conn.commit()
             api(token, "answerCallbackQuery", data={"callback_query_id": callback_id, "text": "Snoozed for 6 hours"})
             if chat_id:
@@ -888,22 +935,31 @@ def handle_callback(conn, token: str, allowed_user_id: int, callback: dict[str, 
             api(token, "answerCallbackQuery", data={"callback_query_id": callback_id, "text": str(exc)[:180], "show_alert": "true"})
         return
     if action == "other":
+        # Bind free text to a short-lived ForceReply prompt, not to arbitrary
+        # future chat text.  The DB binding is saved only after Telegram gives
+        # us the exact prompt message id.
+        api(token, "answerCallbackQuery", data={"callback_query_id": callback_id, "text": "Reply to this prompt"})
+        prompt = api(token, "sendMessage", data={
+            "chat_id": str(chat_id),
+            "text": "✏️ Reply directly to this message with your answer. This prompt expires in 15 minutes.",
+            "reply_markup": json.dumps({"force_reply": True, "input_field_placeholder": "Type your answer"}),
+        })
+        prompt_id = int(prompt["result"]["message_id"])
         with conn.cursor() as cur:
             cur.execute(
                 """INSERT INTO telegram_control_surface_state(
-                       chat_id,pending_question_review_item_id,pending_question_source_sha256,updated_at)
-                   VALUES (%s,%s,%s,now())
+                       chat_id,pending_question_review_item_id,pending_question_source_sha256,
+                       pending_question_expires_at,pending_question_prompt_message_id,updated_at)
+                   VALUES (%s,%s,%s,now() + interval '15 minutes',%s,now())
                    ON CONFLICT (chat_id) DO UPDATE
                    SET pending_question_review_item_id=EXCLUDED.pending_question_review_item_id,
                        pending_question_source_sha256=EXCLUDED.pending_question_source_sha256,
-                       updated_at=now();""", (chat_id, item_id, token_source)
+                       pending_question_expires_at=EXCLUDED.pending_question_expires_at,
+                       pending_question_prompt_message_id=EXCLUDED.pending_question_prompt_message_id,
+                       updated_at=now();""", (chat_id, item_id, token_source, prompt_id)
             )
             cur.execute("UPDATE telegram_callback_tokens SET used_at=now() WHERE id=%s;", (row[0],))
         conn.commit()
-        api(token, "answerCallbackQuery", data={"callback_query_id": callback_id, "text": "Reply with your answer"})
-        if chat_id:
-            api(token, "sendMessage", data={"chat_id": str(chat_id),
-                                             "text": "✏️ Reply to JobOS with the answer only. No ID or command needed."})
         return
     if action == "answer":
         answer = str(callback_payload.get("answer") or "").strip()
@@ -912,11 +968,47 @@ def handle_callback(conn, token: str, allowed_user_id: int, callback: dict[str, 
             answer_question(conn, item_id, answer=answer, actor=f"telegram:{sender_id}", scope=scope, answer_kind="option")
             with conn.cursor() as cur:
                 cur.execute("UPDATE telegram_callback_tokens SET used_at=now() WHERE review_item_id=%s AND used_at IS NULL;", (item_id,))
+                _clear_pending_question(cur, chat_id, item_id=item_id)
                 sync_inbox(cur)
             conn.commit()
             api(token, "answerCallbackQuery", data={"callback_query_id": callback_id, "text": f"Saved: {answer}"})
             if chat_id:
                 api(token, "sendMessage", data={"chat_id": str(chat_id), "text": f"✅ Saved answer: {answer}. JobOS will reuse it only within its approved scope."})
+                dispatch_dashboard(conn, token, allowed_user_id, chat_id, force=True)
+        except ReviewError as exc:
+            conn.rollback()
+            api(token, "answerCallbackQuery", data={"callback_query_id": callback_id, "text": str(exc)[:180], "show_alert": "true"})
+        return
+    if action == "focus_browser":
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT application_id::text,browser_task_id::text FROM human_review_items WHERE id=%s;", (item_id,))
+                app_row = cur.fetchone()
+                if not app_row:
+                    raise ReviewError("Review item no longer exists.")
+                from services.review.review_service_v1 import focus_bound_application_page
+                focus_bound_application_page(cur, str(app_row[0]), browser_task_id=str(app_row[1] or "") or None)
+                cur.execute("UPDATE telegram_callback_tokens SET used_at=now() WHERE id=%s;", (row[0],))
+            conn.commit()
+            api(token, "answerCallbackQuery", data={"callback_query_id": callback_id, "text": "Focused JobOS browser page"})
+            if chat_id:
+                api(token, "sendMessage", data={"chat_id": str(chat_id), "text": "🌐 JobOS focused the exact browser page. Complete the manual step there, then use the next JobOS card."})
+        except ReviewError as exc:
+            conn.rollback()
+            api(token, "answerCallbackQuery", data={"callback_query_id": callback_id, "text": str(exc)[:180], "show_alert": "true"})
+        return
+    if action == "sensitive_confirm":
+        try:
+            result = decide_item(conn, item_id, decision="approve", actor=f"telegram:{sender_id}",
+                                 note="Telegram sensitive-question manual acknowledgement")
+            with conn.cursor() as cur:
+                cur.execute("UPDATE telegram_callback_tokens SET used_at=now() WHERE review_item_id=%s AND used_at IS NULL;", (item_id,))
+                _clear_pending_question(cur, chat_id, item_id=item_id)
+                sync_inbox(cur)
+            conn.commit()
+            api(token, "answerCallbackQuery", data={"callback_query_id": callback_id, "text": "Acknowledged; no answer was stored"})
+            if chat_id:
+                api(token, "sendMessage", data={"chat_id": str(chat_id), "text": "✅ JobOS recorded only that you will answer the exact sensitive question manually. No legal answer was stored or autofilled."})
                 dispatch_dashboard(conn, token, allowed_user_id, chat_id, force=True)
         except ReviewError as exc:
             conn.rollback()
@@ -929,6 +1021,7 @@ def handle_callback(conn, token: str, allowed_user_id: int, callback: dict[str, 
                              actor=f"telegram:{sender_id}", note="Telegram one-tap review decision")
         with conn.cursor() as cur:
             cur.execute("UPDATE telegram_callback_tokens SET used_at = now() WHERE review_item_id = %s AND used_at IS NULL;", (item_id,))
+            _clear_pending_question(cur, chat_id, item_id=item_id)
         conn.commit()  # human decision is durable before privileged browser I/O
 
         observed_reconciliation = result.get("reconciliation_observed_result") or {}
@@ -1020,12 +1113,23 @@ def handle_message(conn, token: str, allowed_user_id: int, message: dict[str, An
     # particular version-bound question card. No review ID or command is needed.
     with conn.cursor() as cur:
         cur.execute(
-            """SELECT pending_question_review_item_id::text,pending_question_source_sha256
+            """SELECT pending_question_review_item_id::text,pending_question_source_sha256,
+                      pending_question_expires_at > now(),pending_question_prompt_message_id
                  FROM telegram_control_surface_state WHERE chat_id=%s;""", (chat_id,)
         )
         pending = cur.fetchone()
+    reply_to = message.get("reply_to_message") or {}
+    reply_to_id = int(reply_to.get("message_id") or 0)
     if pending and pending[0] and text and not text.startswith("/"):
         item_id, expected_source = str(pending[0]), str(pending[1] or "")
+        active_prompt = bool(pending[2]) and int(pending[3] or 0) == reply_to_id
+        if not active_prompt:
+            with conn.cursor() as cur:
+                _clear_pending_question(cur, chat_id, item_id=item_id)
+            conn.commit()
+            api(token, "sendMessage", data={"chat_id": str(chat_id),
+                                             "text": "That answer prompt expired or was not replied to directly. Tap ✏️ Other on the current card again."})
+            return
         try:
             with conn.cursor() as cur:
                 cur.execute("SELECT source_sha256,status FROM human_review_items WHERE id=%s;", (item_id,))
@@ -1036,11 +1140,7 @@ def handle_message(conn, token: str, allowed_user_id: int, message: dict[str, An
                     raise ReviewError("That question changed. Use the newest card.")
             answer_question(conn, item_id, answer=text, actor=f"telegram:{sender_id}", scope="company")
             with conn.cursor() as cur:
-                cur.execute(
-                    """UPDATE telegram_control_surface_state
-                          SET pending_question_review_item_id=NULL,pending_question_source_sha256=NULL,updated_at=now()
-                        WHERE chat_id=%s;""", (chat_id,)
-                )
+                _clear_pending_question(cur, chat_id, item_id=item_id)
                 sync_inbox(cur)
             conn.commit()
             api(token, "sendMessage", data={"chat_id": str(chat_id),
@@ -1048,6 +1148,9 @@ def handle_message(conn, token: str, allowed_user_id: int, message: dict[str, An
             dispatch_dashboard(conn, token, allowed_user_id, chat_id, force=True)
         except ReviewError as exc:
             conn.rollback()
+            with conn.cursor() as cur:
+                _clear_pending_question(cur, chat_id, item_id=item_id)
+            conn.commit()
             api(token, "sendMessage", data={"chat_id": str(chat_id), "text": f"⚠️ {exc}"})
         return
 
@@ -1100,7 +1203,9 @@ def main() -> int:
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--dispatch-only", action="store_true")
     parser.add_argument("--discover-id", action="store_true")
-    parser.add_argument("--poll-timeout", type=int, default=50)
+    # Browser state advances independently; avoid hiding a completed login
+    # behind Telegram's former fifty-second long-poll cadence.
+    parser.add_argument("--poll-timeout", type=int, default=5)
     args = parser.parse_args()
     if args.discover_id:
         token = _bot_token()
@@ -1116,14 +1221,6 @@ def main() -> int:
     print(f"Telegram bot: @{me['result'].get('username', 'unknown')} | chat={chat_id} | allowed_user={allowed_user_id}")
     with psycopg.connect(DSN, autocommit=False) as conn:
         while True:
-            try:
-                from services.auth.browser_state_watcher_v1 import observe_once as observe_browser_state_once
-                observed = observe_browser_state_once(conn)
-                if observed:
-                    print(f"Observed {len(observed)} completed auth/checkpoint transition(s).")
-            except Exception as exc:
-                conn.rollback()
-                print(f"Browser state watcher soft-fail: {exc}", file=sys.stderr)
             dashboard = dispatch_dashboard(conn, token, allowed_user_id, chat_id)
             urgent = dispatch_pending(conn, token, allowed_user_id, chat_id, limit=3, urgent_only=True)
             if dashboard or urgent:
@@ -1131,7 +1228,7 @@ def main() -> int:
             if args.dispatch_only:
                 return 0
             updates = poll_once(conn, token, allowed_user_id,
-                                timeout_seconds=max(1, min(args.poll_timeout, 50)))
+                                timeout_seconds=max(1, min(args.poll_timeout, 10)))
             if args.once:
                 return 0
             if not dashboard and not urgent and not updates:

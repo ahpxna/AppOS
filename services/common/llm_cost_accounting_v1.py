@@ -7,6 +7,7 @@ PostgreSQL is available.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date
 from decimal import Decimal
 import json
 import os
@@ -24,6 +25,10 @@ class Reservation:
     reserved_cost_usd: Decimal
     model_name: str
     provider: str
+    # Kept optional for in-process callers/tests created before immutable
+    # budget-date ownership. Settlement always reloads the authoritative date
+    # from the reservation row under lock.
+    budget_date: date | None = None
 
 
 def _application_id() -> str | None:
@@ -61,13 +66,17 @@ def reserve_paid_call(*, role: str, provider: str, model: str,
     except Exception as exc:
         raise LLMBudgetError(f"Cannot load PostgreSQL accounting for paid LLM call: {exc}") from exc
     with psycopg.connect(database_dsn(), autocommit=False) as conn, conn.cursor() as cur:
+        cur.execute("SELECT CURRENT_DATE;")
+        budget_date = cur.fetchone()[0]
         cur.execute(
             """INSERT INTO daily_budgets(date,max_cost_usd,max_jobs_full_pipeline,max_browser_tasks)
-               VALUES (CURRENT_DATE,2.00,20,50) ON CONFLICT (date) DO NOTHING;"""
+               VALUES (%s,2.00,20,50) ON CONFLICT (date) DO NOTHING;""",
+            (budget_date,),
         )
         cur.execute(
             """SELECT max_cost_usd,current_cost_usd FROM daily_budgets
-                 WHERE date=CURRENT_DATE FOR UPDATE;"""
+                 WHERE date=%s FOR UPDATE;""",
+            (budget_date,),
         )
         max_usd, current = cur.fetchone()
         in_price, out_price, is_local = _price(cur, model, require_priced=True)
@@ -75,7 +84,7 @@ def reserve_paid_call(*, role: str, provider: str, model: str,
             raise LLMBudgetError(f"API backend model {model!r} is marked local in model_pricing; fix pricing metadata.")
         reserve = (Decimal(max(0, estimated_input_tokens)) / Decimal(1000) * in_price
                    + Decimal(max(0, max_output_tokens)) / Decimal(1000) * out_price)
-        cur.execute("SELECT COALESCE(SUM(estimated_cost_usd),0) FROM cost_ledger WHERE created_at::date=CURRENT_DATE;")
+        cur.execute("SELECT COALESCE(SUM(estimated_cost_usd),0) FROM cost_ledger WHERE budget_date=%s;", (budget_date,))
         ledger_spent = Decimal(cur.fetchone()[0] or 0)
         authoritative = max(Decimal(current or 0), ledger_spent)
         if max_usd is not None and authoritative + reserve > Decimal(max_usd):
@@ -84,28 +93,30 @@ def reserve_paid_call(*, role: str, provider: str, model: str,
                 f"${Decimal(max_usd):.2f} (already reserved/settled ${authoritative:.4f})."
             )
         cur.execute(
-            """INSERT INTO llm_cost_reservations(application_id,role,provider,model_name,reserved_cost_usd)
-               VALUES (%s,%s,%s,%s,%s) RETURNING id::text;""",
-            (_application_id(), role, provider, model, reserve),
+            """INSERT INTO llm_cost_reservations(
+                   application_id,role,provider,model_name,reserved_cost_usd,budget_date)
+               VALUES (%s,%s,%s,%s,%s,%s) RETURNING id::text;""",
+            (_application_id(), role, provider, model, reserve, budget_date),
         )
         rid = str(cur.fetchone()[0])
         cur.execute(
-            "UPDATE daily_budgets SET current_cost_usd=%s WHERE date=CURRENT_DATE;",
-            (authoritative + reserve,),
+            "UPDATE daily_budgets SET current_cost_usd=%s WHERE date=%s;",
+            (authoritative + reserve, budget_date),
         )
         conn.commit()
-    return Reservation(rid, reserve, model, provider)
+    return Reservation(rid, reserve, model, provider, budget_date)
 
 
 def _record_ledger(cur, *, role: str, provider: str, configured_model: str,
                    resolved_model: str, input_tokens: int, output_tokens: int,
-                   cost: Decimal, request_id: str | None, is_local: bool) -> None:
+                   cost: Decimal, request_id: str | None, is_local: bool,
+                   budget_date: date | None = None) -> None:
     cur.execute(
         """INSERT INTO cost_ledger(application_id,agent_name,model_name,input_tokens,output_tokens,
-                    estimated_cost_usd,task_type,is_local,provider,provider_request_id,resolved_model_name)
-           VALUES (%s,%s,%s,%s,%s,%s,'single_call',%s,%s,%s,%s);""",
+                    estimated_cost_usd,task_type,is_local,provider,provider_request_id,resolved_model_name,budget_date)
+           VALUES (%s,%s,%s,%s,%s,%s,'single_call',%s,%s,%s,%s,%s);""",
         (_application_id(), role, configured_model, int(input_tokens), int(output_tokens), cost,
-         is_local, provider, request_id, resolved_model),
+         is_local, provider, request_id, resolved_model, budget_date),
     )
 
 
@@ -116,13 +127,13 @@ def settle_paid_call(reservation: Reservation, *, role: str, configured_model: s
     from services.common.config import database_dsn
     with psycopg.connect(database_dsn(), autocommit=False) as conn, conn.cursor() as cur:
         cur.execute(
-            "SELECT reserved_cost_usd,status FROM llm_cost_reservations WHERE id=%s FOR UPDATE;",
+            "SELECT reserved_cost_usd,status,budget_date FROM llm_cost_reservations WHERE id=%s FOR UPDATE;",
             (reservation.id,),
         )
         row = cur.fetchone()
         if not row or row[1] != "reserved":
             raise LLMBudgetError("LLM cost reservation is missing or no longer open.")
-        reserved = Decimal(row[0] or 0)
+        reserved, budget_date = Decimal(row[0] or 0), row[2]
         try:
             in_price, out_price, _ = _price(cur, resolved_model, require_priced=True)
             actual = (Decimal(max(0, input_tokens)) / Decimal(1000) * in_price
@@ -136,17 +147,17 @@ def settle_paid_call(reservation: Reservation, *, role: str, configured_model: s
         _record_ledger(cur, role=role, provider=reservation.provider,
                        configured_model=configured_model, resolved_model=resolved_model,
                        input_tokens=input_tokens, output_tokens=output_tokens,
-                       cost=actual, request_id=request_id, is_local=False)
+                       cost=actual, request_id=request_id, is_local=False, budget_date=budget_date)
         cur.execute(
             """UPDATE llm_cost_reservations SET status='settled',settled_at=now(),detail_json=%s
                  WHERE id=%s;""",
             (json.dumps({"actual_cost_usd": str(actual), "pricing": pricing_note}), reservation.id),
         )
-        cur.execute("SELECT current_cost_usd FROM daily_budgets WHERE date=CURRENT_DATE FOR UPDATE;")
+        cur.execute("SELECT current_cost_usd FROM daily_budgets WHERE date=%s FOR UPDATE;", (budget_date,))
         current = Decimal((cur.fetchone() or [0])[0] or 0)
         cur.execute(
-            "UPDATE daily_budgets SET current_cost_usd=%s WHERE date=CURRENT_DATE;",
-            (max(Decimal(0), current - reserved + actual),),
+            "UPDATE daily_budgets SET current_cost_usd=%s WHERE date=%s;",
+            (max(Decimal(0), current - reserved + actual), budget_date),
         )
         conn.commit()
         return actual
@@ -161,14 +172,17 @@ def mark_paid_call_uncertain(reservation: Reservation, *, role: str, configured_
         with psycopg.connect(database_dsn(), autocommit=False) as conn, conn.cursor() as cur:
             cur.execute(
                 """UPDATE llm_cost_reservations SET status='uncertain',settled_at=now(),detail_json=%s
-                     WHERE id=%s AND status='reserved';""",
+                     WHERE id=%s AND status='reserved'
+                 RETURNING budget_date;""",
                 (json.dumps({"error": error[:500]}), reservation.id),
             )
-            if cur.rowcount:
+            row = cur.fetchone()
+            if row:
                 _record_ledger(cur, role=role, provider=reservation.provider,
                                configured_model=configured_model, resolved_model=configured_model,
                                input_tokens=estimated_input_tokens, output_tokens=0,
-                               cost=reservation.reserved_cost_usd, request_id=None, is_local=False)
+                               cost=reservation.reserved_cost_usd, request_id=None, is_local=False,
+                               budget_date=row[0])
             conn.commit()
     except Exception:
         # The DB reservation was already durably charged before the call. Do not

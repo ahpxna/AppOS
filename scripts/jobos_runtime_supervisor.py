@@ -59,6 +59,7 @@ def _specs() -> dict[str, list[str]]:
         "orchestrator": [sys.executable, "-m", "services.orchestrator.orchestrator_worker_v1", "--poll-seconds", "15"],
         "privileged-actions": [sys.executable, "-m", "services.application_actions.privileged_action_v1", "worker", "--poll-seconds", "5"],
         "browser-worker": [sys.executable, str(ROOT / "services" / "browser-controller" / "browser_queue_worker.py"), "--poll-seconds", "5"],
+        "browser-state-watcher": [sys.executable, "-m", "services.auth.browser_state_watcher_v1", "--poll-seconds", "5"],
     }
     if (os.getenv("JOBOS_TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")) and (
         os.getenv("JOBOS_TELEGRAM_ALLOWED_USER_ID") or os.getenv("TELEGRAM_ALLOWED_USER_ID")
@@ -152,13 +153,12 @@ def daemon() -> int:
 
 
 def _start_infra() -> None:
-    if not _truthy("JOBOS_RUNTIME_START_POSTGRES", True):
-        return
     docker = shutil.which("docker")
     if not docker:
         return
-    subprocess.run([docker, "compose", "up", "-d", "postgres"], cwd=ROOT, check=False,
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if _truthy("JOBOS_RUNTIME_START_POSTGRES", True):
+        subprocess.run([docker, "compose", "up", "-d", "postgres"], cwd=ROOT, check=False,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if _truthy("JOBOS_RUNTIME_START_OPENCLAW", False):
         subprocess.run([docker, "compose", "-f", "docker-compose.openclaw.yml", "up", "-d", "openclaw", "browser"],
                        cwd=ROOT, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
