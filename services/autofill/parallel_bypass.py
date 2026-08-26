@@ -6,7 +6,7 @@ import itertools
 import requests
 import websocket
 import logging
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit
 
 from services.autofill.capsolver_api import solve_captcha
 
@@ -249,33 +249,35 @@ def _fake_mouse_routine(ws_url: str, regimes_file_path: str, stop_event: threadi
         log.warning("[FakeMouse] cannot classify seed target; using exact seed only: %s", exc)
         seed = None
 
-    if seed is not None and _is_linkedin_url(str(seed.get("url") or "")):
+    # Discovery handlers are frozen and historically seed the first page tab.
+    # If any LinkedIn page exists, ignore an unrelated first-page seed and fan
+    # out only across the live LinkedIn targets. Deterministic autofill no
+    # longer calls this helper, so this cannot inject motion into an ATS form.
+    if any(_is_linkedin_url(str(tab.get("url") or "")) for tab in tabs if tab.get("type") == "page"):
         _fake_mouse_linkedin_controller(ws_url, regimes_file_path, stop_event)
         return
 
-    _fake_mouse_target_routine(
-        ws_url,
-        regimes_file_path,
-        stop_event,
-        require_linkedin=False,
-    )
+    _fake_mouse_target_routine(ws_url, regimes_file_path, stop_event, require_linkedin=False)
+
+
+def _canonical_target_url(value: str) -> tuple[str, str, str]:
+    parsed = urlsplit(value)
+    host = (parsed.hostname or "").casefold()
+    path = (parsed.path or "/").rstrip("/") or "/"
+    query = urlencode(sorted(parse_qsl(parsed.query, keep_blank_values=True)))
+    return host, path, query
 
 
 def _select_exact_page(tabs: list[dict], website_url: str) -> str:
-    wanted = urlsplit(website_url)
-    wanted_host = (wanted.hostname or "").casefold()
-    wanted_path = (wanted.path or "/").rstrip("/") or "/"
+    wanted = _canonical_target_url(website_url)
     candidates = []
     for tab in tabs:
         if tab.get("type") != "page" or not tab.get("webSocketDebuggerUrl"):
             continue
-        current = urlsplit(str(tab.get("url") or ""))
-        host = (current.hostname or "").casefold()
-        path = (current.path or "/").rstrip("/") or "/"
-        if host == wanted_host and path == wanted_path:
+        if _canonical_target_url(str(tab.get("url") or "")) == wanted:
             candidates.append(tab)
     if len(candidates) != 1:
-        raise RuntimeError(f"Expected exactly one CDP page for {website_url!r}; found {len(candidates)}")
+        raise RuntimeError(f"Expected exactly one exact CDP page for {website_url!r}; found {len(candidates)}")
     return str(candidates[0]["webSocketDebuggerUrl"])
 
 

@@ -19,7 +19,7 @@ try:
     from tkinter import messagebox, ttk
 except ModuleNotFoundError as exc:  # Ubuntu's minimal Python omits Tk.
     raise SystemExit(
-        "Tk desktop support is unavailable. On Ubuntu run: sudo apt install python3-tk"
+        "Tk desktop support is unavailable. Install the Tk bindings for this Python build (macOS: use a python.org/Homebrew Python with Tk; Debian/Ubuntu: sudo apt install python3-tk)."
     ) from exc
 
 import psycopg
@@ -239,7 +239,7 @@ def main() -> int:
     try:
         root = tk.Tk()
     except tk.TclError as exc:
-        raise SystemExit("Tk desktop support is unavailable. On Ubuntu run: sudo apt install python3-tk") from exc
+        raise SystemExit("Tk desktop support is unavailable. Install the Tk bindings for this Python build (macOS: use a python.org/Homebrew Python with Tk; Debian/Ubuntu: sudo apt install python3-tk).") from exc
     IntakeApp(root)
     root.mainloop()
     return 0

@@ -57,8 +57,8 @@ def doctor(*, check_browser: bool, strict: bool = False, require_autofill: bool 
         import psycopg
         with psycopg.connect(database_dsn(), connect_timeout=5) as conn, conn.cursor() as cur:
             mark(results, "PostgreSQL", True)
-            cur.execute("SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE migration_id = '072_pipeline_recovery_and_scoped_email_trust.sql')")
-            mark(results, "Migrations through 072", bool(cur.fetchone()[0]))
+            cur.execute("SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE migration_id = '073_runtime_lifecycle_recovery.sql')")
+            mark(results, "Migrations through 073", bool(cur.fetchone()[0]))
             cur.execute("SELECT to_regclass('public.privileged_action_executions') IS NOT NULL")
             mark(results, "Human Approval Bus", bool(cur.fetchone()[0]))
             cur.execute("SELECT to_regclass('public.autofill_action_journal') IS NOT NULL")
@@ -74,7 +74,7 @@ def doctor(*, check_browser: bool, strict: bool = False, require_autofill: bool 
             mark(results, "Immigration profile confirmed", int(cur.fetchone()[0]) == 1)
     except Exception as exc:
         mark(results, "PostgreSQL", False, str(exc)[:180])
-        mark(results, "Migrations through 072", False, "PostgreSQL unavailable")
+        mark(results, "Migrations through 073", False, "PostgreSQL unavailable")
 
     if check_browser:
         # Health only: it validates gateway/CDP availability but does not list
@@ -89,7 +89,7 @@ def doctor(*, check_browser: bool, strict: bool = False, require_autofill: bool 
     for name, ok, detail in results:
         print(f"{'✓' if ok else '⚠'} {name}" + (f" — {detail}" if detail else ""))
     checks = {name: ok for name, ok, _ in results}
-    core = all(checks.get(name, False) for name in ("Python 3.11+", "Environment", "PostgreSQL", "Migrations through 072"))
+    core = all(checks.get(name, False) for name in ("Python 3.11+", "Environment", "PostgreSQL", "Migrations through 073"))
     document_ready = core and checks.get("Resume template", False)
     form_fill_ready = core and all(checks.get(name, False) for name in (
         "Autofill action journal", "No unresolved browser action", "Immigration profile confirmed",
@@ -154,9 +154,10 @@ def autofill_prepare(application_id: str, *, create: bool, yes: bool) -> int:
         application = cur.fetchone()
         if not application:
             raise RuntimeError("Application was not found.")
-        if str(application[5] or "") not in {"application_form_ready", "awaiting_approval"}:
+        if str(application[5] or "") != "application_form_ready":
             raise RuntimeError(
-                f"Autofill can only be prepared from application_form_ready/awaiting_approval; current step is {application[5]!r}."
+                f"Autofill can only be prepared from application_form_ready; current step is {application[5]!r}. "
+                "Resolve/close any prior approval or reconciliation first."
             )
         cur.execute("""SELECT autofill_mode, supports_static_text, supports_radio,
                               supports_select, supports_upload
@@ -321,6 +322,9 @@ def autofill_prepare(application_id: str, *, create: bool, yes: bool) -> int:
                 for pkg in upload_packages
             ], separators=(",", ":")),
 
+            "--delegated-upload-packages-json",
+            json.dumps(upload_packages, separators=(",", ":")),
+
             "--review-context-json",
             json.dumps({
                 "write_actions": summary["write_actions"],
@@ -344,25 +348,33 @@ def autofill_prepare(application_id: str, *, create: bool, yes: bool) -> int:
         conn.rollback()
     rc = subprocess.call(command, cwd=ROOT)
     if rc == 0 and pending_upload_packages:
-        from services.application_actions.action_request_v1 import create_privileged_request
+        # Deterministic repair closes the parent-commit/child-create crash window.
+        # It also binds every delegated child to the exact parent approval id.
         from services.approval.approval_service_v1 import queue_ready_autofill_for_plan
         with psycopg.connect(database_dsn(), autocommit=False) as upload_conn, upload_conn.cursor() as upload_cur:
-            created_uploads = []
-            for package in pending_upload_packages:
-                rid = create_privileged_request(
-                    upload_cur, application_id=application_id, action_type="privileged_upload_document",
-                    payload=package,
-                    summary=f"Upload exact approved {package['document_type']} {package['filename']!r} to field {package['field_label'] or package['field_ref']!r}.",
-                    requested_by="autofill-prepare",
-                )
-                created_uploads.append(rid)
-            # Close the parent/child creation race: if the parent was approved
-            # while child gates were materializing, queue it only after every
-            # expected upload gate now exists and has a human decision.
-            queue_ready_autofill_for_plan(upload_cur, application_id=application_id,
-                                          plan_key=plan_key, actor="autofill-prepare")
+            queue_ready_autofill_for_plan(
+                upload_cur, application_id=application_id, plan_key=plan_key, actor="autofill-prepare",
+            )
+            upload_cur.execute(
+                """SELECT id::text FROM approval_requests
+                     WHERE application_id=%s AND type='autofill_form'
+                       AND payload_json->>'autofill_plan_key'=%s
+                     ORDER BY created_at DESC LIMIT 1;""",
+                (application_id, plan_key),
+            )
+            parent_row = upload_cur.fetchone()
+            parent_request_id = str(parent_row[0]) if parent_row else ""
+            upload_cur.execute(
+                """SELECT id::text FROM approval_requests
+                     WHERE application_id=%s AND type='privileged_upload_document'
+                       AND payload_json->>'parent_approval_request_id'=%s
+                     ORDER BY created_at;""",
+                (application_id, parent_request_id),
+            )
+            created_uploads = [str(row[0]) for row in upload_cur.fetchall()]
             upload_conn.commit()
-        print(json.dumps({"separate_upload_approval_requests": created_uploads}, indent=2))
+        print(json.dumps({"parent_approval_request_id": parent_request_id,
+                          "separate_upload_approval_requests": created_uploads}, indent=2))
     return rc
 
 
@@ -458,7 +470,7 @@ def vault_command(command: str, *, origin: str = "", account: str = "", kind: st
 def gmail_verify_command(*, application_id: str, recipient: str, employer_origin: str = "",
                          since_seconds: int = 300, max_results: int = 10) -> int:
     load_repo_env()
-    argv = [sys.executable, str(ROOT / "services" / "auth" / "gmail_verification_v1.py"),
+    argv = [sys.executable, "-m", "services.auth.gmail_verification_v1",
             "--application-id", application_id, "--recipient", recipient,
             "--since-unix", str(__import__('time').time() - max(1, since_seconds)),
             "--max-results", str(max_results)]
@@ -471,7 +483,7 @@ def gmail_watch_command(*, once: bool = False, wake_listen: bool = False,
                         interval_seconds: int = 10, max_results: int = 10,
                         wake_host: str = "127.0.0.1", wake_port: int = 8791) -> int:
     load_repo_env()
-    argv = [sys.executable, str(ROOT / "services" / "auth" / "gmail_verification_watcher_v1.py"),
+    argv = [sys.executable, "-m", "services.auth.gmail_verification_watcher_v1",
             "--interval-seconds", str(interval_seconds), "--max-results", str(max_results)]
     if once:
         argv.append("--once")

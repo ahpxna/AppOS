@@ -133,6 +133,8 @@ def _keyboard(cur, item_id: str, allowed_user_id: int, item_type: str,
     approve_labels = {
         "privileged_begin_application": "✅ OPEN APPLY",
         "privileged_trust_external_domain": "✅ TRUST DOMAIN",
+        "privileged_choose_create_employer_account_path": "✅ CHOOSE CREATE ACCOUNT",
+        "privileged_choose_navigation_target": "✅ CHOOSE APPLICATION TAB",
         "privileged_create_employer_account": "✅ CREATE ACCOUNT",
         "privileged_login_employer_account": "✅ LOGIN",
         "privileged_use_email_verification": "✅ USE EMAIL VERIFICATION",

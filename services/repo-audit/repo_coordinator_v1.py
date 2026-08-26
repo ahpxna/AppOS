@@ -2,6 +2,14 @@
 """High-reasoning report coordinator; it cannot execute code or modify repos."""
 from __future__ import annotations
 
+# JOBOS_DIRECT_FILE_BOOTSTRAP: keep direct `python path/to/file.py` usable
+# while package imports resolve exactly as they do under `python -m ...`.
+import sys as _jobos_sys
+from pathlib import Path as _JobOSPath
+_JOBOS_ROOT = _JobOSPath(__file__).resolve().parents[2]
+if str(_JOBOS_ROOT) not in _jobos_sys.path:
+    _jobos_sys.path.insert(0, str(_JOBOS_ROOT))
+
 import argparse
 import json
 import os

@@ -101,6 +101,32 @@ def close(cur, task_id: str) -> None:
             WHERE browser_task_id = %s AND status IN ('needs_review', 'completed', 'partial');""",
         (task_id,),
     )
+    # Reconciliation is the explicit human fence that retires the uncertain
+    # execution.  Only after that fence may the application return to a
+    # recoverable form-review state.  The old approval remains terminal and a
+    # fresh approval/page binding is required for any later write.
+    cur.execute(
+        """SELECT application_id::text FROM browser_tasks WHERE id = %s""",
+        (task_id,),
+    )
+    app_row = cur.fetchone()
+    if app_row and app_row[0]:
+        application_id = app_row[0]
+        cur.execute(
+            """UPDATE applications
+                  SET current_step = 'application_form_ready', updated_at = now()
+                WHERE id = %s AND current_step = 'autofill_executing'
+                RETURNING id""",
+            (application_id,),
+        )
+        if cur.fetchone() is not None:
+            cur.execute(
+                """INSERT INTO pipeline_events(application_id, event_type, from_step, to_step, detail_json)
+                   VALUES (%s, 'autofill_reconciliation_closed', 'autofill_executing',
+                           'application_form_ready',
+                           '{"replay": false, "fresh_approval_required": true}'::jsonb)""",
+                (application_id,),
+            )
     print("Closed non-replayable capability. Inspect the form, then issue a fresh approval if needed.")
 
 def main() -> int:

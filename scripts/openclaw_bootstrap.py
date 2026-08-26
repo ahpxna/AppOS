@@ -43,8 +43,8 @@ MODEL_DEFAULTS: Dict[str, str] = {
     "COVER_MODEL": "openrouter/auto",
     "REPO_COORDINATOR_MODEL": "openrouter/auto",
     "LINKEDIN_DISCOVERY_MODEL": "openrouter/auto",
-    "HOOKS_MODEL": "openrouter/meta-llama/llama-3.3-70b-instruct:free",
-    "GMAIL_MODEL": "openrouter/meta-llama/llama-3.3-70b-instruct:free",
+    "HOOKS_MODEL": "openrouter/auto",
+    "GMAIL_MODEL": "openrouter/auto",
 }
 
 

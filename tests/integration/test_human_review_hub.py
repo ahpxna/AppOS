@@ -268,3 +268,78 @@ def test_072_later_page_auth_transitions_exist(db):
         )
         observed = {row[0] for row in cur.fetchall()}
     assert observed == expected
+
+
+def test_privileged_expired_idempotency_slot_recreates_cleanly(db):
+    from services.application_actions.action_request_v1 import create_privileged_request
+
+    app_id, _doc_id = _fixture(db)
+    payload = {"purpose": "integration-ttl"}
+    try:
+        with db.connect(TEST_DSN) as conn, conn.cursor() as cur:
+            first = create_privileged_request(
+                cur,
+                application_id=app_id,
+                action_type="privileged_auth_manual_retry",
+                payload=payload,
+                summary="expired integration request",
+                requested_by="integration-test",
+                ttl_minutes=-1,
+            )
+            conn.commit()
+        with db.connect(TEST_DSN) as conn, conn.cursor() as cur:
+            second = create_privileged_request(
+                cur,
+                application_id=app_id,
+                action_type="privileged_auth_manual_retry",
+                payload=payload,
+                summary="expired integration request",
+                requested_by="integration-test",
+                ttl_minutes=10,
+            )
+            conn.commit()
+        assert second != first
+        with db.connect(TEST_DSN) as conn, conn.cursor() as cur:
+            cur.execute("SELECT status FROM approval_requests WHERE id=%s", (first,))
+            assert cur.fetchone() == ("expired",)
+            cur.execute("SELECT status FROM approval_requests WHERE id=%s", (second,))
+            assert cur.fetchone() == ("pending",)
+    finally:
+        _cleanup(db, app_id)
+
+
+def test_concurrent_privileged_materializers_reuse_one_active_request(db):
+    from concurrent.futures import ThreadPoolExecutor
+    from services.application_actions.action_request_v1 import create_privileged_request
+
+    app_id, _doc_id = _fixture(db)
+    payload = {"purpose": "integration-race"}
+
+    def materialize(_index: int) -> str:
+        with db.connect(TEST_DSN) as conn, conn.cursor() as cur:
+            request_id = create_privileged_request(
+                cur,
+                application_id=app_id,
+                action_type="privileged_mfa_retry",
+                payload=payload,
+                summary="concurrent integration request",
+                requested_by="integration-test",
+                ttl_minutes=10,
+            )
+            conn.commit()
+            return request_id
+
+    try:
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            ids = list(pool.map(materialize, range(6)))
+        assert len(set(ids)) == 1
+        with db.connect(TEST_DSN) as conn, conn.cursor() as cur:
+            cur.execute(
+                """SELECT count(*) FROM approval_requests
+                     WHERE application_id=%s AND type='privileged_mfa_retry'
+                       AND status IN ('pending','approved','executing')""",
+                (app_id,),
+            )
+            assert cur.fetchone() == (1,)
+    finally:
+        _cleanup(db, app_id)

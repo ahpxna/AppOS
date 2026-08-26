@@ -134,20 +134,21 @@ def test_parent_autofill_waits_while_expected_upload_child_is_pending(monkeypatc
     from services.approval import approval_service_v1 as approval
 
     expected = [{"field_ref": "resume", "document_type": "resume", "artifact_id": "a1", "sha256": "a" * 64}]
-    child = {**expected[0], "autofill_plan_key": "plan", "delegated_to_autofill": True}
+    child = {**expected[0], "autofill_plan_key": "plan", "delegated_to_autofill": True, "parent_approval_request_id": "parent"}
 
     class Cur:
         def __init__(self): self.query = ""; self.rowcount = 0
         def execute(self, sql, params=None): self.query = " ".join(sql.split()); self.rowcount = 0
         def fetchall(self):
             if "type='privileged_upload_document'" in self.query:
-                return [("child", child, "pending")]
+                return [("child", child, "pending", None)]
             return []
         def fetchone(self):
             if "type='autofill_form'" in self.query:
-                return ("parent", {"expected_upload_capabilities": expected})
+                return ("parent", {"expected_upload_capabilities": expected}, "approved")
             return None
 
+    monkeypatch.setattr(approval, "_repair_delegated_children_for_parent", lambda *_a, **_k: [])
     monkeypatch.setattr(approval, "assert_binding_matches", lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("must not bind/queue while child pending")))
     assert approval.queue_ready_autofill_for_plan(Cur(), application_id="app", plan_key="plan", actor="test") is False
 
@@ -156,7 +157,7 @@ def test_parent_autofill_queues_after_all_expected_upload_children_resolved(monk
     from services.approval import approval_service_v1 as approval
 
     expected = [{"field_ref": "resume", "document_type": "resume", "artifact_id": "a1", "sha256": "a" * 64}]
-    child = {**expected[0], "autofill_plan_key": "plan", "delegated_to_autofill": True}
+    child = {**expected[0], "autofill_plan_key": "plan", "delegated_to_autofill": True, "parent_approval_request_id": "parent"}
     parent_payload = {"expected_upload_capabilities": expected}
 
     class Cur:
@@ -164,13 +165,14 @@ def test_parent_autofill_queues_after_all_expected_upload_children_resolved(monk
         def execute(self, sql, params=None): self.query = " ".join(sql.split()); self.rowcount = 0
         def fetchall(self):
             if "type='privileged_upload_document'" in self.query:
-                return [("child", child, "approved")]
+                return [("child", child, "approved", None)]
             return []
         def fetchone(self):
             if "type='autofill_form'" in self.query:
-                return ("parent", parent_payload)
+                return ("parent", parent_payload, "approved")
             return None
 
+    monkeypatch.setattr(approval, "_repair_delegated_children_for_parent", lambda *_a, **_k: [])
     monkeypatch.setattr(approval, "assert_binding_matches", lambda *_a, **_k: None)
     queued = []
     monkeypatch.setattr(approval, "_queue_autofill_task", lambda _cur, **kwargs: queued.append(kwargs) or True)

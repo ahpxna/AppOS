@@ -243,11 +243,11 @@ def main() -> int:
         print(f"Mapped {len(mapped)} records: {args.map_output.expanduser()}")
         return 0
     if tk is None:
-        raise SystemExit("Tk desktop support is unavailable. On Ubuntu run: sudo apt install python3-tk") from TK_ERROR
+        raise SystemExit("Tk desktop support is unavailable. Install the Tk bindings for this Python build (macOS: use a python.org/Homebrew Python with Tk; Debian/Ubuntu: sudo apt install python3-tk).") from TK_ERROR
     try:
         root = tk.Tk()
     except tk.TclError as exc:
-        raise SystemExit("Tk desktop support is unavailable. On Ubuntu run: sudo apt install python3-tk") from exc
+        raise SystemExit("Tk desktop support is unavailable. Install the Tk bindings for this Python build (macOS: use a python.org/Homebrew Python with Tk; Debian/Ubuntu: sudo apt install python3-tk).") from exc
     ProjectProfileApp(root, args.path.expanduser())
     root.mainloop()
     return 0

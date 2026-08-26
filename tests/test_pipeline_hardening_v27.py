@@ -122,7 +122,7 @@ def test_parallel_bypass_exact_page_selection_and_js_escaping(monkeypatch):
 
     tabs = [
         {"type": "page", "url": "https://example.com/", "webSocketDebuggerUrl": "ws://wrong"},
-        {"type": "page", "url": "https://www.linkedin.com/jobs/search/", "webSocketDebuggerUrl": "ws://right"},
+        {"type": "page", "url": "https://www.linkedin.com/jobs/search/?keywords=x", "webSocketDebuggerUrl": "ws://right"},
     ]
     assert parallel_bypass._select_exact_page(tabs, "https://www.linkedin.com/jobs/search/?keywords=x") == "ws://right"
     with pytest.raises(RuntimeError):
@@ -173,7 +173,12 @@ def test_application_ready_with_review_and_submit_materializes_two_separate_capa
         return f"approval-{action}-{control['ref']}"
 
     monkeypatch.setattr(action, "_prepare_exact_application_ready_control", prepare_exact)
-    ids = action.materialize_application_ready_gate(object(), "app")
+
+    class Cur:
+        def execute(self, _sql, _params=None):
+            return None
+
+    ids = action.materialize_application_ready_gate(Cur(), "app")
     assert ids == ["approval-advance_application_step-review", "approval-submit_application-submit"]
     assert created == [("advance_application_step", "review"), ("submit_application", "submit")]
 

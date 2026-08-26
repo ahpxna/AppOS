@@ -371,16 +371,20 @@ def main() -> int:
     p.add_argument("--since-unix", type=float, default=time.time() - 300)
     p.add_argument("--max-results", type=int, default=10)
     args = p.parse_args()
-    candidate = discover_verification(recipient=args.recipient,
-                                      requested_at=datetime.fromtimestamp(args.since_unix, tz=timezone.utc),
-                                      employer_origin=args.employer_origin,
-                                      max_results=max(1, min(args.max_results, 20)))
-    if not candidate:
-        print("No bounded verification email found (Inbox/other labels + Spam checked).")
-        return 3
-    with psycopg.connect(database_dsn(), autocommit=False) as conn, conn.cursor() as cur:
-        candidate_id = persist_candidate(cur, application_id=args.application_id, candidate=candidate)
-        conn.commit()
+    try:
+        candidate = discover_verification(recipient=args.recipient,
+                                          requested_at=datetime.fromtimestamp(args.since_unix, tz=timezone.utc),
+                                          employer_origin=args.employer_origin,
+                                          max_results=max(1, min(args.max_results, 20)))
+        if not candidate:
+            print("No bounded verification email found (Inbox/other labels + Spam checked).")
+            return 3
+        with psycopg.connect(database_dsn(), autocommit=False) as conn, conn.cursor() as cur:
+            candidate_id = persist_candidate(cur, application_id=args.application_id, candidate=candidate)
+            conn.commit()
+    except GmailVerificationError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
     print(json.dumps({"candidate_id": candidate_id, "message_id": candidate["message_id"],
                       "kind": candidate["kind"], "sender": candidate.get("sender") or "NaN",
                       "subject": candidate.get("subject") or "NaN",

@@ -1,59 +1,55 @@
-import requests
-import websocket
-import json
-import time
-import random
+"""Compatibility entrypoint for the retained FakeMouse feature.
+
+The active implementation lives in services.autofill.parallel_bypass, where CDP
+I/O is timeout-bounded and LinkedIn discovery fans out only to LinkedIn page
+targets.  Keep this legacy module as a safe adapter so an old import cannot
+silently revive the historical first-tab/no-timeout implementation.
+"""
+from __future__ import annotations
+
 import threading
+import time
 
-def inject_mouse_movements(regimes_file_path):
+import requests
+
+from services.autofill.parallel_bypass import _fake_mouse_routine, _is_linkedin_url
+
+
+def _seed_websocket(cdp_url: str = "http://127.0.0.1:9222/json") -> str:
+    response = requests.get(cdp_url, timeout=3)
+    response.raise_for_status()
+    tabs = [t for t in response.json() if isinstance(t, dict) and t.get("type") == "page"
+            and t.get("webSocketDebuggerUrl")]
+    linkedin = [t for t in tabs if _is_linkedin_url(str(t.get("url") or ""))]
+    candidates = linkedin or tabs
+    if len(candidates) != 1 and not linkedin:
+        raise RuntimeError(f"legacy FakeMouse requires one exact non-LinkedIn page; found {len(candidates)}")
+    if not candidates:
+        raise RuntimeError("no eligible CDP page for FakeMouse")
+    # Any LinkedIn seed is safe: the retained helper enumerates all LinkedIn tabs.
+    return str(candidates[0]["webSocketDebuggerUrl"])
+
+
+def inject_mouse_movements(regimes_file_path: str, *, duration_seconds: float = 5.0) -> None:
+    stop_event = threading.Event()
+    ws_url = _seed_websocket()
+    timer = threading.Timer(max(0.1, float(duration_seconds)), stop_event.set)
+    timer.daemon = True
+    timer.start()
     try:
-        # 1. Kết nối vào tab hiện tại
-        res = requests.get("http://127.0.0.1:9222/json")
-        ws_url = next(t["webSocketDebuggerUrl"] for t in res.json() if t["type"] == "page")
-        ws = websocket.create_connection(ws_url)
+        _fake_mouse_routine(ws_url, regimes_file_path, stop_event)
+    finally:
+        stop_event.set()
+        timer.cancel()
 
-        # 2. Lấy kích thước Viewport để Random tọa độ
-        ws.send(json.dumps({
-            "id": 1,
-            "method": "Runtime.evaluate",
-            "params": {"expression": "({width: window.innerWidth, height: window.innerHeight})", "returnByValue": True}
-        }))
-        size_res = json.loads(ws.recv())
-        viewport = size_res.get("result", {}).get("result", {}).get("value", {"width": 1024, "height": 768})
-        
-        current_x = random.uniform(100, viewport["width"] - 100)
-        current_y = random.uniform(100, viewport["height"] - 100)
 
-        # 3. Đọc dữ liệu mô phỏng từ file JSON
-        with open(regimes_file_path, 'r') as f:
-            regimes = json.load(f).get("regimes", [])
-
-        # 4. Múa chuột
-        dt = 0.02
-        for regime in regimes:
-            drift_x = regime["drift"]["x"]
-            drift_y = regime["drift"]["y"]
-            
-            for _ in range(50): # Mỗi regime kéo dài ~1 giây
-                current_x += (drift_x * dt) + random.gauss(0, 1.5)
-                current_y += (drift_y * dt) + random.gauss(0, 1.5)
-
-                # Giới hạn không cho chuột bay ra khỏi màn hình
-                current_x = max(0, min(current_x, viewport["width"]))
-                current_y = max(0, min(current_y, viewport["height"]))
-
-                ws.send(json.dumps({
-                    "id": random.randint(1000, 9999),
-                    "method": "Input.dispatchMouseEvent",
-                    "params": {"type": "mouseMoved", "x": int(current_x), "y": int(current_y)}
-                }))
-                time.sleep(dt)
-                
-        ws.close()
-    except Exception as e:
-        print(f"[FAKE MOUSE] Lỗi: {e}")
-
-def start_fake_mouse_thread(regimes_file_path):
-    t = threading.Thread(target=inject_mouse_movements, args=(regimes_file_path,))
-    t.daemon = True
-    t.start()
+def start_fake_mouse_thread(regimes_file_path: str, *, duration_seconds: float = 5.0) -> threading.Thread:
+    thread = threading.Thread(
+        target=inject_mouse_movements,
+        args=(regimes_file_path,),
+        kwargs={"duration_seconds": duration_seconds},
+        name="jobos-fake-mouse-compat",
+        daemon=True,
+    )
+    thread.start()
+    return thread

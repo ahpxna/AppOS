@@ -110,7 +110,7 @@ Telegram review is opt-in and not local-only. Enabling it uploads selected resum
 
 - No final application submit from Telegram.
 - No LinkedIn save/unsave mutation.
-- No CAPTCHA solving/checkpoint bypass in Saved Jobs.
+- The OpenClaw discovery agent itself does not solve CAPTCHA/checkpoints. If it reports an explicit blocker, the retained bounded FakeMouse/CapSolver helper may be invoked by the surrounding JobOS handler; JD prose alone must never trigger that helper.
 - No Telegram direct SQL mutation of approval capabilities.
 - No generic memory path for immigration/legal answers.
 - No automatic replay after uncertain browser writes.

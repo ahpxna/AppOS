@@ -292,7 +292,7 @@ def test_privileged_post_io_observable_change_and_consent_helpers():
                                     page_changed=False)
     assert not _consent_effect_verified(approved, [{"ref": "c1", "label": "I agree to terms", "selected": False}],
                                         page_changed=True)
-    assert _consent_effect_verified(approved, [], page_changed=True)
+    assert not _consent_effect_verified(approved, [], page_changed=True)
     assert not _consent_effect_verified(approved, [], page_changed=False)
 
 

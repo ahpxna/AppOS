@@ -63,6 +63,7 @@ from services.discovery.linkedin_discovery_v1 import (
     LinkedInDiscoveryError,
     ingest_discovered_jobs,
     ingest_saved_jobs,
+    blocker_safe_agent_response,
     validate_job_url,
     validate_search_request,
     validate_saved_request,
@@ -219,7 +220,10 @@ def openclaw_agent(*, agent: str, message: str, timeout: int,
             raise TransientTaskError(f"session collision: {err}")
         raise TransientTaskError(f"openclaw agent exit {proc.returncode}: {err}")
 
-    return parse_agent_output(proc.stdout)
+    parsed = parse_agent_output(proc.stdout)
+    if agent == OPENCLAW_AGENT_LINKEDIN_DISCOVERY:
+        return blocker_safe_agent_response(parsed)
+    return parsed
 
 
 def openclaw_health():
@@ -816,14 +820,21 @@ def durable_invalidate_delegated_upload(application_id: str, request_id: str, re
             )
 
 
-def _child_application_binding_matches(cur, application_id: str, payload: dict[str, Any]) -> bool:
+def _child_application_binding_matches(cur, application_id: str, payload: dict[str, Any], *,
+                                       allowed_steps: set[str] | None = None) -> bool:
     cur.execute("SELECT coalesce(job_url,''), coalesce(jd_hash,''), current_step FROM applications WHERE id=%s;",
                 (application_id,))
     row = cur.fetchone()
-    return bool(row and str(payload.get("application_id") or "") == str(application_id)
-                and str(payload.get("job_url") or "") == str(row[0] or "")
-                and str(payload.get("jd_hash") or "") == str(row[1] or "")
-                and str(payload.get("expected_application_step") or "") == str(row[2] or ""))
+    if not row:
+        return False
+    if (str(payload.get("application_id") or "") != str(application_id)
+            or str(payload.get("job_url") or "") != str(row[0] or "")
+            or str(payload.get("jd_hash") or "") != str(row[1] or "")):
+        return False
+    current_step = str(row[2] or "")
+    if allowed_steps is not None:
+        return current_step in allowed_steps
+    return str(payload.get("expected_application_step") or "") == current_step
 
 
 def load_delegated_upload_capabilities(cur, task: Dict[str, Any], binding: Dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -847,9 +858,10 @@ def load_delegated_upload_capabilities(cur, task: Dict[str, Any], binding: Dict[
             WHERE application_id=%s AND type='privileged_upload_document'
               AND status='approved' AND consumed_at IS NULL AND token_expires_at > now()
               AND payload_json->>'autofill_plan_key'=%s
+              AND payload_json->>'parent_approval_request_id'=%s
               AND payload_json->>'delegated_to_autofill'='true'
             ORDER BY created_at;""",
-        (task["application_id"], plan_key),
+        (task["application_id"], plan_key, str(binding.get("id") or "")),
     )
     current_documents = _current_upload_document_bindings(cur, task["application_id"])
     result: dict[str, dict[str, Any]] = {}
@@ -858,9 +870,13 @@ def load_delegated_upload_capabilities(cur, task: Dict[str, Any], binding: Dict[
         request_id, payload = str(request_id), dict(raw_payload or {})
         ident = tuple(str(payload.get(key) or "") for key in ("field_ref", "document_type", "artifact_id", "sha256"))
         invalid = ""
-        if ident not in expected_identities:
+        if str(payload.get("parent_approval_request_id") or "") != str(binding.get("id") or ""):
+            invalid = "Upload child belongs to a different parent autofill approval."
+        elif ident not in expected_identities:
             invalid = "Upload child is not an expected identity of the approved parent plan."
-        elif not _child_application_binding_matches(cur, task["application_id"], payload):
+        elif not _child_application_binding_matches(
+            cur, task["application_id"], payload, allowed_steps={"awaiting_approval", "autofill_executing"}
+        ):
             invalid = "Upload child application/JD/pipeline binding changed."
         try:
             same_url = canonical_page_url(str(payload.get("expected_url") or "")) == canonical_page_url(str(binding.get("expected_initial_url") or ""))
@@ -932,8 +948,25 @@ def _durable_connection():
 
 
 def durable_begin_execution(task: Dict[str, Any], binding: Dict[str, Any], target_id: str) -> None:
-    """Move the capability to executing before the first browser write."""
+    """Acquire the application/browser/capability fence in one durable CAS before I/O."""
     with _durable_connection() as conn, conn.cursor() as cur:
+        expected_step = str(binding.get("expected_application_step") or "awaiting_approval")
+        if expected_step != "awaiting_approval":
+            raise PermanentTaskError("Autofill capability is not bound to awaiting_approval.")
+        cur.execute(
+            """UPDATE applications SET current_step='autofill_executing', updated_at=now()
+                 WHERE id=%s AND current_step=%s
+                 RETURNING id;""",
+            (task["application_id"], expected_step),
+        )
+        if cur.fetchone() is None:
+            raise PermanentTaskError("Application lifecycle changed before browser I/O; refusing the write.")
+        cur.execute(
+            """INSERT INTO pipeline_events(application_id, from_step, to_step, actor, reason, detail_json)
+               VALUES (%s,%s,'autofill_executing',%s,
+                       'Acquired durable application execution fence immediately before deterministic browser I/O.',%s);""",
+            (task["application_id"], expected_step, WORKER_ID, Jsonb({"browser_task_id": task["id"], "target_id": target_id})),
+        )
         cur.execute(
             """
             UPDATE approval_requests
@@ -1018,7 +1051,11 @@ def durable_begin_delegated_upload(task: Dict[str, Any], child: dict[str, Any], 
     if str(payload.get("target_id") or "") != str(target_id):
         raise PermanentTaskError("Upload child target changed after approval.")
     with _durable_connection() as conn, conn.cursor() as cur:
-        if not _child_application_binding_matches(cur, task["application_id"], payload):
+        if str(payload.get("parent_approval_request_id") or "") != str(task.get("approval_request_id") or ""):
+            raise PermanentTaskError("Upload child belongs to a different parent autofill approval.")
+        if not _child_application_binding_matches(
+            cur, task["application_id"], payload, allowed_steps={"autofill_executing"}
+        ):
             raise PermanentTaskError("Upload child application/JD/pipeline binding changed before I/O.")
         cur.execute(
             """UPDATE approval_requests SET status='executing', executing_task_id=%s
@@ -1111,57 +1148,90 @@ def durable_close_unused_upload_capabilities(task: Dict[str, Any], capabilities:
 
 
 def durable_finish_execution(task: Dict[str, Any], binding: Dict[str, Any], result) -> None:
-    """Consume once only after the session finishes, including partial writes.
+    """Durably finish only if the application execution fence still belongs to this run.
 
-    A partially written form must never be retried under the same capability.
-    The journal is the recovery record for the user/reviewer.
+    A post-I/O lifecycle race must never be reported as completed. If the
+    application moved away from autofill_executing, preserve all journals and
+    retire the one-shot capability as non-replayable reconciliation work.
     """
     execution_state = "completed" if result.status == "completed" else "partial"
+    reconcile_reason: str | None = None
     with _durable_connection() as conn, conn.cursor() as cur:
-        cur.execute(
-            """
-            UPDATE approval_requests
-            SET status = 'consumed', consumed_at = now(), consumed_by = %s,
-                executing_task_id = NULL
-            WHERE id = %s AND application_id = %s
-              AND status = 'executing' AND executing_task_id = %s
-            RETURNING id;
-            """,
-            (WORKER_ID, binding["id"], task["application_id"], task["id"]),
-        )
-        if cur.fetchone() is None:
-            raise PermanentTaskError("Executing approval changed unexpectedly; manual reconciliation is required.")
-        cur.execute(
-            """
-            UPDATE browser_tasks
-            SET execution_state = %s, pinned_target_id = %s
-            WHERE id = %s;
-            """,
-            (execution_state, result.target_id, task["id"]),
-        )
-        cur.execute(
-            """UPDATE application_attempts
-                   SET status = %s, finished_at = now(),
-                       detail_json = detail_json || %s
-                 WHERE browser_task_id = %s AND status = 'started';""",
-            (execution_state, Jsonb({"verified_refs": list(result.verified_refs),
-                                     "failed_refs": list(result.failed_refs)}), task["id"]),
-        )
         if execution_state == "completed":
             cur.execute(
                 """UPDATE applications
-                      SET current_step = 'form_filled', updated_at = now()
-                    WHERE id = %s AND current_step = 'awaiting_approval';""",
+                      SET current_step='form_filled', updated_at=now()
+                    WHERE id=%s AND current_step='autofill_executing'
+                    RETURNING id;""",
+                (task["application_id"],),
+            )
+            if cur.fetchone() is None:
+                reconcile_reason = (
+                    "Application lifecycle changed after deterministic browser I/O; "
+                    "browser effects require reconciliation and are not replayable."
+                )
+            else:
+                cur.execute(
+                    """INSERT INTO pipeline_events(
+                           application_id, from_step, to_step, actor, reason, detail_json)
+                       VALUES (%s,'autofill_executing','form_filled',%s,
+                               'Deterministic autofill completed under the application execution fence.',%s);""",
+                    (task["application_id"], WORKER_ID, Jsonb({"browser_task_id": task["id"]})),
+                )
+        else:
+            # Verified partial progress is not an unknown side effect. Release
+            # the execution fence back to the reviewable state; the old task
+            # remains terminal and can never replay.
+            cur.execute(
+                """UPDATE applications SET current_step='awaiting_approval', updated_at=now()
+                     WHERE id=%s AND current_step='autofill_executing';""",
                 (task["application_id"],),
             )
             if cur.rowcount == 1:
                 cur.execute(
-                    """INSERT INTO pipeline_events(
-                           application_id, from_step, to_step, actor, reason, detail_json)
-                       VALUES (%s, 'awaiting_approval', 'form_filled', %s,
-                               'Deterministic autofill completed; final submit remains human-only.', %s);""",
+                    """INSERT INTO pipeline_events(application_id,from_step,to_step,actor,reason,detail_json)
+                       VALUES (%s,'autofill_executing','awaiting_approval',%s,
+                               'Deterministic autofill ended partial; old capability is terminal and a fresh plan is required.',%s);""",
                     (task["application_id"], WORKER_ID, Jsonb({"browser_task_id": task["id"]})),
                 )
+
+        terminal_task_state = "needs_reconciliation" if reconcile_reason else execution_state
+        cur.execute(
+            """UPDATE approval_requests
+                SET status='consumed', consumed_at=now(), consumed_by=%s,
+                    executing_task_id = NULL, action_note=COALESCE(action_note,%s)
+              WHERE id=%s AND application_id=%s
+                AND status='executing' AND executing_task_id=%s
+              RETURNING id;""",
+            (WORKER_ID, reconcile_reason, binding["id"], task["application_id"], task["id"]),
+        )
+        if cur.fetchone() is None:
+            raise PermanentTaskError("Executing approval changed unexpectedly; manual reconciliation is required.")
+        cur.execute(
+            """UPDATE browser_tasks
+                  SET execution_state=%s, pinned_target_id=%s,
+                      error_message=CASE WHEN %s IS NULL THEN error_message ELSE %s END
+                WHERE id=%s;""",
+            (terminal_task_state, result.target_id, reconcile_reason, reconcile_reason, task["id"]),
+        )
+        cur.execute(
+            """UPDATE application_attempts
+                  SET status=%s, finished_at=now(), detail_json=detail_json || %s
+                WHERE browser_task_id=%s AND status='started';""",
+            ("needs_review" if reconcile_reason else execution_state,
+             Jsonb({"verified_refs": list(result.verified_refs),
+                    "failed_refs": list(result.failed_refs),
+                    "reconciliation_reason": reconcile_reason}), task["id"]),
+        )
+        if reconcile_reason:
+            cur.execute(
+                """INSERT INTO application_events(application_id,event_type,event_source,event_payload)
+                   VALUES (%s,'autofill_needs_reconciliation',%s,%s);""",
+                (task["application_id"], WORKER_ID,
+                 Jsonb({"browser_task_id": task["id"], "reason": reconcile_reason})),
+            )
+    if reconcile_reason:
+        raise PermanentTaskError(reconcile_reason)
 
 
 def durable_mark_reconciliation(task: Dict[str, Any], target_id: str | None, reason: str) -> None:
@@ -1204,6 +1274,36 @@ def durable_close_unstarted_approval(task: Dict[str, Any], binding: Dict[str, An
         )
         if cur.rowcount != 1:
             raise PermanentTaskError("Unstarted approval changed unexpectedly; do not reuse it.")
+        plan_key = str(binding.get("autofill_plan_key") or "")
+        parent_request_id = str(binding.get("id") or "")
+        if plan_key and parent_request_id:
+            cur.execute(
+                """UPDATE approval_requests SET status='expired', executing_task_id=NULL,
+                           action_note=COALESCE(action_note,%s)
+                     WHERE application_id=%s AND type='privileged_upload_document'
+                       AND payload_json->>'parent_approval_request_id'=%s
+                       AND payload_json->>'delegated_to_autofill'='true'
+                       AND status IN ('pending','approved');""",
+                ("Parent autofill closed before browser I/O; delegated child is no longer executable.",
+                 task["application_id"], parent_request_id),
+            )
+        cur.execute(
+            """UPDATE applications SET current_step='application_form_ready', updated_at=now()
+                 WHERE id=%s AND current_step='awaiting_approval'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM approval_requests ar
+                        WHERE ar.application_id=applications.id AND ar.type='autofill_form'
+                          AND ar.status IN ('pending','approved','executing')
+                          AND ar.token_expires_at > now()
+                   );""",
+            (task["application_id"],),
+        )
+        if cur.rowcount == 1:
+            cur.execute(
+                """INSERT INTO pipeline_events(application_id,from_step,to_step,actor,reason,detail_json)
+                   VALUES (%s,'awaiting_approval','application_form_ready',%s,%s,%s);""",
+                (task["application_id"], WORKER_ID, reason[:500], Jsonb({"browser_task_id": task["id"]})),
+            )
 
 
 def load_allowed_domains(cur) -> list:
@@ -1211,7 +1311,7 @@ def load_allowed_domains(cur) -> list:
     return [r[0].lower() for r in cur.fetchall()]
 
 
-def check_domain(cur, url: str) -> None:
+def check_domain(cur, url: str, *, application_id: str | None = None) -> None:
     """The domain whitelist existed in the schema (allowed_domains,
     migration 038) and was enforced inside autofill_agent_v1.py, but this
     worker -- the actual single chokepoint where every browser task
@@ -1223,6 +1323,15 @@ def check_domain(cur, url: str) -> None:
     host = (m.group(1) if m else "").lower().split(":")[0]
     for domain in load_allowed_domains(cur):
         if host == domain or host.endswith("." + domain):
+            return
+    if application_id and host:
+        cur.execute(
+            """SELECT 1 FROM application_scoped_domain_trusts
+                 WHERE application_id=%s AND domain=%s AND enabled=true AND expires_at>now()
+                 LIMIT 1;""",
+            (application_id, host),
+        )
+        if cur.fetchone() is not None:
             return
     raise PermanentTaskError(
         f"Domain '{host}' is not in allowed_domains. Add it deliberately:\n"
@@ -1581,14 +1690,8 @@ def handle_fill_application_form(cur, task) -> Dict[str, Any]:
     latest_actions = []
     active_upload: tuple[dict[str, Any], str] | None = None
 
-    # =====================================================================
-    # [THÊM MỚI] BIẾN CHỨA LUỒNG CHUỘT MA AUTOFILL
-    # =====================================================================
-    import threading
-    import requests
-    from services.autofill.parallel_bypass import _fake_mouse_routine
-    mouse_stop_event = threading.Event()
-    mouse_thread = None
+    # Deterministic autofill intentionally does not run synthetic mouse motion.
+    # Hover-driven DOM changes would undermine exact page/ref verification.
 
     def make_plan(state: SnapshotState):
         nonlocal latest_actions
@@ -1620,27 +1723,9 @@ def handle_fill_application_form(cur, task) -> Dict[str, Any]:
         return latest_actions
 
     def begin_execution(target_id: str) -> None:
-        nonlocal execution_started, pinned_target_id, mouse_thread
+        nonlocal execution_started, pinned_target_id
         durable_begin_execution(task, binding, target_id)
         execution_started, pinned_target_id = True, target_id
-        
-        # =====================================================================
-        # [THÊM MỚI] BẬT CHUỘT MA NGAY KHI AUTOFILL VỪA KHÓA MỤC TIÊU
-        # =====================================================================
-        try:
-            res = requests.get(f"{BROWSER_CDP_URL}/json", timeout=2)
-            tabs = res.json()
-            # Tìm đúng tab đang điền form dựa trên target_id
-            ws_url = next(t["webSocketDebuggerUrl"] for t in tabs if t["type"] == "page" and target_id in t.get("webSocketDebuggerUrl", ""))
-            mouse_thread = threading.Thread(
-                target=_fake_mouse_routine,
-                args=(ws_url, "data/pointer-regimes.json", mouse_stop_event)
-            )
-            mouse_thread.daemon = True
-            mouse_thread.start()
-            print("  [FakeMouse] Đã thả chuột ma lượn lờ trong lúc Autofill...")
-        except Exception as e:
-            print(f"  [FakeMouse] Cảnh báo - Không thả được chuột ma khi Autofill: {e}")
 
     def before_io(action, target_id: str, journal_id: str) -> None:
         nonlocal active_upload
@@ -1672,6 +1757,9 @@ def handle_fill_application_form(cur, task) -> Dict[str, Any]:
                 task, child, execution_id, target_id,
                 "Upload I/O occurred but the exact filename/field effect could not be verified.",
             )
+            raise PermanentTaskError(
+                "Delegated upload entered needs_reconciliation; parent autofill stops immediately and cannot continue writes."
+            )
 
     try:
         session = AutofillSession(
@@ -1679,7 +1767,7 @@ def handle_fill_application_form(cur, task) -> Dict[str, Any]:
             expected_initial_url=binding["expected_initial_url"],
             expected_page_fingerprint=binding["expected_page_fingerprint"],
             snapshot_state=lambda target_id: snapshot_state(transport, target_id),
-            origin_allowed=lambda url: check_domain(cur, url),
+            origin_allowed=lambda url: check_domain(cur, url, application_id=task["application_id"]),
             begin_execution=begin_execution,
             before_action=lambda action, target_id: durable_journal_start(task, binding, action, target_id),
             before_io=before_io,
@@ -1713,14 +1801,6 @@ def handle_fill_application_form(cur, task) -> Dict[str, Any]:
         # reviewed and approved afresh instead of leaving idempotency stuck.
         durable_close_unstarted_approval(task, binding, f"Preflight refused: {exc}")
         raise PermanentTaskError(str(exc)) from exc
-    finally:
-        # =====================================================================
-        # [THÊM MỚI] GỌI XONG HOẶC CRASH FORM CŨNG PHẢI TẮT CHUỘT
-        # =====================================================================
-        mouse_stop_event.set()
-        if mouse_thread and mouse_thread.is_alive():
-            mouse_thread.join(timeout=2)
-
     screenshot_path = None
     try:
         # This is deliberately performed only after the deterministic session

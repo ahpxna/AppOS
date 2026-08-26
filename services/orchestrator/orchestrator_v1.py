@@ -55,7 +55,7 @@ DOCGEN_SCRIPT = os.path.join(REPO_ROOT, "services", "document-generation", "gene
 VERIFY_SCRIPT = os.path.join(REPO_ROOT, "services", "document-generation", "verify_document_truth_v1.py")
 RESUME_EXPORT_SCRIPT = os.path.join(REPO_ROOT, "services", "document-generation", "render_verified_resume_v1.py")
 COST_SCRIPT = os.path.join(REPO_ROOT, "services", "cost", "cost_controller_v1.py")
-RESEARCH_SCRIPT = os.path.join(REPO_ROOT, "services", "research", "company_research_v1.py")
+RESEARCH_MODULE = "services.research.company_research_v1"
 MARKET_INTELLIGENCE_SCRIPT = os.path.join(
     REPO_ROOT, "services", "discovery", "market_demand_intelligence_v1.py"
 )
@@ -247,9 +247,20 @@ TRANSIENT_MARKERS = (
 
 
 def run_step(script: str, args: List[str]) -> tuple[bool, str, bool]:
-    """Returns (ok, output, is_transient)."""
+    """Run a legacy script path from the repository root."""
     proc = subprocess.run(
-        [PYTHON, script, *args], capture_output=True, text=True, timeout=1800
+        [PYTHON, script, *args], cwd=REPO_ROOT, capture_output=True, text=True, timeout=1800
+    )
+    out = (proc.stdout or "") + (proc.stderr or "")
+    ok = proc.returncode == 0
+    transient = (not ok) and any(m in out for m in TRANSIENT_MARKERS)
+    return ok, out, transient
+
+
+def run_module(module: str, args: List[str]) -> tuple[bool, str, bool]:
+    """Run internal package entrypoints with import semantics intact."""
+    proc = subprocess.run(
+        [PYTHON, "-m", module, *args], cwd=REPO_ROOT, capture_output=True, text=True, timeout=1800
     )
     out = (proc.stdout or "") + (proc.stderr or "")
     ok = proc.returncode == 0
@@ -297,6 +308,50 @@ def check_cost_budget(task: str) -> tuple[bool, str]:
     )
     out = (proc.stdout or "") + (proc.stderr or "")
     return proc.returncode == 0, out
+
+
+def profile_prerequisite_blockers(cur) -> list[str]:
+    """Return missing profile prerequisites without mutating pipeline state."""
+    blockers: list[str] = []
+    cur.execute("SELECT count(*) FROM profile_assets WHERE status='approved';")
+    if int(cur.fetchone()[0]) == 0:
+        blockers.append("no approved profile assets")
+    cur.execute("SELECT count(*) FROM profile_capabilities WHERE status='approved';")
+    if int(cur.fetchone()[0]) == 0:
+        blockers.append("no approved profile capabilities")
+    cur.execute("SELECT count(*) FROM profile_briefs WHERE is_stale=false;")
+    if int(cur.fetchone()[0]) == 0:
+        blockers.append("no fresh profile briefs")
+    required = {
+        "base_fit_check_support", "base_resume_generation", "base_cover_letter_generation",
+        "base_short_answer_generation", "base_interview_prep", "base_message_reply",
+    }
+    cur.execute(
+        """SELECT purpose FROM profile_context_packs
+             WHERE application_id IS NULL AND message_thread_id IS NULL
+               AND purpose = ANY(%s);""",
+        (sorted(required),),
+    )
+    missing = sorted(required - {str(row[0]) for row in cur.fetchall()})
+    if missing:
+        blockers.append("missing base context packs: " + ", ".join(missing))
+    return blockers
+
+
+def soft_block_missing_profile(cur, *, application_id: str, step: str) -> bool:
+    blockers = profile_prerequisite_blockers(cur)
+    if not blockers:
+        return False
+    detail = "; ".join(blockers)
+    cur.execute(
+        """INSERT INTO pipeline_events(application_id,from_step,to_step,actor,reason,detail_json)
+           VALUES (%s,%s,%s,'pipeline-preflight',%s,%s);""",
+        (application_id, step, step,
+         "Missing profile prerequisites; state preserved for recovery instead of transitioning to error.",
+         Jsonb({"blockers": blockers, "browser_io": False, "fabrication": False})),
+    )
+    print(f"    blocked by profile prerequisites (state preserved): {detail}")
+    return True
 
 
 # ---------------------------------------------------------------- fit review gate
@@ -403,6 +458,8 @@ def advance_one(cur, application_id: str, *, apply: bool) -> None:
         run_filter(cur, application_id, rules)
 
     elif step == "screened":
+        if soft_block_missing_profile(cur, application_id=application_id, step=step):
+            return
         # Cost gate: the fit-analysis call below is the first LLM spend for
         # this job. Refusing here (rather than after the call) is the whole
         # point of a *pre*-spend gate. A budget block is treated as
@@ -465,8 +522,8 @@ def advance_one(cur, application_id: str, *, apply: bool) -> None:
         # and company_research_v1.py sat completely unreferenced. Research
         # is best-effort here: a company with no fetchable web presence, or
         # OpenClaw being unavailable, must not block document generation.
-        rok, rout, _ = run_step(RESEARCH_SCRIPT,
-                                ["--for-application", application_id, "--apply"])
+        rok, rout, _ = run_module(RESEARCH_MODULE,
+                                  ["--for-application", application_id, "--apply"])
         if rok:
             print("    company research: refreshed")
         else:

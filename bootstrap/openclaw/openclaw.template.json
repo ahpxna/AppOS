@@ -58,8 +58,7 @@
           "alias": "OpenRouter"
         },
         "openrouter/google/gemini-2.5-flash": {},
-        "openrouter/free": {},
-        "openrouter/meta-llama/llama-3.3-70b-instruct:free": {}
+        "openrouter/free": {}
       },
       "workspace": "~/.openclaw/workspace-main",
       "compaction": {

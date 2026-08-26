@@ -1,7 +1,7 @@
 import threading
 
 
-def test_linkedin_seed_fans_out_but_non_linkedin_seed_stays_exact(monkeypatch):
+def test_arbitrary_frozen_handler_seed_fans_out_to_live_linkedin_tabs(monkeypatch):
     from services.autofill import parallel_bypass
 
     linkedin_seed = "ws://127.0.0.1:9222/devtools/page/linkedin"
@@ -31,8 +31,11 @@ def test_linkedin_seed_fans_out_but_non_linkedin_seed_stays_exact(monkeypatch):
     parallel_bypass._fake_mouse_routine(ats_seed, "regimes.json", stop)
 
     assert calls[0][:3] == ("linkedin", linkedin_seed, "regimes.json")
-    assert calls[1][:3] == ("exact", ats_seed, "regimes.json")
-    assert calls[1][-1] is False
+    # Frozen discovery handlers may seed the helper with the first browser
+    # page.  If the CDP catalog contains LinkedIn pages, the helper repairs
+    # that arbitrary seed by selecting the LinkedIn controller instead of
+    # touching the unrelated ATS page.
+    assert calls[1][:3] == ("linkedin", ats_seed, "regimes.json")
 
 
 def test_linkedin_controller_enrolls_all_live_tabs_and_new_tabs(monkeypatch):
@@ -92,7 +95,7 @@ def test_captcha_injection_remains_exact_target_even_with_multitab_mouse(monkeyp
     from services.autofill import parallel_bypass
 
     tabs = [
-        {"type": "page", "url": "https://www.linkedin.com/jobs/search/", "webSocketDebuggerUrl": "ws://search"},
+        {"type": "page", "url": "https://www.linkedin.com/jobs/search/?keywords=security", "webSocketDebuggerUrl": "ws://search"},
         {"type": "page", "url": "https://www.linkedin.com/jobs/view/1", "webSocketDebuggerUrl": "ws://detail"},
     ]
     assert parallel_bypass._select_exact_page(

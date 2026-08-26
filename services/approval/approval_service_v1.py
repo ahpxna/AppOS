@@ -331,53 +331,152 @@ def _queue_autofill_task(cur, *, request_id: str, application_id: str, payload: 
     return False
 
 
-def queue_ready_autofill_for_plan(cur, *, application_id: str, plan_key: str, actor: str) -> bool:
-    """Queue an approved parent only after every delegated upload gate exists and is decided.
+def _repair_delegated_children_for_parent(cur, *, application_id: str, parent_request_id: str, payload: dict[str, Any]) -> list[str]:
+    """Deterministically materialize any missing upload children for one exact parent.
 
-    A denied/expired child means only that upload will pause. Pending/missing
-    children keep the parent dormant, preventing approval-order races.
+    Parent creation and child creation historically used separate transactions.  The
+    parent payload therefore carries the exact child packages so any later decision,
+    sync, or queue attempt can repair an interrupted materialization without reusing
+    a child from a different parent session.
     """
+    raw_packages = payload.get("delegated_upload_packages") or []
+    if not isinstance(raw_packages, list):
+        raise RuntimeError("delegated_upload_packages must be a list")
+    created: list[str] = []
+    for raw in raw_packages:
+        if not isinstance(raw, dict):
+            raise RuntimeError("delegated upload package must be an object")
+        package = dict(raw)
+        package["parent_approval_request_id"] = str(parent_request_id)
+        package["delegated_to_autofill"] = True
+        required = ("field_ref", "document_type", "artifact_id", "sha256", "autofill_plan_key")
+        if not all(str(package.get(key) or "") for key in required):
+            raise RuntimeError("delegated upload package is missing an exact binding")
+        from services.application_actions.action_request_v1 import create_privileged_request
+        rid = create_privileged_request(
+            cur, application_id=application_id, action_type="privileged_upload_document",
+            payload=package,
+            summary=(f"Upload exact approved {package['document_type']} {package.get('filename')!r} "
+                     f"to field {package.get('field_label') or package['field_ref']!r} for parent {parent_request_id}."),
+            requested_by="autofill-parent-repair",
+        )
+        created.append(str(rid))
+    return created
+
+
+def queue_ready_autofill_for_plan(cur, *, application_id: str, plan_key: str, actor: str) -> bool:
+    """Repair exact children, then queue only the approved parent they belong to."""
     if not application_id or not plan_key:
         return False
     cur.execute(
-        """UPDATE approval_requests SET status='expired'
-              WHERE application_id=%s AND type='privileged_upload_document'
-                AND payload_json->>'autofill_plan_key'=%s
-                AND payload_json->>'delegated_to_autofill'='true'
-                AND status='pending' AND token_expires_at <= now();""",
-        (application_id, plan_key),
-    )
-    cur.execute(
         """SELECT id::text, payload_json, status FROM approval_requests
-              WHERE application_id=%s AND type='privileged_upload_document'
-                AND payload_json->>'autofill_plan_key'=%s
-                AND payload_json->>'delegated_to_autofill'='true';""",
-        (application_id, plan_key),
-    )
-    children = [(str(r[0]), dict(r[1] or {}), str(r[2] or "")) for r in cur.fetchall()]
-    cur.execute(
-        """SELECT id::text, payload_json FROM approval_requests
               WHERE application_id=%s AND type='autofill_form'
                 AND payload_json->>'autofill_plan_key'=%s
-                AND status='approved' AND consumed_at IS NULL AND token_expires_at > now()
               ORDER BY created_at DESC LIMIT 1 FOR UPDATE;""",
         (application_id, plan_key),
     )
-    row = cur.fetchone()
-    if not row:
+    parent = cur.fetchone()
+    if not parent:
         return False
-    request_id, payload = str(row[0]), dict(row[1] or {})
-    expected = _normalise_expected_uploads(payload.get("expected_upload_capabilities") or [])
+    request_id, raw_payload, parent_status = str(parent[0]), dict(parent[1] or {}), str(parent[2] or "")
+
+    # Self-heal the historical parent-commit/child-materialization crash window.
+    if parent_status in {"pending", "approved"}:
+        _repair_delegated_children_for_parent(
+            cur, application_id=application_id, parent_request_id=request_id, payload=raw_payload,
+        )
+
+    cur.execute(
+        """UPDATE approval_requests SET status='expired'
+              WHERE application_id=%s AND type='privileged_upload_document'
+                AND payload_json->>'parent_approval_request_id'=%s
+                AND payload_json->>'delegated_to_autofill'='true'
+                AND status='pending' AND token_expires_at <= now();""",
+        (application_id, request_id),
+    )
+    if parent_status in {"denied", "expired"}:
+        _close_delegated_children_for_parent(
+            cur, application_id=application_id, plan_key=plan_key,
+            parent_request_id=request_id,
+            reason=f"Parent autofill approval is {parent_status}; delegated upload capability closed.",
+        )
+        return False
+    if parent_status != "approved":
+        return False
+
+    cur.execute(
+        """SELECT ar.id::text, ar.payload_json, ar.status, pae.status
+              FROM approval_requests ar
+              LEFT JOIN privileged_action_executions pae ON pae.approval_request_id=ar.id
+             WHERE ar.application_id=%s AND ar.type='privileged_upload_document'
+               AND ar.payload_json->>'parent_approval_request_id'=%s
+               AND ar.payload_json->>'delegated_to_autofill'='true';""",
+        (application_id, request_id),
+    )
+    children = [(str(r[0]), dict(r[1] or {}), str(r[2] or ""), str(r[3] or "")) for r in cur.fetchall()]
+    expected = _normalise_expected_uploads(raw_payload.get("expected_upload_capabilities") or [])
+    terminal_resolved = {"approved", "denied", "expired", "consumed"}
     for spec in expected:
-        matches = [(rid, child, status) for rid, child, status in children
+        matches = [(rid, child, status, exec_status) for rid, child, status, exec_status in children
                    if all(str(child.get(key) or "") == spec[key]
                           for key in ("field_ref", "document_type", "artifact_id", "sha256"))]
-        if not matches or any(status == "pending" for _rid, _child, status in matches):
+        if len(matches) != 1 or matches[0][2] not in terminal_resolved:
+            return False
+        if matches[0][3] == "needs_reconciliation":
             return False
     assert_binding_matches(cur, {"type": "autofill_form", "application_id": application_id,
-                                 "payload_json": payload, "status": "approved"})
+                                 "payload_json": raw_payload, "status": "approved"})
     return _queue_autofill_task(cur, request_id=request_id, application_id=application_id,
-                                payload=payload, actor=actor)
+                                payload=raw_payload, actor=actor)
+
+
+def _close_delegated_children_for_parent(cur, *, application_id: str, plan_key: str, reason: str, parent_request_id: str | None = None) -> None:
+    if not application_id or not plan_key:
+        return
+    if parent_request_id:
+        cur.execute(
+            """UPDATE approval_requests
+                  SET status='expired', executing_task_id=NULL,
+                      action_note=COALESCE(action_note,%s)
+                WHERE application_id=%s AND type='privileged_upload_document'
+                  AND payload_json->>'parent_approval_request_id'=%s
+                  AND payload_json->>'delegated_to_autofill'='true'
+                  AND status IN ('pending','approved');""",
+            (reason[:500], application_id, parent_request_id),
+        )
+    else:
+        cur.execute(
+            """UPDATE approval_requests
+                  SET status='expired', executing_task_id=NULL,
+                      action_note=COALESCE(action_note,%s)
+                WHERE application_id=%s AND type='privileged_upload_document'
+                  AND payload_json->>'autofill_plan_key'=%s
+                  AND payload_json->>'delegated_to_autofill'='true'
+                  AND status IN ('pending','approved');""",
+            (reason[:500], application_id, plan_key),
+        )
+
+
+def _restore_autofill_ready_after_terminal_parent(cur, *, application_id: str, plan_key: str, reason: str, parent_request_id: str | None = None) -> None:
+    """CAS-safe recovery when an autofill approval ends before browser I/O."""
+    _close_delegated_children_for_parent(cur, application_id=application_id, plan_key=plan_key, reason=reason, parent_request_id=parent_request_id)
+    cur.execute(
+        """UPDATE applications SET current_step='application_form_ready', updated_at=now()
+             WHERE id=%s AND current_step='awaiting_approval'
+               AND NOT EXISTS (
+                   SELECT 1 FROM approval_requests ar
+                    WHERE ar.application_id=applications.id AND ar.type='autofill_form'
+                      AND ar.status IN ('pending','approved','executing')
+                      AND ar.token_expires_at > now()
+               );""",
+        (application_id,),
+    )
+    if cur.rowcount == 1:
+        cur.execute(
+            """INSERT INTO pipeline_events(application_id,from_step,to_step,actor,reason,detail_json)
+               VALUES (%s,'awaiting_approval','application_form_ready','approval-service',%s,%s);""",
+            (application_id, reason[:500], Jsonb({"autofill_plan_key": plan_key})),
+        )
 
 
 # ---------------------------------------------------------------- create
@@ -495,9 +594,9 @@ def cmd_create(conn, args) -> int:
                         "Autofill inputs changed after preview; "
                         "run jobos autofill prepare again."
                     )
-                if str(step or "") not in {"application_form_ready", "awaiting_approval"}:
+                if str(step or "") != "application_form_ready":
                     raise RuntimeError(
-                        f"Autofill approval cannot be created from pipeline step {step!r}."
+                        f"Autofill approval can only be created from application_form_ready; current step is {step!r}."
                     )
                 expected_plan_key = autofill_plan_key(
                     application_id=args.application_id, page_url=expected_page_url,
@@ -509,6 +608,9 @@ def cmd_create(conn, args) -> int:
                 expected_upload_capabilities = _normalise_expected_uploads(
                     json.loads(args.expected_upload_capabilities_json or "[]")
                 )
+                delegated_upload_packages = json.loads(args.delegated_upload_packages_json or "[]")
+                if not isinstance(delegated_upload_packages, list):
+                    raise RuntimeError("--delegated-upload-packages-json must be a JSON list.")
             except (RuntimeError, json.JSONDecodeError) as exc:
                 print(f"ERROR: {exc}")
                 return 1
@@ -525,6 +627,7 @@ def cmd_create(conn, args) -> int:
                 "autofill_action_scope": action_scope,
                 "autofill_plan_key": expected_plan_key,
                 "expected_upload_capabilities": expected_upload_capabilities,
+                "delegated_upload_packages": delegated_upload_packages,
                 # Creation normalizes application_form_ready -> awaiting_approval.
                 # Bind redemption/execution to the post-creation authoritative step.
                 "expected_application_step": "awaiting_approval",
@@ -539,6 +642,7 @@ def cmd_create(conn, args) -> int:
                 "autofill_action_scope": action_scope,
                 "autofill_plan_key": expected_plan_key,
                 "expected_upload_capabilities": expected_upload_capabilities,
+                "delegated_upload_packages": delegated_upload_packages,
                 "application_job_url": str(application_job_url or ""),
                 "application_jd_hash": str(application_jd_hash or ""),
             })
@@ -743,6 +847,14 @@ def redeem(conn, token: str, *, decision: str, note: str, actor: str) -> int:
             return 1
 
         autofill_queued = False
+        if application_id and new_status == "denied" and atype == "autofill_form":
+            parent_payload = request["payload_json"] if isinstance(request.get("payload_json"), dict) else {}
+            _restore_autofill_ready_after_terminal_parent(
+                cur, application_id=application_id,
+                plan_key=str(parent_payload.get("autofill_plan_key") or ""),
+                reason="Human denied the exact autofill capability before browser I/O.",
+                parent_request_id=str(request_id),
+            )
         if application_id and new_status == "approved" and atype == "autofill_form":
             payload = payload_request["payload_json"]
             autofill_queued = queue_ready_autofill_for_plan(
@@ -826,6 +938,14 @@ def decide_request_by_id(conn, request_id: str, *, decision: str, note: str,
         if cur.rowcount != 1:
             return {"ok": False, "error": "Approval request changed state concurrently."}
         autofill_queued = False
+        if application_id and new_status == "denied" and atype == "autofill_form":
+            parent_payload = request["payload_json"] if isinstance(request.get("payload_json"), dict) else {}
+            _restore_autofill_ready_after_terminal_parent(
+                cur, application_id=application_id,
+                plan_key=str(parent_payload.get("autofill_plan_key") or ""),
+                reason="Human denied the exact autofill capability before browser I/O.",
+                parent_request_id=str(rid),
+            )
         if application_id and new_status == "approved" and atype == "autofill_form":
             bound = request["payload_json"]
             autofill_queued = queue_ready_autofill_for_plan(
@@ -896,14 +1016,22 @@ def cmd_expire_stale(conn, args) -> int:
         cur.execute(
             """
             UPDATE approval_requests
-            SET status = 'expired'
+            SET status = 'expired', executing_task_id=NULL
             WHERE status IN ('pending', 'approved') AND token_expires_at <= now()
-            RETURNING id::text;
+            RETURNING id::text, type, application_id::text, payload_json;
             """
         )
-        ids = [r[0] for r in cur.fetchall()]
-        for rid in ids:
+        expired = [(str(r[0]), str(r[1] or ""), str(r[2] or ""), dict(r[3] or {})) for r in cur.fetchall()]
+        ids = [row[0] for row in expired]
+        for rid, atype, application_id, payload in expired:
             log_event(cur, rid, "expired", "system", {})
+            if atype == "autofill_form" and application_id:
+                _restore_autofill_ready_after_terminal_parent(
+                    cur, application_id=application_id,
+                    plan_key=str(payload.get("autofill_plan_key") or ""),
+                    reason="Autofill approval expired before browser I/O.",
+                    parent_request_id=rid,
+                )
         if not args.apply:
             conn.rollback()
             print(f"DRY RUN: {len(ids)} request(s) would be expired.")
@@ -949,6 +1077,8 @@ def main() -> int:
     pc.add_argument("--autofill-plan-key", help="Exact parent-plan SHA-256 linking autofill to delegated upload gates.")
     pc.add_argument("--expected-upload-capabilities-json", default="[]",
                     help="Exact delegated upload child identities that must exist before parent queueing.")
+    pc.add_argument("--delegated-upload-packages-json", default="[]",
+                    help="Exact child packages stored on the parent so interrupted materialization can self-repair.")
     pc.add_argument("--review-context-json", help="Best-effort human-review context. Missing context never weakens execution bindings.")
     pc.add_argument("--apply", action="store_true")
 
