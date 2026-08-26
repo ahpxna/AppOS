@@ -79,7 +79,7 @@ def db():
     original = apply_migrations.connection_string
     apply_migrations.connection_string = lambda: TEST_DSN
     try:
-        assert apply_migrations.apply(argparse.Namespace(dry_run=False, adopt_existing=False, through=73)) == 0
+        assert apply_migrations.apply(argparse.Namespace(dry_run=False, adopt_existing=False, through=None)) == 0
     finally:
         apply_migrations.connection_string = original
     return psycopg

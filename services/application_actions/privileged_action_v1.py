@@ -65,25 +65,11 @@ def _origin(url: str) -> str:
 
 
 def _host_is_allowed(cur, url: str, *, application_id: str | None = None, purpose: str | None = None) -> bool:
-    host = (urlsplit(url).hostname or "").casefold()
-    if not host:
-        return False
-    cur.execute("SELECT domain FROM allowed_domains WHERE enabled=true;")
-    if any(host == str(row[0]).casefold() or host.endswith("." + str(row[0]).casefold())
-           for row in cur.fetchall()):
-        return True
-    if application_id:
-        # Scoped human trust is purpose-bound. An email magic-link grant must
-        # not become permission for ordinary employer navigation/autofill.
-        scoped_purpose = purpose or "employer_handoff"
-        cur.execute(
-            """SELECT 1 FROM application_scoped_domain_trusts
-                 WHERE application_id=%s AND domain=%s AND purpose=%s
-                   AND enabled=true AND expires_at>now() LIMIT 1;""",
-            (application_id, host, scoped_purpose),
-        )
-        return cur.fetchone() is not None
-    return False
+    from services.common.domain_authority_v1 import host_is_authorized
+    # Scoped human trust is purpose-bound. An email magic-link grant must not
+    # become permission for ordinary employer navigation/autofill.
+    return host_is_authorized(cur, url, application_id=application_id,
+                              purpose=purpose or "employer_handoff")
 
 
 def _require_trusted_target(cur, url: str, *, application_id: str | None = None, purpose: str | None = None) -> None:
@@ -274,6 +260,22 @@ def _active_checkpoint_evidence(text: str, nodes: list[dict[str, Any]]) -> bool:
     footer_only = "protected by recaptcha" in text or "protected by hcaptcha" in text
     return weak and not footer_only
 
+
+def _verification_code_field(nodes: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Return an actual OTP control, never an application prose question."""
+    exact_markers = ("verification code", "one-time code", "one time code", "security code", "otp")
+    for node in nodes:
+        if not node.get("ref") or str(node.get("role") or "").casefold() not in INPUT_ROLES:
+            continue
+        label = " ".join(str(node.get("label") or "").casefold().split())
+        autocomplete = str(node.get("autocomplete") or "").casefold()
+        input_type = str(node.get("type") or "").casefold()
+        if autocomplete == "one-time-code":
+            return node
+        if any(marker in label for marker in exact_markers) and input_type in {"", "text", "number", "tel"}:
+            return node
+    return None
+
 def detect_page_state(url: str, snapshot: dict[str, Any], nodes: list[dict[str, Any]]) -> tuple[str, dict[str, Any]]:
     text = f"{url}\n{snapshot.get('snapshot') or ''}".casefold()
     inputs = [n for n in nodes if n.get("ref") and str(n.get("role") or "").casefold() in INPUT_ROLES]
@@ -290,21 +292,9 @@ def detect_page_state(url: str, snapshot: dict[str, Any], nodes: list[dict[str, 
     # questions such as "Describe your email verification experience" or
     # "Have you used an authenticator app?" are never an auth gate merely
     # because their labels contain a keyword.
-    def gate_code_field() -> dict[str, Any] | None:
-        exact_markers = ("verification code", "one-time code", "one time code", "security code", "otp")
-        for node in inputs:
-            label = " ".join(str(node.get("label") or "").casefold().split())
-            autocomplete = str(node.get("autocomplete") or "").casefold()
-            input_type = str(node.get("type") or "").casefold()
-            if autocomplete == "one-time-code":
-                return node
-            if any(marker in label for marker in exact_markers) and input_type in {"", "text", "number", "tel"}:
-                return node
-        return None
-
     # Prose alone must not override an active application form. Verification
     # gates need a dedicated non-form page plus a code-control signal.
-    code_field = gate_code_field()
+    code_field = _verification_code_field(nodes)
     email_verify = ("verify your email", "email verification", "code sent to your email",
                     "code sent to email", "check your email")
     email_path = any(token in (urlsplit(url).path or "").casefold() for token in ("verify", "verification", "confirm-email"))
@@ -327,6 +317,8 @@ def detect_page_state(url: str, snapshot: dict[str, Any], nodes: list[dict[str, 
     dedicated_mfa_page = (not app_form) and any(marker in text for marker in strong_mfa)
     if not app_form and (strong_control_mfa or sms_mfa or dedicated_mfa_page):
         return "needs_mfa", {"reason": "non-email MFA detected"}
+    if not app_form and code_field is not None:
+        return "needs_mfa", {"reason": "generic one-time-code challenge requires human MFA handling"}
 
     password = _find_input(nodes, ("password",))
     path = (urlsplit(url).path or "/").casefold()
@@ -436,14 +428,19 @@ def _document_bindings(cur, application_id: str) -> dict[str, Any]:
             for kind, doc_id, artifact_id, path, filename, sha, source_jd, app_jd in cur.fetchall()}
 
 
-def _document_bindings_still_current(cur, application_id: str, approved: dict[str, Any]) -> bool:
+def _document_bindings_still_current(cur, application_id: str, approved: dict[str, Any],
+                                     *, required_types: set[str] | None = None) -> bool:
     current = _document_bindings(cur, application_id)
-    if current != approved:
+    keys = required_types or set(approved)
+    if any(current.get(kind) != approved.get(kind) for kind in keys):
         return False
-    for item in current.values():
+    for kind in keys:
+        item = current.get(kind)
+        if not isinstance(item, dict):
+            return False
         if not item.get("source_jd_hash") or item.get("source_jd_hash") != item.get("application_jd_hash"):
             return False
-    return _document_hashes_still_match(current)
+    return _document_hashes_still_match({kind: current[kind] for kind in keys})
 
 
 def _consent_items(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -529,7 +526,8 @@ def prepare(cur, *, application_id: str, action: str, candidate_id: str | None =
             raise PrivilegedActionError(
                 "OPEN APPLY requires the exact QA-passed resume PDF to be human-approved first"
             )
-        if not _document_bindings_still_current(cur, application_id, approved_documents):
+        if not _document_bindings_still_current(cur, application_id, approved_documents,
+                                                required_types={"resume"}):
             raise PrivilegedActionError(
                 "approved resume artifact changed or is stale against the current job description"
             )
@@ -592,13 +590,19 @@ def prepare(cur, *, application_id: str, action: str, candidate_id: str | None =
     elif action == "use_email_verification":
         if not candidate_id:
             raise PrivilegedActionError("--candidate-id is required")
+        _require_application_step(cur, application_id, "needs_email_verification")
+        page_state, _page_detail = detect_page_state(url, snapshot, nodes)
+        if page_state != "needs_email_verification":
+            raise PrivilegedActionError("browser is not on an exact email-verification gate")
         cur.execute("""SELECT gmail_account, gmail_message_id, sender, subject, received_at, verification_kind, secret_sha256, secret_context_json
                        FROM email_verification_candidates WHERE id=%s AND application_id=%s AND status IN ('discovered','approved');""",
                     (candidate_id, application_id))
         row = cur.fetchone()
         if not row:
             raise PrivilegedActionError("verification candidate unavailable")
-        field = _find_input(nodes, ("code", "verification", "otp", "one-time")) if row[5] == "numeric_code" else None
+        field = _verification_code_field(nodes) if row[5] == "numeric_code" else None
+        if row[5] == "numeric_code" and field is None:
+            raise PrivilegedActionError("email verification code field could not be structurally exact-bound")
         button = None
         if row[5] == "numeric_code":
             try: button = _find_exact_control(nodes, VERIFY_LABELS)
@@ -607,8 +611,10 @@ def prepare(cur, *, application_id: str, action: str, candidate_id: str | None =
                         "subject": row[3] or "NaN", "received_at": row[4].isoformat() if row[4] else "NaN",
                         "verification_kind": row[5], "secret_sha256": row[6], "secret_context": row[7] or {},
                         "field_ref": str(field.get('ref')) if field else "NaN",
+                        "field_label": str(field.get('label') or "NaN") if field else "NaN",
+                        "verification_origin": _origin(url),
                         "control_ref": button["ref"] if button else "NaN", "control_label": button["label"] if button else "NaN"})
-        atype = "privileged_use_email_verification"; summary = f"Use exact Gmail verification {row[5]} from mailbox {row[0]} after Telegram approval; secret stays out of DB/Telegram."
+        atype = "privileged_use_email_verification"; summary = f"Use exact Gmail verification {row[5]} in field {payload['field_label']!r} at {_origin(url)} after Telegram approval; secret stays out of DB/Telegram."
     else:
         raise PrivilegedActionError(f"unsupported prepare action: {action}")
     return create_privileged_request(cur, application_id=application_id, action_type=atype,
@@ -730,6 +736,12 @@ def _snapshot_text_sha256(snapshot: dict[str, Any]) -> str:
 def _observable_page_change(*, before_target: str, before_url: str, before_snapshot: dict[str, Any],
                             after: dict[str, Any]) -> bool:
     """Return whether a post-I/O read proves a visible navigation/modal/page change."""
+    # A classified set of newly-observed targets is browser evidence, even
+    # when authority cannot safely pick one.  Preserve that ambiguity for the
+    # post-commit exact-target chooser instead of trying to parse a missing
+    # synthetic URL and turning a completed click into reconciliation.
+    if after.get("followup") == "navigation_target_ambiguity":
+        return bool(after.get("navigation_candidates"))
     if str(after.get("target_id") or "") != str(before_target):
         return True
     if canonical_page_url(str(after.get("url") or "")) != canonical_page_url(str(before_url)):
@@ -799,15 +811,18 @@ def _select_after_navigation_target(transport: OpenClawTransport, source_target:
                 changed_source = False
         score = 0
         if state != "unknown":
-            score += 50
-        if changed_source:
             score += 100
+        if changed_source:
+            # URL movement is useful supporting evidence, but an unclassified
+            # tracking redirect must never beat a semantically identified ATS
+            # form/auth page.
+            score += 40
         if not is_source and str(tab.get("openerId") or "") == str(source_target):
-            score += 20
+            score += 30
         candidates.append({"target_id": tid, "url": canonical_page_url(url), "page_fingerprint": fp,
                            "state": state, "score": score, "source_changed": changed_source})
 
-    plausible = [item for item in candidates if int(item["score"]) >= 50]
+    plausible = [item for item in candidates if int(item["score"]) >= 100]
     if plausible:
         best = max(int(item["score"]) for item in plausible)
         winners = [item for item in plausible if int(item["score"]) == best]
@@ -853,9 +868,35 @@ def _after_navigation(cur, transport: OpenClawTransport, application_id: str, so
             "page_fingerprint": fp, "consent_items": _consent_items(nodes)}
 
 
+def _pre_io_target_catalog(transport: OpenClawTransport, tabs: list[dict[str, Any]]) -> list[dict[str, str]]:
+    """Minimal durable tab lineage evidence for a crash-safe Apply recovery."""
+    result: list[dict[str, str]] = []
+    for tab in tabs:
+        target_id = transport._stable_id(tab)
+        if target_id:
+            result.append({"target_id": str(target_id), "url": str(tab.get("url") or ""),
+                           "opener_id": str(tab.get("openerId") or "")})
+    return result
+
+
+def _persist_pre_io_target_catalog(execution_id: str, catalog: list[dict[str, str]]) -> None:
+    """Write lineage in a separate committed transaction before browser I/O."""
+    import psycopg
+    with psycopg.connect(database_dsn(), autocommit=True) as conn, conn.cursor() as cur:
+        cur.execute(
+            """UPDATE privileged_action_executions
+                  SET result_json=coalesce(result_json, '{}'::jsonb) || %s
+                WHERE id=%s AND status='running';""",
+            (Jsonb({"pre_io_targets": catalog}), execution_id),
+        )
+        if cur.rowcount != 1:
+            raise PrivilegedActionError("could not durably persist pre-I/O browser target catalog")
+
+
 def _reconciliation_target_snapshot(transport: OpenClawTransport, payload: dict[str, Any], *,
                                     require_exact_page: bool = False,
-                                    allow_handoff_discovery: bool = False) -> tuple[str, str, dict[str, Any], list[dict[str, Any]], str]:
+                                    allow_handoff_discovery: bool = False,
+                                    pre_io_target_ids: set[str] | None = None) -> tuple[str, str, dict[str, Any], list[dict[str, Any]], str]:
     """Resolve reconciliation evidence from the approval-bound target, never browser focus."""
     target_id = str(payload.get("target_id") or "")
     if target_id:
@@ -887,6 +928,8 @@ def _reconciliation_target_snapshot(transport: OpenClawTransport, payload: dict[
     expected_origin = str(payload.get("expected_origin") or "")
     candidates: list[tuple[str, str, dict[str, Any], list[dict[str, Any]], str]] = []
     handoff_candidates: list[tuple[int, str, str, dict[str, Any], list[dict[str, Any]], str]] = []
+    if allow_handoff_discovery and pre_io_target_ids is None:
+        raise PrivilegedActionError("Apply recovery lacks a durable pre-I/O target catalog; cannot infer a new tab safely")
     try:
         for tab in transport._tabs():
             tid = transport._stable_id(tab)
@@ -896,6 +939,8 @@ def _reconciliation_target_snapshot(transport: OpenClawTransport, payload: dict[
             try:
                 url, snap, nodes, fp = _snapshot(transport, tid)
                 if allow_handoff_discovery:
+                    if str(tid) in pre_io_target_ids:
+                        continue
                     if canonical_page_url(url) == canonical_page_url(expected_url):
                         continue
                     state, _detail = detect_page_state(url, snap, nodes)
@@ -938,14 +983,17 @@ def reconcile_observed_privileged_effect(cur, *, application_id: str, approval_r
                                          action_type: str) -> dict[str, Any]:
     """Reconstruct state from exact approval-bound browser evidence without replay."""
     cur.execute(
-        """SELECT payload_json FROM approval_requests
-             WHERE id=%s AND application_id=%s;""",
+        """SELECT ar.payload_json, coalesce(pae.result_json, '{}'::jsonb)
+             FROM approval_requests ar
+             LEFT JOIN privileged_action_executions pae ON pae.approval_request_id=ar.id
+             WHERE ar.id=%s AND ar.application_id=%s;""",
         (approval_request_id, application_id),
     )
     row = cur.fetchone()
     if not row:
         raise PrivilegedActionError("reconciliation approval payload is unavailable")
     payload = dict(row[0] or {})
+    execution_result = dict(row[1] or {})
 
     if action_type == "privileged_submit_application":
         _transition_application_step(
@@ -981,8 +1029,13 @@ def reconcile_observed_privileged_effect(cur, *, application_id: str, approval_r
     if action_type not in recoverable:
         return {"followup": "none", "note": "No browser state reconstruction is required for this action type."}
 
+    raw_catalog = execution_result.get("pre_io_targets")
+    pre_io_target_ids = ({str(item.get("target_id")) for item in raw_catalog
+                          if isinstance(item, dict) and item.get("target_id")}
+                         if isinstance(raw_catalog, list) else None)
     observed_target, url, snap, nodes, fp = _reconciliation_target_snapshot(
         transport, payload, allow_handoff_discovery=(action_type == "privileged_begin_application"),
+        pre_io_target_ids=pre_io_target_ids,
     )
     # For a navigation handoff, an unchanged source page is not evidence that
     # the external effect occurred. Leave reconciliation open rather than using
@@ -1040,13 +1093,15 @@ def _confirmation(*, before_snapshot: dict[str, Any], before_url: str,
     after_text = f"{after_url}\n{after_snapshot.get('snapshot') or ''}".casefold()
     newly_appeared = any(marker in after_text and marker not in before_text for marker in markers)
     route_changed = canonical_page_url(after_url) != canonical_page_url(before_url)
-    route_hint = any(token in urlsplit(after_url).path.casefold() for token in ("confirm", "thank", "submitted", "success", "complete"))
     after_nodes = parse_snapshot(after_snapshot)
     submit_still_present = any(str(node.get("ref") or "") == str(submit_ref) for node in after_nodes)
     if submit_still_present:
         return False
     snapshot_changed = _snapshot_text_sha256(after_snapshot) != _snapshot_text_sha256(before_snapshot)
-    return (newly_appeared and (route_changed or snapshot_changed)) or (route_changed and route_hint)
+    # Route words alone are not submission proof: e.g. /complete-profile is
+    # often the next unfinished application page. A newly observed provider
+    # success marker is mandatory.
+    return newly_appeared and (route_changed or snapshot_changed)
 
 
 def _upload_effect_verified(*, before_snapshot: dict[str, Any], after_snapshot: dict[str, Any],
@@ -1383,6 +1438,7 @@ def execute_one(conn, request_id: str) -> dict[str, Any]:
                 before_tabs = transport._tabs()
                 if atype == "privileged_begin_application":
                     _require_application_step(cur, app_id, "docs_verified")
+                    _persist_pre_io_target_catalog(execution_id, _pre_io_target_catalog(transport, before_tabs))
                     io_started = True; _click(transport, target_id, str(payload["control_ref"]))
                     _transition_application_step(
                         cur, application_id=app_id, to_step="application_entrypoint_ready",

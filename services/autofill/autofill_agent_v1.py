@@ -270,14 +270,15 @@ def load_allowed_domains(cur) -> List[str]:
     return [r[0].lower() for r in cur.fetchall()]
 
 
-def check_domain(cur, url: str) -> None:
+def check_domain(cur, url: str, *, application_id: str | None = None,
+                 purpose: str = "employer_handoff") -> None:
     if not url.startswith(("http://", "https://")):
         raise AutofillError(f"Refusing non-http(s) URL: {url[:120]}")
     m = re.search(r"https?://([^/]+)", url)
     host = (m.group(1) if m else "").lower().split(":")[0]
-    for domain in load_allowed_domains(cur):
-        if host == domain or host.endswith("." + domain):
-            return
+    from services.common.domain_authority_v1 import host_is_authorized
+    if host_is_authorized(cur, url, application_id=application_id, purpose=purpose):
+        return
     raise AutofillError(
         f"Domain '{host}' is not in allowed_domains. Add it deliberately:\n"
         f"  INSERT INTO allowed_domains (domain, category) "

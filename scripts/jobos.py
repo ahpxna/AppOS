@@ -187,12 +187,10 @@ def autofill_prepare(application_id: str, *, create: bool, yes: bool) -> int:
         )
         target = transport.resolve_target()
         actual_url = transport.current_url(target.target_id)
-        from urllib.parse import urlsplit
-        host = (urlsplit(actual_url).hostname or "").casefold()
-        cur.execute("SELECT domain FROM allowed_domains WHERE enabled = true;")
-        allowed = [str(row[0]).casefold() for row in cur.fetchall()]
-        if not any(host == domain or host.endswith("." + domain) for domain in allowed):
-            raise RuntimeError("Pinned browser tab is outside the enabled JobOS browser allowlist.")
+        from services.common.domain_authority_v1 import host_is_authorized
+        if not host_is_authorized(cur, actual_url, application_id=application_id,
+                                  purpose="employer_handoff"):
+            raise RuntimeError("Pinned browser tab is outside the active global or application-scoped employer trust.")
         snapshot = transport.snapshot(target.target_id)
         if snapshot.get("truncated"):
             raise RuntimeError("Browser snapshot is truncated; open the complete form before preparing approval.")

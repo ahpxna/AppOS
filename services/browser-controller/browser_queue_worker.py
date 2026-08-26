@@ -1388,22 +1388,12 @@ def check_domain(cur, url: str, *, application_id: str | None = None,
     OpenClaw -- never called it. A JD or company page containing a link
     could send the agent anywhere. Fixed 2026-07-31: enforced here too,
     same logic as autofill_agent_v1.py's check_domain."""
+    from services.common.domain_authority_v1 import host_is_authorized
     m = re.search(r"https?://([^/]+)", url)
     host = (m.group(1) if m else "").lower().split(":")[0]
-    for domain in load_allowed_domains(cur):
-        if host == domain or host.endswith("." + domain):
-            return
-    if application_id and host:
-        scoped_purpose = purpose or "employer_handoff"
-        cur.execute(
-            """SELECT 1 FROM application_scoped_domain_trusts
-                 WHERE application_id=%s AND domain=%s AND purpose=%s
-                   AND enabled=true AND expires_at>now()
-                 LIMIT 1;""",
-            (application_id, host, scoped_purpose),
-        )
-        if cur.fetchone() is not None:
-            return
+    if host_is_authorized(cur, url, application_id=application_id,
+                          purpose=purpose or "employer_handoff"):
+        return
     raise PermanentTaskError(
         f"Domain '{host}' is not in allowed_domains. Add it deliberately:\n"
         f"  INSERT INTO allowed_domains (domain, category) "
