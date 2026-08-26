@@ -41,6 +41,7 @@ from psycopg.types.json import Jsonb
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from services.common.config import database_dsn, load_repo_env
 from services.common.autofill_identity import canonical_page_url
+from services.common.autofill_action_scope import autofill_plan_key
 from services.autofill.autofill_context_v1 import load_autofill_context
 
 load_repo_env()
@@ -229,6 +230,17 @@ def assert_binding_matches(cur, request_row: Dict[str, Any]) -> None:
     elif atype == "autofill_form":
         if not application_id:
             raise RuntimeError("Autofill approval request missing application_id.")
+        cur.execute("SELECT coalesce(job_url,''), coalesce(jd_hash,''), current_step FROM applications WHERE id=%s;",
+                    (application_id,))
+        app = cur.fetchone()
+        if not app:
+            raise RuntimeError("Autofill application no longer exists.")
+        if str(payload.get("application_job_url") or "") != str(app[0] or ""):
+            raise RuntimeError("Autofill approval job URL changed after preview; prepare a fresh plan.")
+        if str(payload.get("application_jd_hash") or "") != str(app[1] or ""):
+            raise RuntimeError("Autofill approval JD changed after preview; prepare a fresh plan.")
+        if str(payload.get("expected_application_step") or "") != str(app[2] or ""):
+            raise RuntimeError("Autofill approval pipeline step changed; prepare a fresh plan.")
         document_id = payload.get("document_id")
         if not document_id:
             raise RuntimeError("Autofill approval payload missing document_id.")
@@ -254,6 +266,14 @@ def assert_binding_matches(cur, request_row: Dict[str, Any]) -> None:
         )
         if current_hash != payload.get("autofill_input_hash"):
             raise RuntimeError("Autofill inputs or JD changed after preview; prepare and approve a fresh plan.")
+        current_plan_key = autofill_plan_key(
+            application_id=application_id,
+            page_url=str(payload.get("expected_initial_url") or ""),
+            page_fingerprint=str(payload.get("expected_page_fingerprint") or ""),
+            input_hash=current_hash, action_scope=payload.get("autofill_action_scope") or {},
+        )
+        if current_plan_key != str(payload.get("autofill_plan_key") or ""):
+            raise RuntimeError("Autofill plan binding changed after preview; prepare a fresh plan.")
 
 
 def log_event(cur, request_id: Optional[str], event: str,
@@ -265,6 +285,99 @@ def log_event(cur, request_id: Optional[str], event: str,
         """,
         (request_id, event, actor, Jsonb(detail or {})),
     )
+
+
+# ---------------------------------------------------------------- autofill parent/child gating
+
+def _normalise_expected_uploads(raw: Any) -> list[dict[str, str]]:
+    if not isinstance(raw, list):
+        raise RuntimeError("Expected upload capabilities must be a JSON list.")
+    result: list[dict[str, str]] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            raise RuntimeError("Expected upload capability entries must be objects.")
+        spec = {key: str(item.get(key) or "") for key in ("field_ref", "document_type", "artifact_id", "sha256")}
+        if not all(spec.values()) or len(spec["sha256"]) != 64:
+            raise RuntimeError("Expected upload capabilities require exact field/document/artifact/SHA bindings.")
+        ident = tuple(spec[key] for key in ("field_ref", "document_type", "artifact_id", "sha256"))
+        if ident not in seen:
+            seen.add(ident); result.append(spec)
+    return sorted(result, key=lambda item: (item["field_ref"], item["document_type"], item["artifact_id"], item["sha256"]))
+
+
+def _queue_autofill_task(cur, *, request_id: str, application_id: str, payload: dict[str, Any], actor: str) -> bool:
+    cur.execute(
+        """INSERT INTO browser_tasks
+             (task_type, requested_by, application_id, status, priority,
+              input_json, approval_request_id, expected_origin, generated_document_id,
+              document_sha256, timeout_seconds, bound_artifact_id, artifact_sha256,
+              artifact_filename, expected_initial_url, expected_page_fingerprint,
+              autofill_input_hash, autofill_action_scope, idempotency_key, created_at)
+           VALUES ('fill_application_form', %s, %s, 'queued', 'high', '{}'::jsonb,
+                   %s, %s, %s, %s, 300, %s, %s, %s, %s, %s, %s, %s, %s, now())
+           ON CONFLICT (approval_request_id) WHERE approval_request_id IS NOT NULL DO NOTHING;""",
+        (actor, application_id, request_id, payload["expected_origin"], payload["document_id"],
+         payload["document_sha256"], payload.get("artifact_id"), payload.get("artifact_sha256"),
+         payload.get("artifact_filename"), payload["expected_initial_url"],
+         payload["expected_page_fingerprint"], payload["autofill_input_hash"],
+         Jsonb(payload.get("autofill_action_scope") or {}), f"autofill:{request_id}"),
+    )
+    if cur.rowcount == 1:
+        log_event(cur, request_id, "autofill_task_queued", actor,
+                  {"expected_origin": payload["expected_origin"], "document_id": payload["document_id"],
+                   "autofill_plan_key": payload.get("autofill_plan_key")})
+        return True
+    return False
+
+
+def queue_ready_autofill_for_plan(cur, *, application_id: str, plan_key: str, actor: str) -> bool:
+    """Queue an approved parent only after every delegated upload gate exists and is decided.
+
+    A denied/expired child means only that upload will pause. Pending/missing
+    children keep the parent dormant, preventing approval-order races.
+    """
+    if not application_id or not plan_key:
+        return False
+    cur.execute(
+        """UPDATE approval_requests SET status='expired'
+              WHERE application_id=%s AND type='privileged_upload_document'
+                AND payload_json->>'autofill_plan_key'=%s
+                AND payload_json->>'delegated_to_autofill'='true'
+                AND status='pending' AND token_expires_at <= now();""",
+        (application_id, plan_key),
+    )
+    cur.execute(
+        """SELECT id::text, payload_json, status FROM approval_requests
+              WHERE application_id=%s AND type='privileged_upload_document'
+                AND payload_json->>'autofill_plan_key'=%s
+                AND payload_json->>'delegated_to_autofill'='true';""",
+        (application_id, plan_key),
+    )
+    children = [(str(r[0]), dict(r[1] or {}), str(r[2] or "")) for r in cur.fetchall()]
+    cur.execute(
+        """SELECT id::text, payload_json FROM approval_requests
+              WHERE application_id=%s AND type='autofill_form'
+                AND payload_json->>'autofill_plan_key'=%s
+                AND status='approved' AND consumed_at IS NULL AND token_expires_at > now()
+              ORDER BY created_at DESC LIMIT 1 FOR UPDATE;""",
+        (application_id, plan_key),
+    )
+    row = cur.fetchone()
+    if not row:
+        return False
+    request_id, payload = str(row[0]), dict(row[1] or {})
+    expected = _normalise_expected_uploads(payload.get("expected_upload_capabilities") or [])
+    for spec in expected:
+        matches = [(rid, child, status) for rid, child, status in children
+                   if all(str(child.get(key) or "") == spec[key]
+                          for key in ("field_ref", "document_type", "artifact_id", "sha256"))]
+        if not matches or any(status == "pending" for _rid, _child, status in matches):
+            return False
+    assert_binding_matches(cur, {"type": "autofill_form", "application_id": application_id,
+                                 "payload_json": payload, "status": "approved"})
+    return _queue_autofill_task(cur, request_id=request_id, application_id=application_id,
+                                payload=payload, actor=actor)
 
 
 # ---------------------------------------------------------------- create
@@ -282,23 +395,26 @@ def cmd_create(conn, args) -> int:
         )
         if args.application_id:
             cur.execute(
-                "SELECT company, job_title, current_step FROM applications WHERE id = %s;",
+                "SELECT company, job_title, current_step, coalesce(job_url,''), coalesce(jd_hash,'') FROM applications WHERE id = %s;",
                 (args.application_id,),
             )
             row = cur.fetchone()
             if not row:
                 print(f"ERROR: application not found: {args.application_id}")
                 return 1
-            company, job_title, step = row
+            company, job_title, step, application_job_url, application_jd_hash = row
             summary = args.summary or (
                 f"{args.type}: {company} / {job_title} (currently at {step})"
             )
         else:
-            company = job_title = step = None
+            company = job_title = step = application_job_url = application_jd_hash = None
             summary = args.summary or args.type
 
         payload = {"company": company, "job_title": job_title,
                    "service_version": SERVICE_VERSION}
+        if args.application_id:
+            payload["application_job_url"] = str(application_job_url or "")
+            payload["application_jd_hash"] = str(application_jd_hash or "")
         if getattr(args, "review_context_json", None):
             try:
                 review_context = json.loads(args.review_context_json)
@@ -341,13 +457,13 @@ def cmd_create(conn, args) -> int:
                 artifact = (fetch_artifact_binding(cur, args.application_id, args.document_id, args.artifact_id)
                             if args.artifact_id else None)
                 action_scope = json.loads(args.autofill_action_scope_json or "{}")
-                if (not isinstance(action_scope, dict) or int(action_scope.get("version") or 0) != 2
+                if (not isinstance(action_scope, dict) or int(action_scope.get("version") or 0) != 3
                         or not isinstance(action_scope.get("actions"), list)):
-                    raise RuntimeError("--autofill-action-scope-json must contain exact version=2 actions from jobos autofill prepare.")
+                    raise RuntimeError("--autofill-action-scope-json must contain exact version=3 actions from jobos autofill prepare.")
                 for item in action_scope["actions"]:
-                    if (not isinstance(item, dict) or item.get("action") not in {"fill", "select", "check"}
+                    if (not isinstance(item, dict) or item.get("action") not in {"fill", "select", "check", "upload"}
                             or not item.get("ref") or not item.get("value_sha256")):
-                        raise RuntimeError("autofill action scope contains a non-exact or upload action; prepare a fresh plan.")
+                        raise RuntimeError("autofill action scope contains a non-exact action; prepare a fresh plan.")
                 input_hash = current_autofill_input_hash(
                     cur,
                     application_id=args.application_id,
@@ -379,6 +495,20 @@ def cmd_create(conn, args) -> int:
                         "Autofill inputs changed after preview; "
                         "run jobos autofill prepare again."
                     )
+                if str(step or "") not in {"application_form_ready", "awaiting_approval"}:
+                    raise RuntimeError(
+                        f"Autofill approval cannot be created from pipeline step {step!r}."
+                    )
+                expected_plan_key = autofill_plan_key(
+                    application_id=args.application_id, page_url=expected_page_url,
+                    page_fingerprint=args.expected_page_fingerprint.casefold(),
+                    input_hash=input_hash, action_scope=action_scope,
+                )
+                if str(args.autofill_plan_key or "").casefold() != expected_plan_key:
+                    raise RuntimeError("--autofill-plan-key does not match the exact current form plan.")
+                expected_upload_capabilities = _normalise_expected_uploads(
+                    json.loads(args.expected_upload_capabilities_json or "[]")
+                )
             except (RuntimeError, json.JSONDecodeError) as exc:
                 print(f"ERROR: {exc}")
                 return 1
@@ -393,6 +523,11 @@ def cmd_create(conn, args) -> int:
                 "artifact_sha256": artifact["sha256"] if artifact else None,
                 "artifact_filename": artifact["filename"] if artifact else None,
                 "autofill_action_scope": action_scope,
+                "autofill_plan_key": expected_plan_key,
+                "expected_upload_capabilities": expected_upload_capabilities,
+                # Creation normalizes application_form_ready -> awaiting_approval.
+                # Bind redemption/execution to the post-creation authoritative step.
+                "expected_application_step": "awaiting_approval",
             })
             idempotency_key = hash_json({
                 "type": args.type, "application_id": args.application_id,
@@ -402,6 +537,10 @@ def cmd_create(conn, args) -> int:
                 "artifact_id": artifact["id"] if artifact else None,
                 "artifact_sha256": artifact["sha256"] if artifact else None,
                 "autofill_action_scope": action_scope,
+                "autofill_plan_key": expected_plan_key,
+                "expected_upload_capabilities": expected_upload_capabilities,
+                "application_job_url": str(application_job_url or ""),
+                "application_jd_hash": str(application_jd_hash or ""),
             })
         elif args.type == "fit_review" and args.application_id:
             payload["content_hash"] = hash_json({
@@ -603,31 +742,20 @@ def redeem(conn, token: str, *, decision: str, note: str, actor: str) -> int:
             print("  Request changed state concurrently. Nothing done.")
             return 1
 
+        autofill_queued = False
         if application_id and new_status == "approved" and atype == "autofill_form":
             payload = payload_request["payload_json"]
-            cur.execute(
-                """
-                INSERT INTO browser_tasks
-                  (task_type, requested_by, application_id, status, priority,
-                   input_json, approval_request_id, expected_origin,
-                   generated_document_id, document_sha256, timeout_seconds,
-                   bound_artifact_id, artifact_sha256, artifact_filename,
-                   expected_initial_url, expected_page_fingerprint, autofill_input_hash,
-                   autofill_action_scope,
-                   idempotency_key, created_at)
-                VALUES ('fill_application_form', %s, %s, 'queued', 'high',
-                        '{}'::jsonb, %s, %s, %s, %s, 300, %s, %s, %s, %s, %s, %s, %s, %s, now())
-                ON CONFLICT (approval_request_id) WHERE approval_request_id IS NOT NULL DO NOTHING;
-                """,
-                (actor, application_id, request_id, payload["expected_origin"],
-                 payload["document_id"], payload["document_sha256"], payload.get("artifact_id"),
-                 payload.get("artifact_sha256"), payload.get("artifact_filename"), payload["expected_initial_url"],
-                 payload["expected_page_fingerprint"], payload["autofill_input_hash"],
-                 Jsonb(payload.get("autofill_action_scope") or {}), f"autofill:{request_id}"),
+            autofill_queued = queue_ready_autofill_for_plan(
+                cur, application_id=application_id,
+                plan_key=str(payload.get("autofill_plan_key") or ""), actor=actor,
             )
-            log_event(cur, request_id, "autofill_task_queued", actor, {
-                "expected_origin": payload["expected_origin"], "document_id": payload["document_id"],
-            })
+        elif application_id and atype == "privileged_upload_document":
+            child_payload = payload_request["payload_json"]
+            if isinstance(child_payload, dict) and child_payload.get("delegated_to_autofill") is True:
+                autofill_queued = queue_ready_autofill_for_plan(
+                    cur, application_id=application_id,
+                    plan_key=str(child_payload.get("autofill_plan_key") or ""), actor=actor,
+                )
 
         log_event(cur, request_id, new_status, actor, {"note": note})
         conn.commit()
@@ -638,8 +766,11 @@ def redeem(conn, token: str, *, decision: str, note: str, actor: str) -> int:
         print(f"  summary:     {summary}")
         if application_id and new_status == "approved" and atype == "autofill_form":
             print("\n  One document/page/input-bound autofill capability is approved.")
-            print("  A deterministic one-time browser task was queued; it re-checks page identity and")
-            print("  verifies every write. It never submits the application.")
+            if autofill_queued:
+                print("  All delegated upload gates are resolved; the one-time browser task was queued.")
+            else:
+                print("  Waiting for separate document-upload decisions before the browser task can queue.")
+            print("  It re-checks page identity and verifies every write. It never submits the application.")
         return 0
 
 
@@ -694,33 +825,28 @@ def decide_request_by_id(conn, request_id: str, *, decision: str, note: str,
         )
         if cur.rowcount != 1:
             return {"ok": False, "error": "Approval request changed state concurrently."}
+        autofill_queued = False
         if application_id and new_status == "approved" and atype == "autofill_form":
             bound = request["payload_json"]
-            cur.execute(
-                """INSERT INTO browser_tasks
-                     (task_type, requested_by, application_id, status, priority,
-                      input_json, approval_request_id, expected_origin,
-                      generated_document_id, document_sha256, timeout_seconds,
-                      bound_artifact_id, artifact_sha256, artifact_filename,
-                      expected_initial_url, expected_page_fingerprint, autofill_input_hash,
-                      autofill_action_scope, idempotency_key, created_at)
-                   VALUES ('fill_application_form', %s, %s, 'queued', 'high',
-                           '{}'::jsonb, %s, %s, %s, %s, 300, %s, %s, %s, %s, %s, %s, %s, %s, now())
-                   ON CONFLICT (approval_request_id) WHERE approval_request_id IS NOT NULL DO NOTHING;""",
-                (actor, application_id, rid, bound["expected_origin"],
-                 bound["document_id"], bound["document_sha256"], bound.get("artifact_id"),
-                 bound.get("artifact_sha256"), bound.get("artifact_filename"),
-                 bound["expected_initial_url"], bound["expected_page_fingerprint"],
-                 bound["autofill_input_hash"], Jsonb(bound.get("autofill_action_scope") or {}),
-                 f"autofill:{rid}"),
+            autofill_queued = queue_ready_autofill_for_plan(
+                cur, application_id=application_id,
+                plan_key=str(bound.get("autofill_plan_key") or ""), actor=actor,
             )
-            log_event(cur, rid, "autofill_task_queued", actor,
-                      {"expected_origin": bound["expected_origin"], "document_id": bound["document_id"]})
+        elif application_id and atype == "privileged_upload_document":
+            child = request["payload_json"]
+            if isinstance(child, dict) and child.get("delegated_to_autofill") is True:
+                autofill_queued = queue_ready_autofill_for_plan(
+                    cur, application_id=application_id,
+                    plan_key=str(child.get("autofill_plan_key") or ""), actor=actor,
+                )
+
         log_event(cur, rid, new_status, actor, {"note": note, "channel": "trusted_review_ui"})
     if commit:
         conn.commit()
     return {"ok": True, "request_id": rid, "status": new_status,
-            "type": atype, "application_id": application_id}
+            "type": atype, "application_id": application_id,
+            "autofill_queued": bool(autofill_queued),
+            "delegated_to_autofill": bool((request.get("payload_json") or {}).get("delegated_to_autofill"))}
 
 
 # ---------------------------------------------------------------- list / expire
@@ -820,6 +946,9 @@ def main() -> int:
         ),
     )
     pc.add_argument("--autofill-action-scope-json", help="Exact action-scope JSON emitted by jobos autofill prepare.")
+    pc.add_argument("--autofill-plan-key", help="Exact parent-plan SHA-256 linking autofill to delegated upload gates.")
+    pc.add_argument("--expected-upload-capabilities-json", default="[]",
+                    help="Exact delegated upload child identities that must exist before parent queueing.")
     pc.add_argument("--review-context-json", help="Best-effort human-review context. Missing context never weakens execution bindings.")
     pc.add_argument("--apply", action="store_true")
 

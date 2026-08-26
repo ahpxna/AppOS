@@ -75,7 +75,8 @@ class AutofillSession:
                  snapshot_state: Callable[[str], SnapshotState], origin_allowed: Callable[[str], None],
                  begin_execution: Callable[[str], None], before_action: Callable[[PlannedAction, str], str],
                  after_verified: Callable[[PlannedAction, str, str], None],
-                 after_failed: Callable[[PlannedAction, str, str], None]):
+                 after_failed: Callable[[PlannedAction, str, str], None],
+                 before_io: Callable[[PlannedAction, str, str], None] | None = None):
         self.transport = transport
         self.expected_origin = _origin(expected_origin)
         self.expected_initial_url = canonical_page_url(expected_initial_url)
@@ -84,6 +85,7 @@ class AutofillSession:
         self.origin_allowed = origin_allowed
         self.begin_execution, self.before_action = begin_execution, before_action
         self.after_verified, self.after_failed = after_verified, after_failed
+        self.before_io = before_io
 
     def _assert_origin(self, target: BrowserTarget) -> None:
         current = self.transport.current_url(target.target_id)
@@ -155,6 +157,8 @@ class AutofillSession:
                 continue
             journal_id = self.before_action(candidate, target.target_id)
             self._assert_origin(target)
+            if self.before_io is not None:
+                self.before_io(candidate, target.target_id, journal_id)
             self.transport.execute(target.target_id, {"action": candidate.action, "target": candidate.ref, "value": candidate.value or ""})
             executed.append(candidate.ref)
             self._assert_origin(target)

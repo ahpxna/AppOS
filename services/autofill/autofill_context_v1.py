@@ -115,10 +115,15 @@ def load_autofill_context(
         if str(doc_type) not in {"resume", "cover_letter"}:
             continue
         path = Path(str(file_path)).expanduser().resolve()
+        # Supplemental approved documents are planning conveniences, not the
+        # capability's primary artifact binding. If one disappeared or was
+        # tampered with, omit only that optional upload from the planner so the
+        # corresponding field pauses for human review while safe text fields
+        # can still proceed. The exact primary artifact above remains hard-bound.
         if not path.is_file() or root not in path.parents or path.name != str(filename):
-            raise AutofillContextError(f"Current approved {doc_type} artifact is missing or outside managed data.")
+            continue
         if hashlib.sha256(path.read_bytes()).hexdigest() != str(digest):
-            raise AutofillContextError(f"Current approved {doc_type} artifact bytes changed.")
+            continue
         profile["documents"][str(doc_type)] = str(path)
 
     cur.execute(

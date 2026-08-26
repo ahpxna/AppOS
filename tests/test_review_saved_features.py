@@ -103,7 +103,9 @@ def test_worker_retry_policy_never_blindly_replays_journaled_autofill():
 def test_approval_create_expires_ttl_stale_idempotency_rows_first():
     source = (Path(__file__).resolve().parents[1] / "services" / "approval" / "approval_service_v1.py").read_text(encoding="utf-8")
     start = source.index("def cmd_create")
-    end = source.index("def cmd_decide", start) if "def cmd_decide" in source[start:] else start + 9000
+    # Bound the actual function section instead of assuming it stays below an
+    # arbitrary source length; helper additions must not disable this guard.
+    end = source.index("# ---------------------------------------------------------------- redeem", start)
     create_logic = source[start:end]
     expiry = create_logic.index("token_expires_at <= now()")
     lookup = create_logic.index("WHERE idempotency_key = %s")

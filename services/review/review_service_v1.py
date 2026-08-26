@@ -1024,6 +1024,8 @@ def decide_item(conn, item_id: str, *, decision: str, actor: str, note: str = ""
     if capability_result:
         response["approval_request_id"] = approval_id
         response["approval_type"] = capability_result.get("type")
+        response["delegated_to_autofill"] = bool(capability_result.get("delegated_to_autofill"))
+        response["autofill_queued"] = bool(capability_result.get("autofill_queued"))
     if materialized_approval_id:
         response["materialized_approval_request_id"] = materialized_approval_id
     if materialized_approval_ids:

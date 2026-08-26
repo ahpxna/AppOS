@@ -142,17 +142,22 @@ def autofill_prepare(application_id: str, *, create: bool, yes: bool) -> int:
     from services.autofill.form_inspector_v1 import inspect_nodes, inspect_question_groups
     from services.common.immigration_semantics import classify_immigration_question
     from services.common.question_memory import normalize_question
-    from services.common.autofill_action_scope import build_exact_action_scope
+    from services.common.autofill_action_scope import build_exact_action_scope, autofill_plan_key
     with psycopg.connect(database_dsn(), autocommit=False) as conn, conn.cursor() as cur:
         cur.execute(
             """SELECT company, job_title, coalesce(ats_type, 'unknown'),
-                      approved_resume_id::text, approved_resume_artifact_id::text
+                      approved_resume_id::text, approved_resume_artifact_id::text,
+                      current_step, coalesce(job_url,''), coalesce(jd_hash,'')
                  FROM applications WHERE id = %s;""",
             (application_id,),
         )
         application = cur.fetchone()
         if not application:
             raise RuntimeError("Application was not found.")
+        if str(application[5] or "") not in {"application_form_ready", "awaiting_approval"}:
+            raise RuntimeError(
+                f"Autofill can only be prepared from application_form_ready/awaiting_approval; current step is {application[5]!r}."
+            )
         cur.execute("""SELECT autofill_mode, supports_static_text, supports_radio,
                               supports_select, supports_upload
                        FROM ats_capabilities WHERE ats_type = %s;""", (application[2],))
@@ -214,13 +219,18 @@ def autofill_prepare(application_id: str, *, create: bool, yes: bool) -> int:
         writes = [item for item in actions if item.action in {"fill", "select", "check"}]
         upload_actions = [item for item in actions if item.action == "upload"]
         pauses = [item.question_label or item.reason for item in actions if item.action == "pause"]
-        action_scope = build_exact_action_scope(writes)
+        action_scope = build_exact_action_scope([*writes, *upload_actions])
         # Human-facing summary keys remain useful, but authorization is the
         # exact action list in build_exact_action_scope().
         action_scope["sensitive_classes"] = sorted({kind.value for item in writes if item.question_label
                                                     for kind in [classify_immigration_question(item.question_label)] if kind is not None})
         action_scope["remembered_questions"] = sorted({normalize_question(item.question_label) for item in writes
                                                        if item.profile_key is None and item.question_label and classify_immigration_question(item.question_label) is None})
+        plan_key = autofill_plan_key(
+            application_id=application_id, page_url=canonical_url,
+            page_fingerprint=fingerprint, input_hash=context.input_hash,
+            action_scope=action_scope,
+        )
         upload_packages = []
         for item in upload_actions:
             doc_type = str(item.profile_key or "").removeprefix("documents.")
@@ -249,6 +259,7 @@ def autofill_prepare(application_id: str, *, create: bool, yes: bool) -> int:
                 "document_type": doc_type, "generated_document_id": bound[0], "artifact_id": bound[1],
                 "file_path": bound[2], "filename": bound[3], "sha256": bound[4],
                 "source_jd_hash": str(bound[5]), "application_jd_hash": str(bound[6]),
+                "autofill_plan_key": plan_key, "delegated_to_autofill": True,
                 "review_context": {"screenshot_path": "NaN", "upload": {"field": item.question_label or item.ref, "document_type": doc_type, "filename": bound[3], "sha256": bound[4]}},
             })
         summary = {
@@ -262,7 +273,7 @@ def autofill_prepare(application_id: str, *, create: bool, yes: bool) -> int:
             "separate_upload_approvals": [{"field": pkg["field_label"], "ref": pkg["field_ref"],
                                             "document_type": pkg["document_type"], "filename": pkg["filename"],
                                             "sha256": pkg["sha256"]} for pkg in upload_packages],
-            "action_scope": action_scope, "will_pause": pauses,
+            "action_scope": action_scope, "autofill_plan_key": plan_key, "will_pause": pauses,
             "submit": "telegram_human_approval_required",
         }
         print(json.dumps(summary, indent=2))
@@ -300,6 +311,16 @@ def autofill_prepare(application_id: str, *, create: bool, yes: bool) -> int:
             "--autofill-action-scope-json",
             json.dumps(action_scope, separators=(",", ":")),
 
+            "--autofill-plan-key",
+            plan_key,
+
+            "--expected-upload-capabilities-json",
+            json.dumps([
+                {"field_ref": pkg["field_ref"], "document_type": pkg["document_type"],
+                 "artifact_id": pkg["artifact_id"], "sha256": pkg["sha256"]}
+                for pkg in upload_packages
+            ], separators=(",", ":")),
+
             "--review-context-json",
             json.dumps({
                 "write_actions": summary["write_actions"],
@@ -324,6 +345,7 @@ def autofill_prepare(application_id: str, *, create: bool, yes: bool) -> int:
     rc = subprocess.call(command, cwd=ROOT)
     if rc == 0 and pending_upload_packages:
         from services.application_actions.action_request_v1 import create_privileged_request
+        from services.approval.approval_service_v1 import queue_ready_autofill_for_plan
         with psycopg.connect(database_dsn(), autocommit=False) as upload_conn, upload_conn.cursor() as upload_cur:
             created_uploads = []
             for package in pending_upload_packages:
@@ -334,6 +356,11 @@ def autofill_prepare(application_id: str, *, create: bool, yes: bool) -> int:
                     requested_by="autofill-prepare",
                 )
                 created_uploads.append(rid)
+            # Close the parent/child creation race: if the parent was approved
+            # while child gates were materializing, queue it only after every
+            # expected upload gate now exists and has a human decision.
+            queue_ready_autofill_for_plan(upload_cur, application_id=application_id,
+                                          plan_key=plan_key, actor="autofill-prepare")
             upload_conn.commit()
         print(json.dumps({"separate_upload_approval_requests": created_uploads}, indent=2))
     return rc

@@ -698,7 +698,7 @@ def require_bound_approval(cur, task: Dict[str, Any]) -> Dict[str, Any]:
         SELECT id::text, target_action, bound_document_id::text,
                bound_document_sha256, expected_origin, bound_artifact_id::text,
                bound_artifact_sha256, bound_artifact_filename, expected_initial_url,
-               expected_page_fingerprint, bound_autofill_input_hash, bound_autofill_action_scope
+               expected_page_fingerprint, bound_autofill_input_hash, bound_autofill_action_scope, payload_json
         FROM approval_requests
         WHERE id = %s
           AND application_id = %s
@@ -713,7 +713,16 @@ def require_bound_approval(cur, task: Dict[str, Any]) -> Dict[str, Any]:
         raise PermanentTaskError(
             "No valid unused approval exists for this exact application capability."
         )
-    approved_id, target_action, bound_doc, bound_hash, bound_origin, artifact_id, artifact_hash, artifact_filename, page_url, page_fingerprint_sha, input_hash, action_scope = row
+    approved_id, target_action, bound_doc, bound_hash, bound_origin, artifact_id, artifact_hash, artifact_filename, page_url, page_fingerprint_sha, input_hash, action_scope, approval_payload = row
+    approval_payload = dict(approval_payload or {})
+    cur.execute("SELECT coalesce(job_url,''), coalesce(jd_hash,''), current_step FROM applications WHERE id=%s;",
+                (application_id,))
+    app_row = cur.fetchone()
+    if (not app_row
+            or str(app_row[0] or "") != str(approval_payload.get("application_job_url") or "")
+            or str(app_row[1] or "") != str(approval_payload.get("application_jd_hash") or "")
+            or str(app_row[2] or "") != str(approval_payload.get("expected_application_step") or "")):
+        raise PermanentTaskError("Autofill application job/JD/pipeline binding changed after approval.")
     if target_action != "fill_application_form":
         raise PermanentTaskError(f"Approval {approved_id} is not for fill_application_form.")
     if bound_doc != document_id or bound_hash != document_sha256:
@@ -738,7 +747,12 @@ def require_bound_approval(cur, task: Dict[str, Any]) -> Dict[str, Any]:
     return {"id": approved_id, "document_id": document_id, "expected_origin": origin,
             "artifact_id": artifact_id, "artifact_sha256": artifact_hash, "artifact_filename": artifact_filename,
             "expected_initial_url": page_url, "expected_page_fingerprint": page_fingerprint_sha,
-            "autofill_input_hash": input_hash, "autofill_action_scope": action_scope or {}}
+            "autofill_input_hash": input_hash, "autofill_action_scope": action_scope or {},
+            "autofill_plan_key": str(approval_payload.get("autofill_plan_key") or ""),
+            "expected_upload_capabilities": approval_payload.get("expected_upload_capabilities") or [],
+            "application_job_url": str(approval_payload.get("application_job_url") or ""),
+            "application_jd_hash": str(approval_payload.get("application_jd_hash") or ""),
+            "expected_application_step": str(approval_payload.get("expected_application_step") or "")}
 
 
 def require_current_input_hash(binding: Dict[str, Any], current_hash: str) -> None:
@@ -753,10 +767,157 @@ def action_is_in_approved_scope(action, scope: Dict[str, Any]) -> bool:
     """Authorize only the exact human-reviewed write tuple.
 
     Dynamic fields revealed after approval are never covered by a profile-key
-    wildcard. A changed ref/label/value needs a fresh capability. Uploads use
-    ``privileged_upload_document`` and are always refused here.
+    wildcard. Upload identity is part of the parent scope, but browser upload
+    still requires a separately approved delegated child capability.
     """
     return action_is_exactly_approved(action, scope)
+
+
+
+def _current_upload_document_bindings(cur, application_id: str) -> dict[str, dict[str, str]]:
+    cur.execute(
+        """SELECT gd.doc_type, gd.id::text, gda.id::text, gda.file_path, gda.filename, gda.sha256,
+                  gd.source_jd_hash, a.jd_hash
+             FROM applications a
+             JOIN generated_document_artifacts gda
+               ON gda.id IN (a.approved_resume_artifact_id, a.approved_cover_letter_artifact_id)
+             JOIN generated_documents gd ON gd.id = gda.generated_document_id
+            WHERE a.id=%s AND gda.application_id=a.id AND gd.application_id=a.id
+              AND ((gd.doc_type='resume' AND gd.id=a.approved_resume_id AND gda.id=a.approved_resume_artifact_id)
+                OR (gd.doc_type='cover_letter' AND gd.id=a.approved_cover_letter_id AND gda.id=a.approved_cover_letter_artifact_id));""",
+        (application_id,),
+    )
+    return {
+        str(kind): {
+            "generated_document_id": str(doc_id), "artifact_id": str(artifact_id),
+            "file_path": str(path), "filename": str(filename), "sha256": str(sha),
+            "source_jd_hash": str(source_jd or ""), "application_jd_hash": str(app_jd or ""),
+        }
+        for kind, doc_id, artifact_id, path, filename, sha, source_jd, app_jd in cur.fetchall()
+    }
+
+
+def durable_invalidate_delegated_upload(application_id: str, request_id: str, reason: str) -> None:
+    """Expire one unusable child before I/O; unrelated safe form fields may continue."""
+    with _durable_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """UPDATE approval_requests
+                  SET status='expired', action_note=%s
+                WHERE id=%s AND application_id=%s AND type='privileged_upload_document'
+                  AND status='approved' AND consumed_at IS NULL
+                RETURNING id;""",
+            (f"Delegated upload invalidated before browser I/O: {reason}"[:500], request_id, application_id),
+        )
+        if cur.fetchone() is not None:
+            cur.execute(
+                """INSERT INTO approval_events(approval_request_id,event,actor,detail_json)
+                   VALUES (%s,'expired',%s,%s);""",
+                (request_id, WORKER_ID, Jsonb({"reason": reason[:500], "browser_io_started": False})),
+            )
+
+
+def _child_application_binding_matches(cur, application_id: str, payload: dict[str, Any]) -> bool:
+    cur.execute("SELECT coalesce(job_url,''), coalesce(jd_hash,''), current_step FROM applications WHERE id=%s;",
+                (application_id,))
+    row = cur.fetchone()
+    return bool(row and str(payload.get("application_id") or "") == str(application_id)
+                and str(payload.get("job_url") or "") == str(row[0] or "")
+                and str(payload.get("jd_hash") or "") == str(row[1] or "")
+                and str(payload.get("expected_application_step") or "") == str(row[2] or ""))
+
+
+def load_delegated_upload_capabilities(cur, task: Dict[str, Any], binding: Dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Load only live upload children for this exact parent plan.
+
+    Invalid/stale children are expired before any browser I/O and omitted, so
+    the planner degrades that upload to a pause instead of aborting safe writes.
+    """
+    plan_key = str(binding.get("autofill_plan_key") or "")
+    if not plan_key:
+        return {}
+    expected = binding.get("expected_upload_capabilities")
+    expected = expected if isinstance(expected, list) else []
+    expected_identities = {
+        tuple(str(item.get(key) or "") for key in ("field_ref", "document_type", "artifact_id", "sha256"))
+        for item in expected if isinstance(item, dict)
+    }
+    cur.execute(
+        """SELECT id::text, payload_json
+             FROM approval_requests
+            WHERE application_id=%s AND type='privileged_upload_document'
+              AND status='approved' AND consumed_at IS NULL AND token_expires_at > now()
+              AND payload_json->>'autofill_plan_key'=%s
+              AND payload_json->>'delegated_to_autofill'='true'
+            ORDER BY created_at;""",
+        (task["application_id"], plan_key),
+    )
+    current_documents = _current_upload_document_bindings(cur, task["application_id"])
+    result: dict[str, dict[str, Any]] = {}
+    ambiguous: set[str] = set()
+    for request_id, raw_payload in cur.fetchall():
+        request_id, payload = str(request_id), dict(raw_payload or {})
+        ident = tuple(str(payload.get(key) or "") for key in ("field_ref", "document_type", "artifact_id", "sha256"))
+        invalid = ""
+        if ident not in expected_identities:
+            invalid = "Upload child is not an expected identity of the approved parent plan."
+        elif not _child_application_binding_matches(cur, task["application_id"], payload):
+            invalid = "Upload child application/JD/pipeline binding changed."
+        try:
+            same_url = canonical_page_url(str(payload.get("expected_url") or "")) == canonical_page_url(str(binding.get("expected_initial_url") or ""))
+        except ValueError:
+            same_url = False
+        if not invalid and (not same_url
+                or str(payload.get("expected_origin") or "") != str(binding.get("expected_origin") or "")
+                or str(payload.get("expected_page_fingerprint") or "") != str(binding.get("expected_page_fingerprint") or "")):
+            invalid = "Upload child page binding changed."
+        doc_type = str(payload.get("document_type") or "")
+        approved_doc = {key: str(payload.get(key) or "") for key in (
+            "generated_document_id", "artifact_id", "file_path", "filename", "sha256",
+            "source_jd_hash", "application_jd_hash",
+        )}
+        if not invalid and (current_documents.get(doc_type) != approved_doc
+                or not approved_doc["source_jd_hash"]
+                or approved_doc["source_jd_hash"] != approved_doc["application_jd_hash"]):
+            invalid = "Upload child document pointer/JD binding changed."
+        path: Path | None = None
+        if not invalid:
+            try:
+                path = Path(approved_doc["file_path"]).expanduser().resolve()
+                if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != approved_doc["sha256"].casefold():
+                    invalid = "Upload child artifact bytes changed or are unavailable."
+            except (OSError, RuntimeError, ValueError):
+                invalid = "Upload child artifact bytes changed or are unavailable."
+        ref = str(payload.get("field_ref") or "")
+        if not invalid and not ref:
+            invalid = "Upload child field binding is missing."
+        if invalid:
+            durable_invalidate_delegated_upload(task["application_id"], request_id, invalid)
+            continue
+        if ref in ambiguous:
+            durable_invalidate_delegated_upload(task["application_id"], request_id, "Duplicate delegated upload field is ambiguous.")
+            continue
+        if ref in result:
+            prior = result.pop(ref)
+            ambiguous.add(ref)
+            durable_invalidate_delegated_upload(task["application_id"], str(prior["id"]), "Duplicate delegated upload field is ambiguous.")
+            durable_invalidate_delegated_upload(task["application_id"], request_id, "Duplicate delegated upload field is ambiguous.")
+            continue
+        result[ref] = {"id": request_id, "payload": payload, "resolved_path": str(path)}
+    return result
+
+
+def upload_capability_matches_action(action, child: dict[str, Any], scope: Dict[str, Any]) -> bool:
+    payload = child.get("payload") if isinstance(child, dict) else None
+    if not isinstance(payload, dict) or not action_is_in_approved_scope(action, scope):
+        return False
+    doc_type = str(getattr(action, "profile_key", "") or "").removeprefix("documents.")
+    try:
+        action_path = str(Path(str(getattr(action, "value", "") or "")).expanduser().resolve())
+    except Exception:
+        return False
+    return (str(payload.get("field_ref") or "") == str(getattr(action, "ref", "") or "")
+            and str(payload.get("document_type") or "") == doc_type
+            and str(child.get("resolved_path") or "") == action_path)
 
 
 def _durable_connection():
@@ -848,6 +1009,104 @@ def durable_journal_failed(action, target_id: str, journal_id: str) -> None:
             WHERE id = %s AND status = 'started';
             """,
             (Jsonb({"target_id": target_id, "ref": action.ref, "action": action.action}), journal_id),
+        )
+
+
+
+def durable_begin_delegated_upload(task: Dict[str, Any], child: dict[str, Any], target_id: str) -> str:
+    payload = dict(child.get("payload") or {})
+    if str(payload.get("target_id") or "") != str(target_id):
+        raise PermanentTaskError("Upload child target changed after approval.")
+    with _durable_connection() as conn, conn.cursor() as cur:
+        if not _child_application_binding_matches(cur, task["application_id"], payload):
+            raise PermanentTaskError("Upload child application/JD/pipeline binding changed before I/O.")
+        cur.execute(
+            """UPDATE approval_requests SET status='executing', executing_task_id=%s
+                  WHERE id=%s AND application_id=%s AND type='privileged_upload_document'
+                    AND status='approved' AND consumed_at IS NULL AND token_expires_at > now()
+                  RETURNING id;""",
+            (task["id"], child["id"], task["application_id"]),
+        )
+        if cur.fetchone() is None:
+            raise PermanentTaskError("Upload child approval changed before I/O; prepare a fresh form plan.")
+        cur.execute(
+            """INSERT INTO privileged_action_executions(
+                   approval_request_id, application_id, action_type, status, target_id,
+                   expected_url, expected_page_fingerprint)
+               VALUES (%s,%s,'privileged_upload_document','running',%s,%s,%s)
+               ON CONFLICT (approval_request_id) DO NOTHING RETURNING id::text;""",
+            (child["id"], task["application_id"], target_id,
+             payload.get("expected_url"), payload.get("expected_page_fingerprint")),
+        )
+        row = cur.fetchone()
+        if not row:
+            raise PermanentTaskError("Upload child already has an execution record; never replay it.")
+        return str(row[0])
+
+
+def durable_complete_delegated_upload(task: Dict[str, Any], child: dict[str, Any], execution_id: str, target_id: str) -> None:
+    payload = dict(child.get("payload") or {})
+    with _durable_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """UPDATE privileged_action_executions
+                  SET status='completed', observed_url=expected_url,
+                      observed_page_fingerprint=expected_page_fingerprint,
+                      result_json=%s, finished_at=now()
+                WHERE id=%s AND approval_request_id=%s AND status='running';""",
+            (Jsonb({"uploaded": True, "target_id": target_id, "field_ref": payload.get("field_ref"),
+                    "artifact_id": payload.get("artifact_id"), "filename": payload.get("filename")}),
+             execution_id, child["id"]),
+        )
+        if cur.rowcount != 1:
+            raise PermanentTaskError("Upload execution record changed unexpectedly; reconciliation is required.")
+        cur.execute(
+            """UPDATE approval_requests
+                  SET status='consumed', consumed_at=now(), consumed_by=%s, executing_task_id=NULL
+                WHERE id=%s AND application_id=%s AND status='executing' AND executing_task_id=%s
+                RETURNING id;""",
+            (WORKER_ID, child["id"], task["application_id"], task["id"]),
+        )
+        if cur.fetchone() is None:
+            raise PermanentTaskError("Upload child capability changed after verified I/O; reconciliation is required.")
+
+
+def durable_reconcile_delegated_upload(task: Dict[str, Any], child: dict[str, Any], execution_id: str,
+                                       target_id: str | None, reason: str) -> None:
+    with _durable_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """UPDATE privileged_action_executions
+                  SET status='needs_reconciliation', error_message=%s, finished_at=now()
+                WHERE id=%s AND approval_request_id=%s AND status='running';""",
+            (reason[:2000], execution_id, child["id"]),
+        )
+        cur.execute(
+            """UPDATE approval_requests
+                  SET status='consumed', consumed_at=now(), consumed_by=%s,
+                      executing_task_id=NULL, action_note=%s
+                WHERE id=%s AND application_id=%s AND status='executing';""",
+            (WORKER_ID, f"Uncertain delegated upload: {reason}"[:500],
+             child["id"], task["application_id"]),
+        )
+        cur.execute(
+            """INSERT INTO application_events(application_id,event_type,event_source,event_payload)
+               VALUES (%s,'privileged_action_needs_reconciliation',%s,%s);""",
+            (task["application_id"], WORKER_ID,
+             Jsonb({"approval_request_id": child["id"], "action_type": "privileged_upload_document",
+                    "target_id": target_id, "reason": reason[:500]})),
+        )
+
+
+def durable_close_unused_upload_capabilities(task: Dict[str, Any], capabilities: dict[str, dict[str, Any]]) -> None:
+    ids = [str(item.get("id") or "") for item in capabilities.values() if item.get("id")]
+    if not ids:
+        return
+    with _durable_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """UPDATE approval_requests SET status='expired', action_note=COALESCE(action_note,%s)
+                 WHERE id = ANY(%s) AND application_id=%s AND type='privileged_upload_document'
+                   AND status='approved' AND consumed_at IS NULL;""",
+            ("Parent autofill session closed without consuming this exact upload capability.",
+             ids, task["application_id"]),
         )
 
 
@@ -1307,11 +1566,11 @@ def handle_fill_application_form(cur, task) -> Dict[str, Any]:
     except AutofillContextError as exc:
         raise PermanentTaskError(str(exc)) from exc
     require_current_input_hash(binding, context.input_hash)
-    approved_upload_hashes = {}
-    if binding.get("artifact_id") and binding.get("artifact_sha256"):
-        for approved_path in (context.profile.get("documents") or {}).values():
-            if approved_path:
-                approved_upload_hashes[str(Path(str(approved_path)).expanduser().resolve())] = str(binding["artifact_sha256"])
+    upload_capabilities = load_delegated_upload_capabilities(cur, task, binding)
+    approved_upload_hashes = {
+        str(item["resolved_path"]): str((item.get("payload") or {}).get("sha256") or "")
+        for item in upload_capabilities.values()
+    }
     transport = OpenClawTransport(
         binary=OPENCLAW_BIN, profile=os.getenv("JOBOS_BROWSER_PROFILE", "remote"),
         timeout=min(int(task["timeout_seconds"]), 90), environment=openclaw_runtime_env(),
@@ -1320,6 +1579,7 @@ def handle_fill_application_form(cur, task) -> Dict[str, Any]:
     execution_started = False
     pinned_target_id: str | None = None
     latest_actions = []
+    active_upload: tuple[dict[str, Any], str] | None = None
 
     # =====================================================================
     # [THÊM MỚI] BIẾN CHỨA LUỒNG CHUỘT MA AUTOFILL
@@ -1337,13 +1597,26 @@ def handle_fill_application_form(cur, task) -> Dict[str, Any]:
             approved_sensitive_answers=context.sensitive_answers,
             remembered_answers=context.remembered_answers,
         )
-        latest_actions = [
-            action if action_is_in_approved_scope(action, binding["autofill_action_scope"]) and
-                      (action.action not in action_capabilities or action_capabilities[action.action])
-            else type(action)("pause", action.ref, None, action.profile_key,
-                              "Action is outside the approved scope or unsupported by this ATS.", action.question_label)
-            for action in latest_actions
-        ]
+        approved_actions = []
+        for action in latest_actions:
+            if action.action == "upload":
+                child = upload_capabilities.get(str(action.ref))
+                in_scope = bool(child and upload_capability_matches_action(
+                    action, child, binding["autofill_action_scope"]
+                ))
+                refusal = "Document upload needs its exact separately approved upload capability."
+            else:
+                in_scope = action_is_in_approved_scope(action, binding["autofill_action_scope"])
+                refusal = "Action is outside the exact human-reviewed scope."
+            if in_scope and (action.action not in action_capabilities or action_capabilities[action.action]):
+                approved_actions.append(action)
+            else:
+                approved_actions.append(type(action)(
+                    "pause", action.ref, None, action.profile_key,
+                    refusal if not in_scope else f"ATS capability does not permit {action.action}.",
+                    action.question_label,
+                ))
+        latest_actions = approved_actions
         return latest_actions
 
     def begin_execution(target_id: str) -> None:
@@ -1369,6 +1642,37 @@ def handle_fill_application_form(cur, task) -> Dict[str, Any]:
         except Exception as e:
             print(f"  [FakeMouse] Cảnh báo - Không thả được chuột ma khi Autofill: {e}")
 
+    def before_io(action, target_id: str, journal_id: str) -> None:
+        nonlocal active_upload
+        if action.action != "upload":
+            return
+        child = upload_capabilities.get(str(action.ref))
+        if not child or not upload_capability_matches_action(action, child, binding["autofill_action_scope"]):
+            raise PermanentTaskError("Exact separately approved upload capability is unavailable.")
+        execution_id = durable_begin_delegated_upload(task, child, target_id)
+        active_upload = (child, execution_id)
+
+    def after_verified(action, target_id: str, journal_id: str) -> None:
+        nonlocal active_upload
+        durable_journal_verified(action, target_id, journal_id)
+        if action.action == "upload":
+            if active_upload is None:
+                raise PermanentTaskError("Verified upload has no active one-shot child capability.")
+            child, execution_id = active_upload
+            durable_complete_delegated_upload(task, child, execution_id, target_id)
+            active_upload = None
+
+    def after_failed(action, target_id: str, journal_id: str) -> None:
+        nonlocal active_upload
+        durable_journal_failed(action, target_id, journal_id)
+        if action.action == "upload" and active_upload is not None:
+            child, execution_id = active_upload
+            active_upload = None
+            durable_reconcile_delegated_upload(
+                task, child, execution_id, target_id,
+                "Upload I/O occurred but the exact filename/field effect could not be verified.",
+            )
+
     try:
         session = AutofillSession(
             transport=transport, expected_origin=binding["expected_origin"],
@@ -1378,10 +1682,12 @@ def handle_fill_application_form(cur, task) -> Dict[str, Any]:
             origin_allowed=lambda url: check_domain(cur, url),
             begin_execution=begin_execution,
             before_action=lambda action, target_id: durable_journal_start(task, binding, action, target_id),
-            after_verified=durable_journal_verified,
-            after_failed=durable_journal_failed,
+            before_io=before_io,
+            after_verified=after_verified,
+            after_failed=after_failed,
         )
         result = session.execute(make_plan)
+        durable_close_unused_upload_capabilities(task, upload_capabilities)
         if execution_started:
             durable_finish_execution(task, binding, result)
         else:
@@ -1390,6 +1696,10 @@ def handle_fill_application_form(cur, task) -> Dict[str, Any]:
                 "No deterministic browser write ran; issue a fresh approval after review or form changes.",
             )
     except (SessionError, TransportError, PermanentTaskError) as exc:
+        if active_upload is not None:
+            child, execution_id = active_upload
+            active_upload = None
+            durable_reconcile_delegated_upload(task, child, execution_id, pinned_target_id, str(exc))
         if execution_started:
             durable_mark_reconciliation(task, pinned_target_id, str(exc))
             raise PermanentTaskError(

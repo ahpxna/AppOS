@@ -2,6 +2,7 @@ import threading
 import time
 import json
 import random
+import itertools
 import requests
 import websocket
 import logging
@@ -10,6 +11,7 @@ from urllib.parse import urlsplit
 from services.autofill.capsolver_api import solve_captcha
 
 log = logging.getLogger(__name__)
+_CDP_IDS = itertools.count(10000)
 
 
 def _is_linkedin_url(url: str) -> bool:
@@ -62,9 +64,39 @@ def _linkedin_page_targets(tabs: list[dict]) -> list[tuple[str, str]]:
     return targets
 
 
+def _cdp_call(ws, method: str, params: dict | None = None, *, timeout_seconds: float = 3.0) -> dict:
+    """Send one CDP command and wait for its matching response, ignoring async events.
+
+    CDP websocket streams can interleave Runtime/Network/Page event messages with
+    command responses.  Treating the very next ``recv()`` as our response can
+    mis-parse an event as success/failure.  This helper stays bounded while it
+    skips unrelated messages until the exact command id arrives.
+    """
+    call_id = next(_CDP_IDS)
+    ws.send(json.dumps({"id": call_id, "method": method, "params": params or {}}))
+    deadline = time.monotonic() + max(0.1, float(timeout_seconds))
+    while True:
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"timed out waiting for CDP response to {method}")
+        raw = ws.recv()
+        message = json.loads(raw)
+        if not isinstance(message, dict):
+            continue
+        if message.get("id") != call_id:
+            # Async events and responses for other in-flight commands are not
+            # evidence about this call.  This websocket is single-owner, so it
+            # is safe to ignore them here.
+            continue
+        if message.get("error"):
+            raise RuntimeError(f"CDP {method} failed: {message['error']}")
+        return message
+
+
 def _page_url(ws) -> str:
-    ws.send(json.dumps({"id": 1, "method": "Runtime.evaluate", "params": {"expression": "location.href", "returnByValue": True}}))
-    response = json.loads(ws.recv())
+    response = _cdp_call(
+        ws, "Runtime.evaluate",
+        {"expression": "location.href", "returnByValue": True},
+    )
     return str(response.get("result", {}).get("result", {}).get("value") or "")
 
 
@@ -91,12 +123,10 @@ def _fake_mouse_target_routine(
             log.warning("[FakeMouse] LinkedIn target changed; refusing stale target: %s", current_url)
             return
 
-        ws.send(json.dumps({
-            "id": 2,
-            "method": "Runtime.evaluate",
-            "params": {"expression": "({width: window.innerWidth, height: window.innerHeight})", "returnByValue": True},
-        }))
-        size_res = json.loads(ws.recv())
+        size_res = _cdp_call(
+            ws, "Runtime.evaluate",
+            {"expression": "({width: window.innerWidth, height: window.innerHeight})", "returnByValue": True},
+        )
         viewport = size_res.get("result", {}).get("result", {}).get("value", {"width": 1024, "height": 768})
         width = max(1, int(viewport.get("width") or 1024))
         height = max(1, int(viewport.get("height") or 768))
@@ -118,13 +148,21 @@ def _fake_mouse_target_routine(
                 for _step in range(20):
                     if stop_event.wait(dt):
                         break
+                    # A LinkedIn tab can navigate to an employer ATS while
+                    # retaining the same CDP target/websocket.  Revalidate the
+                    # live URL periodically so the LinkedIn multi-tab helper
+                    # never keeps dispatching mouse events after that boundary.
+                    if require_linkedin and _step % 10 == 0:
+                        live_url = _page_url(ws)
+                        if not _is_linkedin_url(live_url):
+                            log.info("[FakeMouse] LinkedIn target navigated away; stopping coverage: %s", live_url)
+                            return
                     current_x = max(0, min(current_x + (drift_x * dt) + random.gauss(0, 2.0), width))
                     current_y = max(0, min(current_y + (drift_y * dt) + random.gauss(0, 2.0), height))
-                    ws.send(json.dumps({
-                        "id": random.randint(1000, 9999),
-                        "method": "Input.dispatchMouseEvent",
-                        "params": {"type": "mouseMoved", "x": int(current_x), "y": int(current_y)},
-                    }))
+                    _cdp_call(
+                        ws, "Input.dispatchMouseEvent",
+                        {"type": "mouseMoved", "x": int(current_x), "y": int(current_y)},
+                    )
     except Exception as exc:
         log.error("[FakeMouse] bounded target helper stopped for %s: %s", ws_url, exc)
     finally:
@@ -268,8 +306,10 @@ def _inject_solution(ws_url: str, solution_token: str, captcha_type: str) -> Non
                 "if (typeof captchaCallback === 'function') captchaCallback(token); "
                 "return {ok:true}; })()"
             )
-        ws.send(json.dumps({"id": 9999, "method": "Runtime.evaluate", "params": {"expression": expression, "returnByValue": True}}))
-        response = json.loads(ws.recv())
+        response = _cdp_call(
+            ws, "Runtime.evaluate",
+            {"expression": expression, "returnByValue": True},
+        )
         value = response.get("result", {}).get("result", {}).get("value") or {}
         if not value.get("ok"):
             raise RuntimeError(f"captcha token injection could not bind to the expected DOM control: {value}")

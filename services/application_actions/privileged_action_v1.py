@@ -222,35 +222,86 @@ def detect_platform(url: str, snapshot: dict[str, Any]) -> str:
     return "custom"
 
 
+def _node_text(nodes: list[dict[str, Any]]) -> str:
+    return " ".join(
+        str(node.get("label") or node.get("value") or "")
+        for node in nodes
+    ).casefold()
+
+
+def _application_form_evidence(nodes: list[dict[str, Any]]) -> bool:
+    """Return whether controls look like an actual job-application form.
+
+    Header/footer copy such as ``Sign in`` or ``protected by reCAPTCHA`` is
+    common on ATS pages and must not outweigh the controls the user is really
+    filling.  This deliberately uses only visible/control evidence and does not
+    guess answers.
+    """
+    labels = _node_text(nodes)
+    signals = (
+        "first name", "last name", "phone", "resume", "résumé", "cover letter",
+        "work authorization", "sponsorship", "linkedin", "portfolio", "experience",
+        "education", "current company", "salary", "address", "submit application",
+        "apply now", "apply for",
+    )
+    score = sum(1 for signal in signals if signal in labels)
+    click_labels = {str(item.get("label") or "").strip().casefold() for item in _clickables(nodes)}
+    if any(label in SUBMIT_LABELS or "submit application" in label for label in click_labels):
+        return True
+    return score >= 2
+
+
+def _active_checkpoint_evidence(text: str, nodes: list[dict[str, Any]]) -> bool:
+    strong = ("verify you are human", "security check", "risk checkpoint", "bot challenge", "arkose")
+    if any(marker in text for marker in strong):
+        return True
+    node_text = _node_text(nodes)
+    if any(marker in node_text for marker in ("i'm not a robot", "i am not a robot", "captcha challenge", "hcaptcha challenge", "recaptcha challenge")):
+        return True
+    # Many legitimate forms contain only the legal footer
+    # "This site is protected by reCAPTCHA/hCaptcha".  That is not an active
+    # challenge and must not route the user to a manual checkpoint gate.
+    weak = any(marker in text for marker in ("recaptcha", "hcaptcha", "captcha"))
+    footer_only = "protected by recaptcha" in text or "protected by hcaptcha" in text
+    return weak and not footer_only and not _application_form_evidence(nodes)
+
+
 def detect_page_state(url: str, snapshot: dict[str, Any], nodes: list[dict[str, Any]]) -> tuple[str, dict[str, Any]]:
     text = f"{url}\n{snapshot.get('snapshot') or ''}".casefold()
+    inputs = [n for n in nodes if n.get("ref") and str(n.get("role") or "").casefold() in INPUT_ROLES]
+    app_form = _application_form_evidence(nodes)
 
     # =====================================================================
     # !!! HUMAN CHECKPOINT BOUNDARY — DO NOT MERGE WITH OTP/MFA APPROVAL !!!
-    # CAPTCHA / bot challenge / risk checkpoint always becomes
-    # needs_human_checkpoint. Telegram approval here means only "I handled it;
-    # re-snapshot now". It never authorizes CAPTCHA solving, OTP reuse, login,
-    # consent, autofill, or final Submit.
+    # Route only an *active* challenge, not a generic reCAPTCHA legal footer.
     # =====================================================================
-    checkpoint_markers = ("captcha", "verify you are human", "security check", "risk checkpoint", "bot challenge", "recaptcha", "hcaptcha", "arkose")
-    if any(marker in text for marker in checkpoint_markers):
-        return "needs_human_checkpoint", {"reason": "human checkpoint detected"}
+    if _active_checkpoint_evidence(text, nodes):
+        return "needs_human_checkpoint", {"reason": "active human checkpoint detected"}
 
-    mfa_markers = ("authenticator", "security key", "passkey", "text message", "sms code", "push notification", "approve the sign-in")
-    if any(marker in text for marker in mfa_markers):
-        return "needs_mfa", {"reason": "non-email MFA detected"}
-    email_verify = ("verify your email", "verification code", "email verification", "code sent to", "check your email")
+    # Email verification is more specific than generic OTP/MFA wording.
+    email_verify = ("verify your email", "email verification", "code sent to your email",
+                    "code sent to email", "check your email")
     if any(marker in text for marker in email_verify):
         field = _find_input(nodes, ("code", "verification", "otp", "one-time"))
         return "needs_email_verification", {"field_ref": str(field.get("ref")) if field else "NaN"}
+
+    code_field = _find_input(nodes, ("code", "verification", "otp", "one-time"))
+    strong_mfa = ("authenticator", "security key", "passkey", "push notification", "approve the sign-in")
+    sms_mfa = any(marker in text for marker in ("sms code", "text message", "texted you", "sent you a text")) and code_field is not None
+    if any(marker in text for marker in strong_mfa) or sms_mfa:
+        return "needs_mfa", {"reason": "non-email MFA detected"}
+
     password = _find_input(nodes, ("password",))
-    if password or any(marker in text for marker in ("create account", "sign in", "log in", "register")):
+    path = (urlsplit(url).path or "/").casefold()
+    auth_path = any(token in path for token in ("/login", "/signin", "/sign-in", "/register", "/signup", "/sign-up", "/account"))
+    auth_copy = any(marker in text for marker in ("create account", "sign in", "log in", "register", "sign up"))
+    if password or (auth_copy and (auth_path or not app_form)):
         if any(marker in text for marker in ("sign in with google", "continue with google", "sign in with microsoft", "continue with microsoft")):
             return "needs_manual_sso", {"reason": "browser SSO requires manual identity-provider session"}
         return "needs_account_auth", {"reason": "employer account authentication required"}
-    inputs = [n for n in nodes if n.get("ref") and str(n.get("role") or "").casefold() in INPUT_ROLES]
-    if inputs:
-        return "application_form_ready", {"input_count": len(inputs)}
+
+    if inputs or app_form:
+        return "application_form_ready", {"input_count": len(inputs), "form_evidence": bool(app_form)}
     return "unknown", {"reason": "page state could not be classified"}
 
 
@@ -555,31 +606,41 @@ def _enqueue_state_followup(cur, transport: OpenClawTransport, *, application_id
     if state != "needs_account_auth":
         return
     text = " ".join(str(n.get("label") or n.get("value") or "") for n in nodes).casefold()
-    action = "create_employer_account" if any(k in text for k in ("create account", "create an account", "register", "sign up")) else (
-             "login_employer_account" if any(k in text for k in ("sign in", "log in", "login")) else "")
-    if not action:
+    has_create = any(k in text for k in ("create account", "create an account", "register", "sign up"))
+    has_login = any(k in text for k in ("sign in", "log in", "login"))
+    actions = (["login_employer_account"] if has_login else []) + (["create_employer_account"] if has_create else [])
+    if not actions:
         create_privileged_request(cur, application_id=application_id, action_type="privileged_auth_manual_retry",
                                   payload=base, summary="Employer auth page could not be classified safely. Complete login/register manually, then approve AUTH RETRY.",
                                   requested_by="auth-state-router")
         return
-    try:
-        account_payload, _ = _account_action_payload(cur, nodes, url, action=action)
-    except Exception:
+
+    materialized = 0
+    for action in actions:
+        try:
+            account_payload, _ = _account_action_payload(cur, nodes, url, action=action)
+        except Exception:
+            continue
+        if action == "create_employer_account" and account_payload.get("consent_blockers"):
+            consent_payload = dict(base); consent_payload["consent_items"] = account_payload.get("consent_items") or []
+            create_privileged_request(cur, application_id=application_id, action_type="privileged_accept_terms",
+                                      payload=consent_payload, summary="Create-account path requires explicit terms/consent approval. Approve this only if you want to register a new employer account.",
+                                      requested_by="auth-state-router")
+            materialized += 1
+            continue
+        atype = "privileged_create_employer_account" if action == "create_employer_account" else "privileged_login_employer_account"
+        action_payload = dict(base); action_payload.update(account_payload)
+        create_privileged_request(
+            cur, application_id=application_id, action_type=atype, payload=action_payload,
+            summary=("Use the existing employer-account LOGIN path." if action == "login_employer_account"
+                     else "Use the CREATE NEW EMPLOYER ACCOUNT path."),
+            requested_by="auth-state-router",
+        )
+        materialized += 1
+    if materialized == 0:
         create_privileged_request(cur, application_id=application_id, action_type="privileged_auth_manual_retry",
                                   payload=base, summary="Employer auth controls are ambiguous. Complete this auth step manually, then approve AUTH RETRY.",
                                   requested_by="auth-state-router")
-        return
-    if action == "create_employer_account" and account_payload.get("consent_blockers"):
-        consent_payload = dict(base); consent_payload["consent_items"] = account_payload.get("consent_items") or []
-        create_privileged_request(cur, application_id=application_id, action_type="privileged_accept_terms",
-                                  payload=consent_payload, summary="Employer account registration requires explicit terms/consent approval before account creation.",
-                                  requested_by="auth-state-router")
-        return
-    atype = "privileged_create_employer_account" if action == "create_employer_account" else "privileged_login_employer_account"
-    action_payload = dict(base); action_payload.update(account_payload)
-    create_privileged_request(cur, application_id=application_id, action_type=atype, payload=action_payload,
-                              summary=f"{action.replace('_',' ').title()} using exact profile fields and encrypted-vault password if present.",
-                              requested_by="auth-state-router")
 
 
 def _snapshot_text_sha256(snapshot: dict[str, Any]) -> str:
@@ -898,6 +959,8 @@ def execute_one(conn, request_id: str) -> dict[str, Any]:
         if not row or row[1] not in PRIVILEGED_TYPES:
             raise PrivilegedActionError("privileged approval not found")
         _rid, atype, app_id, status, expires, payload = row
+        if atype == "privileged_upload_document" and isinstance(payload, dict) and payload.get("delegated_to_autofill") is True:
+            raise PrivilegedActionError("delegated upload approvals execute only inside their exact parent autofill session")
         if status != "approved" or not expires or expires <= __import__('datetime').datetime.now(expires.tzinfo):
             raise PrivilegedActionError(f"approval is not live/approved: {status}")
         cur.execute("""INSERT INTO privileged_action_executions(
@@ -1221,6 +1284,7 @@ def execute_next(conn) -> dict[str, Any] | None:
         cur.execute("""SELECT ar.id::text FROM approval_requests ar
                        WHERE ar.status='approved' AND ar.type = ANY(%s)
                          AND ar.token_expires_at > now()
+                         AND NOT (ar.type='privileged_upload_document' AND COALESCE(ar.payload_json->>'delegated_to_autofill','false')='true')
                          AND NOT EXISTS (SELECT 1 FROM privileged_action_executions e WHERE e.approval_request_id=ar.id)
                        ORDER BY ar.responded_at NULLS LAST, ar.created_at LIMIT 1;""", (list(PRIVILEGED_TYPES),))
         row = cur.fetchone()

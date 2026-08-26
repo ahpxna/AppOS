@@ -138,7 +138,7 @@ def test_parallel_bypass_exact_page_selection_and_js_escaping(monkeypatch):
             sent.append(json.loads(payload))
 
         def recv(self):
-            return json.dumps({"result": {"result": {"value": {"ok": True}}}})
+            return json.dumps({"id": sent[-1]["id"], "result": {"result": {"value": {"ok": True}}}})
 
         def close(self):
             pass

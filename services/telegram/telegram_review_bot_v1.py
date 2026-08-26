@@ -450,7 +450,8 @@ def handle_callback(conn, token: str, allowed_user_id: int, callback: dict[str, 
                 result["reconciliation_followup"] = {"ok": False, "error": str(followup_exc)[:1000]}
         approval_type = str(result.get("approval_type") or "")
         approval_request_id = str(result.get("approval_request_id") or "")
-        if action == "approve" and approval_type.startswith("privileged_") and approval_request_id:
+        if (action == "approve" and approval_type.startswith("privileged_") and approval_request_id
+                and not result.get("delegated_to_autofill")):
             from services.application_actions.privileged_action_v1 import execute_one
             execution_result = execute_one(conn, approval_request_id)
             # Materialize any approval/reconciliation produced by the executor.
@@ -463,6 +464,12 @@ def handle_callback(conn, token: str, allowed_user_id: int, callback: dict[str, 
             suffix = ""
             if execution_result:
                 suffix = f"\nBrowser action: {execution_result.get('action_type')} completed."
+            elif approval_type == "autofill_form" and not result.get("autofill_queued"):
+                suffix = "\nAutofill approval recorded; waiting for the separate document-upload decisions before browser writes can queue."
+            elif result.get("delegated_to_autofill") and result.get("autofill_queued"):
+                suffix = "\nUpload decision recorded; all upload gates are resolved and the exact parent autofill task is now queued."
+            elif result.get("delegated_to_autofill"):
+                suffix = "\nUpload decision recorded; parent autofill is still waiting for the remaining upload gates."
             elif result.get("materialized_approval_request_id"):
                 suffix = "\nFresh exact-bound next gate prepared; approve it separately."
             elif result.get("reconciliation_outcome"):
