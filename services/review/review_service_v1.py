@@ -35,6 +35,48 @@ def _sha256_text(value: str) -> str:
     return hashlib.sha256((value or "").encode("utf-8")).hexdigest()
 
 
+def _focus_or_open_exact_job_page(job_url: str) -> str:
+    """Put the exact stored job page in the dedicated JobOS browser.
+
+    This is a user-requested UI handoff, not a privileged Apply click.  It is
+    deliberately strict: an existing exact tab is focused; otherwise exactly
+    one new tab is opened.  Ambiguous tabs never become an implicit browser
+    binding for a later capability.
+    """
+    from services.application_actions.privileged_action_v1 import _transport
+    from services.autofill.autofill_executor_v1 import TransportError
+    from services.common.autofill_identity import canonical_page_url
+
+    try:
+        expected = canonical_page_url(job_url)
+    except ValueError as exc:
+        raise ReviewError("This application has no valid stored job URL to open.") from exc
+    transport = _transport()
+    matches: list[str] = []
+    for tab in transport.tabs():
+        target_id = transport._stable_id(tab)
+        raw_url = str(tab.get("url") or "")
+        if not target_id:
+            continue
+        try:
+            if canonical_page_url(raw_url) == expected:
+                matches.append(target_id)
+        except ValueError:
+            continue
+    if len(matches) > 1:
+        raise ReviewError("More than one JobOS browser tab matches this job. Close duplicates or focus the intended tab, then retry.")
+    try:
+        target = transport.focus(matches[0]) if matches else transport.open(job_url)
+    except TransportError as exc:
+        raise ReviewError(f"JobOS could not open/focus the dedicated browser page: {exc}") from exc
+    try:
+        if canonical_page_url(target.url) != expected:
+            raise ReviewError("The opened page redirected away from the exact stored job URL; JobOS will not bind it automatically.")
+    except ValueError as exc:
+        raise ReviewError("The opened browser tab has no valid HTTP(S) job URL.") from exc
+    return str(target.target_id)
+
+
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -677,8 +719,12 @@ def sync_runtime_questions(cur) -> int:
 def ensure_question_review(cur, *, application_id: str, document_id: str,
                            question: str, missing_information: str = "") -> str | None:
     from services.common.question_memory import normalize_question
+    from services.common.immigration_semantics import legal_question_pause_reason
     normalized = normalize_question(question)
-    if not normalized:
+    # Generic document-question memory may never turn legal/immigration text
+    # into a one-tap Yes/No card.  Those answers require the separate exact,
+    # candidate-confirmed workflow.
+    if not normalized or legal_question_pause_reason(question):
         return None
     cur.execute("SELECT company, job_title FROM applications WHERE id = %s;", (application_id,))
     app = cur.fetchone()
@@ -953,7 +999,8 @@ def safe_batch_review_items(cur, *, limit: int = 20) -> list[dict[str, Any]]:
     from services.review.ux_policy_v1 import is_batch_safe_item
     cur.execute(
         """SELECT v.review_item_id::text, v.application_id::text, v.item_type,
-                  v.payload_json, h.source_sha256, v.company, v.job_title
+                  v.payload_json, h.source_sha256, v.company, v.job_title,
+                  h.status, h.reviewed_artifact_id::text
              FROM v_human_review_inbox v
              JOIN human_review_items h ON h.id = v.review_item_id
             ORDER BY CASE v.priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 ELSE 2 END,
@@ -962,9 +1009,14 @@ def safe_batch_review_items(cur, *, limit: int = 20) -> list[dict[str, Any]]:
         (max(1, min(int(limit), 100)),),
     )
     result = []
-    for item_id, app_id, item_type, payload, source_sha, company, role in cur.fetchall():
+    for item_id, app_id, item_type, payload, source_sha, company, role, status, reviewed_artifact_id in cur.fetchall():
         payload = dict(payload or {})
         if not is_batch_safe_item(item_type=str(item_type), payload=payload):
+            continue
+        # A QA-pass document with no canonical reviewed PDF is deliberately
+        # held at needs_revision.  Never advertise it inside a one-tap batch
+        # that will fail later in decide_item().
+        if str(item_type) == "document_review" and (str(status) != "pending" or not reviewed_artifact_id):
             continue
         result.append({
             "item_id": str(item_id), "application_id": str(app_id),
@@ -1007,6 +1059,9 @@ def question_quick_choices(cur, item_id: str) -> list[str]:
     if not row:
         return []
     question = str((row[0] or {}).get("question") or "")
+    from services.common.immigration_semantics import legal_question_pause_reason
+    if legal_question_pause_reason(question):
+        return []
     # Discovery salary_floor is a user-owned configured number; use it only as
     # a convenience suggestion, never as an automatic answer.
     cur.execute("SELECT salary_floor FROM job_search_preferences WHERE profile_key='primary';")
@@ -1263,10 +1318,20 @@ def decide_item(conn, item_id: str, *, decision: str, actor: str, note: str = ""
                 cur.execute("SELECT execution_state FROM browser_tasks WHERE id = %s;", (browser_task_id,))
                 task = cur.fetchone()
                 if task and task[0] == "needs_reconciliation":
-                    raise ReviewError(
-                        "Underlying autofill task still needs reconciliation; close it with autofill_reconcile_v1 first. "
-                        "Reject/revise cannot dismiss an uncertain browser side effect."
-                    )
+                    if decision != "approve":
+                        raise ReviewError(
+                            "Inspect the form first, then use ‘I inspected the form’ to close this uncertain autofill safely."
+                        )
+                    # Reuse the canonical reconciliation close path so Telegram
+                    # cannot accidentally make an uncertain capability replayable.
+                    # The human has explicitly inspected the browser state; this
+                    # retires the old task and restores a fresh-approval boundary.
+                    from services.autofill.autofill_reconcile_v1 import close as close_autofill_reconciliation
+                    try:
+                        close_autofill_reconciliation(cur, str(browser_task_id))
+                    except SystemExit as exc:
+                        raise ReviewError(str(exc)) from exc
+                    reconciliation_outcome = "autofill_inspected_closed"
 
         elif item_type == "action_required":
             payload = dict(item_payload or {})
@@ -1276,6 +1341,13 @@ def decide_item(conn, item_id: str, *, decision: str, actor: str, note: str = ""
                 try:
                     from services.application_actions.privileged_action_v1 import prepare as prepare_privileged
                     if action_kind == "open_apply_binding_required":
+                        cur.execute("SELECT coalesce(job_url, '') FROM applications WHERE id=%s;", (app_id,))
+                        current_job = cur.fetchone()
+                        stored_job_url = str(current_job[0] if current_job else "")
+                        handoff_job_url = str(payload.get("job_url") or "")
+                        if not stored_job_url or handoff_job_url != stored_job_url:
+                            raise ReviewError("The stored job page changed; JobOS issued no browser action. Sync the newest handoff card.")
+                        _focus_or_open_exact_job_page(stored_job_url)
                         materialized_approval_id = prepare_privileged(
                             cur, application_id=app_id, action="begin_application"
                         )

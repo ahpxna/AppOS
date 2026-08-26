@@ -85,8 +85,13 @@ def _write_state(children: dict[str, subprocess.Popen[Any]], restarts: dict[str,
 def _spawn(name: str, argv: list[str]) -> subprocess.Popen[Any]:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     stream = (LOG_DIR / f"{name}.log").open("ab", buffering=0)
-    return subprocess.Popen(argv, cwd=ROOT, stdout=stream, stderr=subprocess.STDOUT,
-                            start_new_session=False, close_fds=True)
+    try:
+        return subprocess.Popen(argv, cwd=ROOT, stdout=stream, stderr=subprocess.STDOUT,
+                                start_new_session=False, close_fds=True)
+    finally:
+        # The child inherited its descriptor.  Keeping a parent descriptor open
+        # on each restart eventually leaks FDs in a long-running daily runtime.
+        stream.close()
 
 
 def _shutdown(children: dict[str, subprocess.Popen[Any]]) -> None:
@@ -169,12 +174,28 @@ def start() -> int:
         return 0
     _start_infra()
     log = (LOG_DIR / "supervisor.log").open("ab", buffering=0)
-    proc = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "daemon"], cwd=ROOT,
-                            stdout=log, stderr=subprocess.STDOUT, start_new_session=True, close_fds=True)
-    deadline = time.time() + 5
+    try:
+        proc = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "daemon"], cwd=ROOT,
+                                stdout=log, stderr=subprocess.STDOUT, start_new_session=True, close_fds=True)
+    finally:
+        log.close()
+    expected = set(_specs())
+    deadline = time.time() + 8
     while time.time() < deadline:
-        if _alive(proc.pid) and SUPERVISOR_PID.exists():
-            print("JobOS started. Daily control surface: Telegram /start")
+        try:
+            state = json.loads(STATE_FILE.read_text())
+        except Exception:
+            state = {}
+        services = state.get("services") if isinstance(state.get("services"), dict) else {}
+        children_ready = bool(expected) and all(
+            bool(isinstance(services.get(name), dict) and services[name].get("running"))
+            for name in expected
+        )
+        if _alive(proc.pid) and SUPERVISOR_PID.exists() and children_ready:
+            if "telegram" in expected:
+                print("JobOS workers are running. Daily control surface: Telegram /start")
+            else:
+                print("JobOS workers are running, but Telegram is not configured. Complete Telegram setup before daily use.")
             return 0
         time.sleep(0.1)
     print(f"JobOS supervisor did not become ready. Check {LOG_DIR / 'supervisor.log'}", file=sys.stderr)

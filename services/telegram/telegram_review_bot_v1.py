@@ -164,11 +164,20 @@ def _keyboard(cur, item_id: str, allowed_user_id: int, item_type: str,
         ]
         return render(rows)
 
+    if item_type == "reconciliation_required":
+        inspected = tok("approve")
+        rows = [
+            [{"text": "✅ I inspected the form", "callback_data": f"rv:{inspected}"}],
+            [{"text": "👀 Details", "callback_data": f"rv:{details}"},
+             {"text": "⏭ Later", "callback_data": f"rv:{later}"}],
+        ]
+        return render(rows)
+
     if item_type == "action_required":
         action_kind = str(payload.get("action_kind") or "")
         approve, reject = tok("approve"), tok("reject")
         label = {
-            "open_apply_binding_required": "✅ Open / bind Apply",
+            "open_apply_binding_required": "🌐 Open JobOS Apply page",
             "email_verification_binding_required": "📧 Bind OTP page",
             "email_verification_candidate_ambiguity": "📧 Confirm email",
             "workflow_followup_required": "🔄 Retry safely",
@@ -177,7 +186,7 @@ def _keyboard(cur, item_id: str, allowed_user_id: int, item_type: str,
             [{"text": label, "callback_data": f"rv:{approve}"}],
             [{"text": "👀 Review", "callback_data": f"rv:{details}"},
              {"text": "⏭ Later", "callback_data": f"rv:{later}"},
-             {"text": "❌ Stop", "callback_data": f"rv:{reject}"}],
+             {"text": "❌ Dismiss", "callback_data": f"rv:{reject}"}],
         ]
         return render(rows)
 
@@ -259,7 +268,8 @@ def _message_text(row: tuple[Any, ...], envelope: dict[str, Any] | None = None,
     fit_score = fit.get("fit_score", job.get("fit_score"))
     if fit_score not in (None, NAN, ""):
         lines.append(f"Match: {fit_score}%")
-    lines.append(status_badges(envelope))
+    reviewing_doc = str(payload.get("doc_type") or "") if item_type == "document_review" else None
+    lines.append(status_badges(envelope, reviewing_doc=reviewing_doc))
 
     if item_type == "document_review":
         changes = payload.get("resume_changes") if isinstance(payload.get("resume_changes"), list) else []
@@ -348,16 +358,16 @@ def _detail_text(row: tuple[Any, ...], envelope: dict[str, Any] | None = None,
             if len(changes) > 10:
                 lines.append(f"• … {len(changes) - 10} more change(s) in attached context JSON")
     if item_type == "question_required":
-        lines.extend(["", f"Question: {payload.get('question') or NAN}", f"Reply: /answer {item_id} <your answer>"])
+        lines.extend(["", f"Question: {payload.get('question') or NAN}", "Tap ✏️ Other, then reply naturally in this chat."])
     elif item_type == "reconciliation_required":
         if payload.get("privileged_execution_id"):
             lines.extend(["", "⚠️ Browser effect is uncertain. Choose OCCURRED or NOT OCCURRED. This consumed approval will never be replayed."])
         else:
-            lines.extend(["", "⚠️ Do not retry until the uncertain browser execution is reconciled."])
+            lines.extend(["", "⚠️ Inspect the form in the JobOS browser first. Then tap ‘I inspected the form’; JobOS retires the old capability and requires a fresh approval for any later write."])
     elif item_type == "application_ready":
         lines.extend(["", "Final Submit is not part of normal autofill. Prepare a separate privileged Submit approval when ready."])
     lines.extend(["", "Context delivery is soft-fail: missing sections show NaN and do not remove approval controls.",
-                  f"Review ID: {item_id}", f"Priority: {priority}"])
+                  f"Priority: {priority}"])
     return "\n".join(lines)[:3900]
 
 
@@ -446,6 +456,7 @@ def _dashboard_data(cur) -> dict[str, Any]:
         """SELECT current_step, count(*)
              FROM applications
             WHERE status NOT IN ('submitted','abandoned')
+              AND current_step NOT IN ('filtered_out','fit_rejected')
             GROUP BY current_step;"""
     )
     by_step = {str(step): int(count) for step, count in cur.fetchall()}
@@ -508,9 +519,17 @@ def dispatch_dashboard(conn, token: str, allowed_user_id: int, chat_id: int, *, 
         ]}
         text = _dashboard_text(data)
         digest = hashlib.sha256((text + json.dumps(batch_payload, sort_keys=True)).encode("utf-8")).hexdigest()
-        cur.execute("SELECT dashboard_message_id, last_digest FROM telegram_control_surface_state WHERE chat_id=%s;", (chat_id,))
+        cur.execute(
+            """SELECT dashboard_message_id, last_digest,
+                      updated_at > now() - interval '20 minutes'
+                 FROM telegram_control_surface_state WHERE chat_id=%s;""",
+            (chat_id,),
+        )
         existing = cur.fetchone()
-        if existing and existing[1] == digest and not force:
+        # Dashboard buttons expire after 30 minutes.  Re-render before that
+        # point even if the textual state did not change, otherwise its own
+        # Refresh button becomes a dead end.
+        if existing and existing[1] == digest and bool(existing[2]) and not force:
             conn.commit()
             return 0
         rows = []
@@ -652,11 +671,15 @@ def _handle_ui_callback(conn, token: str, allowed_user_id: int, callback: dict[s
         if not row or row[2] != sender_id or row[5] is not None:
             conn.rollback()
             api(token, "answerCallbackQuery", data={"callback_query_id": callback_id, "text": "Button expired; refresh JobOS", "show_alert": "true"})
+            if chat_id:
+                dispatch_dashboard(conn, token, allowed_user_id, chat_id, force=True)
             return
         cur.execute("SELECT %s < now();", (row[4],))
         if cur.fetchone()[0]:
             conn.rollback()
             api(token, "answerCallbackQuery", data={"callback_query_id": callback_id, "text": "Button expired; refresh JobOS", "show_alert": "true"})
+            if chat_id:
+                dispatch_dashboard(conn, token, allowed_user_id, chat_id, force=True)
             return
         token_id, action, payload = row[0], str(row[1]), dict(row[3] or {})
     try:
@@ -908,7 +931,6 @@ def handle_callback(conn, token: str, allowed_user_id: int, callback: dict[str, 
             cur.execute("UPDATE telegram_callback_tokens SET used_at = now() WHERE review_item_id = %s AND used_at IS NULL;", (item_id,))
         conn.commit()  # human decision is durable before privileged browser I/O
 
-        execution_result = None
         observed_reconciliation = result.get("reconciliation_observed_result") or {}
         followup_source = result.get("post_commit_followup_result") or observed_reconciliation
         if followup_source.get("state") and followup_source.get("state") != "submitted":
@@ -920,10 +942,10 @@ def handle_callback(conn, token: str, allowed_user_id: int, callback: dict[str, 
 
         approval_type = str(result.get("approval_type") or "")
         approval_request_id = str(result.get("approval_request_id") or "")
-        if (action == "approve" and approval_type.startswith("privileged_") and approval_request_id
-                and not result.get("delegated_to_autofill")):
-            from services.application_actions.privileged_action_v1 import execute_one
-            execution_result = execute_one(conn, approval_request_id)
+        # Telegram is the human decision surface, not a second executor.  The
+        # single privileged-action worker owns browser I/O after this durable
+        # commit.  Calling execute_one() here raced that worker and could tell
+        # the user "refused" even while the worker had already started safely.
 
         with conn.cursor() as cur:
             sync_inbox(cur)
@@ -931,9 +953,7 @@ def handle_callback(conn, token: str, allowed_user_id: int, callback: dict[str, 
         api(token, "answerCallbackQuery", data={"callback_query_id": callback_id, "text": "Done"})
 
         if chat_id:
-            if execution_result and execution_result.get("followup", {}).get("ok") is False:
-                message = "⚠️ Browser action completed, but JobOS could not prepare the next gate. No action will be replayed. Tap Review next for the safe recovery card."
-            elif result.get("post_commit_followup", {}).get("ok") is False:
+            if result.get("post_commit_followup", {}).get("ok") is False:
                 message = "⚠️ Decision saved, but the next gate needs a safe retry. JobOS added an actionable recovery card."
             elif approval_type == "autofill_form" and not result.get("autofill_queued"):
                 message = "✅ Autofill approved. Waiting for the exact document-upload decisions; browser writes have not started yet."
@@ -945,8 +965,8 @@ def handle_callback(conn, token: str, allowed_user_id: int, callback: dict[str, 
                 message = "✅ Done. JobOS prepared the next exact-bound action; it is waiting in your inbox."
             elif result.get("reconciliation_outcome"):
                 message = f"✅ Reconciliation recorded: {result['reconciliation_outcome']}."
-            elif approval_type == "privileged_submit_application" and execution_result:
-                message = "🚀 Application submitted and confirmed by the configured submit verifier."
+            elif action == "approve" and approval_type.startswith("privileged_") and approval_request_id:
+                message = "🚀 Approved. JobOS started the exact browser action in its single safe worker; this chat will receive the next decision or recovery card."
             else:
                 message = "✅ Done. JobOS will continue automatically until another real decision is needed."
             api(token, "sendMessage", data={"chat_id": str(chat_id), "text": message})

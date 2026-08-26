@@ -81,6 +81,15 @@ class OpenClawTransport:
             raise TransportError("OpenClaw did not provide a tab list.")
         return [item for item in tabs if isinstance(item, dict)]
 
+    def tabs(self) -> list[dict[str, Any]]:
+        """Return the current dedicated-browser catalog for safe UI handoffs.
+
+        Callers must still bind an exact target before any privileged browser
+        action.  Exposing the catalog here avoids each UI surface inventing its
+        own parsing of the OpenClaw response.
+        """
+        return self._tabs()
+
     @staticmethod
     def _stable_id(tab: dict[str, Any]) -> str:
         return str(tab.get("suggestedTargetId") or tab.get("tabId") or "")
@@ -96,6 +105,37 @@ class OpenClawTransport:
         if not target_id or not url.startswith(("https://", "http://")):
             raise TransportError("Focused OpenClaw tab has no stable target id or HTTP(S) URL.")
         return BrowserTarget(target_id, url)
+
+    def focus(self, target_id: str) -> BrowserTarget:
+        """Focus one already-known dedicated-browser target and re-read its URL."""
+        target_id = str(target_id or "").strip()
+        if not target_id:
+            raise TransportError("Cannot focus an empty browser target id.")
+        self._run(["focus", target_id])
+        return BrowserTarget(target_id, self.current_url(target_id))
+
+    def open(self, url: str) -> BrowserTarget:
+        """Open one user-requested URL and return its uniquely new browser tab.
+
+        This is intentionally limited to a user-facing handoff.  It never
+        clicks, fills, uploads, or treats the tab as approval for a later
+        browser write.  A new target must be unique; otherwise the caller must
+        ask the human to resolve the browser state instead of guessing.
+        """
+        url = str(url or "").strip()
+        if not url.startswith(("https://", "http://")):
+            raise TransportError("Browser handoff URL must be absolute HTTP(S).")
+        before = {self._stable_id(tab) for tab in self._tabs() if self._stable_id(tab)}
+        self._run(["open", url])
+        created = [tab for tab in self._tabs()
+                   if self._stable_id(tab) and self._stable_id(tab) not in before]
+        if len(created) != 1:
+            raise TransportError(
+                "JobOS could not identify exactly one tab opened for this handoff; focus the job page and retry."
+            )
+        tab = created[0]
+        target_id = self._stable_id(tab)
+        return self.focus(target_id)
 
     def current_url(self, target_id: str) -> str:
         for tab in self._tabs():

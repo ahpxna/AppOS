@@ -110,5 +110,6 @@ def test_privileged_upload_and_state_machine_are_wired_in_source():
     assert '_require_application_step(cur, application_id, "application_ready")' in executor
     assert "_document_bindings_still_current" in executor
     assert "privileged_execution_id" in review and "allowed_outcomes" in review
-    assert "execute_one(conn, approval_request_id)" in telegram
+    assert "single privileged-action worker owns browser I/O" in telegram
+    assert "execute_one(conn, approval_request_id)" not in telegram
     assert "expires_at > now()" in telegram

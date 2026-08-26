@@ -130,7 +130,8 @@ def test_reconciliation_review_cannot_be_dismissed_while_browser_state_is_uncert
     end = source.index('elif item_type == "application_ready"', start)
     logic = source[start:end]
     assert 'task[0] == "needs_reconciliation"' in logic
-    assert "Reject/revise cannot dismiss" in logic
+    assert "decision != \"approve\"" in logic
+    assert "close_autofill_reconciliation" in logic
 
 
 def test_review_materialization_is_after_durable_task_completion_commit():

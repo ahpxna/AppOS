@@ -50,12 +50,18 @@ def is_batch_safe_item(*, item_type: str, payload: dict[str, Any] | None) -> boo
     return True
 
 
-def status_badges(envelope: dict[str, Any]) -> str:
+def status_badges(envelope: dict[str, Any], *, reviewing_doc: str | None = None) -> str:
     documents = envelope.get("documents") if isinstance(envelope.get("documents"), dict) else {}
     job = envelope.get("job") if isinstance(envelope.get("job"), dict) else {}
     form = envelope.get("form") if isinstance(envelope.get("form"), dict) else {}
     resume = "✅" if isinstance(documents.get("resume"), dict) else "—"
     cover = "✅" if isinstance(documents.get("cover_letter"), dict) else "—"
+    # A document-review card describes a candidate artifact that is not yet an
+    # approved application binding.  Calling it missing is misleading.
+    if reviewing_doc == "resume":
+        resume = "🟡 review"
+    elif reviewing_doc == "cover_letter":
+        cover = "🟡 review"
     step = str(job.get("current_step") or "")
     form_ready = "✅" if step in {"application_form_ready", "awaiting_approval", "autofill_executing", "form_filled", "application_ready", "submitted"} else "—"
     if isinstance(form, dict) and form.get("proposed_fields"):
