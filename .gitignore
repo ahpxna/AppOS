@@ -50,3 +50,4 @@ bootstrap/openclaw/*.bundle.tar.gz
 
 # === Local credential vault ===
 data/secrets/
+*.orig

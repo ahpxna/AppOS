@@ -64,17 +64,27 @@ def _origin(url: str) -> str:
     return f"{p.scheme.casefold()}://{p.netloc.casefold()}"
 
 
-def _host_is_allowed(cur, url: str) -> bool:
+def _host_is_allowed(cur, url: str, *, application_id: str | None = None, purpose: str | None = None) -> bool:
     host = (urlsplit(url).hostname or "").casefold()
     if not host:
         return False
     cur.execute("SELECT domain FROM allowed_domains WHERE enabled=true;")
-    return any(host == str(row[0]).casefold() or host.endswith("." + str(row[0]).casefold())
-               for row in cur.fetchall())
+    if any(host == str(row[0]).casefold() or host.endswith("." + str(row[0]).casefold())
+           for row in cur.fetchall()):
+        return True
+    if application_id and purpose:
+        cur.execute(
+            """SELECT 1 FROM application_scoped_domain_trusts
+                 WHERE application_id=%s AND domain=%s AND purpose=%s
+                   AND enabled=true AND expires_at>now() LIMIT 1;""",
+            (application_id, host, purpose),
+        )
+        return cur.fetchone() is not None
+    return False
 
 
-def _require_trusted_target(cur, url: str) -> None:
-    if not _host_is_allowed(cur, url):
+def _require_trusted_target(cur, url: str, *, application_id: str | None = None, purpose: str | None = None) -> None:
+    if not _host_is_allowed(cur, url, application_id=application_id, purpose=purpose):
         host = (urlsplit(url).hostname or "unknown").casefold()
         raise PrivilegedActionError(
             f"target domain {host!r} is not human-trusted yet; approve the separate trust-domain gate first"
@@ -630,6 +640,90 @@ def _after_navigation(cur, transport: OpenClawTransport, application_id: str, so
             "page_fingerprint": fp, "consent_items": _consent_items(nodes)}
 
 
+def reconcile_observed_privileged_effect(cur, *, application_id: str, approval_request_id: str,
+                                         action_type: str) -> dict[str, Any]:
+    """Reconstruct durable pipeline state after a human confirms uncertain I/O occurred.
+
+    This never replays the action. It only fresh-reads the browser and updates state
+    from observable evidence. If the target cannot be identified safely, the caller
+    must leave the reconciliation item open.
+    """
+    cur.execute(
+        """SELECT payload_json FROM approval_requests
+             WHERE id=%s AND application_id=%s;""",
+        (approval_request_id, application_id),
+    )
+    row = cur.fetchone()
+    if not row:
+        raise PrivilegedActionError("reconciliation approval payload is unavailable")
+    payload = dict(row[0] or {})
+
+    if action_type == "privileged_submit_application":
+        _transition_application_step(
+            cur, application_id=application_id, to_step="submitted", actor="privileged-reconciliation",
+            reason="Human confirmed the uncertain final Submit browser effect occurred.",
+            detail={"approval_request_id": approval_request_id}, status="submitted",
+        )
+        cur.execute("UPDATE applications SET submitted_at=coalesce(submitted_at,now()), updated_at=now() WHERE id=%s;",
+                    (application_id,))
+        return {"submitted": True, "state": "submitted", "followup": "none"}
+
+    transport = _transport()
+    target_id = str(payload.get("target_id") or "")
+    if action_type == "privileged_upload_document":
+        if not target_id:
+            raise PrivilegedActionError("upload reconciliation has no exact target id")
+        url, snap, _nodes, fp = _snapshot(transport, target_id)
+        if not _upload_effect_verified(before_snapshot={"snapshot": ""}, after_snapshot=snap,
+                                       field_ref=str(payload.get("field_ref") or ""),
+                                       filename=str(payload.get("filename") or "")):
+            raise PrivilegedActionError("human reported upload occurred, but the exact upload field effect is not observable")
+        return {"uploaded": True, "target_id": target_id, "url": url, "page_fingerprint": fp,
+                "document_type": payload.get("document_type"), "followup": "none"}
+
+    recoverable = {
+        "privileged_begin_application", "privileged_advance_application_step",
+        "privileged_create_employer_account", "privileged_login_employer_account",
+        "privileged_accept_terms", "privileged_use_email_verification",
+    }
+    if action_type not in recoverable:
+        return {"followup": "none", "note": "No browser state reconstruction is required for this action type."}
+
+    # Prefer the human-focused tab during recovery, but only when it is exactly
+    # resolvable. Fall back to the original pinned target if focus is ambiguous.
+    try:
+        focused = transport.resolve_target()
+        observed_target = focused.target_id
+    except Exception:
+        observed_target = target_id
+    if not observed_target:
+        raise PrivilegedActionError("cannot identify a browser target for reconciliation; refocus the application tab")
+
+    url, snap, nodes, fp = _snapshot(transport, observed_target)
+    if action_type not in {"privileged_begin_application", "privileged_use_email_verification"}:
+        _require_trusted_target(cur, url, application_id=application_id, purpose="gmail_magic_link")
+
+    if action_type == "privileged_begin_application" and _application_step(cur, application_id) == "docs_verified":
+        _transition_application_step(
+            cur, application_id=application_id, to_step="application_entrypoint_ready",
+            actor="privileged-reconciliation",
+            reason="Human confirmed the uncertain Apply/application-entrypoint effect occurred.",
+            detail={"approval_request_id": approval_request_id, "target_id": observed_target},
+        )
+
+    platform = detect_platform(url, snap)
+    state, detail = detect_page_state(url, snap, nodes)
+    _update_auth_session(
+        cur, application_id=application_id, url=url, fingerprint=fp, state=state, platform=platform,
+        detail={**detail, "target_id": observed_target, "reconciled_from": action_type},
+    )
+    followup = "trust_domain_required" if not _host_is_allowed(
+        cur, url, application_id=application_id, purpose="gmail_magic_link"
+    ) else "state_gate"
+    return {"target_id": observed_target, "url": url, "page_fingerprint": fp,
+            "state": state, "platform": platform, "followup": followup}
+
+
 def _document_hashes_still_match(bindings: dict[str, Any]) -> bool:
     for item in bindings.values():
         if not isinstance(item, dict):
@@ -677,22 +771,80 @@ def _upload_effect_verified(*, before_snapshot: dict[str, Any], after_snapshot: 
     return bool(name and name in after_text.casefold() and name not in before_text.casefold())
 
 
-def materialize_application_ready_gate(cur, application_id: str) -> str | None:
-    """Freshly inspect application_ready and create exactly one next human gate."""
+def _prepare_exact_application_ready_control(cur, *, application_id: str, action: str,
+                                             control: dict[str, Any]) -> str:
+    """Create one exact-bound application_ready capability for a human-selected control."""
     _require_application_step(cur, application_id, "application_ready")
     transport = _transport()
-    target_id, url, _snapshot_payload, nodes, _fingerprint = _base_binding(transport)
+    target_id, url, _snapshot_payload, nodes, fingerprint = _base_binding(transport)
+    _require_trusted_target(cur, url)
+    live = next((candidate for candidate in _clickables(nodes)
+                 if str(candidate.get("ref") or "") == str(control.get("ref") or "")
+                 and str(candidate.get("label") or "") == str(control.get("label") or "")), None)
+    if not live:
+        raise PrivilegedActionError("candidate control changed while preparing ambiguity review")
+    screenshot = _capture_review_screenshot(transport, application_id, action, target_id)
+    field_digest, fields, blockers = _field_state(nodes)
+    payload: dict[str, Any] = {
+        "target_id": target_id, "expected_url": url,
+        "expected_page_fingerprint": fingerprint, "expected_origin": _origin(url),
+        "control_ref": live["ref"], "control_label": live["label"],
+        "field_state_sha256": field_digest, "required_blockers": blockers,
+        "review_context": {"screenshot_path": screenshot or "NaN",
+                           "write_actions": fields, "will_pause": blockers,
+                           "ambiguity_choice": {"action": action, "ref": live["ref"], "label": live["label"]}},
+    }
+    if action == "submit_application":
+        document_bindings = _document_bindings(cur, application_id)
+        if not isinstance(document_bindings.get("resume"), dict):
+            raise PrivilegedActionError("final Submit requires the current approved resume artifact pointer")
+        if not _document_bindings_still_current(cur, application_id, document_bindings):
+            raise PrivilegedActionError("approved resume/cover letter is stale against current pointers or JD")
+        payload["document_bindings"] = document_bindings
+        atype = "privileged_submit_application"
+        summary = f"AMBIGUITY CHOICE — FINAL SUBMIT: exact control {live['label']!r}."
+    elif action == "advance_application_step":
+        atype = "privileged_advance_application_step"
+        summary = f"AMBIGUITY CHOICE — advance/review using exact control {live['label']!r}; final Submit remains separate."
+    else:
+        raise PrivilegedActionError(f"unsupported application-ready candidate action: {action}")
+    return create_privileged_request(cur, application_id=application_id, action_type=atype,
+                                     payload=payload, summary=summary, requested_by="application-ready-ambiguity")
+
+
+def materialize_application_ready_gate(cur, application_id: str) -> list[str]:
+    """Freshly inspect application_ready and materialize exact candidate gates.
+
+    The function never clicks. If several Review/Next/Submit controls coexist,
+    each exact control becomes its own Telegram approval so the human can choose.
+    """
+    _require_application_step(cur, application_id, "application_ready")
+    transport = _transport()
+    _target_id, url, _snapshot_payload, nodes, _fingerprint = _base_binding(transport)
     _require_trusted_target(cur, url)
     pending_consents = [item for item in _consent_items(nodes) if item.get("selected") is not True]
     if pending_consents:
-        return prepare(cur, application_id=application_id, action="accept_terms")
+        return [prepare(cur, application_id=application_id, action="accept_terms")]
     submit_matches = [c for c in _clickables(nodes) if c["label"].strip().casefold() in SUBMIT_LABELS]
     advance_matches = [c for c in _clickables(nodes) if c["label"].strip().casefold() in ADVANCE_LABELS]
-    if len(submit_matches) == 1 and not advance_matches:
-        return prepare(cur, application_id=application_id, action="submit_application")
-    if len(advance_matches) == 1 and not submit_matches:
-        return prepare(cur, application_id=application_id, action="advance_application_step")
-    return None
+    candidates = [("advance_application_step", item) for item in advance_matches] + [
+        ("submit_application", item) for item in submit_matches
+    ]
+    if not candidates:
+        return []
+    if len(candidates) > 6:
+        # Too many candidate controls is itself ambiguous; keep the human gate
+        # open rather than flooding Telegram or guessing.
+        return []
+    if len(candidates) == 1:
+        action, _control = candidates[0]
+        return [prepare(cur, application_id=application_id, action=action)]
+    approvals: list[str] = []
+    for action, control in candidates:
+        approvals.append(_prepare_exact_application_ready_control(
+            cur, application_id=application_id, action=action, control=control
+        ))
+    return approvals
 
 
 def _post_commit_followup(conn, application_id: str, result: dict[str, Any]) -> dict[str, Any] | None:
@@ -760,6 +912,18 @@ def execute_one(conn, request_id: str) -> dict[str, Any]:
     try:
         with conn.cursor() as cur:
             payload = dict(payload or {})
+            cur.execute("SELECT coalesce(job_url,''), coalesce(jd_hash,''), current_step FROM applications WHERE id=%s FOR UPDATE;", (app_id,))
+            current_app = cur.fetchone()
+            if not current_app:
+                raise PrivilegedActionError("application no longer exists")
+            if str(payload.get("application_id") or "") != str(app_id):
+                raise PrivilegedActionError("approval application binding changed")
+            if str(payload.get("job_url") or "") != str(current_app[0] or ""):
+                raise PrivilegedActionError("application job URL changed after approval")
+            if str(payload.get("jd_hash") or "") != str(current_app[1] or ""):
+                raise PrivilegedActionError("application JD changed after approval")
+            if str(payload.get("expected_application_step") or "") != str(current_app[2] or ""):
+                raise PrivilegedActionError("application pipeline step changed after approval")
             if atype == "privileged_trust_external_domain":
                 domain = str(payload.get("domain") or "").casefold()
                 if payload.get("trust_source") == "gmail_magic_link":
@@ -774,6 +938,8 @@ def execute_one(conn, request_id: str) -> dict[str, Any]:
                         raise PrivilegedActionError("email magic-link trust candidate is unavailable")
                     if str(cand[3]) != str(payload.get("secret_sha256") or "") or str(cand[0]) != str(payload.get("gmail_account") or cand[0]):
                         raise PrivilegedActionError("email magic-link trust hash changed")
+                    if json.dumps(cand[4] or {}, sort_keys=True, separators=(",", ":"), default=str) != json.dumps(payload.get("secret_context") or {}, sort_keys=True, separators=(",", ":"), default=str):
+                        raise PrivilegedActionError("email magic-link trust context changed")
                     secret = refetch_secret({
                         "gmail_account": cand[0], "gmail_message_id": cand[1], "verification_kind": cand[2],
                         "secret_sha256": cand[3], "secret_context": cand[4] or {},
@@ -781,14 +947,24 @@ def execute_one(conn, request_id: str) -> dict[str, Any]:
                     observed_domain = (urlsplit(secret).hostname or "").casefold()
                     if not domain or domain != observed_domain:
                         raise PrivilegedActionError("email magic-link domain does not match the approved trust gate")
+                    ttl_minutes = max(15, min(60, int(os.getenv("JOBOS_MAGIC_LINK_TRUST_TTL_MINUTES", "30"))))
                     cur.execute(
-                        """INSERT INTO allowed_domains(domain, category, enabled)
-                           VALUES (%s,'email_verification',true)
-                           ON CONFLICT (domain) DO UPDATE SET enabled=true;""",
-                        (domain,),
+                        """UPDATE application_scoped_domain_trusts
+                              SET enabled=true, expires_at=now()+make_interval(mins => %s),
+                                  approval_request_id=%s, updated_at=now()
+                            WHERE application_id=%s AND domain=%s AND purpose='gmail_magic_link';""",
+                        (ttl_minutes, request_id, app_id, domain),
                     )
+                    if cur.rowcount == 0:
+                        cur.execute(
+                            """INSERT INTO application_scoped_domain_trusts(
+                                   application_id, domain, purpose, expires_at, approval_request_id, enabled)
+                               VALUES (%s,%s,'gmail_magic_link',now()+make_interval(mins => %s),%s,true);""",
+                            (app_id, domain, ttl_minutes, request_id),
+                        )
                     secret = ""
-                    result = {"trusted_domain": domain, "trust_source": "gmail_magic_link"}
+                    result = {"trusted_domain": domain, "trust_source": "gmail_magic_link",
+                              "scope": "application", "purpose": "gmail_magic_link", "ttl_minutes": ttl_minutes}
                 else:
                     live_url, live_snap, live_nodes, live_fp = _revalidate(transport, dict(payload or {}))
                     if not domain or domain != (urlsplit(str(payload.get("expected_url") or "")).hostname or "").casefold():
@@ -879,6 +1055,8 @@ def execute_one(conn, request_id: str) -> dict[str, Any]:
                         raise PrivilegedActionError("verification candidate mailbox/message binding changed after approval")
                     if str(cand[3]) != str(payload.get("secret_sha256") or "") or str(cand[2]) != str(payload.get("verification_kind") or ""):
                         raise PrivilegedActionError("verification candidate kind/hash changed after approval")
+                    if json.dumps(cand[4] or {}, sort_keys=True, separators=(",", ":"), default=str) != json.dumps(payload.get("secret_context") or {}, sort_keys=True, separators=(",", ":"), default=str):
+                        raise PrivilegedActionError("verification candidate context changed after approval")
                     secret = refetch_secret({"gmail_account": cand[0], "gmail_message_id": cand[1], "verification_kind": cand[2],
                                               "secret_sha256": cand[3], "secret_context": cand[4] or {}})
                     if cand[2] == "numeric_code":
@@ -889,7 +1067,7 @@ def execute_one(conn, request_id: str) -> dict[str, Any]:
                         if control and control != "NaN": io_started = True; _click(transport, target_id, control)
                         result = _after_navigation(cur, transport, app_id, target_id, before_tabs)
                     else:
-                        _require_trusted_target(cur, secret)
+                        _require_trusted_target(cur, secret, application_id=app_id, purpose="gmail_magic_link")
                         io_started = True; transport._run(["open", secret])
                         result = _after_navigation(cur, transport, app_id, target_id, before_tabs)
                     if not _observable_page_change(before_target=target_id, before_url=url, before_snapshot=snap, after=result):

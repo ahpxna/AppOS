@@ -430,6 +430,7 @@ def handle_callback(conn, token: str, allowed_user_id: int, callback: dict[str, 
                                                      "text": "Button expired", "show_alert": "true"})
             return
         item_id, action = row[1], row[2]
+    approval_request_id = ""
     try:
         result = decide_item(conn, item_id, decision=action,
                              actor=f"telegram:{sender_id}", note="Telegram review decision")
@@ -438,6 +439,15 @@ def handle_callback(conn, token: str, allowed_user_id: int, callback: dict[str, 
         # The human decision is durable before any privileged browser I/O.
         conn.commit()
         execution_result = None
+        observed_reconciliation = result.get("reconciliation_observed_result") or {}
+        if observed_reconciliation.get("state") and observed_reconciliation.get("state") != "submitted":
+            try:
+                from services.application_actions.privileged_action_v1 import _post_commit_followup
+                result["reconciliation_followup"] = _post_commit_followup(
+                    conn, result["application_id"], observed_reconciliation
+                )
+            except Exception as followup_exc:
+                result["reconciliation_followup"] = {"ok": False, "error": str(followup_exc)[:1000]}
         approval_type = str(result.get("approval_type") or "")
         approval_request_id = str(result.get("approval_request_id") or "")
         if action == "approve" and approval_type.startswith("privileged_") and approval_request_id:
@@ -464,20 +474,34 @@ def handle_callback(conn, token: str, allowed_user_id: int, callback: dict[str, 
         api(token, "answerCallbackQuery", data={"callback_query_id": callback_id,
                                                  "text": str(exc)[:180], "show_alert": "true"})
     except Exception as exc:
-        # execute_one already persists a consumed approval + needs_reconciliation
-        # when browser I/O may have occurred. Surface that state immediately.
+        outcome = "pre_io_refused"
         try:
             with conn.cursor() as cur:
+                if approval_request_id:
+                    cur.execute(
+                        """SELECT status FROM privileged_action_executions
+                             WHERE approval_request_id=%s ORDER BY started_at DESC LIMIT 1;""",
+                        (approval_request_id,),
+                    )
+                    execution = cur.fetchone()
+                    if execution and execution[0] == "needs_reconciliation":
+                        outcome = "post_io_uncertain"
                 sync_inbox(cur)
             conn.commit()
         except Exception:
             conn.rollback()
+        if outcome == "post_io_uncertain":
+            alert = "Browser I/O is uncertain; reconciliation required"
+            detail = f"⚠️ {str(exc)[:700]}\nBrowser I/O may have occurred. A reconciliation item is available; do not retry the old approval."
+        else:
+            alert = "Browser action refused before I/O"
+            detail = f"⛔ {str(exc)[:700]}\nThe exact binding was refused before browser I/O; no external side effect is assumed."
         api(token, "answerCallbackQuery", data={"callback_query_id": callback_id,
-                                                 "text": "Browser action needs reconciliation", "show_alert": "true"})
+                                                 "text": alert, "show_alert": "true"})
         chat_id = int((callback.get("message") or {}).get("chat", {}).get("id") or 0)
         if chat_id:
             api(token, "sendMessage", data={"chat_id": str(chat_id),
-                                             "text": f"⚠️ {str(exc)[:700]}\nA reconciliation item was created if browser I/O was uncertain."})
+                                             "text": f"{detail}\nOutcome: {outcome}"})
 
 
 def handle_message(conn, token: str, allowed_user_id: int, message: dict[str, Any]) -> None:

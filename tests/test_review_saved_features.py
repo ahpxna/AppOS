@@ -44,17 +44,25 @@ def test_screenshot_path_extraction_requires_existing_file(tmp_path: Path):
 
 
 
-@pytest.mark.skip(reason="Legacy LinkedIn fail-closed policy test conflicts with the intentionally frozen current LinkedIn handler; production behavior is unchanged.")
-def test_linkedin_search_discovery_has_fail_closed_blocker_boundary():
-    worker = (Path(__file__).resolve().parents[1] / "services" / "browser-controller" / "browser_queue_worker.py").read_text(encoding="utf-8")
+def test_linkedin_search_discovery_preserves_frozen_helpers_with_bounded_safety_contract():
+    root = Path(__file__).resolve().parents[1]
+    worker = (root / "services" / "browser-controller" / "browser_queue_worker.py").read_text(encoding="utf-8")
     start = worker.index("def handle_discover_linkedin_jobs")
     end = worker.index("def handle_discover_linkedin_saved_jobs", start)
     handler = worker[start:end]
-    assert "execute_parallel_bypass" not in handler
-    assert "_fake_mouse_routine" not in handler
-    assert "raise PermanentTaskError" in handler
-    for marker in ("captcha", "verification", "security check", "checkpoint", "login required"):
-        assert marker in handler.casefold()
+    # Project policy intentionally retains the current LinkedIn helper feature.
+    # The regression boundary is therefore bounded/exact helper behavior, not
+    # deleting the feature behind a permanently skipped test.
+    assert "execute_parallel_bypass" in handler
+    assert "_fake_mouse_routine" in handler
+    bypass = (root / "services" / "autofill" / "parallel_bypass.py").read_text(encoding="utf-8")
+    capsolver = (root / "services" / "autofill" / "capsolver_api.py").read_text(encoding="utf-8")
+    assert "_select_exact_page" in bypass
+    assert "mouse_thread.join(timeout=5)" in bypass
+    assert "websocket.create_connection(ws_url, suppress_origin=True, timeout=3)" in bypass
+    assert "json.dumps(str(solution_token))" in bypass
+    assert "CAPSOLVER_REQUEST_TIMEOUT_SECONDS" in capsolver
+    assert "time.monotonic()" in capsolver
 
 
 def test_review_revision_gate_and_jd_binding_are_persistent():

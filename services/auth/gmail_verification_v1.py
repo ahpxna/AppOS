@@ -24,6 +24,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 import psycopg
+from psycopg.types.json import Jsonb
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
@@ -200,19 +201,31 @@ def _sender_subject(message: Any) -> tuple[str, str]:
     return sender, subject
 
 
-def _relevant(message: Any, *, employer_domain: str | None) -> bool:
+def _relevance_score(message: Any, *, employer_domain: str | None) -> int:
     sender, subject = _sender_subject(message)
     text = f"{sender}\n{subject}\n{_all_text(message)}".casefold()
     if not any(word in text for word in VERIFY_WORDS):
-        return False
+        return -1
+    score = 2
+    if any(word in f"{sender} {subject}".casefold() for word in ("verify", "verification", "code", "candidate")):
+        score += 2
     if employer_domain:
         host_token = (urlsplit(employer_domain).hostname or employer_domain).casefold().removeprefix("www.")
         company_token = host_token.split(".")[0]
-        if host_token not in text and company_token and company_token not in text:
-            # Branded recruiting vendors often send from a different domain;
-            # verification semantics can still qualify when the company token is absent.
-            return any(word in text for word in ("candidate account", "verify your email", "verification code"))
-    return True
+        if host_token and host_token in text:
+            score += 8
+        elif company_token and company_token in text:
+            score += 5
+        elif any(word in text for word in ("candidate account", "verify your email", "verification code")):
+            # Soft fallback for branded ATS mail, but rank it below employer-matched mail.
+            score += 1
+        else:
+            return -1
+    return score
+
+
+def _relevant(message: Any, *, employer_domain: str | None) -> bool:
+    return _relevance_score(message, employer_domain=employer_domain) >= 0
 
 
 def _extract_numeric_code(message: Any) -> str | None:
@@ -247,13 +260,24 @@ def _extract_magic_link(message: Any) -> str | None:
 
 def discover_verification(*, recipient: str, requested_at: datetime,
                           employer_origin: str | None, max_results: int = 10) -> dict[str, Any] | None:
-    for message_id in search_candidate_ids(recipient=recipient, requested_at=requested_at, max_results=max_results):
+    if requested_at.tzinfo is None:
+        requested_at = requested_at.replace(tzinfo=timezone.utc)
+    requested_utc = requested_at.astimezone(timezone.utc)
+    ranked: list[tuple[int, datetime, str, Any]] = []
+    for message_id in search_candidate_ids(recipient=recipient, requested_at=requested_utc, max_results=max_results):
         sanitized = read_message(message_id, sanitized=True)
         msg_time = _timestamp(sanitized)
-        if msg_time and msg_time < requested_at.astimezone(timezone.utc):
+        # Missing/ambiguous time is not enough evidence for automatic selection.
+        # Keep the pipeline waiting instead of risking an old same-day OTP.
+        if msg_time is None or msg_time < requested_utc:
             continue
-        if not _relevant(sanitized, employer_domain=employer_origin):
+        score = _relevance_score(sanitized, employer_domain=employer_origin)
+        if score < 0:
             continue
+        ranked.append((score, msg_time, message_id, sanitized))
+
+    ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    for _score, msg_time, message_id, sanitized in ranked:
         sender, subject = _sender_subject(sanitized)
         code = _extract_numeric_code(sanitized)
         if code:
@@ -261,14 +285,17 @@ def discover_verification(*, recipient: str, requested_at: datetime,
                     "received_at": msg_time, "kind": "numeric_code",
                     "secret_sha256": hashlib.sha256(code.encode()).hexdigest(),
                     "secret_context": {"kind": "numeric_code", "digits": len(code)}}
-        # Sanitized gog reads deliberately strip unsafe/raw URLs. Full-read only
-        # this already-qualified candidate and persist only the link hash.
+        # Only full-read a sanitized candidate that already passed recipient,
+        # time and relevance ranking. Plaintext link is never persisted.
         full = read_message(message_id, sanitized=False)
+        full_time = _timestamp(full)
+        if full_time is None or full_time < requested_utc:
+            continue
         link = _extract_magic_link(full)
         if link:
             parsed = urlsplit(link)
             return {"message_id": message_id, "sender": sender, "subject": subject,
-                    "received_at": _timestamp(full) or msg_time, "kind": "magic_link",
+                    "received_at": full_time, "kind": "magic_link",
                     "secret_sha256": hashlib.sha256(link.encode()).hexdigest(),
                     "secret_context": {"kind": "magic_link",
                                        "link_origin": f"{parsed.scheme.casefold()}://{parsed.netloc.casefold()}",
@@ -288,7 +315,7 @@ def persist_candidate(cur, *, application_id: str, candidate: dict[str, Any]) ->
            RETURNING id::text;""",
         (application_id, gmail_account(), candidate["message_id"], candidate.get("sender"),
          candidate.get("subject"), candidate.get("received_at"), candidate["kind"], candidate["secret_sha256"],
-         candidate.get("secret_context") or {}),
+         Jsonb(candidate.get("secret_context") or {})),
     )
     return str(cur.fetchone()[0])
 

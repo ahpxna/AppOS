@@ -19,6 +19,7 @@ from datetime import timedelta
 from pathlib import Path
 
 import psycopg
+from psycopg.types.json import Jsonb
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
@@ -45,6 +46,9 @@ def process_pending(conn, *, max_results: int = 10) -> int:
                 ORDER BY s.updated_at LIMIT 20;"""
         )
         rows = cur.fetchall()
+    # Release the read transaction before bounded Gmail/network calls so an idle
+    # mailbox can never leave PostgreSQL idle-in-transaction while we sleep.
+    conn.commit()
     for app_id, recipient, origin, current_url, stored_fp, detail, updated_at in rows:
         requested_at = updated_at - timedelta(minutes=2)
         candidate = discover_verification(recipient=recipient, requested_at=requested_at,
@@ -72,9 +76,36 @@ def process_pending(conn, *, max_results: int = 10) -> int:
                             pass
                 except Exception:
                     pass
+            if candidate["kind"] == "numeric_code" and (not field_ref or field_ref == "NaN"):
+                # We found a secret candidate, but browser binding is not executable.
+                # Persist hash/metadata only and route a safe read-only refocus gate
+                # instead of sending Telegram an approval that must fail at execution.
+                cur.execute(
+                    """INSERT INTO application_events(application_id,event_type,event_source,event_payload)
+                       VALUES (%s,'email_verification_binding_required','gmail-verification-watcher',%s);""",
+                    (app_id, Jsonb({
+                        "candidate_id": candidate_id, "gmail_message_id": candidate["message_id"],
+                        "verification_kind": candidate["kind"], "secret_sha256": candidate["secret_sha256"],
+                        "target_id": target_id or "NaN", "reason": "verification input could not be exact-bound",
+                    })),
+                )
+                if target_id and expected_url and expected_fp:
+                    create_privileged_request(
+                        cur, application_id=app_id, action_type="privileged_auth_manual_retry",
+                        payload={"target_id": target_id, "expected_url": expected_url,
+                                 "expected_page_fingerprint": expected_fp, "expected_origin": origin or "NaN",
+                                 "review_context": {"screenshot_path": "NaN",
+                                                    "notice": "OTP found, but input binding is unavailable. Refocus the verification page, then run a fresh snapshot."}},
+                        summary="OTP was found but the code field could not be exact-bound. Refocus the employer verification page, then approve AUTH RETRY; the OTP remains hash-only.",
+                        requested_by="gmail-verification-watcher",
+                    )
+                    created += 1
+                conn.commit()
+                continue
+
             if candidate["kind"] == "magic_link":
                 link_origin = str((candidate.get("secret_context") or {}).get("link_origin") or "")
-                if link_origin and not _host_is_allowed(cur, link_origin):
+                if link_origin and not _host_is_allowed(cur, link_origin, application_id=app_id, purpose="gmail_magic_link"):
                     from urllib.parse import urlsplit
                     link_host = (urlsplit(link_origin).hostname or "").casefold()
                     if link_host:

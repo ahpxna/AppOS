@@ -40,13 +40,17 @@ def create_privileged_request(cur, *, application_id: str, action_type: str,
                               requested_by: str = "jobos", ttl_minutes: int = 60) -> str:
     if action_type not in PRIVILEGED_TYPES:
         raise RuntimeError(f"unsupported privileged action: {action_type}")
-    cur.execute("SELECT company, job_title FROM applications WHERE id = %s;", (application_id,))
+    cur.execute("SELECT company, job_title, coalesce(job_url,''), coalesce(jd_hash,''), current_step FROM applications WHERE id = %s;", (application_id,))
     app = cur.fetchone()
     if not app:
         raise RuntimeError("application not found")
     body = dict(payload or {})
-    body.update({"action_type": action_type, "company": app[0], "job_title": app[1],
-                 "binding_sha256": _hash_json(payload or {})})
+    body.update({
+        "action_type": action_type, "company": app[0], "job_title": app[1],
+        "application_id": application_id, "job_url": str(app[2] or ""),
+        "jd_hash": str(app[3] or ""), "expected_application_step": str(app[4] or ""),
+    })
+    body["binding_sha256"] = _hash_json({key: value for key, value in body.items() if key != "binding_sha256"})
     idem = _hash_json({"type": action_type, "application_id": application_id,
                        "binding_sha256": body["binding_sha256"]})
     cur.execute(

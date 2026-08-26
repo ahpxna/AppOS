@@ -85,31 +85,33 @@ def test_gmail_numeric_otp_and_magic_link_are_hashed_not_returned_in_candidate(m
     code = "481293"
     link = "https://accounts.example.com/verify?token=secret-token"
 
+    requested_at = datetime.now(timezone.utc)
+    received_ms = int((requested_at.timestamp() + 1) * 1000)
     monkeypatch.setattr(gmail, "search_candidate_ids", lambda **kwargs: ["m1"])
     monkeypatch.setattr(gmail, "read_message", lambda message_id, sanitized: {
         "id": "m1", "subject": "Verification code", "from": "recruiting@example.com",
-        "body": f"Your verification code is {code}",
+        "body": f"Your verification code is {code}", "internalDate": str(received_ms),
     })
     candidate = gmail.discover_verification(
-        recipient="candidate@example.com", requested_at=datetime.now(timezone.utc),
+        recipient="candidate@example.com", requested_at=requested_at,
         employer_origin="https://example.com", max_results=3,
     )
     assert candidate["kind"] == "numeric_code"
     assert candidate["secret_sha256"] == hashlib.sha256(code.encode()).hexdigest()
-    assert code not in json.dumps(candidate)
+    assert code not in json.dumps(candidate, default=str)
 
     monkeypatch.setattr(gmail, "read_message", lambda message_id, sanitized: (
-        {"id": "m1", "subject": "Verify your email", "from": "recruiting@example.com", "body": "Verify your email"}
+        {"id": "m1", "subject": "Verify your email", "from": "recruiting@example.com", "body": "Verify your email", "internalDate": str(received_ms)}
         if sanitized else
-        {"id": "m1", "subject": "Verify your email", "from": "recruiting@example.com", "body": f"Verify here: {link}"}
+        {"id": "m1", "subject": "Verify your email", "from": "recruiting@example.com", "body": f"Verify here: {link}", "internalDate": str(received_ms)}
     ))
     candidate = gmail.discover_verification(
-        recipient="candidate@example.com", requested_at=datetime.now(timezone.utc),
+        recipient="candidate@example.com", requested_at=requested_at,
         employer_origin="https://example.com", max_results=3,
     )
     assert candidate["kind"] == "magic_link"
     assert candidate["secret_sha256"] == hashlib.sha256(link.encode()).hexdigest()
-    assert link not in json.dumps(candidate)
+    assert link not in json.dumps(candidate, default=str)
 
 
 class VaultCursor:
@@ -239,7 +241,8 @@ def test_magic_link_requires_separate_trusted_domain_before_opening():
     assert 'Trust email-verification link domain' in watcher
     assert 'payload.get("trust_source") == "gmail_magic_link"' in executor
     assert 'email magic-link domain does not match the approved trust gate' in executor
-    assert '_require_trusted_target(cur, secret)' in executor
+    assert '_require_trusted_target(cur, secret, application_id=app_id, purpose="gmail_magic_link")' in executor
+    assert 'application_scoped_domain_trusts' in executor
 
 
 def test_openclaw_gmail_hook_wake_bridge_is_additive_and_payload_minimal():

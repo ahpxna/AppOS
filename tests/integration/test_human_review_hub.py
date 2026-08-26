@@ -228,3 +228,43 @@ def test_document_review_rejects_mutated_pdf(db, monkeypatch, tmp_path):
             conn.rollback()
     finally:
         _cleanup(db, app_id)
+
+
+def test_gmail_candidate_secret_context_uses_real_jsonb_adapter(db, monkeypatch):
+    from services.auth import gmail_verification_v1 as gmail
+    from datetime import datetime, timezone
+
+    app_id, _doc_id = _fixture(db)
+    monkeypatch.setenv("JOBOS_GMAIL_ACCOUNT", "candidate@example.com")
+    candidate = {
+        "message_id": f"integration-{uuid.uuid4()}",
+        "sender": "recruiting@example.com",
+        "subject": "Verification code",
+        "received_at": datetime.now(timezone.utc),
+        "kind": "numeric_code",
+        "secret_sha256": "b" * 64,
+        "secret_context": {"kind": "numeric_code", "digits": 6},
+    }
+    try:
+        with db.connect(TEST_DSN) as conn, conn.cursor() as cur:
+            candidate_id = gmail.persist_candidate(cur, application_id=app_id, candidate=candidate)
+            conn.commit()
+        with db.connect(TEST_DSN) as conn, conn.cursor() as cur:
+            cur.execute("SELECT secret_context_json FROM email_verification_candidates WHERE id=%s", (candidate_id,))
+            stored = cur.fetchone()[0]
+        assert stored == {"kind": "numeric_code", "digits": 6}
+    finally:
+        _cleanup(db, app_id)
+
+
+def test_072_later_page_auth_transitions_exist(db):
+    expected = {"needs_account_auth", "needs_email_verification", "needs_mfa", "needs_human_checkpoint"}
+    with db.connect(TEST_DSN) as conn, conn.cursor() as cur:
+        cur.execute(
+            """SELECT to_step FROM pipeline_transitions
+                 WHERE from_step='application_ready'
+                   AND to_step = ANY(%s);""",
+            (list(expected),),
+        )
+        observed = {row[0] for row in cur.fetchall()}
+    assert observed == expected

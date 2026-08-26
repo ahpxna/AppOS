@@ -24,7 +24,7 @@ def mark(results: list[tuple[str, bool, str]], name: str, ok: bool, detail: str 
     results.append((name, ok, detail))
 
 
-def doctor(*, check_browser: bool) -> int:
+def doctor(*, check_browser: bool, strict: bool = False, require_autofill: bool = False) -> int:
     """Report readiness without invoking a model, mutating data, or opening a tab."""
     load_repo_env()
     results: list[tuple[str, bool, str]] = []
@@ -57,8 +57,8 @@ def doctor(*, check_browser: bool) -> int:
         import psycopg
         with psycopg.connect(database_dsn(), connect_timeout=5) as conn, conn.cursor() as cur:
             mark(results, "PostgreSQL", True)
-            cur.execute("SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE migration_id = '071_human_approval_bus_and_privileged_actions.sql')")
-            mark(results, "Migrations through 071", bool(cur.fetchone()[0]))
+            cur.execute("SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE migration_id = '072_pipeline_recovery_and_scoped_email_trust.sql')")
+            mark(results, "Migrations through 072", bool(cur.fetchone()[0]))
             cur.execute("SELECT to_regclass('public.privileged_action_executions') IS NOT NULL")
             mark(results, "Human Approval Bus", bool(cur.fetchone()[0]))
             cur.execute("SELECT to_regclass('public.autofill_action_journal') IS NOT NULL")
@@ -74,7 +74,7 @@ def doctor(*, check_browser: bool) -> int:
             mark(results, "Immigration profile confirmed", int(cur.fetchone()[0]) == 1)
     except Exception as exc:
         mark(results, "PostgreSQL", False, str(exc)[:180])
-        mark(results, "Migrations through 071", False, "PostgreSQL unavailable")
+        mark(results, "Migrations through 072", False, "PostgreSQL unavailable")
 
     if check_browser:
         # Health only: it validates gateway/CDP availability but does not list
@@ -89,14 +89,32 @@ def doctor(*, check_browser: bool) -> int:
     for name, ok, detail in results:
         print(f"{'✓' if ok else '⚠'} {name}" + (f" — {detail}" if detail else ""))
     checks = {name: ok for name, ok, _ in results}
-    core = all(checks.get(name, False) for name in ("Python 3.11+", "Environment", "PostgreSQL", "Migrations through 071"))
-    autofill = core and all(ok for name, ok, _ in results if name in {
-        "Autofill action journal", "No unresolved autofill task", "Immigration profile confirmed",
+    core = all(checks.get(name, False) for name in ("Python 3.11+", "Environment", "PostgreSQL", "Migrations through 072"))
+    document_ready = core and checks.get("Resume template", False)
+    form_fill_ready = core and all(checks.get(name, False) for name in (
+        "Autofill action journal", "No unresolved browser action", "Immigration profile confirmed",
         "OpenClaw runtime", "Managed upload root", "Human Review Hub", "Human Approval Bus",
-    })
-    print(f"\nCORE READY: {'YES' if core else 'NO'}")
-    print(f"AUTOFILL READY: {'YES' if autofill else 'NO'}")
+    ))
+    auth_flow_ready = form_fill_ready and checks.get("Credential vault key", False)
+    privileged_ready = form_fill_ready and checks.get("Telegram approval channel", False)
+    email_verification_ready = auth_flow_ready and checks.get("Gmail gog reader", False) and checks.get("Telegram approval channel", False)
+    submit_ready = privileged_ready and checks.get("No unresolved browser action", False)
+    readiness = {
+        "CORE READY": core,
+        "DOCUMENT READY": document_ready,
+        "FORM-FILL READY": form_fill_ready,
+        "AUTH FLOW READY": auth_flow_ready,
+        "PRIVILEGED ACTION READY": privileged_ready,
+        "EMAIL VERIFICATION READY": email_verification_ready,
+        "SUBMIT READY": submit_ready,
+    }
+    for label, ok in readiness.items():
+        print(f"{label}: {'YES' if ok else 'NO'}")
     print("SUBMIT: TELEGRAM HUMAN APPROVAL + PRIVILEGED ONE-SHOT EXECUTOR ONLY")
+    if strict:
+        return 0 if all(readiness.values()) else 1
+    if require_autofill:
+        return 0 if form_fill_ready else 1
     return 0 if core else 1
 
 
@@ -439,6 +457,8 @@ def main() -> int:
     commands = parser.add_subparsers(dest="command", required=True)
     doctor_parser = commands.add_parser("doctor", help="Read-only readiness and safety checks.")
     doctor_parser.add_argument("--check-browser", action="store_true", help="Also probe gateway and CDP health; never opens a page.")
+    doctor_parser.add_argument("--strict", action="store_true", help="Exit non-zero unless every readiness lane is ready.")
+    doctor_parser.add_argument("--require-autofill", action="store_true", help="Exit non-zero unless deterministic form-fill readiness is ready.")
     autofill_parser = commands.add_parser("autofill", help="Prepare a deterministic, approval-bound form session.")
     autofill_subcommands = autofill_parser.add_subparsers(dest="autofill_command", required=True)
     prepare_parser = autofill_subcommands.add_parser("prepare", help="Inspect the pinned application tab and optionally create its exact approval.")
@@ -505,7 +525,7 @@ def main() -> int:
 
     args = parser.parse_args()
     if args.command == "doctor":
-        return doctor(check_browser=args.check_browser)
+        return doctor(check_browser=args.check_browser, strict=args.strict, require_autofill=args.require_autofill)
     if args.command == "status":
         return status()
     if args.command == "saved":

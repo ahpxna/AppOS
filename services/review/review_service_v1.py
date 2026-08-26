@@ -798,7 +798,9 @@ def decide_item(conn, item_id: str, *, decision: str, actor: str, note: str = ""
          source_sha, reviewed_artifact_id, item_payload) = row
         capability_result: dict[str, Any] | None = None
         materialized_approval_id: str | None = None
+        materialized_approval_ids: list[str] = []
         reconciliation_outcome: str | None = None
+        reconciliation_observed_result: dict[str, Any] | None = None
         if status not in {"pending", "needs_revision"}:
             raise ReviewError(f"Review item is already {status}.")
 
@@ -904,7 +906,8 @@ def decide_item(conn, item_id: str, *, decision: str, actor: str, note: str = ""
                 )
                 from services.application_actions.privileged_action_v1 import materialize_application_ready_gate
                 try:
-                    materialized_approval_id = materialize_application_ready_gate(cur, app_id)
+                    materialized_approval_ids = materialize_application_ready_gate(cur, app_id)
+                    materialized_approval_id = materialized_approval_ids[0] if materialized_approval_ids else None
                 except Exception as exc:
                     # Classification/package failure is not permission to submit. Keep
                     # application_ready visible so the user can retry gate preparation.
@@ -913,8 +916,9 @@ def decide_item(conn, item_id: str, *, decision: str, actor: str, note: str = ""
                            VALUES (%s, 'application_ready_gate_materialization_failed', 'human_review_hub', %s);""",
                         (app_id, Jsonb({"review_item_id": item_id, "error": str(exc)[:1000]})),
                     )
-                if materialized_approval_id:
-                    ensure_approval_review(cur, materialized_approval_id)
+                if materialized_approval_ids:
+                    for candidate_approval_id in materialized_approval_ids:
+                        ensure_approval_review(cur, candidate_approval_id)
                 else:
                     ensure_application_ready_review(cur, app_id)
 
@@ -938,8 +942,21 @@ def decide_item(conn, item_id: str, *, decision: str, actor: str, note: str = ""
                 action_type = execution[1]
                 reconciliation_outcome = "occurred" if decision == "approve" else "not_occurred"
                 reconciled_result = dict(execution[3] or {})
+                if reconciliation_outcome == "occurred":
+                    from services.application_actions.privileged_action_v1 import reconcile_observed_privileged_effect
+                    try:
+                        reconciliation_observed_result = reconcile_observed_privileged_effect(
+                            cur, application_id=app_id, approval_request_id=str(execution[2]),
+                            action_type=str(action_type),
+                        )
+                    except Exception as exc:
+                        raise ReviewError(
+                            "Human reported OCCURRED, but JobOS could not reconstruct the current browser/application state safely. "
+                            f"Refocus the application tab and retry reconciliation: {exc}"
+                        ) from exc
                 reconciled_result.update({"reconciliation": reconciliation_outcome,
-                                          "reconciled_by": actor, "review_item_id": item_id})
+                                          "reconciled_by": actor, "review_item_id": item_id,
+                                          "observed": reconciliation_observed_result or {}})
                 new_execution_status = "completed" if reconciliation_outcome == "occurred" else "failed"
                 cur.execute(
                     """UPDATE privileged_action_executions
@@ -947,15 +964,6 @@ def decide_item(conn, item_id: str, *, decision: str, actor: str, note: str = ""
                         WHERE id = %s;""",
                     (new_execution_status, Jsonb(reconciled_result), privileged_execution_id),
                 )
-                if reconciliation_outcome == "occurred" and action_type == "privileged_submit_application":
-                    from services.application_actions.privileged_action_v1 import _transition_application_step
-                    _transition_application_step(
-                        cur, app_id, "submitted", actor="privileged-reconciliation",
-                        reason="Human confirmed the uncertain final Submit browser effect occurred.",
-                        detail={"privileged_execution_id": privileged_execution_id, "review_item_id": item_id},
-                        status="submitted",
-                    )
-                    cur.execute("UPDATE applications SET submitted_at = coalesce(submitted_at, now()) WHERE id = %s;", (app_id,))
                 cur.execute(
                     """INSERT INTO application_events(application_id, event_type, event_source, event_payload)
                        VALUES (%s, 'privileged_action_reconciled', 'human_review_hub', %s);""",
@@ -975,15 +983,20 @@ def decide_item(conn, item_id: str, *, decision: str, actor: str, note: str = ""
         elif item_type == "application_ready":
             if decision == "approve":
                 from services.application_actions.privileged_action_v1 import materialize_application_ready_gate
-                materialized_approval_id = materialize_application_ready_gate(cur, app_id)
-                if not materialized_approval_id:
-                    raise ReviewError("The fresh page has no single unambiguous Next/Consent/Submit gate. Inspect the pinned browser page before trying again.")
-                ensure_approval_review(cur, materialized_approval_id)
-                note = (note + " Prepared a fresh exact-bound browser approval; no browser action executed.").strip()
+                materialized_approval_ids = materialize_application_ready_gate(cur, app_id)
+                materialized_approval_id = materialized_approval_ids[0] if materialized_approval_ids else None
+                if not materialized_approval_ids:
+                    raise ReviewError("The fresh page has no unambiguous exact candidate gate. Refocus the application tab or inspect the page before trying again.")
+                for candidate_approval_id in materialized_approval_ids:
+                    ensure_approval_review(cur, candidate_approval_id)
+                if len(materialized_approval_ids) > 1:
+                    note = (note + " Multiple exact candidate gates were prepared separately; choose the intended Telegram approval. No browser action executed.").strip()
+                else:
+                    note = (note + " Prepared a fresh exact-bound browser approval; no browser action executed.").strip()
             elif decision == "reject":
                 from services.application_actions.privileged_action_v1 import _transition_application_step
                 _transition_application_step(
-                    cur, app_id, "abandoned", actor=actor,
+                    cur, application_id=app_id, to_step="abandoned", actor=actor,
                     reason="Human declined to continue from application_ready.",
                     detail={"review_item_id": item_id}, status="abandoned",
                 )
@@ -1013,8 +1026,12 @@ def decide_item(conn, item_id: str, *, decision: str, actor: str, note: str = ""
         response["approval_type"] = capability_result.get("type")
     if materialized_approval_id:
         response["materialized_approval_request_id"] = materialized_approval_id
+    if materialized_approval_ids:
+        response["materialized_approval_request_ids"] = materialized_approval_ids
     if reconciliation_outcome:
         response["reconciliation_outcome"] = reconciliation_outcome
+    if reconciliation_observed_result:
+        response["reconciliation_observed_result"] = reconciliation_observed_result
     return response
 
 
@@ -1053,7 +1070,15 @@ def main() -> int:
                                   scope=args.scope, answer_kind=args.answer_kind)
             conn.commit(); print(json.dumps(out, indent=2)); return 0
         out = decide_item(conn, args.item_id, decision=args.command, actor=args.actor, note=args.note)
-        conn.commit(); print(json.dumps(out, indent=2)); return 0
+        conn.commit()
+        observed = out.get("reconciliation_observed_result") or {}
+        if observed.get("state") and observed.get("state") != "submitted":
+            try:
+                from services.application_actions.privileged_action_v1 import _post_commit_followup
+                out["reconciliation_followup"] = _post_commit_followup(conn, out["application_id"], observed)
+            except Exception as exc:
+                out["reconciliation_followup"] = {"ok": False, "error": str(exc)[:1000]}
+        print(json.dumps(out, indent=2)); return 0
 
 
 if __name__ == "__main__":

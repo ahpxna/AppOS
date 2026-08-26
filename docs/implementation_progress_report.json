@@ -5,17 +5,30 @@
   "desktop_manual_intake": {
     "status": "implemented",
     "summary": "Added a Tk desktop form for user-pasted job descriptions. It creates normal applications with source metadata, queues market-demand extraction through the existing trigger, supports free screening, and offers explicit opt-in progression through LLM/document stages. It has no browser, CDP, LinkedIn login, cursor injection, or application-submission capability.",
-    "files": ["scripts/jobos_intake_app.py", "services/intake/manual_job_intake.py", "test_manual_job_intake.py"]
+    "files": [
+      "scripts/jobos_intake_app.py",
+      "services/intake/manual_job_intake.py",
+      "test_manual_job_intake.py"
+    ]
   },
   "project_profile_registry": {
     "status": "implemented",
     "summary": "Added a private local Python/Tk project-profile form and JSON source of truth for the six existing Word resume blocks. It records template identity, aliases, skills, technologies, JD keywords, evidence locations, allowed facts, and do-not-overclaim boundaries. Parsed/aggregated records map only through user-confirmed aliases; ties and unknown records remain unmapped. Resume generation now reads those aliases to bind an approved profile asset to its correct immutable project block.",
-    "files": ["scripts/jobos_project_profile_app.py", "services/common/project_registry.py", "docs/project_profile_registry.md", "test_project_registry.py"]
+    "files": [
+      "scripts/jobos_project_profile_app.py",
+      "services/common/project_registry.py",
+      "docs/project_profile_registry.md",
+      "test_project_registry.py"
+    ]
   },
   "resume_template_pdf": {
     "status": "implemented_docx_review_before_pdf",
     "summary": "A template-preserving renderer limits tailoring to the existing 12 project bullet slots, five skill rows, and six audited header subtitles of the supplied one-page Word resume. It hard-enforces six fixed project blocks, immutable project name/date/GitHub fields, per-slot two-line/one-line character budgets, primary-before-secondary pairing, evidence-backed ranked skill rows, a project-slot-to-approved-asset binding, and literal JD/project-evidence change logs for both project bullets and subtitles. The verifier independently rejects unsupported resume changes before DOCX export. Cover-letter prompting and validation now require literal candidate/JD evidence and, where research exists, a candidate-asset-backed, URL-backed company-specific paragraph with a literal quote from the sourced company context rather than generic company praise. It runs only after claim QA passes and writes a local DOCX for Word-based review/Print to PDF; JobOS intentionally does not use LibreOffice to make the final PDF because that engine paginated the source template differently.",
-    "files": ["services/document-generation/resume_template_renderer.py", "services/document-generation/render_verified_resume_v1.py", "docs/resume_template_contract.md"]
+    "files": [
+      "services/document-generation/resume_template_renderer.py",
+      "services/document-generation/render_verified_resume_v1.py",
+      "docs/resume_template_contract.md"
+    ]
   },
   "code_change_notes": [
     {
@@ -72,7 +85,7 @@
         "services/discovery/profile_job_search_v1.py",
         "services/common/profile_job_matching.py"
       ],
-      "summary": "Added approved-profile search terms, transparent ranking, and a dedicated JobOS LinkedIn browser profile. The native browser launcher creates a loopback-CDP Chrome profile that the user signs into manually once; no password/cookie transfer occurs. A user-created, bounded discovery task can search supplied terms, read at most five job-detail pages, validate structured JD output, and auto-ingest it into applications. It cannot authenticate, solve CAPTCHA, save jobs, set alerts, change preferences, message, fill forms, or submit."
+      "summary": "Added approved-profile search terms, transparent ranking, and a dedicated JobOS LinkedIn browser profile. The native browser launcher creates a loopback-CDP Chrome profile that the user signs into manually once; no password/cookie transfer occurs. A user-created, bounded discovery task can search supplied terms, read at most five job-detail pages, validate structured JD output, and auto-ingest it into applications. It does not automate login, save jobs, set alerts, change preferences, message, fill application forms, or submit. The frozen LinkedIn discovery worker currently retains optional FakeMouse/CapSolver checkpoint helpers; those helpers are operationally bounded and separate from final application submission."
     },
     {
       "files": [
@@ -248,8 +261,8 @@
   "decision_log": [
     {
       "topic": "LinkedIn integration",
-      "decision": "Allow only a user-created, bounded discovery task against the manually authorized dedicated LinkedIn profile; no automated login, cursor simulation, or application submission.",
-      "reason": "Keeps intake auditable while allowing the JobOS browser executor to collect a small, explicit set of full JDs.",
+      "decision": "Allow only a user-created, bounded discovery task against the manually authorized dedicated LinkedIn profile. The frozen production discovery path currently retains optional FakeMouse/CapSolver helpers; no automated login or application submission is authorized by that discovery capability.",
+      "reason": "Keeps intake auditable while documenting the actual production boundary: bounded discovery may use the retained helper path, while login, application writes, and final Submit remain separate human-gated capabilities.",
       "status": "operationally_verified"
     },
     {
@@ -338,25 +351,25 @@
       "Runtime Docker smoke test: PostgreSQL and n8n started from local arm64 images; n8n /healthz returned status ok",
       "All 52 SQL migrations applied to the running PostgreSQL instance; schema smoke check found applications, market-demand, company-research, profile-search, and repository-evidence relations",
       "Repository-evidence CLI review against the live database; repository_evidence_item_id and L2 component_registry entry verified",
-      "Browser queue worker health preflight: OpenClaw binary was found and the expected loopback gateway failure was reported without a task or model invocation"
-      ,"Market-requirement LLM pipeline unit test: unfamiliar tool retained only with a literal JD quote; hallucinated item rejected"
-      ,"Migration 048 applied to the running PostgreSQL database; trigger queued existing captured JD and dry-run worker found it without invoking an LLM"
-      ,"Pointer telemetry fit completed from a user-recorded 14,962-sample trace: 373 time-ordered Theil-Sen/MAD regimes written to an ignored local JSON file"
-      ,"LinkedIn browser discovery tests: nested agent JSON parsing, result-cap rejection, job-URL validation, and full-JD minimum were checked without browser or model invocation"
-      ,"Migration 049 applied to running PostgreSQL; Compose configuration validated with non-secret placeholder values"
-      ,"Private OpenClaw 2026.7.1-2 installed with project-managed Node 24.15.0; native bootstrap passed, gateway RPC connectivity passed, and all four agents were visible without invoking an LLM"
-      ,"Browser queue worker now automatically selects the project Node runtime; its RPC health check passed against the live gateway without a model call"
-      ,"Dedicated Chrome CDP session verified on the LinkedIn Jobs page after manual user login; OpenClaw browser doctor, status, tab listing, and snapshot checks passed"
-      ,"Live LinkedIn discovery completed through the JobOS OpenClaw executor using the attach-only remote CDP profile: one IBM posting was validated, canonicalized, and stored with a 4,578-character JD; its market-requirement extraction run was automatically queued"
-      ,"Targeted regression suite for immigration semantics, document grounding, and fixed-template resume rules passed (14 tests); Python compilation passed for the changed safety modules. No browser or LLM invocation was used."
-      ,"Python syntax compilation and whitespace checks passed for the Ubuntu bootstrap, migration ledger, immigration synthesis, approval reissue change, and deterministic autofill contracts."
-      ,"Pure immigration classification and deterministic autofill plan/verify smoke checks passed without a database, browser, LLM, or external call."
-      ,"Deterministic session smoke check passed with a fake transport: a semantic sponsorship answer selected the explicit Yes option, a static field verified after a write, and an incomplete immigration profile could not reach HIGH. No browser command was invoked."
-      ,"Python compilation passed for the pinned OpenClaw transport, rematching session, durable journal worker wiring, and approval artifact binding. The focused unit test exercises the exact fill --fields JSON payload and target id with a fake transport; no OpenClaw/browser/LLM invocation was used."
-      ,"Python compilation passed for the runtime installer, setup wrapper, profile onboarding helper, migration integration-test source, and worker. The OpenClaw setup dry run and profile-onboarding status command returned valid JSON; deterministic autofill tests passed (6). No runtime download, database integration, browser, or model run was started."
-      ,"P0 autofill hardening compile and deterministic checks passed: exact initial-page URL/fingerprint binding, profile/input hash binding, re-rendered-ref recovery, normalized phone verification, separated STEM/I-983/E-Verify question classes, and the durable reconciliation CLI. No browser, model, DB integration, or runtime download was invoked."
-      ,"Follow-up hardening passed static compilation and 11 focused deterministic tests: same-origin/different-job page refusal, separate candidate-confirmed STEM/I-983 answers, safe Node archive internal-link extraction, automatic .env loading for the bootstrapped virtualenv, and manual profile-asset review/approval commands. No browser, LLM, network, Docker, or live database operation was invoked."
-      ,"Second autofill gate hardening passed static compilation and 21 focused deterministic tests: query-preserving job identity, strict single-page rechecks before/after every write, truncated-snapshot refusal, prefilled-value verification, exact legal-question table coverage, and empty OPENCLAW_BIN private-runtime resolution. A fresh-schema FakeTransport lifecycle suite plus local fake-ATS fixtures were added but intentionally not executed against a database/browser on this host."
+      "Browser queue worker health preflight: OpenClaw binary was found and the expected loopback gateway failure was reported without a task or model invocation",
+      "Market-requirement LLM pipeline unit test: unfamiliar tool retained only with a literal JD quote; hallucinated item rejected",
+      "Migration 048 applied to the running PostgreSQL database; trigger queued existing captured JD and dry-run worker found it without invoking an LLM",
+      "Pointer telemetry fit completed from a user-recorded 14,962-sample trace: 373 time-ordered Theil-Sen/MAD regimes written to an ignored local JSON file",
+      "LinkedIn browser discovery tests: nested agent JSON parsing, result-cap rejection, job-URL validation, and full-JD minimum were checked without browser or model invocation",
+      "Migration 049 applied to running PostgreSQL; Compose configuration validated with non-secret placeholder values",
+      "Private OpenClaw 2026.7.1-2 installed with project-managed Node 24.15.0; native bootstrap passed, gateway RPC connectivity passed, and all four agents were visible without invoking an LLM",
+      "Browser queue worker now automatically selects the project Node runtime; its RPC health check passed against the live gateway without a model call",
+      "Dedicated Chrome CDP session verified on the LinkedIn Jobs page after manual user login; OpenClaw browser doctor, status, tab listing, and snapshot checks passed",
+      "Live LinkedIn discovery completed through the JobOS OpenClaw executor using the attach-only remote CDP profile: one IBM posting was validated, canonicalized, and stored with a 4,578-character JD; its market-requirement extraction run was automatically queued",
+      "Targeted regression suite for immigration semantics, document grounding, and fixed-template resume rules passed (14 tests); Python compilation passed for the changed safety modules. No browser or LLM invocation was used.",
+      "Python syntax compilation and whitespace checks passed for the Ubuntu bootstrap, migration ledger, immigration synthesis, approval reissue change, and deterministic autofill contracts.",
+      "Pure immigration classification and deterministic autofill plan/verify smoke checks passed without a database, browser, LLM, or external call.",
+      "Deterministic session smoke check passed with a fake transport: a semantic sponsorship answer selected the explicit Yes option, a static field verified after a write, and an incomplete immigration profile could not reach HIGH. No browser command was invoked.",
+      "Python compilation passed for the pinned OpenClaw transport, rematching session, durable journal worker wiring, and approval artifact binding. The focused unit test exercises the exact fill --fields JSON payload and target id with a fake transport; no OpenClaw/browser/LLM invocation was used.",
+      "Python compilation passed for the runtime installer, setup wrapper, profile onboarding helper, migration integration-test source, and worker. The OpenClaw setup dry run and profile-onboarding status command returned valid JSON; deterministic autofill tests passed (6). No runtime download, database integration, browser, or model run was started.",
+      "P0 autofill hardening compile and deterministic checks passed: exact initial-page URL/fingerprint binding, profile/input hash binding, re-rendered-ref recovery, normalized phone verification, separated STEM/I-983/E-Verify question classes, and the durable reconciliation CLI. No browser, model, DB integration, or runtime download was invoked.",
+      "Follow-up hardening passed static compilation and 11 focused deterministic tests: same-origin/different-job page refusal, separate candidate-confirmed STEM/I-983 answers, safe Node archive internal-link extraction, automatic .env loading for the bootstrapped virtualenv, and manual profile-asset review/approval commands. No browser, LLM, network, Docker, or live database operation was invoked.",
+      "Second autofill gate hardening passed static compilation and 21 focused deterministic tests: query-preserving job identity, strict single-page rechecks before/after every write, truncated-snapshot refusal, prefilled-value verification, exact legal-question table coverage, and empty OPENCLAW_BIN private-runtime resolution. A fresh-schema FakeTransport lifecycle suite plus local fake-ATS fixtures were added but intentionally not executed against a database/browser on this host."
     ],
     "blocked_by_environment": [
       "The Chrome sidecar image kasmweb/chrome:1.16.0 is not present; Docker Desktop image pulls currently fail before download with Keychain Error (-67674).",
@@ -372,10 +385,10 @@
     "Run repo_inventory_v1.py, then import-inventory → explicit confirm-ownership → build-asset → human review → approve-asset for every GitHub project that should be usable as portfolio evidence.",
     "Set JOBOS_LLM_BACKEND and, if using a token API, its base URL/key/model in untracked .env; use per-role overrides only where needed.",
     "Repair Docker Desktop Keychain access or load kasmweb/chrome:1.16.0 through an approved registry path, then start the OpenClaw + browser overlay with an environment-only OPENCLAW_GATEWAY_TOKEN.",
-    "Configure OpenClaw model names and re-run scripts/openclaw_bootstrap.py bootstrap --force after reviewing backups."
-    ,"Apply migration 050, then use immigration_profile_v1.py set --confirm --apply only with candidate-verified values. Review JD flags and attach employer evidence with source URLs; do not treat E-Verify as a sponsorship guarantee."
-    ,"Before enabling deterministic form writes, apply migrations through 058 and review the exact JobOS doctor output; browser writes remain review-only until an ATS capability is explicitly promoted after a local pilot."
-    ,"On a clean clone, run setup_openclaw_jobos.py with --install-runtime before start_openclaw_jobos.py; use docs/profile_onboarding.md to stage private candidate inputs."
+    "Configure OpenClaw model names and re-run scripts/openclaw_bootstrap.py bootstrap --force after reviewing backups.",
+    "Apply migration 050, then use immigration_profile_v1.py set --confirm --apply only with candidate-verified values. Review JD flags and attach employer evidence with source URLs; do not treat E-Verify as a sponsorship guarantee.",
+    "Before enabling deterministic form writes, apply migrations through 058 and review the exact JobOS doctor output; browser writes remain review-only until an ATS capability is explicitly promoted after a local pilot.",
+    "On a clean clone, run setup_openclaw_jobos.py with --install-runtime before start_openclaw_jobos.py; use docs/profile_onboarding.md to stage private candidate inputs."
   ],
   "privacy_note": "This is a decision/progress report. It intentionally excludes private chain-of-thought and secrets."
 }

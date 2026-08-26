@@ -3,17 +3,18 @@ import websocket
 import json
 import time
 import random
+import os
 __test__ = False
 
 def test_fake_mouse(regimes_file_path):
     try:
         print("[1] Đang tìm Chrome ở cổng 9222...")
-        res = requests.get("http://127.0.0.1:9222/json")
+        res = requests.get("http://127.0.0.1:9222/json", timeout=3)
         tabs = res.json()
         
         # Lấy tab đầu tiên là trang web
         ws_url = next(t["webSocketDebuggerUrl"] for t in tabs if t["type"] == "page")
-        ws = websocket.create_connection(ws_url, suppress_origin=True)
+        ws = websocket.create_connection(ws_url, suppress_origin=True, timeout=3)
         print(f"[2] Đã cắm ống vào Tab: {ws_url}")
 
         # Điều hướng tab tới một trang test (tùy chọn)
@@ -75,4 +76,4 @@ def test_fake_mouse(regimes_file_path):
         print(f"[LỖI] {e}")
 
 if __name__ == "__main__":
-    test_fake_mouse("/Users/phanan/pointer-regimes.json")
+    test_fake_mouse(os.getenv("JOBOS_POINTER_REGIMES_PATH", "data/pointer-regimes.json"))
