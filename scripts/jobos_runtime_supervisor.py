@@ -60,6 +60,7 @@ def _specs() -> dict[str, list[str]]:
         "privileged-actions": [sys.executable, "-m", "services.application_actions.privileged_action_v1", "worker", "--poll-seconds", "5"],
         "browser-worker": [sys.executable, str(ROOT / "services" / "browser-controller" / "browser_queue_worker.py"), "--poll-seconds", "5"],
         "browser-state-watcher": [sys.executable, "-m", "services.auth.browser_state_watcher_v1", "--poll-seconds", "5"],
+        "document-revision": [sys.executable, "-m", "services.review.document_revision_worker_v1", "--poll-seconds", "5"],
     }
     if (os.getenv("JOBOS_TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")) and (
         os.getenv("JOBOS_TELEGRAM_ALLOWED_USER_ID") or os.getenv("TELEGRAM_ALLOWED_USER_ID")

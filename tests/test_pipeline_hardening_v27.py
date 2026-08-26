@@ -157,7 +157,7 @@ def test_application_ready_with_review_and_submit_materializes_two_separate_capa
 
     monkeypatch.setattr(action, "_require_application_step", lambda *_a, **_k: None)
     monkeypatch.setattr(action, "_transport", lambda: object())
-    monkeypatch.setattr(action, "_base_binding", lambda _t: (
+    monkeypatch.setattr(action, "_base_binding", lambda *_a, **_k: (
         "target", "https://ats.example/app", {}, [], "fp",
     ))
     monkeypatch.setattr(action, "_require_trusted_target", lambda *_a, **_k: None)

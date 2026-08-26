@@ -241,6 +241,8 @@ def assert_binding_matches(cur, request_row: Dict[str, Any]) -> None:
             raise RuntimeError("Autofill approval JD changed after preview; prepare a fresh plan.")
         if str(payload.get("expected_application_step") or "") != str(app[2] or ""):
             raise RuntimeError("Autofill approval pipeline step changed; prepare a fresh plan.")
+        if not str(payload.get("expected_target_id") or "").strip():
+            raise RuntimeError("Autofill approval predates exact browser-target binding; prepare a fresh plan.")
         document_id = payload.get("document_id")
         if not document_id:
             raise RuntimeError("Autofill approval payload missing document_id.")
@@ -568,9 +570,9 @@ def cmd_create(conn, args) -> int:
                 "content_hash": binding["content_hash"],
             })
         elif args.type == "autofill_form":
-            if not all((args.application_id, args.document_id, args.expected_origin,
+            if not all((args.application_id, args.document_id, args.expected_origin, args.expected_target_id,
                         args.expected_page_url, args.expected_page_fingerprint, args.expected_autofill_input_hash,)):
-                print("ERROR: autofill_form requires --application-id, --document-id, --expected-origin, --expected-page-url, --expected-page-fingerprint and --expected-autofill-input-hash.")
+                print("ERROR: autofill_form requires --application-id, --document-id, --expected-origin, --expected-target-id, --expected-page-url, --expected-page-fingerprint and --expected-autofill-input-hash.")
                 return 1
             try:
                 binding = fetch_document_binding(cur, args.application_id, args.document_id)
@@ -645,6 +647,7 @@ def cmd_create(conn, args) -> int:
                 "document_id": binding["id"],
                 "document_sha256": binding["content_hash"],
                 "expected_origin": expected_origin,
+                "expected_target_id": str(args.expected_target_id),
                 "expected_initial_url": expected_page_url,
                 "expected_page_fingerprint": args.expected_page_fingerprint.casefold(),
                 "autofill_input_hash": input_hash,
@@ -662,7 +665,8 @@ def cmd_create(conn, args) -> int:
             idempotency_key = hash_json({
                 "type": args.type, "application_id": args.application_id,
                 "document_id": binding["id"], "document_sha256": binding["content_hash"],
-                "expected_origin": expected_origin, "expected_initial_url": expected_page_url,
+                "expected_origin": expected_origin, "expected_target_id": str(args.expected_target_id),
+                "expected_initial_url": expected_page_url,
                 "expected_page_fingerprint": args.expected_page_fingerprint.casefold(), "autofill_input_hash": input_hash,
                 "artifact_id": artifact["id"] if artifact else None,
                 "artifact_sha256": artifact["sha256"] if artifact else None,
@@ -795,6 +799,59 @@ def cmd_create(conn, args) -> int:
         return 0
 
 
+def _stop_application_for_denied_privileged(cur, *, application_id: str | None,
+                                              atype: str, payload: dict[str, Any], actor: str) -> bool:
+    """Make the daily-UX ❌ decision durable for application-level gates.
+
+    Exact email candidates, delegated uploads, autofill plans, and navigation
+    alternatives are capability-level decisions and therefore do not abandon
+    the whole application. Employer/app progression gates do.
+    """
+    if not application_id:
+        return False
+    stop_types = {
+        'privileged_begin_application', 'privileged_create_employer_account',
+        'privileged_login_employer_account', 'privileged_choose_create_employer_account_path',
+        'privileged_auth_manual_retry', 'privileged_mfa_retry', 'privileged_checkpoint_retry',
+        'privileged_accept_terms', 'privileged_advance_application_step',
+        'privileged_submit_application',
+    }
+    if atype == 'privileged_trust_external_domain':
+        if str(payload.get('trust_source') or '') == 'gmail_magic_link':
+            return False
+        stop_types.add(atype)
+    if atype not in stop_types:
+        return False
+    cur.execute('SELECT current_step FROM applications WHERE id=%s FOR UPDATE;', (application_id,))
+    row = cur.fetchone()
+    if not row or str(row[0] or '') == 'abandoned':
+        return False
+    current = str(row[0] or '')
+    cur.execute("SELECT 1 FROM pipeline_transitions WHERE from_step=%s AND to_step='abandoned';", (current,))
+    if not cur.fetchone():
+        return False
+    cur.execute(
+        "UPDATE applications SET current_step='abandoned',status='abandoned',updated_at=now() "
+        "WHERE id=%s AND current_step=%s;",
+        (application_id, current),
+    )
+    if cur.rowcount != 1:
+        return False
+    cur.execute(
+        """INSERT INTO pipeline_events(application_id,from_step,to_step,actor,reason,detail_json)
+           VALUES (%s,%s,'abandoned',%s,'Human stopped the application by denying an application-level privileged gate.',%s);""",
+        (application_id, current, actor, Jsonb({'approval_type': atype})),
+    )
+    cur.execute(
+        """UPDATE approval_requests SET status='expired',executing_task_id=NULL,
+                  action_note=coalesce(action_note,'') || ' Application stopped by human.'
+              WHERE application_id=%s AND id <> coalesce(%s::uuid,id)
+                AND status IN ('pending','approved') AND consumed_at IS NULL;""",
+        (application_id, str(payload.get('_request_id') or '') or None),
+    )
+    return True
+
+
 # ---------------------------------------------------------------- redeem
 
 def redeem(conn, token: str, *, decision: str, note: str, actor: str) -> int:
@@ -896,9 +953,13 @@ def redeem(conn, token: str, *, decision: str, note: str, actor: str) -> int:
             return 1
 
         if new_status == "denied":
+            denied_payload = payload_request["payload_json"] if isinstance(payload_request.get("payload_json"), dict) else {}
             _reject_email_candidate_for_denied_request(
+                cur, application_id=application_id, atype=atype, payload=denied_payload,
+            )
+            _stop_application_for_denied_privileged(
                 cur, application_id=application_id, atype=atype,
-                payload=payload_request["payload_json"] if isinstance(payload_request.get("payload_json"), dict) else {},
+                payload={**denied_payload, "_request_id": request_id}, actor=actor,
             )
 
         autofill_queued = False
@@ -993,9 +1054,13 @@ def decide_request_by_id(conn, request_id: str, *, decision: str, note: str,
         if cur.rowcount != 1:
             return {"ok": False, "error": "Approval request changed state concurrently."}
         if new_status == "denied":
+            denied_payload = request["payload_json"] if isinstance(request.get("payload_json"), dict) else {}
             _reject_email_candidate_for_denied_request(
+                cur, application_id=application_id, atype=atype, payload=denied_payload,
+            )
+            _stop_application_for_denied_privileged(
                 cur, application_id=application_id, atype=atype,
-                payload=request["payload_json"] if isinstance(request.get("payload_json"), dict) else {},
+                payload={**denied_payload, "_request_id": rid}, actor=actor,
             )
         autofill_queued = False
         if application_id and new_status == "denied" and atype == "autofill_form":
@@ -1118,6 +1183,7 @@ def main() -> int:
     pc.add_argument("--document-id", help="Required for type=autofill_form.")
     pc.add_argument("--artifact-id", help="Optional exact resume/cover artifact to authorize for upload.")
     pc.add_argument("--expected-origin", help="Required for type=autofill_form, e.g. https://jobs.example.com")
+    pc.add_argument("--expected-target-id", help="Exact JobOS browser target id for type=autofill_form.")
     pc.add_argument("--expected-page-url", help="Exact initial application URL for type=autofill_form.")
     pc.add_argument(
         "--expected-page-fingerprint",

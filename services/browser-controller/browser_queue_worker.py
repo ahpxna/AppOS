@@ -782,6 +782,9 @@ def require_bound_approval(cur, task: Dict[str, Any]) -> Dict[str, Any]:
             or str(app_row[1] or "") != str(approval_payload.get("application_jd_hash") or "")
             or str(app_row[2] or "") != str(approval_payload.get("expected_application_step") or "")):
         raise PermanentTaskError("Autofill application job/JD/pipeline binding changed after approval.")
+    expected_target_id = str(approval_payload.get("expected_target_id") or "").strip()
+    if not expected_target_id:
+        raise PermanentTaskError("Autofill approval lacks an exact browser target id; prepare a fresh capability.")
     if target_action != "fill_application_form":
         raise PermanentTaskError(f"Approval {approved_id} is not for fill_application_form.")
     if bound_doc != document_id or bound_hash != document_sha256:
@@ -805,6 +808,7 @@ def require_bound_approval(cur, task: Dict[str, Any]) -> Dict[str, Any]:
         raise PermanentTaskError("Approval page/input binding does not match this task.")
     return {"id": approved_id, "document_id": document_id, "expected_origin": origin,
             "artifact_id": artifact_id, "artifact_sha256": artifact_hash, "artifact_filename": artifact_filename,
+            "expected_target_id": expected_target_id,
             "expected_initial_url": page_url, "expected_page_fingerprint": page_fingerprint_sha,
             "autofill_input_hash": input_hash, "autofill_action_scope": action_scope or {},
             "autofill_plan_key": str(approval_payload.get("autofill_plan_key") or ""),
@@ -1825,6 +1829,7 @@ def handle_fill_application_form(cur, task) -> Dict[str, Any]:
     try:
         session = AutofillSession(
             transport=transport, expected_origin=binding["expected_origin"],
+            expected_target_id=binding["expected_target_id"],
             expected_initial_url=binding["expected_initial_url"],
             expected_page_fingerprint=binding["expected_page_fingerprint"],
             snapshot_state=lambda target_id: snapshot_state(transport, target_id),

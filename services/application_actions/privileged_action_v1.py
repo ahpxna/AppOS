@@ -484,8 +484,15 @@ def _consent_items(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if role in {"checkbox", "radio"}:
             if not any(word in low for word in CONSENT_WORDS):
                 continue
+            # Optional consent/preferences must never become a blocker just
+            # because their wording contains terms/privacy/consent. Only a
+            # control the ATS marks required may be auto-packaged as a legal
+            # gate. Optional choices remain untouched unless the user handles
+            # them explicitly in the browser.
+            if not bool(n.get("required")):
+                continue
             items.append({"ref": ref, "label": label, "role": role,
-                          "selected": n.get("selected"), "required": bool(n.get("required"))})
+                          "selected": n.get("selected"), "required": True})
             continue
         # Buttons have no selected state. Only an explicit affirmative action is
         # consent; informational buttons such as "Privacy Policy" are excluded.
@@ -521,15 +528,34 @@ def _capture_review_screenshot(transport: OpenClawTransport, application_id: str
         return None
 
 
-def _base_binding(transport: OpenClawTransport) -> tuple[str, str, dict[str, Any], list[dict[str, Any]], str]:
-    target = transport.resolve_target()
+def _base_binding(cur, transport: OpenClawTransport, *, application_id: str,
+                  allow_focused_rebind: bool = False, expected_url: str = "") -> tuple[str, str, dict[str, Any], list[dict[str, Any]], str]:
+    from services.common.application_browser_binding_v1 import (
+        ApplicationBrowserBindingError, resolve_application_bound_target,
+    )
+    try:
+        target = resolve_application_bound_target(
+            cur, transport, application_id=application_id,
+            allow_focused_rebind=allow_focused_rebind, expected_url=expected_url,
+        )
+    except ApplicationBrowserBindingError as exc:
+        raise PrivilegedActionError(str(exc)) from exc
     url, snapshot, nodes, fingerprint = _snapshot(transport, target.target_id)
     return target.target_id, canonical_page_url(url), snapshot, nodes, fingerprint
 
 
 def prepare(cur, *, application_id: str, action: str, candidate_id: str | None = None) -> str:
     transport = _transport()
-    target_id, url, snapshot, nodes, fingerprint = _base_binding(transport)
+    source_job_url = ""
+    if action == "begin_application":
+        cur.execute("SELECT coalesce(job_url,'') FROM applications WHERE id=%s;", (application_id,))
+        row = cur.fetchone()
+        source_job_url = str(row[0] or "") if row else ""
+    target_id, url, snapshot, nodes, fingerprint = _base_binding(
+        cur, transport, application_id=application_id,
+        allow_focused_rebind=(action == "begin_application"),
+        expected_url=source_job_url,
+    )
     screenshot = _capture_review_screenshot(transport, application_id, action, target_id)
     payload: dict[str, Any] = {"target_id": target_id, "expected_url": url,
                                "expected_page_fingerprint": fingerprint,
@@ -548,9 +574,6 @@ def prepare(cur, *, application_id: str, action: str, candidate_id: str | None =
             raise PrivilegedActionError(
                 "approved resume artifact changed or is stale against the current job description"
             )
-        cur.execute("SELECT job_url FROM applications WHERE id=%s;", (application_id,))
-        source_row = cur.fetchone()
-        source_job_url = str(source_row[0] or "") if source_row else ""
         if not source_job_url or canonical_page_url(source_job_url) != canonical_page_url(url):
             raise PrivilegedActionError("focused browser page is not the exact stored job URL for this application")
         control = _find_exact_control(nodes, APPLY_LABELS)
@@ -1145,7 +1168,9 @@ def _prepare_exact_application_ready_control(cur, *, application_id: str, action
     """Create one exact-bound application_ready capability for a human-selected control."""
     _require_application_step(cur, application_id, "application_ready")
     transport = _transport()
-    target_id, url, _snapshot_payload, nodes, fingerprint = _base_binding(transport)
+    target_id, url, _snapshot_payload, nodes, fingerprint = _base_binding(
+        cur, transport, application_id=application_id
+    )
     _require_trusted_target(cur, url, application_id=application_id)
     live = next((candidate for candidate in _clickables(nodes)
                  if str(candidate.get("ref") or "") == str(control.get("ref") or "")
@@ -1185,7 +1210,9 @@ def materialize_application_ready_gate(cur, application_id: str) -> list[str]:
     """
     _require_application_step(cur, application_id, "application_ready")
     transport = _transport()
-    _target_id, url, _snapshot_payload, nodes, _fingerprint = _base_binding(transport)
+    _target_id, url, _snapshot_payload, nodes, _fingerprint = _base_binding(
+        cur, transport, application_id=application_id
+    )
     _require_trusted_target(cur, url, application_id=application_id)
     pending_consents = [item for item in _consent_items(nodes) if item.get("selected") is not True]
     if pending_consents:

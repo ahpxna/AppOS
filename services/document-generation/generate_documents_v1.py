@@ -1088,6 +1088,12 @@ def main() -> int:
     p.add_argument("--print-prompt", action="store_true")
     p.add_argument("--force", action="store_true",
                    help="Generate even when fit_decision is reject.")
+    p.add_argument("--revision-source-document-id",
+                   help="Exact reviewed resume/cover-letter document being revised from human feedback.")
+    p.add_argument("--revision-feedback",
+                   help="Candidate-authored revision request. This is an editing instruction, never factual evidence.")
+    p.add_argument("--revision-feedback-stdin", action="store_true",
+                   help="Read candidate revision feedback from stdin so private text is not exposed in the process command line.")
     p.add_argument("--skip-live-project-refresh", action="store_true",
                    help="Offline diagnostic only. DB freshness gates still apply; current GitHub HEAD is not polled.")
     p.add_argument("--project-max-stale-hours", type=int,
@@ -1150,6 +1156,35 @@ def main() -> int:
                 else:
                     print(f"ERROR: {e}")
                     return 1
+
+            revision_context: dict[str, Any] = {}
+            if args.revision_feedback and args.revision_feedback_stdin:
+                print("ERROR: use only one of --revision-feedback or --revision-feedback-stdin.")
+                return 2
+            feedback = ((sys.stdin.read() if args.revision_feedback_stdin else (args.revision_feedback or ""))).strip()
+            if feedback or args.revision_source_document_id:
+                if args.doc_type not in {"resume", "cover_letter"} or not feedback or not args.revision_source_document_id:
+                    print("ERROR: document revisions require both --revision-source-document-id and --revision-feedback for resume/cover_letter.")
+                    return 2
+                cur.execute(
+                    """SELECT gd.doc_type,gd.content,gd.evidence_map,gd.source_jd_hash,a.jd_hash
+                         FROM generated_documents gd JOIN applications a ON a.id=gd.application_id
+                        WHERE gd.id=%s AND gd.application_id=%s;""",
+                    (args.revision_source_document_id, args.application_id),
+                )
+                prior = cur.fetchone()
+                if not prior or str(prior[0]) != args.doc_type:
+                    print("ERROR: revision source document is not the exact same application/document type.")
+                    return 2
+                if not prior[3] or str(prior[3]) != str(prior[4] or ""):
+                    print("ERROR: revision source document is stale against the current JD; regenerate from the current application context instead.")
+                    return 2
+                revision_context = {
+                    "source_document_id": str(args.revision_source_document_id),
+                    "current_content": str(prior[1] or ""),
+                    "current_resume_template": dict((prior[2] or {}).get("resume_template") or {}),
+                    "human_feedback": feedback,
+                }
 
             assets = fetch_source_assets(cur, app["role_family"])
             if not assets:
@@ -1216,6 +1251,20 @@ def main() -> int:
                 prompt = build_cover_letter_prompt(app, catalog, cover_alignment_blueprint)
             else:
                 prompt = build_short_answer_prompt(app, catalog, args.question)
+
+            if revision_context:
+                prompt += (
+                    "\n\nHUMAN REVISION REQUEST — EDITING DIRECTION ONLY, NEVER EVIDENCE\n"
+                    "The candidate reviewed the previous draft and requested a targeted revision.\n"
+                    "Follow the request where it is compatible with every existing grounding, immutable-field, JD, and do-not-overclaim rule.\n"
+                    "Do NOT treat the feedback text itself as proof of a fact, metric, tool, title, employer, date, project outcome, or skill.\n"
+                    "Preserve verified parts of the current draft that the request does not ask to change.\n"
+                    "If the requested change cannot be supported, keep the truthful baseline/current wording and report it in not_supported/self_check instead of inventing support.\n\n"
+                    "CURRENT REVIEWED DRAFT:\n" + revision_context["current_content"] +
+                    "\n\nCURRENT STRUCTURED RESUME OVERRIDES (if any):\n" +
+                    json.dumps(revision_context.get("current_resume_template") or {}, ensure_ascii=False, sort_keys=True) +
+                    "\n\nCANDIDATE FEEDBACK:\n" + revision_context["human_feedback"] + "\n"
+                )
 
             print(f"Company:        {app['company']}")
             print(f"Job title:      {app['job_title']}")
@@ -1322,6 +1371,8 @@ def main() -> int:
                     "approved_asset_count": len(assets),
                     "company_context_source_count": len(valid_company_urls),
                     "questions": args.question,
+                    "revision_source_document_id": revision_context.get("source_document_id") if revision_context else None,
+                    "human_revision_feedback": revision_context.get("human_feedback") if revision_context else None,
                     "resume_target_coverage_percent": (RESUME_TARGET_COVERAGE_PERCENT if args.doc_type == "resume" else None),
                     "cover_positioning_target_percent": (COVER_POSITIONING_TARGET_PERCENT if args.doc_type == "cover_letter" else None),
                     "cover_alignment_blueprint": cover_alignment_blueprint,

@@ -28,7 +28,8 @@ from services.common.config import database_dsn, load_repo_env
 from services.review.review_service_v1 import (
     ReviewError, answer_question, decide_item, review_artifacts, sync_inbox,
     safe_batch_review_items, snooze_review_item, question_quick_choices,
-    document_change_summary,
+    document_change_summary, submit_document_feedback,
+    prepare_fresh_autofill_after_human_input,
 )
 from services.review.approval_context_v1 import NAN, build_envelope, context_files, snapshot_context
 
@@ -141,7 +142,7 @@ def _keyboard(cur, item_id: str, allowed_user_id: int, item_type: str,
         focus, confirm = tok("focus_browser"), tok("sensitive_confirm")
         rows = [
             [{"text": "🌐 Focus JobOS form", "callback_data": f"rv:{focus}"}],
-            [{"text": "✅ I will answer this exact question", "callback_data": f"rv:{confirm}"}],
+            [{"text": "✅ Done — recheck form", "callback_data": f"rv:{confirm}"}],
             [{"text": "👀 Review", "callback_data": f"rv:{details}"},
              {"text": "⏭ Later", "callback_data": f"rv:{later}"}],
         ]
@@ -151,20 +152,23 @@ def _keyboard(cur, item_id: str, allowed_user_id: int, item_type: str,
         revise, reject = tok("revise"), tok("reject")
         rows = [
             [{"text": "✏️ Prepare again", "callback_data": f"rv:{revise}"},
-             {"text": "❌ Reject", "callback_data": f"rv:{reject}"}],
+             {"text": "❌ Stop application", "callback_data": f"rv:{reject}"}],
             [{"text": "👀 Review", "callback_data": f"rv:{details}"},
              {"text": "⏭ Later", "callback_data": f"rv:{later}"}],
         ]
         return render(rows)
 
-    if item_type == "document_review" and payload.get("qa_status") != "pass":
-        revise, reject = tok("revise"), tok("reject")
-        rows = [
-            [{"text": "✏️ Revise", "callback_data": f"rv:{revise}"},
-             {"text": "❌ Reject", "callback_data": f"rv:{reject}"}],
-            [{"text": "👀 Review", "callback_data": f"rv:{details}"},
-             {"text": "⏭ Later", "callback_data": f"rv:{later}"}],
-        ]
+    if item_type == "document_review":
+        feedback = tok("document_feedback")
+        rows = []
+        if payload.get("qa_status") == "pass":
+            approve = tok("approve")
+            rows.append([{"text": "✅ Approve", "callback_data": f"rv:{approve}"},
+                         {"text": "✏️ Tell agent what to fix", "callback_data": f"rv:{feedback}"}])
+        else:
+            rows.append([{"text": "✏️ Tell agent what to fix", "callback_data": f"rv:{feedback}"}])
+        rows.append([{"text": "👀 Review", "callback_data": f"rv:{details}"},
+                     {"text": "⏭ Later", "callback_data": f"rv:{later}"}])
         return render(rows)
 
     if item_type == "reconciliation_required" and payload.get("privileged_execution_id"):
@@ -187,6 +191,14 @@ def _keyboard(cur, item_id: str, allowed_user_id: int, item_type: str,
 
     if item_type == "action_required":
         action_kind = str(payload.get("action_kind") or "")
+        if action_kind == "workflow_followup_required" and str(payload.get("expected_step") or "") == "needs_email_verification":
+            focus = tok("focus_browser")
+            rows = [
+                [{"text": "🌐 Open verification page in JobOS", "callback_data": f"rv:{focus}"}],
+                [{"text": "👀 Review", "callback_data": f"rv:{details}"},
+                 {"text": "⏭ Later", "callback_data": f"rv:{later}"}],
+            ]
+            return render(rows)
         approve, reject = tok("approve"), tok("reject")
         label = {
             "open_apply_binding_required": "🌐 Open JobOS Apply page",
@@ -251,12 +263,19 @@ def _keyboard(cur, item_id: str, allowed_user_id: int, item_type: str,
         return render(rows)
 
     revise = tok("revise")
+    application_stop_types = {
+        "privileged_begin_application", "privileged_trust_external_domain",
+        "privileged_choose_create_employer_account_path", "privileged_create_employer_account",
+        "privileged_accept_terms", "privileged_advance_application_step",
+        "privileged_submit_application",
+    }
+    reject_label = "❌ Stop application" if approval_type in application_stop_types else "❌ Reject"
     rows = [
         [{"text": approve_labels.get(approval_type, "✅ Approve"), "callback_data": f"rv:{approve}"}],
         [{"text": "👀 Review", "callback_data": f"rv:{details}"},
          {"text": "✏️ Edit", "callback_data": f"rv:{revise}"},
          {"text": "⏭ Later", "callback_data": f"rv:{later}"}],
-        [{"text": "❌ Reject", "callback_data": f"rv:{reject}"}],
+        [{"text": reject_label, "callback_data": f"rv:{reject}"}],
     ]
     return render(rows)
 
@@ -855,6 +874,31 @@ def _clear_pending_question(cur, chat_id: int, *, item_id: str | None = None) ->
         )
 
 
+def _clear_pending_document_feedback(cur, chat_id: int, *, item_id: str | None = None) -> None:
+    """Clear an exact, short-lived document-agent feedback capture."""
+    if item_id:
+        cur.execute(
+            """UPDATE telegram_control_surface_state
+                  SET pending_document_review_item_id=NULL,
+                      pending_document_source_sha256=NULL,
+                      pending_document_feedback_expires_at=NULL,
+                      pending_document_prompt_message_id=NULL,
+                      updated_at=now()
+                WHERE chat_id=%s AND pending_document_review_item_id=%s;""",
+            (chat_id, item_id),
+        )
+    else:
+        cur.execute(
+            """UPDATE telegram_control_surface_state
+                  SET pending_document_review_item_id=NULL,
+                      pending_document_source_sha256=NULL,
+                      pending_document_feedback_expires_at=NULL,
+                      pending_document_prompt_message_id=NULL,
+                      updated_at=now() WHERE chat_id=%s;""",
+            (chat_id,),
+        )
+
+
 def handle_callback(conn, token: str, allowed_user_id: int, callback: dict[str, Any]) -> None:
     callback_id = str(callback.get("id") or "")
     sender_id = int((callback.get("from") or {}).get("id") or 0)
@@ -933,6 +977,8 @@ def handle_callback(conn, token: str, allowed_user_id: int, callback: dict[str, 
             snooze_review_item(conn, item_id, actor=f"telegram:{sender_id}", hours=6)
             with conn.cursor() as cur:
                 _clear_pending_question(cur, chat_id, item_id=item_id)
+                _clear_pending_document_feedback(cur, chat_id, item_id=item_id)
+                cur.execute("UPDATE telegram_callback_tokens SET used_at=now() WHERE review_item_id=%s AND used_at IS NULL;", (item_id,))
             conn.commit()
             api(token, "answerCallbackQuery", data={"callback_query_id": callback_id, "text": "Snoozed for 6 hours"})
             if chat_id:
@@ -940,6 +986,33 @@ def handle_callback(conn, token: str, allowed_user_id: int, callback: dict[str, 
         except ReviewError as exc:
             conn.rollback()
             api(token, "answerCallbackQuery", data={"callback_query_id": callback_id, "text": str(exc)[:180], "show_alert": "true"})
+        return
+    if action == "document_feedback":
+        api(token, "answerCallbackQuery", data={"callback_query_id": callback_id, "text": "Reply with what to change"})
+        prompt = api(token, "sendMessage", data={
+            "chat_id": str(chat_id),
+            "text": ("✏️ Tell the document agent exactly what is wrong or what to improve. "
+                     "Your feedback is editing direction, never evidence; JobOS will not invent unsupported facts. "
+                     "Reply directly to this message within 15 minutes."),
+            "reply_markup": json.dumps({"force_reply": True, "input_field_placeholder": "What should the resume/cover letter agent fix?"}),
+        })
+        prompt_id = int(prompt["result"]["message_id"])
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO telegram_control_surface_state(
+                       chat_id,pending_document_review_item_id,pending_document_source_sha256,
+                       pending_document_feedback_expires_at,pending_document_prompt_message_id,updated_at)
+                   VALUES (%s,%s,%s,now() + interval '15 minutes',%s,now())
+                   ON CONFLICT (chat_id) DO UPDATE
+                   SET pending_document_review_item_id=EXCLUDED.pending_document_review_item_id,
+                       pending_document_source_sha256=EXCLUDED.pending_document_source_sha256,
+                       pending_document_feedback_expires_at=EXCLUDED.pending_document_feedback_expires_at,
+                       pending_document_prompt_message_id=EXCLUDED.pending_document_prompt_message_id,
+                       updated_at=now();""",
+                (chat_id, item_id, token_source, prompt_id),
+            )
+            cur.execute("UPDATE telegram_callback_tokens SET used_at=now() WHERE id=%s;", (row[0],))
+        conn.commit()
         return
     if action == "other":
         # Bind free text to a short-lived ForceReply prompt, not to arbitrary
@@ -972,12 +1045,18 @@ def handle_callback(conn, token: str, allowed_user_id: int, callback: dict[str, 
         answer = str(callback_payload.get("answer") or "").strip()
         scope = str(callback_payload.get("scope") or "company")
         try:
-            answer_question(conn, item_id, answer=answer, actor=f"telegram:{sender_id}", scope=scope, answer_kind="option")
+            answer_result = answer_question(conn, item_id, answer=answer, actor=f"telegram:{sender_id}", scope=scope, answer_kind="option")
             with conn.cursor() as cur:
                 cur.execute("UPDATE telegram_callback_tokens SET used_at=now() WHERE review_item_id=%s AND used_at IS NULL;", (item_id,))
                 _clear_pending_question(cur, chat_id, item_id=item_id)
                 sync_inbox(cur)
             conn.commit()
+            if answer_result.get("autofill_reprepare_required"):
+                reprepare = prepare_fresh_autofill_after_human_input(str(answer_result["application_id"]))
+                if not reprepare.get("ok"):
+                    with conn.cursor() as cur:
+                        sync_inbox(cur)
+                    conn.commit()
             api(token, "answerCallbackQuery", data={"callback_query_id": callback_id, "text": f"Saved: {answer}"})
             if chat_id:
                 api(token, "sendMessage", data={"chat_id": str(chat_id), "text": f"✅ Saved answer: {answer}. JobOS will reuse it only within its approved scope."})
@@ -1007,15 +1086,21 @@ def handle_callback(conn, token: str, allowed_user_id: int, callback: dict[str, 
     if action == "sensitive_confirm":
         try:
             result = decide_item(conn, item_id, decision="approve", actor=f"telegram:{sender_id}",
-                                 note="Telegram sensitive-question manual acknowledgement")
+                                 note="Telegram sensitive-question exact completion recheck")
             with conn.cursor() as cur:
                 cur.execute("UPDATE telegram_callback_tokens SET used_at=now() WHERE review_item_id=%s AND used_at IS NULL;", (item_id,))
                 _clear_pending_question(cur, chat_id, item_id=item_id)
                 sync_inbox(cur)
             conn.commit()
-            api(token, "answerCallbackQuery", data={"callback_query_id": callback_id, "text": "Acknowledged; no answer was stored"})
+            if result.get("autofill_reprepare_required"):
+                reprepare = prepare_fresh_autofill_after_human_input(str(result["application_id"]))
+                if not reprepare.get("ok"):
+                    with conn.cursor() as cur:
+                        sync_inbox(cur)
+                    conn.commit()
+            api(token, "answerCallbackQuery", data={"callback_query_id": callback_id, "text": "Verified complete; no legal answer stored"})
             if chat_id:
-                api(token, "sendMessage", data={"chat_id": str(chat_id), "text": "✅ JobOS recorded only that you will answer the exact sensitive question manually. No legal answer was stored or autofilled."})
+                api(token, "sendMessage", data={"chat_id": str(chat_id), "text": "✅ JobOS rechecked the exact sensitive question as completed. No legal answer was stored or autofilled; a fresh plan will continue automatically."})
                 dispatch_dashboard(conn, token, allowed_user_id, chat_id, force=True)
         except ReviewError as exc:
             conn.rollback()
@@ -1029,7 +1114,13 @@ def handle_callback(conn, token: str, allowed_user_id: int, callback: dict[str, 
         with conn.cursor() as cur:
             cur.execute("UPDATE telegram_callback_tokens SET used_at = now() WHERE review_item_id = %s AND used_at IS NULL;", (item_id,))
             _clear_pending_question(cur, chat_id, item_id=item_id)
+            _clear_pending_document_feedback(cur, chat_id, item_id=item_id)
         conn.commit()  # human decision is durable before privileged browser I/O
+
+        if result.get("autofill_reprepare_required"):
+            reprepare = prepare_fresh_autofill_after_human_input(str(result["application_id"]))
+            if not reprepare.get("ok"):
+                result["autofill_reprepare"] = reprepare
 
         observed_reconciliation = result.get("reconciliation_observed_result") or {}
         followup_source = result.get("post_commit_followup_result") or observed_reconciliation
@@ -1116,6 +1207,55 @@ def handle_message(conn, token: str, allowed_user_id: int, message: dict[str, An
         dispatch_dashboard(conn, token, allowed_user_id, chat_id, force=True)
         return
 
+    # Document-agent feedback is accepted only as a direct reply to the exact
+    # short-lived prompt created from a version-bound document review card.
+    with conn.cursor() as cur:
+        cur.execute(
+            """SELECT pending_document_review_item_id::text,pending_document_source_sha256,
+                      pending_document_feedback_expires_at > now(),pending_document_prompt_message_id
+                 FROM telegram_control_surface_state WHERE chat_id=%s;""", (chat_id,)
+        )
+        pending_doc = cur.fetchone()
+    reply_to = message.get("reply_to_message") or {}
+    reply_to_id = int(reply_to.get("message_id") or 0)
+    if pending_doc and pending_doc[0] and text and not text.startswith("/"):
+        item_id, expected_source = str(pending_doc[0]), str(pending_doc[1] or "")
+        active_prompt = bool(pending_doc[2]) and int(pending_doc[3] or 0) == reply_to_id
+        if not active_prompt:
+            with conn.cursor() as cur:
+                _clear_pending_document_feedback(cur, chat_id, item_id=item_id)
+            conn.commit()
+            api(token, "sendMessage", data={"chat_id": str(chat_id),
+                                             "text": "That edit prompt expired or was not replied to directly. Tap ✏️ Tell agent what to fix on the current document card again."})
+            return
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT source_sha256,status,item_type FROM human_review_items WHERE id=%s;", (item_id,))
+                current = cur.fetchone()
+                if not current or current[2] != "document_review" or current[1] not in {"pending", "needs_revision"}:
+                    raise ReviewError("That document is no longer waiting for feedback. Refresh JobOS.")
+                if str(current[0] or "") != expected_source:
+                    raise ReviewError("That document changed. Use the newest review card.")
+            revision = submit_document_feedback(conn, item_id, feedback=text, actor=f"telegram:{sender_id}")
+            with conn.cursor() as cur:
+                _clear_pending_document_feedback(cur, chat_id, item_id=item_id)
+                cur.execute("UPDATE telegram_callback_tokens SET used_at=now() WHERE review_item_id=%s AND used_at IS NULL;", (item_id,))
+                sync_inbox(cur)
+            conn.commit()
+            api(token, "sendMessage", data={
+                "chat_id": str(chat_id),
+                "text": ("✏️ Feedback queued for the document agent. It will regenerate this exact draft, "
+                         "truth-check it, and return a fresh review card automatically. Feedback is never treated as evidence."),
+            })
+            dispatch_dashboard(conn, token, allowed_user_id, chat_id, force=True)
+        except ReviewError as exc:
+            conn.rollback()
+            with conn.cursor() as cur:
+                _clear_pending_document_feedback(cur, chat_id, item_id=item_id)
+            conn.commit()
+            api(token, "sendMessage", data={"chat_id": str(chat_id), "text": f"⚠️ {exc}"})
+        return
+
     # Free-text is accepted only after the user explicitly tapped ✏️ Other on a
     # particular version-bound question card. No review ID or command is needed.
     with conn.cursor() as cur:
@@ -1145,11 +1285,17 @@ def handle_message(conn, token: str, allowed_user_id: int, message: dict[str, An
                     raise ReviewError("That question is no longer waiting for an answer. Refresh JobOS.")
                 if str(current[0] or "") != expected_source:
                     raise ReviewError("That question changed. Use the newest card.")
-            answer_question(conn, item_id, answer=text, actor=f"telegram:{sender_id}", scope="company")
+            answer_result = answer_question(conn, item_id, answer=text, actor=f"telegram:{sender_id}", scope="company")
             with conn.cursor() as cur:
                 _clear_pending_question(cur, chat_id, item_id=item_id)
                 sync_inbox(cur)
             conn.commit()
+            if answer_result.get("autofill_reprepare_required"):
+                reprepare = prepare_fresh_autofill_after_human_input(str(answer_result["application_id"]))
+                if not reprepare.get("ok"):
+                    with conn.cursor() as cur:
+                        sync_inbox(cur)
+                    conn.commit()
             api(token, "sendMessage", data={"chat_id": str(chat_id),
                                              "text": "✅ Answer saved. JobOS will continue automatically and reuse it only within its approved scope."})
             dispatch_dashboard(conn, token, allowed_user_id, chat_id, force=True)
@@ -1168,8 +1314,10 @@ def handle_message(conn, token: str, allowed_user_id: int, message: dict[str, An
             api(token, "sendMessage", data={"chat_id": str(chat_id), "text": "Tap ✏️ Other on the question card, then reply naturally."})
             return
         try:
-            answer_question(conn, parts[1], answer=parts[2], actor=f"telegram:{sender_id}", scope="company")
+            answer_result = answer_question(conn, parts[1], answer=parts[2], actor=f"telegram:{sender_id}", scope="company")
             conn.commit()
+            if answer_result.get("autofill_reprepare_required"):
+                prepare_fresh_autofill_after_human_input(str(answer_result["application_id"]))
             api(token, "sendMessage", data={"chat_id": str(chat_id), "text": "✅ Answer saved."})
             dispatch_dashboard(conn, token, allowed_user_id, chat_id, force=True)
         except ReviewError as exc:

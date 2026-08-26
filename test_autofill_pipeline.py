@@ -121,6 +121,9 @@ def test_session_pins_target_rematches_after_write_and_journals_it():
             self.snapshots = 0
         def resolve_target(self):
             return BrowserTarget("tab-1", "https://jobs.example.com/apply")
+        def focus(self, target_id):
+            assert target_id == "tab-1"
+            return BrowserTarget("tab-1", "https://jobs.example.com/apply")
         def current_url(self, target_id):
             assert target_id == "tab-1"
             return "https://jobs.example.com/apply"
@@ -133,7 +136,7 @@ def test_session_pins_target_rematches_after_write_and_journals_it():
     actions, _ = plan_autofill([FormField("first", "First name", "textbox")], {"personal": {"first_name": "An"}})
     journal = []
     session = AutofillSession(
-        transport=transport, expected_origin="https://jobs.example.com",
+        transport=transport, expected_target_id="tab-1", expected_origin="https://jobs.example.com",
         expected_initial_url="https://jobs.example.com/apply", expected_page_fingerprint="fingerprint",
         snapshot_state=lambda _target: SnapshotState((FormField("first", "First name", "textbox", transport.value),), (), "fingerprint"),
         origin_allowed=lambda _url: None,
@@ -154,13 +157,16 @@ def test_session_verifies_re_rendered_ref_and_normalized_phone():
     class FakeTransport:
         def __init__(self): self.value = ""
         def resolve_target(self): return BrowserTarget("tab-1", "https://jobs.example.com/apply")
+        def focus(self, target_id):
+            assert target_id == "tab-1"
+            return BrowserTarget("tab-1", "https://jobs.example.com/apply")
         def current_url(self, _target): return "https://jobs.example.com/apply"
         def snapshot(self, _target): return {}
         def execute(self, _target, command): self.value = command["value"]
     transport = FakeTransport()
     actions, _ = plan_autofill([FormField("old-ref", "Phone", "textbox")], {"personal": {"phone": "6095551234"}})
     session = AutofillSession(
-        transport=transport, expected_origin="https://jobs.example.com", expected_initial_url="https://jobs.example.com/apply",
+        transport=transport, expected_target_id="tab-1", expected_origin="https://jobs.example.com", expected_initial_url="https://jobs.example.com/apply",
         expected_page_fingerprint="fingerprint",
         snapshot_state=lambda _target: SnapshotState((FormField("new-ref", "Phone", "textbox", "(609) 555-1234"),), (), "fingerprint"),
         origin_allowed=lambda _url: None, begin_execution=lambda _target: None,
@@ -173,11 +179,14 @@ def test_session_verifies_re_rendered_ref_and_normalized_phone():
 def test_session_refuses_same_origin_but_different_approved_job_page():
     class FakeTransport:
         def resolve_target(self): return BrowserTarget("tab-1", "https://jobs.example.com/job-B/apply")
+        def focus(self, target_id):
+            assert target_id == "tab-1"
+            return BrowserTarget("tab-1", "https://jobs.example.com/job-B/apply")
         def current_url(self, _target): return "https://jobs.example.com/job-B/apply"
         def snapshot(self, _target): return {}
         def execute(self, _target, _command): raise AssertionError("must not write")
     session = AutofillSession(
-        transport=FakeTransport(), expected_origin="https://jobs.example.com",
+        transport=FakeTransport(), expected_target_id="tab-1", expected_origin="https://jobs.example.com",
         expected_initial_url="https://jobs.example.com/job-A/apply", expected_page_fingerprint="fingerprint",
         snapshot_state=lambda _target: SnapshotState((), (), "fingerprint"), origin_allowed=lambda _url: None,
         begin_execution=lambda _target: raise_error("must not begin"),
@@ -201,11 +210,14 @@ def test_page_identity_preserves_job_query_parameters_but_ignores_fragment():
 def test_truncated_initial_snapshot_never_begins_execution():
     class FakeTransport:
         def resolve_target(self): return BrowserTarget("tab-1", "https://jobs.example.com/apply")
+        def focus(self, target_id):
+            assert target_id == "tab-1"
+            return BrowserTarget("tab-1", "https://jobs.example.com/apply")
         def current_url(self, _target): return "https://jobs.example.com/apply"
         def snapshot(self, _target): return {}
         def execute(self, _target, _command): raise AssertionError("must not write")
     session = AutofillSession(
-        transport=FakeTransport(), expected_origin="https://jobs.example.com",
+        transport=FakeTransport(), expected_target_id="tab-1", expected_origin="https://jobs.example.com",
         expected_initial_url="https://jobs.example.com/apply", expected_page_fingerprint="fingerprint",
         snapshot_state=lambda _target: SnapshotState((), (), "fingerprint", True),
         origin_allowed=lambda _url: None, begin_execution=lambda _target: raise_error("must not begin"),

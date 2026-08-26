@@ -71,7 +71,7 @@ def action_identity(action: PlannedAction) -> tuple[str, str | None, str | None,
 class AutofillSession:
     """Replans from a fresh snapshot; old refs never survive an action."""
     def __init__(self, *, transport: AutofillTransport, expected_origin: str,
-                 expected_initial_url: str, expected_page_fingerprint: str,
+                 expected_target_id: str, expected_initial_url: str, expected_page_fingerprint: str,
                  snapshot_state: Callable[[str], SnapshotState], origin_allowed: Callable[[str], None],
                  begin_execution: Callable[[str], None], before_action: Callable[[PlannedAction, str], str],
                  after_verified: Callable[[PlannedAction, str, str], None],
@@ -79,6 +79,9 @@ class AutofillSession:
                  before_io: Callable[[PlannedAction, str, str], None] | None = None):
         self.transport = transport
         self.expected_origin = _origin(expected_origin)
+        self.expected_target_id = str(expected_target_id or "").strip()
+        if not self.expected_target_id:
+            raise SessionError("Autofill session requires an exact approval-bound browser target id.")
         self.expected_initial_url = canonical_page_url(expected_initial_url)
         self.expected_page_fingerprint = expected_page_fingerprint
         self.snapshot_state = snapshot_state
@@ -124,7 +127,12 @@ class AutofillSession:
         return _equivalent_value(action, field.value, field.role)
 
     def execute(self, plan: Callable[[SnapshotState], list[PlannedAction]]) -> SessionResult:
-        target = self.transport.resolve_target()
+        try:
+            target = self.transport.focus(self.expected_target_id)
+        except Exception as exc:
+            raise SessionError("The exact approval-bound browser target is unavailable; never fall back to ambient focus.") from exc
+        if str(target.target_id) != self.expected_target_id:
+            raise SessionError("Browser transport returned a different target than the approval-bound target id.")
         self._assert_origin(target)
         # Do not consume a capability merely to inspect a form with no
         # deterministic write.  The preflight snapshot is read-only.

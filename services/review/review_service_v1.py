@@ -78,44 +78,30 @@ def _focus_or_open_exact_job_page(job_url: str) -> str:
 
 
 def focus_bound_application_page(cur, application_id: str, *, browser_task_id: str | None = None) -> str:
-    """Focus the exact dedicated-browser target already bound to an app.
+    """Focus the exact dedicated-browser target durably bound to one application.
 
-    This is a read-only UX handoff for manual login/MFA/checkpoint/sensitive
-    answers.  It refuses missing or changed targets and never opens a phone or
-    arbitrary default-browser URL.
+    Browser identity is resolved through the same canonical authority helper used
+    by automatic preparation/execution. A long-lived target id is insufficient:
+    its live URL must still equal one durable URL for this application.
     """
     from services.application_actions.privileged_action_v1 import _transport
-    from services.autofill.autofill_executor_v1 import TransportError
-    cur.execute(
-        """SELECT current_url, detail_json FROM application_auth_sessions
-             WHERE application_id=%s;""",
-        (application_id,),
+    from services.common.application_browser_binding_v1 import (
+        ApplicationBrowserBindingError, resolve_application_bound_target,
     )
-    row = cur.fetchone()
-    expected_url, detail = (str(row[0] or ""), dict(row[1] or {})) if row else ("", {})
-    target_id = str(detail.get("target_id") or "")
-    if not target_id and browser_task_id:
-        cur.execute(
-            """SELECT pinned_target_id FROM browser_tasks
-                 WHERE id=%s AND application_id=%s;""",
-            (browser_task_id, application_id),
-        )
-        task = cur.fetchone()
-        target_id = str(task[0] or "") if task else ""
-    if not target_id:
-        raise ReviewError("JobOS has no exact browser target to focus for this application.")
+    transport = _transport()
     try:
-        target = _transport().focus(target_id)
-    except TransportError as exc:
+        bound = resolve_application_bound_target(
+            cur, transport, application_id=application_id,
+            browser_task_id=browser_task_id, allow_focused_rebind=False,
+        )
+        target = transport.focus(bound.target_id)
+    except ApplicationBrowserBindingError as exc:
+        raise ReviewError(str(exc)) from exc
+    except Exception as exc:
         raise ReviewError(f"The exact JobOS browser page is unavailable: {exc}") from exc
-    from services.common.autofill_identity import canonical_page_url
-    if expected_url:
-        try:
-            if canonical_page_url(target.url) != canonical_page_url(expected_url):
-                raise ReviewError("The bound browser page changed; refresh the application handoff before continuing.")
-        except ValueError as exc:
-            raise ReviewError("The bound browser page has no valid HTTP(S) URL.") from exc
-    return target_id
+    if str(target.target_id) != str(bound.target_id):
+        raise ReviewError("JobOS browser focus returned a different target than the application-bound target.")
+    return str(bound.target_id)
 
 
 def _sha256_file(path: Path) -> str:
@@ -584,7 +570,7 @@ def sync_workflow_followup_required(cur) -> int:
                   s.current_url, s.page_fingerprint, s.detail_json
              FROM applications a
              LEFT JOIN application_auth_sessions s ON s.application_id=a.id
-            WHERE a.current_step IN ('needs_account_auth','needs_mfa','needs_human_checkpoint','application_form_ready')
+            WHERE a.current_step IN ('needs_account_auth','needs_email_verification','needs_mfa','needs_human_checkpoint','application_form_ready')
               AND a.status NOT IN ('submitted','abandoned')
               AND NOT EXISTS (
                     SELECT 1 FROM approval_requests ar
@@ -713,15 +699,19 @@ def ensure_runtime_question_review(cur, *, application_id: str, browser_task_id:
     if question_class is not None:
         source_sha = _sha256_text(f"runtime-sensitive|{application_id}|{browser_task_id}|{normalized}|{question_class.value}")
         cur.execute(
-            """SELECT id::text FROM human_review_items
+            """SELECT id::text,status FROM human_review_items
                  WHERE application_id=%s AND item_type='sensitive_question_required'
-                   AND source_sha256=%s AND status IN ('pending','needs_revision')
+                   AND source_sha256=%s
                  ORDER BY created_at DESC LIMIT 1;""",
             (application_id, source_sha),
         )
         existing = cur.fetchone()
         if existing:
-            return str(existing[0])
+            # Historical paused_fields are scanned repeatedly. Once the exact
+            # task/question source has a terminal human decision, never resurrect
+            # it from that historical browser task. A later browser task gets a
+            # different source SHA and may legitimately surface the question again.
+            return str(existing[0]) if existing[1] in {'pending','needs_revision'} else None
         bundle_id = ensure_bundle(cur, application_id)
         # This card intentionally does not save generic question memory or
         # execute a browser fill.  It makes the exact legal wording visible in
@@ -745,6 +735,16 @@ def ensure_runtime_question_review(cur, *, application_id: str, browser_task_id:
         )
         return str(cur.fetchone()[0])
     source_sha = _sha256_text(f"runtime|{application_id}|{browser_task_id}|{normalized}")
+    cur.execute(
+        """SELECT id::text,status FROM human_review_items
+             WHERE application_id=%s AND item_type='question_required'
+               AND source_sha256=%s
+             ORDER BY created_at DESC LIMIT 1;""",
+        (application_id, source_sha),
+    )
+    existing = cur.fetchone()
+    if existing:
+        return str(existing[0]) if existing[1] in {'pending','needs_revision'} else None
     bundle_id = ensure_bundle(cur, application_id)
     cur.execute(
         """INSERT INTO human_review_items(
@@ -773,10 +773,12 @@ def ensure_runtime_question_review(cur, *, application_id: str, browser_task_id:
 
 def sync_runtime_questions(cur) -> int:
     cur.execute(
-        """SELECT id::text, application_id::text, result_json
-             FROM browser_tasks
-            WHERE task_type = 'fill_application_form' AND status = 'completed'
-              AND jsonb_typeof(coalesce(result_json, '{}'::jsonb)->'paused_fields') = 'array';"""
+        """SELECT bt.id::text, bt.application_id::text, bt.result_json
+             FROM browser_tasks bt
+             JOIN applications a ON a.id=bt.application_id
+            WHERE bt.task_type = 'fill_application_form' AND bt.status = 'completed'
+              AND a.status NOT IN ('submitted','abandoned')
+              AND jsonb_typeof(coalesce(bt.result_json, '{}'::jsonb)->'paused_fields') = 'array';"""
     )
     count = 0
     for task_id, app_id, result in cur.fetchall():
@@ -914,11 +916,224 @@ def answer_question(conn, item_id: str, *, answer: str, actor: str,
                 WHERE id = %s;""",
             (actor, f"Human supplied {scope}-scoped answer.", item_id),
         )
+        browser_task_id = str((payload or {}).get("browser_task_id") or "")
+        restored = _restore_form_ready_after_human_input(
+            cur, application_id=_app_id, browser_task_id=browser_task_id, actor=actor,
+            reason="Human answered every paused runtime question; create a fresh exact autofill plan.",
+        )
     return {"ok": True, "review_item_id": item_id, "status": "resolved",
-            "scope": scope, "question": normalized, "answer_kind": answer_kind}
+            "application_id": _app_id, "scope": scope, "question": normalized,
+            "answer_kind": answer_kind, "autofill_reprepare_required": restored}
+
+
+def _runtime_questions_resolved_for_task(cur, *, application_id: str, browser_task_id: str) -> bool:
+    cur.execute(
+        """SELECT count(*) FROM human_review_items
+             WHERE application_id=%s AND browser_task_id=%s
+               AND item_type IN ('question_required','sensitive_question_required')
+               AND status IN ('pending','needs_revision');""",
+        (application_id, browser_task_id),
+    )
+    if int((cur.fetchone() or (0,))[0] or 0) != 0:
+        return False
+    cur.execute(
+        """SELECT count(*) FROM browser_tasks
+             WHERE application_id=%s AND execution_state='needs_reconciliation';""",
+        (application_id,),
+    )
+    if int((cur.fetchone() or (0,))[0] or 0) != 0:
+        return False
+    cur.execute(
+        """SELECT count(*) FROM approval_requests
+             WHERE application_id=%s AND type='autofill_form'
+               AND status IN ('pending','approved','executing')
+               AND (status='executing' OR token_expires_at>now());""",
+        (application_id,),
+    )
+    if int((cur.fetchone() or (0,))[0] or 0) != 0:
+        return False
+    cur.execute(
+        """SELECT count(*) FROM browser_tasks
+             WHERE application_id=%s AND task_type='fill_application_form'
+               AND status IN ('queued','running');""",
+        (application_id,),
+    )
+    return int((cur.fetchone() or (0,))[0] or 0) == 0
+
+
+def _restore_form_ready_after_human_input(cur, *, application_id: str, browser_task_id: str,
+                                          actor: str, reason: str) -> bool:
+    if not browser_task_id or not _runtime_questions_resolved_for_task(
+        cur, application_id=application_id, browser_task_id=browser_task_id
+    ):
+        return False
+    cur.execute("SELECT current_step FROM applications WHERE id=%s FOR UPDATE;", (application_id,))
+    row = cur.fetchone()
+    if not row or str(row[0] or "") not in {'awaiting_approval','form_filled'}:
+        return False
+    from services.application_actions.privileged_action_v1 import _transition_application_step
+    _transition_application_step(
+        cur, application_id=application_id, to_step='application_form_ready', actor=actor,
+        reason=reason, detail={"browser_task_id": browser_task_id, "fresh_approval_required": True},
+    )
+    return True
+
+
+def prepare_fresh_autofill_after_human_input(application_id: str) -> dict[str, Any]:
+    """Create a fresh exact plan after human input; never reuse the old capability."""
+    import subprocess
+    command = [sys.executable, str(ROOT / 'scripts' / 'jobos.py'), 'autofill', 'prepare',
+               '--application-id', application_id, '--create', '--yes']
+    proc = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, timeout=180)
+    return {"ok": proc.returncode == 0, "detail": (proc.stdout or proc.stderr or '')[-1600:]}
+
+
+def _sensitive_question_completed(cur, *, application_id: str, browser_task_id: str, question: str) -> bool:
+    """Verify the exact manual sensitive question is no longer unanswered."""
+    from services.application_actions.privileged_action_v1 import _transport, _snapshot, detect_page_state
+    from services.autofill.autofill_agent_v1 import parse_snapshot
+    from services.autofill.form_inspector_v1 import inspect_nodes, inspect_question_groups
+    from services.common.question_memory import normalize_question
+
+    target_id = focus_bound_application_page(cur, application_id, browser_task_id=browser_task_id)
+    transport = _transport()
+    url, snap, nodes, _fp = _snapshot(transport, target_id)
+    state, _detail = detect_page_state(url, snap, nodes)
+    if state != 'application_form_ready':
+        raise ReviewError(
+            f"The bound page is now {state!r}, not the application form. Use the current workflow card instead of closing this question."
+        )
+    qn = normalize_question(question)
+    fields = inspect_nodes(parse_snapshot(snap))
+    groups = inspect_question_groups(parse_snapshot(snap))
+    matched = False
+    for field in fields:
+        if normalize_question(field.label or '') == qn:
+            matched = True
+            value = str(field.value or '').strip()
+            if not value:
+                return False
+    for group in groups:
+        if normalize_question(group.label or '') == qn:
+            matched = True
+            if not any(option.selected is True for option in group.options):
+                return False
+    # If the exact question disappeared from the same bound form after manual
+    # interaction, treat it as completed; the next fresh plan will re-snapshot
+    # and can pause again if the ATS reintroduces it.
+    return True if not matched else True
+
+
+def submit_document_feedback(conn, item_id: str, *, feedback: str, actor: str) -> dict[str, Any]:
+    """Queue a human-authored revision request for the exact reviewed draft."""
+    feedback = (feedback or '').strip()
+    if not feedback:
+        raise ReviewError('Revision feedback cannot be empty.')
+    if len(feedback) > 8000:
+        raise ReviewError('Revision feedback is too long; keep it under 8000 characters.')
+    with conn.cursor() as cur:
+        cur.execute(
+            """SELECT application_id::text FROM human_review_items WHERE id=%s;""",
+            (item_id,),
+        )
+        seed = cur.fetchone()
+        if not seed:
+            raise ReviewError('Document review item not found.')
+        cur.execute("SELECT id::text FROM applications WHERE id=%s FOR UPDATE;", (seed[0],))
+        if not cur.fetchone():
+            raise ReviewError('Application no longer exists.')
+        cur.execute(
+            """SELECT h.application_id::text,h.status,h.source_sha256,h.generated_document_id::text,
+                      gd.doc_type,gd.content
+                 FROM human_review_items h
+                 JOIN generated_documents gd ON gd.id=h.generated_document_id
+                WHERE h.id=%s AND h.item_type='document_review'
+                FOR UPDATE OF h,gd;""",
+            (item_id,),
+        )
+        row = cur.fetchone()
+        if not row or row[1] not in {'pending','needs_revision'}:
+            raise ReviewError('Document review item is no longer editable; use the newest review card.')
+        app_id, _status, source_sha, document_id, doc_type, content = row
+        if doc_type not in {'resume','cover_letter'}:
+            raise ReviewError('Only resume and cover-letter review cards support agent revision feedback.')
+        if _sha256_text(content or '') != str(source_sha or ''):
+            raise ReviewError('Document content changed after this review card was created; use the newest card.')
+        # Serialize feedback for the exact review item. Pending feedback may be
+        # edited before a worker claims it, but a running request is immutable:
+        # overwriting it would make the durable request say B while the worker
+        # is already generating from A.
+        cur.execute(
+            """SELECT id::text,status FROM document_revision_requests
+                 WHERE source_review_item_id=%s AND source_sha256=%s
+                   AND status IN ('pending','running')
+                 ORDER BY created_at DESC LIMIT 1 FOR UPDATE;""",
+            (item_id, source_sha),
+        )
+        active_revision = cur.fetchone()
+        if active_revision and str(active_revision[1]) == 'running':
+            raise ReviewError('The document agent is already revising this exact draft. Wait for the fresh review card before sending more feedback.')
+        if active_revision:
+            request_id = str(active_revision[0])
+            cur.execute(
+                """UPDATE document_revision_requests
+                      SET feedback_text=%s,requested_by=%s,error_message=NULL,updated_at=now()
+                    WHERE id=%s AND status='pending';""",
+                (feedback, actor, request_id),
+            )
+        else:
+            cur.execute(
+                """INSERT INTO document_revision_requests(
+                       application_id,document_type,source_document_id,source_review_item_id,
+                       source_sha256,feedback_text,status,requested_by,created_at,updated_at)
+                   VALUES (%s,%s,%s,%s,%s,%s,'pending',%s,now(),now())
+                   RETURNING id::text;""",
+                (app_id, doc_type, document_id, item_id, source_sha, feedback, actor),
+            )
+            request_id = str(cur.fetchone()[0])
+        cur.execute(
+            """UPDATE human_review_items
+                  SET status='needs_revision',
+                      payload_json=payload_json || %s,
+                      decision_note=%s,updated_at=now()
+                WHERE id=%s;""",
+            (Jsonb({"human_revision_required": True, "document_revision_request_id": request_id,
+                    "human_feedback": feedback}),
+             'Human sent direct feedback to the document agent; regeneration is queued.', item_id),
+        )
+    return {"ok": True, "review_item_id": item_id, "application_id": app_id,
+            "document_type": doc_type, "revision_request_id": request_id}
 
 
 def reconcile_materialized_review_state(cur) -> None:
+    # Terminal applications must not keep ordinary daily-work cards/capabilities
+    # alive. Reconciliation is intentionally excluded: an uncertain external
+    # effect still needs a human verdict even after the application is stopped.
+    cur.execute(
+        """UPDATE approval_requests ar SET status='expired',executing_task_id=NULL
+             FROM applications a
+            WHERE ar.application_id=a.id AND a.status IN ('submitted','abandoned')
+              AND ar.status IN ('pending','approved');"""
+    )
+    cur.execute(
+        """UPDATE document_revision_requests drr
+              SET status='cancelled',claimed_by=NULL,lease_expires_at=NULL,
+                  error_message='Application became terminal before document revision execution.',
+                  finished_at=now(),updated_at=now()
+             FROM applications a
+            WHERE drr.application_id=a.id AND a.status IN ('submitted','abandoned')
+              AND drr.status='pending';"""
+    )
+    cur.execute(
+        """UPDATE human_review_items h SET status='resolved',updated_at=now(),
+                  decision_note=coalesce(h.decision_note,'Application became terminal; ordinary review closed.')
+             FROM applications a
+            WHERE h.application_id=a.id AND a.status IN ('submitted','abandoned')
+              AND h.status IN ('pending','needs_revision')
+              AND h.item_type IN ('document_review','autofill_review','question_required',
+                                  'sensitive_question_required','application_ready','action_required');"""
+    )
+
     # Expire stale parent autofill capabilities first, then restore the
     # recoverable application state and close delegated children. Otherwise a
     # timed-out approval leaves the application stranded at awaiting_approval.
@@ -1002,7 +1217,10 @@ def reconcile_materialized_review_state(cur) -> None:
                 OR (h.payload_json->>'action_kind' LIKE 'email_verification_%'
                     AND ar.type='privileged_use_email_verification'
                     AND COALESCE(h.payload_json->>'candidate_id','') <> ''
-                    AND ar.payload_json->>'candidate_id' = h.payload_json->>'candidate_id'))
+                    AND ar.payload_json->>'candidate_id' = h.payload_json->>'candidate_id')
+                OR (h.payload_json->>'action_kind'='workflow_followup_required'
+                    AND h.payload_json->>'expected_step'='needs_email_verification'
+                    AND ar.type='privileged_use_email_verification'))
               AND ar.status IN ('pending','approved','executing');"""
     )
 
@@ -1287,6 +1505,8 @@ def decide_item(conn, item_id: str, *, decision: str, actor: str, note: str = ""
         reconciliation_outcome: str | None = None
         reconciliation_observed_result: dict[str, Any] | None = None
         workflow_followup_result: dict[str, Any] | None = None
+        autofill_reprepare_required = False
+        explicit_new_status: str | None = None
         if status not in {"pending", "needs_revision"}:
             raise ReviewError(f"Review item is already {status}.")
 
@@ -1302,6 +1522,14 @@ def decide_item(conn, item_id: str, *, decision: str, actor: str, note: str = ""
             doc = cur.fetchone()
             if not doc or _sha256_text(doc[0] or "") != source_sha:
                 raise ReviewError("Document changed after review creation; sync a fresh review item.")
+            cur.execute(
+                """SELECT 1 FROM document_revision_requests
+                     WHERE source_review_item_id=%s AND source_sha256=%s
+                       AND status IN ('pending','running') LIMIT 1;""",
+                (item_id, source_sha),
+            )
+            if cur.fetchone():
+                raise ReviewError("The document agent has an active revision for this exact draft; wait for the fresh review card.")
             if decision == "approve":
                 if doc[1] != "pass":
                     raise ReviewError("Only a QA-passed document may be approved.")
@@ -1366,14 +1594,16 @@ def decide_item(conn, item_id: str, *, decision: str, actor: str, note: str = ""
                 raise ReviewError(capability_result.get("error") or "Approval request decision failed.")
 
         elif item_type == "autofill_review":
+            cur.execute("SELECT status, execution_state, result_json FROM browser_tasks WHERE id = %s;", (browser_task_id,))
+            task = cur.fetchone()
+            if not task or task[0] != "completed":
+                raise ReviewError("Autofill task is no longer reviewable.")
+            current_sha = _sha256_text(json.dumps(task[2] or {}, sort_keys=True, separators=(",", ":"), default=str))
+            if source_sha and current_sha != source_sha:
+                raise ReviewError("Autofill result changed after the review item was created.")
             if decision == "approve":
-                cur.execute("SELECT status, execution_state, result_json FROM browser_tasks WHERE id = %s;", (browser_task_id,))
-                task = cur.fetchone()
-                if not task or task[0] != "completed" or task[1] != "completed":
+                if task[1] != "completed":
                     raise ReviewError("Only a fully completed deterministic autofill may be approved.")
-                current_sha = _sha256_text(json.dumps(task[2] or {}, sort_keys=True, separators=(",", ":"), default=str))
-                if source_sha and current_sha != source_sha:
-                    raise ReviewError("Autofill result changed after the review item was created.")
                 cur.execute(
                     """SELECT file_path, sha256 FROM human_review_artifacts
                          WHERE review_item_id = %s AND artifact_kind = 'autofill_screenshot'
@@ -1381,19 +1611,13 @@ def decide_item(conn, item_id: str, *, decision: str, actor: str, note: str = ""
                     (item_id,),
                 )
                 screenshot = cur.fetchone()
-                # Screenshot capture is best-effort. A missing screenshot must not
-                # invalidate an otherwise durable, deterministic browser completion.
-                # If a screenshot exists, however, its exact bytes remain review-bound.
                 if screenshot:
                     screenshot_path = Path(screenshot[0]).expanduser()
                     if not screenshot_path.is_file() or _sha256_file(screenshot_path) != screenshot[1]:
                         raise ReviewError("Autofill screenshot artifact changed after review creation; capture a fresh artifact or remove the stale binding.")
                 cur.execute("UPDATE applications SET current_step = 'application_ready', updated_at = now() WHERE id = %s AND current_step = 'form_filled';", (app_id,))
-                transitioned = cur.rowcount == 1
-                if not transitioned:
-                    raise ReviewError(
-                        "Application is no longer at form_filled; a fresh human review is required."
-                    )
+                if cur.rowcount != 1:
+                    raise ReviewError("Application is no longer at form_filled; a fresh human review is required.")
                 cur.execute(
                     """INSERT INTO pipeline_events(application_id, from_step, to_step, actor, reason, detail_json)
                        VALUES (%s, 'form_filled', 'application_ready', %s,
@@ -1406,8 +1630,6 @@ def decide_item(conn, item_id: str, *, decision: str, actor: str, note: str = ""
                     materialized_approval_ids = materialize_application_ready_gate(cur, app_id)
                     materialized_approval_id = materialized_approval_ids[0] if materialized_approval_ids else None
                 except Exception as exc:
-                    # Classification/package failure is not permission to submit. Keep
-                    # application_ready visible so the user can retry gate preparation.
                     cur.execute(
                         """INSERT INTO application_events(application_id, event_type, event_source, event_payload)
                            VALUES (%s, 'application_ready_gate_materialization_failed', 'human_review_hub', %s);""",
@@ -1418,26 +1640,53 @@ def decide_item(conn, item_id: str, *, decision: str, actor: str, note: str = ""
                         ensure_approval_review(cur, candidate_approval_id)
                 else:
                     ensure_application_ready_review(cur, app_id)
+            elif decision == "revise":
+                cur.execute("SELECT current_step FROM applications WHERE id=%s FOR UPDATE;", (app_id,))
+                current = str((cur.fetchone() or ('',))[0] or '')
+                if current not in {'awaiting_approval','form_filled'}:
+                    raise ReviewError(f"Application is at {current!r}; cannot safely prepare a fresh autofill plan from this review.")
+                from services.application_actions.privileged_action_v1 import _transition_application_step
+                _transition_application_step(
+                    cur, application_id=app_id, to_step='application_form_ready', actor=actor,
+                    reason='Human requested a fresh deterministic autofill plan after reviewing the form.',
+                    detail={"review_item_id": item_id, "browser_task_id": browser_task_id},
+                )
+                autofill_reprepare_required = True
+                explicit_new_status = 'resolved'
+                note = (note + " Fresh exact autofill plan requested; the previous capability remains retired.").strip()
+            else:
+                from services.application_actions.privileged_action_v1 import _transition_application_step
+                _transition_application_step(
+                    cur, application_id=app_id, to_step='abandoned', actor=actor,
+                    reason='Human stopped the application from post-autofill review.',
+                    detail={"review_item_id": item_id, "browser_task_id": browser_task_id}, status='abandoned',
+                )
+                explicit_new_status = 'rejected'
 
         elif item_type == "question_required":
             raise ReviewError("Question items require an explicit answer; use the answer command.")
 
         elif item_type == "sensitive_question_required":
             if decision != "approve":
-                raise ReviewError("Sensitive legal questions cannot be dismissed. Use Later or answer the exact question manually in the JobOS browser.")
-            # This is a candidate acknowledgement of the exact wording, not
-            # permission to store/reuse a legal answer or write the page.  The
-            # item remains fully auditable and a fresh browser plan is required
-            # after the candidate completes the form manually.
+                raise ReviewError("Sensitive legal questions cannot be dismissed. Use Later or stop the application from its workflow card.")
+            question = str((item_payload or {}).get("question") or "")
+            if not _sensitive_question_completed(
+                cur, application_id=app_id, browser_task_id=str(browser_task_id or ''), question=question
+            ):
+                raise ReviewError("That exact sensitive question still appears unanswered in the bound JobOS form. Answer it there, then tap Done again.")
             cur.execute(
                 """INSERT INTO application_events(application_id,event_type,event_source,event_payload)
-                   VALUES (%s,'sensitive_question_manual_handoff','human_review_hub',%s);""",
+                   VALUES (%s,'sensitive_question_manual_completed','human_review_hub',%s);""",
                 (app_id, Jsonb({"review_item_id": item_id,
                                 "question_class": str((item_payload or {}).get("question_class") or ""),
                                 "browser_task_id": browser_task_id,
-                                "actor": actor})),
+                                "actor": actor, "answer_stored": False})),
             )
-            note = (note + " Candidate acknowledged the exact sensitive question; no answer was stored or autofilled. Complete it manually in the focused JobOS form, then prepare a fresh plan.").strip()
+            autofill_reprepare_required = _restore_form_ready_after_human_input(
+                cur, application_id=app_id, browser_task_id=str(browser_task_id or ''), actor=actor,
+                reason='Human completed every paused sensitive/runtime question; create a fresh exact autofill plan.',
+            )
+            note = (note + " Exact sensitive question was rechecked as completed; no legal answer was stored or autofilled.").strip()
 
         elif item_type == "reconciliation_required":
             privileged_execution_id = str((item_payload or {}).get("privileged_execution_id") or "").strip()
@@ -1602,23 +1851,35 @@ def decide_item(conn, item_id: str, *, decision: str, actor: str, note: str = ""
                         current = cur.fetchone()
                         if not current or str(current[0]) != expected_step:
                             raise ReviewError("workflow state changed; sync a fresh next-gate handoff")
-                        from services.application_actions.privileged_action_v1 import _transport, _snapshot, detect_page_state
-                        target_id = str(payload.get("target_id") or "")
+                        from services.application_actions.privileged_action_v1 import (
+                            _transport, _snapshot, detect_page_state, detect_platform, _update_auth_session,
+                        )
+                        from services.common.application_browser_binding_v1 import (
+                            ApplicationBrowserBindingError, resolve_application_bound_target,
+                        )
                         transport = _transport()
-                        if not target_id:
-                            # This review item is explicitly a non-executable REFOCUS/BIND handoff.
-                            # The human has just approved using the currently focused employer page,
-                            # so it is safe to fresh-bind focus here; no browser write occurs.
-                            focused = transport.resolve_target()
-                            target_id = str(focused.target_id or "")
-                        if not target_id:
-                            raise ReviewError("no exact browser target is available after refocus")
+                        expected_url = str(payload.get("expected_url") or "")
+                        try:
+                            bound = resolve_application_bound_target(
+                                cur, transport, application_id=app_id,
+                                allow_focused_rebind=not bool(str(payload.get("target_id") or "")),
+                                expected_url=expected_url,
+                            )
+                        except ApplicationBrowserBindingError as exc:
+                            raise ReviewError(str(exc)) from exc
+                        target_id = bound.target_id
                         live_url, live_snap, live_nodes, live_fp = _snapshot(transport, target_id)
                         live_state, live_detail = detect_page_state(live_url, live_snap, live_nodes)
                         if live_state != expected_step:
                             raise ReviewError(
                                 f"live page classifies as {live_state!r}, not authoritative {expected_step!r}; resync auth state first"
                             )
+                        platform = detect_platform(live_url, live_snap)
+                        _update_auth_session(
+                            cur, application_id=app_id, url=live_url, fingerprint=live_fp,
+                            state=live_state, platform=platform,
+                            detail={**live_detail, "target_id": target_id, "human_refocus": True},
+                        )
                         workflow_followup_result = {
                             "target_id": target_id, "url": live_url, "state": live_state,
                             "detail": live_detail, "page_fingerprint": live_fp, "followup": "state_gate",
@@ -1670,7 +1931,7 @@ def decide_item(conn, item_id: str, *, decision: str, actor: str, note: str = ""
             else:
                 note = (note + " Keep application_ready pending for manual inspection and fresh gate preparation.").strip()
 
-        new_status = {"approve": "approved", "reject": "rejected", "revise": "needs_revision"}[review_decision]
+        new_status = explicit_new_status or {"approve": "approved", "reject": "rejected", "revise": "needs_revision"}[review_decision]
         cur.execute(
             """UPDATE human_review_items
                   SET status = %s, decided_by = %s, decision_note = %s,
@@ -1703,6 +1964,8 @@ def decide_item(conn, item_id: str, *, decision: str, actor: str, note: str = ""
         response["reconciliation_observed_result"] = reconciliation_observed_result
     if workflow_followup_result:
         response["post_commit_followup_result"] = workflow_followup_result
+    if autofill_reprepare_required:
+        response["autofill_reprepare_required"] = True
     return response
 
 
@@ -1718,6 +1981,8 @@ def main() -> int:
     answer.add_argument("--scope", choices=("company", "ats", "global"), default="company")
     answer.add_argument("--answer-kind", choices=("text", "option"), default="text")
     answer.add_argument("--actor", default="user")
+    feedback = sub.add_parser("feedback"); feedback.add_argument("item_id"); feedback.add_argument("--text", required=True)
+    feedback.add_argument("--actor", default="user")
     args = parser.parse_args()
     with psycopg.connect(DSN, autocommit=False) as conn:
         if args.command == "sync":
@@ -1739,9 +2004,17 @@ def main() -> int:
         if args.command == "answer":
             out = answer_question(conn, args.item_id, answer=args.text, actor=args.actor,
                                   scope=args.scope, answer_kind=args.answer_kind)
+            conn.commit()
+            if out.get("autofill_reprepare_required"):
+                out["autofill_reprepare"] = prepare_fresh_autofill_after_human_input(str(out["application_id"]))
+            print(json.dumps(out, indent=2)); return 0
+        if args.command == "feedback":
+            out = submit_document_feedback(conn, args.item_id, feedback=args.text, actor=args.actor)
             conn.commit(); print(json.dumps(out, indent=2)); return 0
         out = decide_item(conn, args.item_id, decision=args.command, actor=args.actor, note=args.note)
         conn.commit()
+        if out.get("autofill_reprepare_required"):
+            out["autofill_reprepare"] = prepare_fresh_autofill_after_human_input(str(out["application_id"]))
         observed = out.get("reconciliation_observed_result") or {}
         followup_source = out.get("post_commit_followup_result") or observed
         if followup_source.get("state") and followup_source.get("state") != "submitted":

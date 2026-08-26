@@ -197,6 +197,9 @@ def test_autofill_session_marks_child_before_upload_io():
     class Transport:
         def __init__(self): self.value = ""
         def resolve_target(self): return BrowserTarget("tab", "https://jobs.example/apply")
+        def focus(self, target_id):
+            assert target_id == "tab"
+            return BrowserTarget("tab", "https://jobs.example/apply")
         def current_url(self, _target): return "https://jobs.example/apply"
         def execute(self, _target, command):
             events.append("io")
@@ -208,7 +211,7 @@ def test_autofill_session_marks_child_before_upload_io():
 
     action = PlannedAction("upload", "upload-ref", "/tmp/resume.pdf", "documents.resume", "", "Resume")
     session = AutofillSession(
-        transport=transport, expected_origin="https://jobs.example",
+        transport=transport, expected_target_id="tab", expected_origin="https://jobs.example",
         expected_initial_url="https://jobs.example/apply", expected_page_fingerprint="f" * 64,
         snapshot_state=state, origin_allowed=lambda _url: None,
         begin_execution=lambda _target: events.append("parent-executing"),

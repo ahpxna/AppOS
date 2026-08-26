@@ -213,7 +213,15 @@ def autofill_prepare(application_id: str, *, create: bool, yes: bool) -> int:
             profile=os.getenv("JOBOS_BROWSER_PROFILE", "remote"),
             timeout=90,
         )
-        target = transport.resolve_target()
+        from services.common.application_browser_binding_v1 import (
+            ApplicationBrowserBindingError, resolve_application_bound_target,
+        )
+        try:
+            target = resolve_application_bound_target(
+                cur, transport, application_id=application_id, allow_focused_rebind=False
+            )
+        except ApplicationBrowserBindingError as exc:
+            raise RuntimeError(str(exc)) from exc
         actual_url = transport.current_url(target.target_id)
         from services.common.domain_authority_v1 import host_is_authorized
         if not host_is_authorized(cur, actual_url, application_id=application_id,
@@ -325,6 +333,9 @@ def autofill_prepare(application_id: str, *, create: bool, yes: bool) -> int:
 
             "--expected-origin",
             _origin(canonical_url),
+
+            "--expected-target-id",
+            target.target_id,
 
             "--expected-page-url",
             canonical_url,

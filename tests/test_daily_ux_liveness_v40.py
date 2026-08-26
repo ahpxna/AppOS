@@ -34,7 +34,7 @@ def test_sensitive_runtime_question_has_one_tap_jobos_handoff_without_secret_ech
     assert "candidate" not in card.casefold()
     assert "Yes" not in card
     assert "Focus JobOS form" in keyboard
-    assert "I will answer this exact question" in keyboard
+    assert "recheck form" in keyboard
     assert 'tok("focus_browser"), tok("sensitive_confirm")' in _source("services/telegram/telegram_review_bot_v1.py")
 
 
