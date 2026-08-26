@@ -18,7 +18,6 @@ SPEC = importlib.util.spec_from_file_location("jobos_docgen_alignment_test", GEN
 docgen = importlib.util.module_from_spec(SPEC)
 assert SPEC and SPEC.loader
 SPEC.loader.exec_module(docgen)
-restore(_psycopg_saved)
 
 from services.common.document_prompt_templates_v1 import (
     build_cover_alignment_blueprint_prompt,
@@ -351,6 +350,7 @@ VER_SPEC = importlib.util.spec_from_file_location("jobos_docverify_alignment_tes
 verifier = importlib.util.module_from_spec(VER_SPEC)
 assert VER_SPEC and VER_SPEC.loader
 VER_SPEC.loader.exec_module(verifier)
+restore(_psycopg_saved)
 
 
 def test_truth_checker_allows_jd_bound_subjective_positioning_but_not_uncited_facts(monkeypatch):

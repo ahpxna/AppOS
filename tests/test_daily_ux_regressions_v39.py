@@ -114,3 +114,52 @@ def test_batch_query_requires_a_live_reviewed_pdf_for_documents():
     source = (Path(__file__).resolve().parents[1] / "services" / "review" / "review_service_v1.py").read_text()
     assert "h.reviewed_artifact_id::text" in source
     assert 'str(status) != "pending" or not reviewed_artifact_id' in source
+
+
+def test_application_ready_daily_ux_auto_prepares_read_only_gate_and_uses_fallback_only_on_failure():
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    review = (root / "services" / "review" / "review_service_v1.py").read_text()
+    telegram = (root / "services" / "telegram" / "telegram_review_bot_v1.py").read_text()
+    assert "materialize_application_ready_gate(cur, app_id)" in review
+    assert "SAVEPOINT jobos_auto_prepare_application_ready" in review
+    assert "Once a fallback card is visible" in review
+    assert "PREPARE NEXT GATE" not in telegram
+    assert "Retry page check" in telegram
+
+
+def test_telegram_privileged_labels_are_human_actions_not_internal_gate_terms():
+    import os
+    from tests.psycopg_stub_utils import install_if_missing, restore
+    os.environ.setdefault("JOBOS_DB_PASSWORD", "test")
+    saved = install_if_missing()
+    try:
+        from services.telegram import telegram_review_bot_v1 as tg
+    finally:
+        restore(saved)
+
+    class Cur:
+        def __init__(self): self.last_sql = ""
+        def execute(self, sql, *args, **kwargs): self.last_sql = str(sql)
+        def fetchone(self):
+            if "source_sha256" in self.last_sql:
+                return ("source-sha",)
+            return None
+
+    cur = Cur()
+    upload = tg._keyboard(cur, "r1", 7, "approval_request", {
+        "approval_type": "privileged_upload_document", "document_type": "resume",
+    })
+    external = tg._keyboard(cur, "r2", 7, "approval_request", {
+        "approval_type": "privileged_trust_external_domain",
+    })
+    create = tg._keyboard(cur, "r3", 7, "approval_request", {
+        "approval_type": "privileged_choose_create_employer_account_path",
+    })
+    assert "Upload resume" in upload
+    assert "Continue to employer site" in external
+    assert "Create new account" in create
+    assert "UPLOAD DOCUMENT" not in upload
+    assert "Trust domain" not in external
+    assert "Create account path" not in create

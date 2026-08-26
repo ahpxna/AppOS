@@ -466,16 +466,16 @@ def ensure_application_ready_review(cur, application_id: str) -> str | None:
                review_bundle_id, application_id, item_type, status, title,
                summary_text, priority, payload_json)
            VALUES (%s, %s, 'application_ready', 'pending',
-                   'Final human submission required', %s, 'urgent', %s)
+                   'Application page needs a refresh', %s, 'urgent', %s)
            ON CONFLICT (application_id)
              WHERE item_type = 'application_ready' AND status = 'pending'
            DO UPDATE SET summary_text = EXCLUDED.summary_text,
                          payload_json = EXCLUDED.payload_json, updated_at = now()
            RETURNING id::text;""",
         (bundle_id, application_id,
-         f"{company} — {role}. Autofill review is complete, but the next browser gate could not be classified automatically. Approve this item only to prepare a fresh bound Next/Consent/Submit approval; it does not perform the browser action.",
+         f"{company} — {role}. JobOS could not identify the next safe application action from the current browser page. Tap Retry to inspect the page again; this does not click Next, accept terms, or submit.",
          Jsonb({"submit": "separate_privileged_gate", "browser_action_authorized": False,
-                "approve_semantics": "prepare_next_gate_only"})),
+                "approve_semantics": "retry_read_only_page_inspection"})),
     )
     return str(cur.fetchone()[0])
 
@@ -1049,9 +1049,67 @@ def sync_inbox(cur) -> dict[str, int]:
         if ensure_privileged_reconciliation_review(cur, execution_id):
             counts["reconciliation"] += 1
     cur.execute("SELECT id::text FROM applications WHERE current_step = 'application_ready';")
-    for (app_id,) in cur.fetchall():
-        if ensure_application_ready_review(cur, app_id):
+    application_ready_ids = [str(row[0]) for row in cur.fetchall()]
+    for app_id in application_ready_ids:
+        # application_ready gate preparation is read-only browser inspection: it
+        # snapshots the exact focused application page and materializes a bound
+        # Consent/Next/Submit approval, but never clicks. Do it automatically so
+        # daily UX does not require a meaningless "prepare next gate" tap.
+        #
+        # Once a fallback card is visible, do not hammer the browser on every
+        # inbox refresh. The user's Retry action explicitly asks for a new check.
+        cur.execute(
+            """SELECT id::text FROM human_review_items
+                 WHERE application_id=%s AND item_type='application_ready'
+                   AND status IN ('pending','needs_revision')
+                 ORDER BY created_at DESC LIMIT 1;""",
+            (app_id,),
+        )
+        if cur.fetchone():
             counts["application_ready"] += 1
+            continue
+
+        # If an exact application-ready capability is already live, no fallback
+        # review card is needed.
+        cur.execute(
+            """SELECT count(*) FROM approval_requests
+                 WHERE application_id=%s
+                   AND type IN ('privileged_accept_terms',
+                                'privileged_advance_application_step',
+                                'privileged_submit_application')
+                   AND status IN ('pending','approved','executing')
+                   AND (status='executing' OR token_expires_at > now());""",
+            (app_id,),
+        )
+        if int((cur.fetchone() or (0,))[0] or 0) > 0:
+            continue
+
+        cur.execute("SAVEPOINT jobos_auto_prepare_application_ready")
+        preparation_error = ""
+        try:
+            from services.application_actions.privileged_action_v1 import materialize_application_ready_gate
+            prepared = materialize_application_ready_gate(cur, app_id)
+        except Exception as exc:
+            cur.execute("ROLLBACK TO SAVEPOINT jobos_auto_prepare_application_ready")
+            prepared = []
+            preparation_error = str(exc)[:500]
+        finally:
+            cur.execute("RELEASE SAVEPOINT jobos_auto_prepare_application_ready")
+
+        if prepared:
+            # create_privileged_request() materializes the exact Review Hub item.
+            continue
+
+        fallback_id = ensure_application_ready_review(cur, app_id)
+        if fallback_id:
+            counts["application_ready"] += 1
+            if preparation_error:
+                cur.execute(
+                    """UPDATE human_review_items
+                          SET payload_json = payload_json || %s, updated_at=now()
+                        WHERE id=%s;""",
+                    (Jsonb({"auto_prepare_error": preparation_error}), fallback_id),
+                )
     return counts
 
 

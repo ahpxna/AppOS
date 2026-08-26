@@ -66,11 +66,11 @@ def test_telegram_no_screenshot_still_allows_autofill_approval_and_new_gates():
     autofill = tg._keyboard(cur, "r1", 7, "autofill_review", {"execution_state": "completed"})
     assert "Approve" in autofill
     app_ready = tg._keyboard(cur, "r2", 7, "application_ready", {})
-    assert "PREPARE NEXT GATE" in app_ready
+    assert "Retry page check" in app_ready
     recon = tg._keyboard(cur, "r3", 7, "reconciliation_required", {"privileged_execution_id": "e1"})
     assert "OCCURRED" in recon and "NOT OCCURRED" in recon
     upload = tg._keyboard(cur, "r4", 7, "approval_request", {"approval_type": "privileged_upload_document"})
-    assert "UPLOAD DOCUMENT" in upload
+    assert "Upload document" in upload
 
 
 def test_gmail_refetch_uses_exact_approved_mailbox(monkeypatch):

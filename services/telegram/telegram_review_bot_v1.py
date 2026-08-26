@@ -206,7 +206,7 @@ def _keyboard(cur, item_id: str, allowed_user_id: int, item_type: str,
     if item_type == "application_ready":
         prepare_gate, reject = tok("approve"), tok("reject")
         rows = [
-            [{"text": "✅ PREPARE NEXT GATE", "callback_data": f"rv:{prepare_gate}"}],
+            [{"text": "🔄 Retry page check", "callback_data": f"rv:{prepare_gate}"}],
             [{"text": "👀 Review", "callback_data": f"rv:{details}"},
              {"text": "⏭ Later", "callback_data": f"rv:{later}"},
              {"text": "❌ Stop", "callback_data": f"rv:{reject}"}],
@@ -216,21 +216,28 @@ def _keyboard(cur, item_id: str, allowed_user_id: int, item_type: str,
     approval_type = str(payload.get("approval_type") or "")
     approve_labels = {
         "privileged_begin_application": "✅ Apply",
-        "privileged_trust_external_domain": "✅ Trust domain",
-        "privileged_choose_create_employer_account_path": "✅ Create account path",
-        "privileged_choose_navigation_target": "✅ Use this application tab",
+        "privileged_trust_external_domain": "🌐 Continue to employer site",
+        "privileged_choose_create_employer_account_path": "👤 Create new account",
+        "privileged_choose_navigation_target": "🌐 Use this application tab",
         "privileged_create_employer_account": "✅ Create account",
         "privileged_login_employer_account": "🔐 Login",
         "privileged_use_email_verification": "📧 Verify email",
-        "privileged_accept_terms": "✅ Accept terms",
-        "privileged_upload_document": "✅ UPLOAD DOCUMENT",
+        "privileged_accept_terms": "✅ Accept & continue",
+        "privileged_upload_document": "📄 Upload document",
         "privileged_advance_application_step": "✅ Continue",
         "privileged_auth_manual_retry": "🔄 Retry auth",
         "privileged_mfa_retry": "🔄 Continue after MFA",
         "privileged_checkpoint_retry": "🔄 Continue after checkpoint",
-        "privileged_submit_application": "✅ APPROVE SUBMIT",
+        "privileged_submit_application": "🚨 Submit application",
         "autofill_form": "✅ Autofill",
     }
+    if approval_type == "privileged_upload_document":
+        document_type = str(payload.get("document_type") or "").strip().casefold()
+        if document_type == "resume":
+            approve_labels[approval_type] = "📄 Upload resume"
+        elif document_type == "cover_letter":
+            approve_labels[approval_type] = "📄 Upload cover letter"
+
     approve, reject = tok("approve"), tok("reject")
     if approval_type in {"privileged_login_employer_account", "privileged_auth_manual_retry", "privileged_mfa_retry", "privileged_checkpoint_retry"}:
         focus = tok("focus_browser")
@@ -386,7 +393,7 @@ def _detail_text(row: tuple[Any, ...], envelope: dict[str, Any] | None = None,
         else:
             lines.extend(["", "⚠️ Inspect the form in the JobOS browser first. Then tap ‘I inspected the form’; JobOS retires the old capability and requires a fresh approval for any later write."])
     elif item_type == "application_ready":
-        lines.extend(["", "Final Submit is not part of normal autofill. Prepare a separate privileged Submit approval when ready."])
+        lines.extend(["", "JobOS could not classify the current page automatically. Retry only refreshes the page binding; Submit still requires its own explicit confirmation."])
     lines.extend(["", "Context delivery is soft-fail: missing sections show NaN and do not remove approval controls.",
                   f"Priority: {priority}"])
     return "\n".join(lines)[:3900]

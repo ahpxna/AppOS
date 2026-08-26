@@ -210,7 +210,7 @@ def test_telegram_softfail_message_keeps_nan_and_privileged_submit_button():
     cur = SavepointCursor()
     keyboard = tg._keyboard(cur, "review1", 123, "approval_request",
                             {"approval_type": "privileged_submit_application"})
-    assert "APPROVE SUBMIT" in keyboard
+    assert "Submit application" in keyboard
 
 
 def test_migration_071_contracts_and_visible_checkpoint_note_only_in_privileged_executor():
