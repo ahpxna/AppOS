@@ -24,7 +24,6 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from services.common.llm_gateway import LLMGatewayError, chat_text, resolve_config
 from services.common.config import database_dsn
 
-DSN = database_dsn()
 EXTRACTOR_VERSION = "market_requirement_llm_v2_2026_08_20"
 MAX_CHUNK_CHARS, CHUNK_OVERLAP_CHARS = 9000, 650
 ALLOWED_CATEGORIES = {
@@ -233,7 +232,7 @@ def save_failure(cur, application_id: str, error: Exception) -> None:
 
 def cmd_process(args: argparse.Namespace) -> int:
     """Process the queue independently of active/terminal application state."""
-    with psycopg.connect(DSN, autocommit=False) as conn:
+    with psycopg.connect(database_dsn(), autocommit=False) as conn:
         with conn.cursor() as cur:
             candidates = load_candidates(cur, args)
         conn.commit()
@@ -332,7 +331,7 @@ def main() -> int:
     args = parser.parse_args()
     if args.command == "process":
         return cmd_process(args)
-    with psycopg.connect(DSN, autocommit=False) as conn:
+    with psycopg.connect(database_dsn(), autocommit=False) as conn:
         with conn.cursor() as cur:
             code = cmd_ideas(cur, args) if args.command == "ideas" else print_rows(
                 cur, "v_market_keyword_demands" if args.command == "demands" else "v_market_skill_gaps", args)

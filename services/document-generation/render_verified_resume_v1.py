@@ -15,7 +15,6 @@ sys.path.insert(0, str(ROOT))
 from services.common.canonical_resume_artifact_v1 import render_canonical_resume, ResumeTemplateError
 from services.common.config import database_dsn
 
-DSN = database_dsn()
 TEMPLATE = Path(os.getenv("JOBOS_RESUME_TEMPLATE_PATH", ROOT / "data/resume-template/VU PHAN AN NGUYEN-official_For_all.docx"))
 OUTPUT_ROOT = Path(os.getenv("JOBOS_RESUME_OUTPUT_DIR", ROOT / "data/generated-resumes"))
 
@@ -52,7 +51,7 @@ def main() -> int:
     parser.add_argument("--template", type=Path, default=TEMPLATE)
     parser.add_argument("--output-dir", type=Path)
     args = parser.parse_args()
-    with psycopg.connect(DSN, autocommit=True) as conn:
+    with psycopg.connect(database_dsn(), autocommit=True) as conn:
         with conn.cursor() as cur:
             document_id, tailoring = load_tailoring(cur, args.application_id)
     destination = args.output_dir or OUTPUT_ROOT / args.application_id / document_id
@@ -64,7 +63,7 @@ def main() -> int:
         raise SystemExit(f"Resume export blocked: {exc}") from exc
     # This utility still registers the editable DOCX for backwards-compatible
     # local use. Human Review registers/binds the canonical PDF separately.
-    with psycopg.connect(DSN, autocommit=True) as conn:
+    with psycopg.connect(database_dsn(), autocommit=True) as conn:
         with conn.cursor() as cur:
             register_artifact(cur, args.application_id, document_id, docx_path)
     print(f"DOCX: {docx_path}\nCANONICAL PDF: {pdf_path}\nHuman approval/upload must use the canonical PDF bytes.")

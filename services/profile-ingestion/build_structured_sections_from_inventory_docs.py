@@ -13,8 +13,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from services.common.config import database_dsn  # noqa: E402
 
 
-DSN = database_dsn()
-
 # PATCH H4: VERSION tu sinh theo hash cua logic. Doi logic -> doi version
 # -> existing_structured_count() khong chan nua -> tu chay lai.
 def _logic_version() -> str:
@@ -496,7 +494,7 @@ def main() -> int:
     print(f"Filters: {args.file_like}")
     print("")
 
-    with psycopg.connect(DSN) as conn:
+    with psycopg.connect(database_dsn()) as conn:
         with conn.cursor() as cur:
             docs = fetch_candidate_docs(cur, args.file_like, args.limit)
 

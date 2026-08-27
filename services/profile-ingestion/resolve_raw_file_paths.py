@@ -18,9 +18,6 @@ PARSED_DIR = Path(os.getenv("JOBOS_PROFILE_PARSED_DIR", PROJECT_ROOT / "data" / 
 COMPONENT_NAME = "source_file_path_resolver"
 TASK_TYPE = "resolve_raw_file_paths"
 
-DSN = database_dsn()
-
-
 def sha256_file(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as f:
@@ -77,7 +74,7 @@ def main() -> int:
     if not RAW_DIR.exists():
         raise SystemExit(f"Raw dir does not exist: {RAW_DIR}")
 
-    with psycopg.connect(DSN) as conn:
+    with psycopg.connect(database_dsn()) as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """

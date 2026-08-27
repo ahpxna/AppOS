@@ -23,8 +23,6 @@ from common.config import database_dsn  # noqa: E402
 
 
 
-DSN = database_dsn()
-
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
 DEFAULT_MODEL = _model_config.get_model("structured_asset_synth")
 
@@ -580,7 +578,7 @@ def main() -> int:
     print(f"Model:           {args.model}")
     print("")
 
-    with psycopg.connect(DSN) as conn:
+    with psycopg.connect(database_dsn()) as conn:
         with conn.cursor() as cur:
             units = fetch_units(cur, args.file_like, args.workflow_group, args.limit_units)
             grouped = group_units(units, args.min_units)

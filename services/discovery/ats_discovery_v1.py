@@ -54,13 +54,12 @@ from services.common.config import database_dsn
 from services.ats.contracts import canonical_job_url, jd_is_complete, normalize_work_mode
 from services.ats.http_client import DiscoveryHttpError, get_json
 from services.ats.public_page import PublicPageDiscoveryError, fetch_public_job_board
+from services.ats.browser_discovery import BrowserDiscoveryError, discover_public_jobs_with_browser
 from services.ats.registry import (
     DiscoveryStrategy, detect_ats_platform, discovery_platform_keys, get_definition, normalize_ats_key,
 )
-from services.intake.posting_identity import build_posting_identity, find_existing_application
-from services.intake.source_observation import observe_existing_posting
-
-DSN = database_dsn()
+from services.intake.posting_identity import build_posting_identity
+from services.intake.source_observation import find_and_observe_existing, observe_existing_posting
 
 DISCOVERY_VERSION = "ats_discovery_v1_2026_07_31"
 USER_AGENT = "jobos-ats-discovery/1 (personal job search tool, contact via GitHub repo)"
@@ -373,11 +372,16 @@ ADAPTERS = {
 }
 
 
-def fetch_jobs(platform: str, slug: str, *, with_details: bool = False,
+def fetch_jobs(platform: str, slug: str | None, *, with_details: bool = False,
                source_url: str | None = None, company: str | None = None) -> List[Dict[str, Any]]:
     platform = normalize_ats_key(platform)
+    slug = str(slug or "").strip()
     adapter = ADAPTERS.get(platform)
     if adapter is not None:
+        if not slug:
+            raise DiscoveryError(
+                f"{get_definition(platform).display_name} native discovery requires --slug/tenant-key."
+            )
         if platform in ("smartrecruiters", "workable"):
             return adapter(slug, with_details=with_details)
         return adapter(slug)
@@ -402,6 +406,30 @@ def fetch_jobs(platform: str, slug: str, *, with_details: bool = False,
             max_details=DETAIL_REQUEST_BUDGET,
         )
     except PublicPageDiscoveryError as exc:
+        # Only a deterministic "no complete structured posting" result may
+        # fall through to the read-only rendered-browser adapter. HTTP 429/5xx,
+        # invalid URLs and other typed failures preserve their original retry
+        # semantics and are never hidden behind a second network path.
+        if (exc.kind == "incomplete_or_missing_jobposting"
+                and os.getenv("JOBOS_ATS_BROWSER_DISCOVERY_ENABLED", "1").strip().casefold()
+                    not in {"0", "false", "no", "off"}):
+            try:
+                return discover_public_jobs_with_browser(
+                    career_url=career_url, platform=platform,
+                    company_hint=str(company or slug or platform),
+                    max_details=min(DETAIL_REQUEST_BUDGET, 50),
+                )
+            except BrowserDiscoveryError as browser_exc:
+                # Preserve the strongest retry signal. Browser availability is
+                # not itself a transient source failure; a browser timeout is.
+                if browser_exc.transient:
+                    raise DiscoveryError(
+                        str(browser_exc), kind=browser_exc.kind, transient=True
+                    ) from browser_exc
+                raise DiscoveryError(
+                    f"{exc}; read-only browser fallback: {browser_exc}",
+                    kind=exc.kind, transient=exc.transient,
+                ) from browser_exc
         raise DiscoveryError(str(exc), kind=exc.kind, transient=exc.transient) from exc
 
 
@@ -421,16 +449,13 @@ def intake_job(cur, *, jd_text: str, company: str, job_title: str, job_url: str,
         company=company, job_title=job_title, jd_text=jd_text, job_url=job_url, ats_hint=ats_type
     )
     ats_type = identity.ats_type if identity.ats_type != "custom" else normalize_ats_key(ats_type)
-    existing = find_existing_application(
-        cur, identity, ats_company_id=ats_company_id, source_job_id=ats_external_id
+    existing, _observation = find_and_observe_existing(
+        cur, identity=identity, ats_company_id=ats_company_id, source_job_id=ats_external_id,
+        source_name=ats_type, company=company, job_title=job_title, jd_text=jd_text,
+        location=location, work_mode=work_mode,
+        metadata={"ats_company_id": ats_company_id, "ats_external_id": ats_external_id},
     )
     if existing:
-        observe_existing_posting(
-            cur, application_id=existing[0], source_name=ats_type, source_job_id=ats_external_id,
-            company=company, job_title=job_title, job_url=identity.canonical_url,
-            jd_text=jd_text, jd_hash=identity.jd_hash, location=location, work_mode=work_mode,
-            metadata={"ats_company_id": ats_company_id, "ats_external_id": ats_external_id},
-        )
         return None
     cur.execute(
         """
@@ -469,26 +494,70 @@ def intake_job(cur, *, jd_text: str, company: str, job_title: str, job_url: str,
     return app_id
 
 
+def _validated_company_locator(platform: str, slug: str | None, source_url: str | None) -> tuple[str, str | None, str | None]:
+    platform = normalize_ats_key(platform)
+    slug = str(slug or "").strip() or None
+    source_url = str(source_url or "").strip() or None
+    definition = get_definition(platform)
+    if platform in ADAPTERS:
+        if not slug:
+            raise DiscoveryError(f"{definition.display_name} native discovery requires --slug/tenant-key.")
+    elif definition.discovery_strategy != DiscoveryStrategy.EXTERNAL_SOURCE:
+        if not source_url:
+            raise DiscoveryError(
+                f"{definition.display_name} structured/browser discovery requires --source-url; "
+                "do not invent a vendor slug."
+            )
+        try:
+            source_url = canonical_job_url(source_url)
+        except ValueError as exc:
+            raise DiscoveryError(str(exc), kind="invalid_url") from exc
+    return platform, slug, source_url
+
+
 def cmd_add(conn, args) -> int:
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO ats_companies (company_name, ats_platform, slug, source_url, notes)
-            VALUES (%s, %s, %s, %s, %s)
-            ON CONFLICT (ats_platform, slug) DO UPDATE
-            SET company_name = EXCLUDED.company_name, source_url = EXCLUDED.source_url,
-                notes = EXCLUDED.notes, updated_at = now()
-            RETURNING id::text;
-            """,
-            (args.company, normalize_ats_key(args.platform), args.slug, args.source_url, args.notes),
+    try:
+        platform, slug, source_url = _validated_company_locator(
+            args.platform, args.slug, args.source_url
         )
-        company_id = cur.fetchone()[0]
+    except DiscoveryError as exc:
+        print(f"  ERROR: {exc}")
+        return 1
+    with conn.cursor() as cur:
+        if slug:
+            cur.execute(
+                "SELECT id::text FROM ats_companies WHERE ats_platform=%s AND slug=%s FOR UPDATE;",
+                (platform, slug),
+            )
+        else:
+            cur.execute(
+                "SELECT id::text FROM ats_companies WHERE ats_platform=%s AND source_url=%s FOR UPDATE;",
+                (platform, source_url),
+            )
+        existing = cur.fetchone()
+        if existing:
+            company_id = str(existing[0])
+            cur.execute(
+                """UPDATE ats_companies
+                      SET company_name=%s, slug=%s, source_url=%s, notes=%s, updated_at=now()
+                    WHERE id=%s;""",
+                (args.company, slug, source_url, args.notes, company_id),
+            )
+        else:
+            cur.execute(
+                """INSERT INTO ats_companies (company_name, ats_platform, slug, source_url, notes)
+                   VALUES (%s,%s,%s,%s,%s) RETURNING id::text;""",
+                (args.company, platform, slug, source_url, args.notes),
+            )
+            company_id = str(cur.fetchone()[0])
         if not args.apply:
             conn.rollback()
-            print(f"DRY RUN. Would add/update {args.company} ({args.platform}:{args.slug}).")
+            locator = slug or source_url or "?"
+            print(f"DRY RUN. Would add/update {args.company} ({platform}:{locator}).")
             return 0
         conn.commit()
-        print(f"  saved: {company_id}  {args.company}  {args.platform}:{args.slug}")
+        locator = slug or source_url or "?"
+        print(f"  saved: {company_id}  {args.company}  {platform}:{locator}")
     return 0
 
 
@@ -504,20 +573,23 @@ def cmd_list(conn, args) -> int:
         rows = cur.fetchall()
         if not rows:
             print("\nNo companies configured yet. Add one with:")
-            print("  python services/discovery/ats_discovery_v1.py add "
-                  "--company NAME --platform PLATFORM --slug SLUG --apply")
+            print("  Native adapter:     python services/discovery/ats_discovery_v1.py add "
+                  "--company NAME --platform greenhouse --slug TENANT --apply")
+            print("  Structured adapter: python services/discovery/ats_discovery_v1.py add "
+                  "--company NAME --platform workday --source-url URL --apply")
             return 0
-        print(f"\n{'COMPANY':<28} {'PLATFORM':<16} {'SLUG':<20} {'EN':<4} "
+        print(f"\n{'COMPANY':<28} {'PLATFORM':<16} {'LOCATOR':<34} {'EN':<4} "
               f"{'LAST POLL':<20} {'JOBS':<6} FAILS")
         for cid, name, plat, slug, source_url, en, polled, success, jobs, fails in rows:
-            print(f"{(name or '?')[:28]:<28} {plat:<16} {slug:<20} "
+            locator = str(slug or source_url or "-")
+            print(f"{(name or '?')[:28]:<28} {plat:<16} {locator[:34]:<34} "
                   f"{'y' if en else 'n':<4} {str(polled)[:19] if polled else '-':<20} "
                   f"{jobs if jobs is not None else '-':<6} {fails}")
     return 0
 
 
 def cmd_test(conn, args) -> int:
-    print(f"  fetching {args.platform}:{args.slug} (no DB writes) ...")
+    print(f"  fetching {args.platform}:{args.slug or args.source_url or '?'} (no DB writes) ...")
     try:
         jobs = fetch_jobs(args.platform, args.slug, with_details=args.with_details, source_url=args.source_url, company=args.company)
     except DiscoveryError as e:
@@ -667,7 +739,7 @@ def cmd_poll(conn, args) -> int:
 
     total_new = 0
     for cid, name, platform, slug, source_url in rows:
-        print(f"\n  polling {name} ({platform}:{slug}) ...")
+        print(f"\n  polling {name} ({platform}:{slug or source_url or '?'}) ...")
         ok, seen, new, dup, err = poll_company(
             conn, cid, name, platform, slug, source_url,
             apply=args.apply, with_details=args.with_details,
@@ -690,7 +762,7 @@ def main() -> int:
 
     pt = sub.add_parser("test", help="Fetch one company, print results, write nothing.")
     pt.add_argument("--platform", required=True, choices=PLATFORMS)
-    pt.add_argument("--slug", required=True)
+    pt.add_argument("--slug", help="Native ATS tenant/company key; required only for native adapters.")
     pt.add_argument("--source-url", help="Official careers URL for structured-web fallback.")
     pt.add_argument("--company", help="Company name for structured-web normalization.")
     test_detail_mode = pt.add_mutually_exclusive_group()
@@ -703,7 +775,7 @@ def main() -> int:
     pa = sub.add_parser("add", help="Add or update a company to poll.")
     pa.add_argument("--company", required=True)
     pa.add_argument("--platform", required=True, choices=PLATFORMS)
-    pa.add_argument("--slug", required=True)
+    pa.add_argument("--slug", help="Native ATS tenant/company key; omit for structured/browser adapters.")
     pa.add_argument("--source-url", help="Official careers URL; required for non-native ATS polling.")
     pa.add_argument("--notes")
     pa.add_argument("--apply", action="store_true")
@@ -727,7 +799,7 @@ def main() -> int:
     if args.command == "test":
         return cmd_test(None, args)
 
-    with psycopg.connect(DSN, autocommit=False) as conn:
+    with psycopg.connect(database_dsn(), autocommit=False) as conn:
         return {
             "add": cmd_add, "list": cmd_list, "poll": cmd_poll,
         }[args.command](conn, args)

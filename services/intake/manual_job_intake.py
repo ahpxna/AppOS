@@ -16,7 +16,8 @@ from urllib.parse import urlparse
 
 from psycopg.types.json import Jsonb
 from services.discovery.immigration_intelligence import record_jd_immigration_assessment
-from services.intake.posting_identity import build_posting_identity, find_existing_application
+from services.intake.posting_identity import build_posting_identity
+from services.intake.source_observation import find_and_observe_existing, observe_existing_posting
 
 
 MIN_JD_CHARS = 200
@@ -93,7 +94,11 @@ def create_application(cur: Any, draft: JobDraft) -> tuple[str | None, JobDraft]
     identity = build_posting_identity(
         company=clean.company, job_title=clean.job_title, jd_text=clean.jd_text, job_url=clean.job_url,
     )
-    existing = find_existing_application(cur, identity)
+    existing, _observation = find_and_observe_existing(
+        cur, identity=identity, source_name=clean.source, jd_text=clean.jd_text,
+        company=clean.company, job_title=clean.job_title, location=clean.location,
+        work_mode=clean.work_mode, metadata={"intake_channel": "desktop_manual_form"},
+    )
     if existing:
         return None, clean
     jd_hash = identity.jd_hash
@@ -112,6 +117,12 @@ def create_application(cur: Any, draft: JobDraft) -> tuple[str | None, JobDraft]
          identity.ats_type, clean.location, clean.work_mode, clean.seniority_level, clean.deadline, clean.salary_range),
     )
     application_id = cur.fetchone()[0]
+    observe_existing_posting(
+        cur, application_id=application_id, source_name=clean.source,
+        company=clean.company, job_title=clean.job_title, job_url=identity.canonical_url,
+        jd_text=clean.jd_text, jd_hash=identity.jd_hash, location=clean.location,
+        work_mode=clean.work_mode, metadata={"intake_channel": "desktop_manual_form", "initial": True},
+    )
     immigration = record_jd_immigration_assessment(cur, application_id, clean.jd_text)
     event_detail = {
         "channel": "desktop_manual_form", "source": clean.source, "jd_hash": jd_hash,

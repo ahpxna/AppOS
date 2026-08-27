@@ -47,8 +47,6 @@ from services.control_plane.pipeline_state import DEFAULT_PIPELINE_STATE_STORE, 
 
 load_repo_env()
 
-DSN = database_dsn()
-
 SERVICE_VERSION = "approval_service_v2_capability_bound_2026_08_23"
 
 APPROVAL_TYPES = (
@@ -1261,7 +1259,7 @@ def main() -> int:
 
     print(f"===== APPROVAL SERVICE ({SERVICE_VERSION}) =====")
 
-    with psycopg.connect(DSN, autocommit=False) as conn:
+    with psycopg.connect(database_dsn(), autocommit=False) as conn:
         if args.command == "create":
             return cmd_create(conn, args)
         if args.command == "approve":

@@ -24,9 +24,6 @@ EMBED_DIM = int(os.getenv("PROFILE_EMBED_DIM", "768"))
 COMPONENT_NAME = "profile_chunk_embedder"
 TASK_TYPE = "embed_profile_chunk"
 
-DSN = database_dsn()
-
-
 def content_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
 
@@ -121,7 +118,7 @@ def main() -> int:
     embedded = 0
     failed = 0
 
-    with psycopg.connect(DSN) as conn:
+    with psycopg.connect(database_dsn()) as conn:
         with conn.cursor() as cur:
             rows = fetch_chunks(cur, limit)
             print(f"Chunks selected: {len(rows)}")

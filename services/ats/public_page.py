@@ -232,7 +232,7 @@ def normalize_jobposting(job: dict[str, Any], *, page_url: str, company_hint: st
     }
 
 
-def _looks_like_job_link(url: str, *, board_url: str, platform: str) -> bool:
+def is_candidate_job_link(url: str, *, board_url: str, platform: str) -> bool:
     parsed = urlsplit(url)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         return False
@@ -304,7 +304,7 @@ def fetch_public_job_board(*, career_url: str, platform: str, company_hint: str,
     for link in candidate_links:
         if link in detail_seen:
             continue
-        if _looks_like_job_link(link, board_url=final_url, platform=platform):
+        if is_candidate_job_link(link, board_url=final_url, platform=platform):
             detail_seen.add(link)
             detail_urls.append(link)
 

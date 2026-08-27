@@ -24,9 +24,6 @@ TASK_TYPE_OCR = "run_ocr"
 
 ENGINE = "tesseract_cli_plus_poppler"
 
-DSN = database_dsn()
-
-
 def require_binary(name: str) -> None:
     if shutil.which(name) is None:
         raise RuntimeError(f"Missing required binary: {name}. Install it first.")
@@ -360,7 +357,7 @@ def run_audit(args) -> int:
     require_binary("pdfinfo")
     require_binary("pdftotext")
 
-    with psycopg.connect(DSN) as conn:
+    with psycopg.connect(database_dsn()) as conn:
         with conn.cursor() as cur:
             rows = fetch_files_for_audit(cur, args.id, args.limit)
             print(f"Files selected for audit: {len(rows)}")
@@ -439,7 +436,7 @@ def run_ocr(args) -> int:
 
     OCR_DIR.mkdir(parents=True, exist_ok=True)
 
-    with psycopg.connect(DSN) as conn:
+    with psycopg.connect(database_dsn()) as conn:
         with conn.cursor() as cur:
             rows = fetch_files_for_ocr(cur, args.id, args.limit)
             print(f"Files selected for OCR: {len(rows)}")

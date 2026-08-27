@@ -59,8 +59,6 @@ from services.common.llm_gateway import generate_text
 from services.common.model_config import get_model
 from services.common.config import database_dsn
 
-DSN = database_dsn()
-
 WRITER_VERSION = "reply_writer_v1_asset_grounded_2026_07_29"
 CLASSIFIER_VERSION = "message_classifier_v1_2026_07_29"
 DEFAULT_OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
@@ -1047,7 +1045,7 @@ def main() -> int:
     args = p.parse_args()
     print("===== MESSAGE REPLY (L8) =====")
 
-    with psycopg.connect(DSN, autocommit=False) as conn:
+    with psycopg.connect(database_dsn(), autocommit=False) as conn:
         try:
             return {"ingest": cmd_ingest, "classify": cmd_classify,
                     "draft": cmd_draft, "verify": cmd_verify,

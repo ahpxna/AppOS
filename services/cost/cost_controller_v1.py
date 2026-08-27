@@ -42,8 +42,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from services.common.config import database_dsn
 from services.control_plane.budget_admissions import admit
 
-DSN = database_dsn()
-
 CONTROLLER_VERSION = "cost_controller_v1_2026_07_29"
 
 TASK_KINDS = ("full_pipeline", "browser_task", "single_call")
@@ -388,7 +386,7 @@ def main() -> int:
     args = p.parse_args()
     print(f"===== COST CONTROLLER ({CONTROLLER_VERSION}) =====")
 
-    with psycopg.connect(DSN, autocommit=False) as conn:
+    with psycopg.connect(database_dsn(), autocommit=False) as conn:
         return {
             "backfill": cmd_backfill,
             "report": cmd_report,

@@ -26,7 +26,6 @@ from services.control_plane.review_materialization import (
 )
 
 load_repo_env()
-DSN = database_dsn()
 SERVICE_VERSION = "human_review_hub_v1_2026_08_24"
 
 
@@ -1945,7 +1944,7 @@ def main() -> int:
     feedback = sub.add_parser("feedback"); feedback.add_argument("item_id"); feedback.add_argument("--text", required=True)
     feedback.add_argument("--actor", default="user")
     args = parser.parse_args()
-    with psycopg.connect(DSN, autocommit=False) as conn:
+    with psycopg.connect(database_dsn(), autocommit=False) as conn:
         if args.command == "sync":
             with conn.cursor() as cur:
                 result = sync_inbox(cur)

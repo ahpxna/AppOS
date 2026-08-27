@@ -9,9 +9,6 @@ from services.common.config import database_dsn
 
 WATCHDOG_ID = f"watchdog-{socket.gethostname()}-{uuid.uuid4().hex[:8]}"
 
-DSN = database_dsn()
-
-
 def mark_uncertain_expired_tasks(conn):
     """Fail closed after any state that may have touched the browser.
 
@@ -150,7 +147,7 @@ def dead_letter_expired_tasks(conn):
 
 def main():
     print(f"Watchdog ID: {WATCHDOG_ID}")
-    with psycopg.connect(DSN, autocommit=False) as conn:
+    with psycopg.connect(database_dsn(), autocommit=False) as conn:
         uncertain = mark_uncertain_expired_tasks(conn)
         dead = dead_letter_expired_tasks(conn)
         requeued = requeue_expired_tasks(conn)

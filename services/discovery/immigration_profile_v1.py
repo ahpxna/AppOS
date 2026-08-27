@@ -38,8 +38,6 @@ from services.discovery.immigration_intelligence import (
     record_jd_immigration_assessment,
 )
 
-DSN = database_dsn()
-
 # These are candidate attestations. Employer E-Verify is deliberately absent:
 # it is employer evidence, not a candidate-provided legal profile field.
 EXACT_ADDITIONAL_QUESTION_CLASSES = EXACT_CANDIDATE_ADDITIONAL_CLASSES
@@ -296,7 +294,7 @@ def main() -> int:
     exact.add_argument("--confirm", action="store_true")
     exact.add_argument("--apply", action="store_true")
     args = parser.parse_args()
-    with psycopg.connect(DSN, autocommit=False) as conn:
+    with psycopg.connect(database_dsn(), autocommit=False) as conn:
         if args.command == "show":
             with conn.cursor() as cur:
                 return cmd_show(cur)

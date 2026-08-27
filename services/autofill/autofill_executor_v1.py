@@ -29,11 +29,19 @@ class BrowserTarget:
 
 
 class OpenClawTransport:
-    """Use only documented OpenClaw browser primitives on one stable tab."""
-    def __init__(self, *, binary: str = "openclaw", profile: str = "remote", timeout: int = 60,
+    """Use only documented OpenClaw browser primitives on one stable tab.
+
+    The binary defaults to JobOS's managed Node runtime.  A caller may pass an
+    explicit path for dependency injection/tests, but a bare PATH lookup is
+    never the production default.
+    """
+    def __init__(self, *, binary: str | None = None, profile: str = "remote", timeout: int = 60,
                  environment: dict[str, str] | None = None, uploads_dir: Path | None = None,
                  approved_upload_hashes: dict[str, str] | None = None):
-        self.binary, self.profile, self.timeout = binary, profile, timeout
+        if binary is None:
+            from services.common.openclaw_runtime import resolve_openclaw_binary
+            binary = resolve_openclaw_binary(required=True)
+        self.binary, self.profile, self.timeout = str(binary), profile, timeout
         self.environment = environment or dict(os.environ)
         self.uploads_dir = uploads_dir or Path(os.getenv("JOBOS_OPENCLAW_UPLOADS_DIR", "/tmp/openclaw/uploads"))
         # ``None`` means this transport is read-only/non-uploading.  Production
@@ -136,6 +144,13 @@ class OpenClawTransport:
         tab = created[0]
         target_id = self._stable_id(tab)
         return self.focus(target_id)
+
+    def close(self, target_id: str) -> None:
+        """Close one exact OpenClaw tab by its stable target reference."""
+        target_id = str(target_id or "").strip()
+        if not target_id:
+            raise TransportError("Cannot close an empty browser target id.")
+        self._run(["close", target_id])
 
     def current_url(self, target_id: str) -> str:
         for tab in self._tabs():

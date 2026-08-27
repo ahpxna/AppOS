@@ -22,8 +22,6 @@ from common.config import database_dsn  # noqa: E402
 
 
 
-DSN = database_dsn()
-
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
 DEFAULT_MODEL = _model_config.get_model("profile_asset_synthesizer")
 VERSION = "profile_asset_synthesizer_qwen_v2_2026_08_25"
@@ -661,7 +659,7 @@ def main() -> int:
     print(f"Force:         {args.force}")
     print("")
 
-    with psycopg.connect(DSN) as conn:
+    with psycopg.connect(database_dsn()) as conn:
         with conn.cursor() as cur:
             docs = fetch_docs(cur, args.limit, args.document_type, args.force)
 

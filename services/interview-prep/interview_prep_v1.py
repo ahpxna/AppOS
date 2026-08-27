@@ -35,8 +35,6 @@ from services.common.llm_gateway import generate_text
 from services.common.model_config import get_model
 from services.common.config import database_dsn
 
-DSN = database_dsn()
-
 MODEL = get_model("interview_prep")
 DEFAULT_OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
 PREP_VERSION = "interview_prep_v1_2026_07_31"
@@ -285,7 +283,7 @@ def main() -> int:
     print("===== INTERVIEW PREP (L9) =====")
     print(f"Model: {args.model}")
 
-    with psycopg.connect(DSN, autocommit=False) as conn:
+    with psycopg.connect(database_dsn(), autocommit=False) as conn:
         try:
             return cmd_prep(conn, args)
         except RuntimeError as e:

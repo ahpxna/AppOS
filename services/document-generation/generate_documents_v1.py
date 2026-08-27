@@ -69,8 +69,6 @@ from services.control_plane.document_attempts import (
 )
 from services.runtime.process_runner import DEFAULT_PROCESS_RUNNER
 
-DSN = database_dsn()
-
 GENERATOR_VERSION = "document_generator_v5_recoverable_attempts_2026_08_26"
 DEFAULT_OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
 DEFAULT_MODEL = get_model("docgen")
@@ -1131,7 +1129,7 @@ def main() -> int:
     print(f"Mode:      {'APPLY' if args.apply else 'DRY RUN'}")
     print(f"Model:     {args.model}\n")
 
-    with psycopg.connect(DSN, autocommit=False) as conn:
+    with psycopg.connect(database_dsn(), autocommit=False) as conn:
         with conn.cursor() as cur:
             if args.doc_type == "resume":
                 ready, freshness_report, blockers = database_resume_freshness(

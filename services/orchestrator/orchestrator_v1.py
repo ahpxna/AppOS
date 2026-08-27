@@ -45,9 +45,8 @@ from services.discovery.immigration_intelligence import record_jd_immigration_as
 from services.common.config import database_dsn
 from services.control_plane.pipeline_state import DEFAULT_PIPELINE_STATE_STORE, PipelineStateError
 from services.runtime.process_runner import DEFAULT_PROCESS_RUNNER
-from services.intake.posting_identity import build_posting_identity, find_existing_application
-
-DSN = database_dsn()
+from services.intake.posting_identity import build_posting_identity
+from services.intake.source_observation import find_and_observe_existing, observe_existing_posting
 
 ORCHESTRATOR_VERSION = "orchestrator_v1_state_machine_2026_07_28"
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -114,9 +113,12 @@ def intake(cur, *, jd_text: str, company: str, job_title: str,
         company=company, job_title=job_title, jd_text=jd_text, job_url=job_url,
     )
     job_url, jd_hash = identity.canonical_url, identity.jd_hash
-    existing = find_existing_application(cur, identity)
+    existing, _observation = find_and_observe_existing(
+        cur, identity=identity, source_name=source or "orchestrator_intake", jd_text=jd_text,
+        company=company, job_title=job_title, metadata={"intake_channel": channel},
+    )
     if existing:
-        print(f"  duplicate of {existing[0]} ({existing[1]} / {existing[2]}); skipped")
+        print(f"  duplicate of {existing[0]} ({existing[1]} / {existing[2]}); source observation recorded")
         return None
 
     cur.execute(
@@ -130,6 +132,11 @@ def intake(cur, *, jd_text: str, company: str, job_title: str,
         (source, company, job_title, job_url, jd_text, jd_hash, channel, identity.ats_type),
     )
     app_id = cur.fetchone()[0]
+    observe_existing_posting(
+        cur, application_id=app_id, source_name=source or "orchestrator_intake",
+        company=company, job_title=job_title, job_url=job_url, jd_text=jd_text, jd_hash=jd_hash,
+        metadata={"intake_channel": channel, "initial": True},
+    )
     immigration = record_jd_immigration_assessment(cur, app_id, jd_text)
 
     cur.execute(
@@ -830,7 +837,7 @@ def main() -> int:
 
     print(f"===== JOBOS ORCHESTRATOR ({ORCHESTRATOR_VERSION}) =====")
 
-    with psycopg.connect(DSN, autocommit=False) as conn:
+    with psycopg.connect(database_dsn(), autocommit=False) as conn:
         if args.command == "intake":
             return cmd_intake(conn, args)
         if args.command == "filter":

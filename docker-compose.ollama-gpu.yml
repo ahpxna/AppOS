@@ -6,7 +6,7 @@
 #   docker compose -f docker-compose.yml -f docker-compose.ollama-gpu.yml up -d ollama
 services:
   ollama:
-    image: ${JOBOS_OLLAMA_IMAGE:-ollama/ollama:latest}
+    image: ${JOBOS_OLLAMA_IMAGE:-ollama/ollama:0.32.14}
     container_name: jobos-ollama
     restart: unless-stopped
     ports:

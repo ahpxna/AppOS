@@ -29,11 +29,8 @@ from services.discovery.linkedin_discovery_v1 import (
     validate_saved_request,
 )
 from services.common.config import database_dsn
-from services.intake.posting_identity import build_posting_identity, find_existing_application
-from services.intake.source_observation import observe_existing_posting
-
-DSN = database_dsn()
-
+from services.intake.posting_identity import build_posting_identity
+from services.intake.source_observation import find_and_observe_existing, observe_existing_posting
 
 class IntakeError(ValueError):
     pass
@@ -97,14 +94,12 @@ def intake(cur, *, company: str, title: str, url: str, jd_text: str,
         company=company, job_title=title, jd_text=jd_text, job_url=url,
         ats_hint="linkedin_browser_linked_session",
     )
-    existing = find_existing_application(cur, identity, source_job_id=source_job_id)
+    existing, _observation = find_and_observe_existing(
+        cur, identity=identity, source_job_id=source_job_id, source_name="linkedin",
+        company=company, job_title=title, jd_text=jd_text, location=location, work_mode=work_mode,
+        metadata={"intake_channel": source},
+    )
     if existing:
-        observe_existing_posting(
-            cur, application_id=existing[0], source_name="linkedin", source_job_id=source_job_id,
-            company=company, job_title=title, job_url=identity.canonical_url,
-            jd_text=jd_text, jd_hash=identity.jd_hash, location=location, work_mode=work_mode,
-            metadata={"intake_channel": source},
-        )
         return None
     cur.execute(
         """
@@ -281,7 +276,7 @@ def main() -> int:
     imported.add_argument("--file", required=True)
     imported.add_argument("--apply", action="store_true", help="Commit; otherwise run in a rolled-back transaction.")
     args = parser.parse_args()
-    with psycopg.connect(DSN, autocommit=False) as conn:
+    with psycopg.connect(database_dsn(), autocommit=False) as conn:
         try:
             with conn.cursor() as cur:
                 code = {

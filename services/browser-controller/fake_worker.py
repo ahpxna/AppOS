@@ -11,8 +11,6 @@ from services.common.config import database_dsn
 
 WORKER_ID = f"fake-worker-{socket.gethostname()}-{uuid.uuid4().hex[:8]}"
 
-DSN = database_dsn()
-
 def claim_one_task(conn):
     with conn.cursor() as cur:
         cur.execute(
@@ -63,7 +61,7 @@ def complete_task(conn, task_id, result):
 
 def main():
     print(f"Worker ID: {WORKER_ID}")
-    with psycopg.connect(DSN, autocommit=False) as conn:
+    with psycopg.connect(database_dsn(), autocommit=False) as conn:
         task = claim_one_task(conn)
         if not task:
             conn.commit()
@@ -95,7 +93,7 @@ def main():
             "worker_id": WORKER_ID,
         }
 
-        with psycopg.connect(DSN, autocommit=False) as conn2:
+        with psycopg.connect(database_dsn(), autocommit=False) as conn2:
             complete_task(conn2, task_id, result)
             conn2.commit()
 

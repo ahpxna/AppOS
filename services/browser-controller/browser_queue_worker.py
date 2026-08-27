@@ -86,8 +86,6 @@ load_repo_env()
 
 # ---------------------------------------------------------------- config
 
-DSN = database_dsn()
-
 # Prefer the pinned JobOS runtime when setup installed it.  A global OpenClaw
 # can otherwise inherit an unsupported Node version or a different plugin set.
 OPENCLAW_BIN = resolve_openclaw_binary()
@@ -1008,7 +1006,7 @@ def _durable_connection():
     """
     # A dedicated connection is durable relative to the queue worker's outer
     # transaction, but its related statements must still commit atomically.
-    return psycopg.connect(DSN, autocommit=False)
+    return psycopg.connect(database_dsn(), autocommit=False)
 
 
 def durable_begin_execution(task: Dict[str, Any], binding: Dict[str, Any], target_id: str) -> None:
@@ -1388,9 +1386,8 @@ def check_domain(cur, url: str, *, application_id: str | None = None,
                           purpose=purpose or "employer_handoff"):
         return
     raise PermanentTaskError(
-        f"Domain '{host}' is not in allowed_domains. Add it deliberately:\n"
-        f"  INSERT INTO allowed_domains (domain, category) "
-        f"VALUES ('{host}', 'ats');"
+        f"Domain '{host}' is not globally authorized and has no live application-scoped trust. "
+        "Use the privileged trust-domain approval for this application; do not promote ATS catalog domains to global authority."
     )
 
 
@@ -2122,7 +2119,7 @@ def main() -> int:
     print(f"Transport: {OPENCLAW_BIN} agent --json")
     print("Concurrency: 1 task at a time (single browser session)\n")
 
-    with psycopg.connect(DSN, autocommit=False) as conn:
+    with psycopg.connect(database_dsn(), autocommit=False) as conn:
         if args.once:
             if not process_one(conn):
                 print("Queue empty.")

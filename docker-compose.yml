@@ -18,7 +18,7 @@ services:
     # keeping n8n behind an explicit profile prevents an unused service from
     # becoming part of default production readiness while preserving the feature.
     profiles: ["legacy-n8n"]
-    image: n8nio/n8n:latest
+    image: ${JOBOS_N8N_IMAGE:-n8nio/n8n:2.32.6}
     container_name: jobos-n8n
     restart: unless-stopped
     depends_on:

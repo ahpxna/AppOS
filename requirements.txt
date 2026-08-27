@@ -6,7 +6,7 @@
 #
 #   python -m venv .venv
 #   source .venv/bin/activate        # Windows/WSL: same command inside WSL bash
-#   pip install -r requirements.txt
+#   pip install -r requirements.txt -c constraints-v1.txt
 #
 # `services/browser-controller/requirements.txt` also documents two
 # system binaries (poppler, tesseract) that pip cannot install -- see

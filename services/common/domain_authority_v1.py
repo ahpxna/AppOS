@@ -13,10 +13,18 @@ def host_is_authorized(cur, url: str, *, application_id: str | None = None,
     host = (urlsplit(str(url)).hostname or "").casefold()
     if not host:
         return False
-    cur.execute("SELECT domain FROM allowed_domains WHERE enabled=true;")
-    if any(host == str(row[0]).casefold() or host.endswith("." + str(row[0]).casefold())
-           for row in cur.fetchall()):
-        return True
+    cur.execute("SELECT domain, category FROM allowed_domains WHERE enabled=true;")
+    for domain, category in cur.fetchall():
+        # ATS registry/candidate-domain entries are recognition metadata only.
+        # They must never become global browser authority merely because a
+        # vendor hostname is known. Explicit administrator rows in any other
+        # category remain global policy; employer ATS redirects use the
+        # application-scoped human trust table below.
+        if str(category or "").casefold() == "ats_candidate_catalog":
+            continue
+        allowed = str(domain or "").casefold()
+        if host == allowed or host.endswith("." + allowed):
+            return True
     if not application_id:
         return False
     cur.execute(

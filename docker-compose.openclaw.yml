@@ -17,7 +17,7 @@
 
 services:
   openclaw:
-    image: ${OPENCLAW_IMAGE:-khal3d/openclaw:latest}
+    image: ${OPENCLAW_IMAGE:-khal3d/openclaw:2026.2.12}
     container_name: jobos-openclaw
     restart: unless-stopped
     ports:

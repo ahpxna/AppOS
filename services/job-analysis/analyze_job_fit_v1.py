@@ -25,10 +25,8 @@ from services.common.observability import emit_trace, make_trace_id
 from services.common.llm_gateway import generate_text
 from services.common.model_config import get_model
 from services.common.config import database_dsn
-from services.intake.posting_identity import build_posting_identity, find_existing_application
-from services.intake.source_observation import observe_existing_posting
-
-DSN = database_dsn()
+from services.intake.posting_identity import build_posting_identity
+from services.intake.source_observation import find_and_observe_existing, observe_existing_posting
 
 ANALYZER_VERSION = "job_fit_analyzer_v1_profile_pack_2026_04_28"
 COMPONENT_NAME = "fit_checker_jd_analyzer"
@@ -145,15 +143,12 @@ def get_or_create_application(
     identity = build_posting_identity(
         company=company, job_title=job_title, jd_text=jd_text, job_url=job_url,
     )
-    existing = find_existing_application(cur, identity)
+    existing, _observation = find_and_observe_existing(
+        cur, identity=identity, source_name=source or "fit_analyzer_cli", jd_text=jd_text,
+        company=company, job_title=job_title, metadata={"intake_channel": "fit_analyzer_cli"},
+    )
     if existing:
         app_id, _company, _title, _old_jd_hash, _current_step = existing
-        observe_existing_posting(
-            cur, application_id=app_id, source_name=source or "fit_analyzer_cli",
-            company=company, job_title=job_title, job_url=identity.canonical_url,
-            jd_text=jd_text, jd_hash=identity.jd_hash,
-            metadata={"intake_channel": "fit_analyzer_cli"},
-        )
         cur.execute(
             "UPDATE applications SET ats_type=coalesce(nullif(%s,'custom'),ats_type), updated_at=now() WHERE id=%s AND current_step='intake';",
             (identity.ats_type, app_id),
@@ -564,7 +559,7 @@ def main() -> int:
     print(f"Ollama URL:       {args.ollama_url}")
     print("")
 
-    with psycopg.connect(DSN, autocommit=False) as conn:
+    with psycopg.connect(database_dsn(), autocommit=False) as conn:
         with conn.cursor() as cur:
             profile_pack_id, snapshot_hash, profile_pack_text = fetch_profile_pack(cur)
 

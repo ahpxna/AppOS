@@ -22,9 +22,6 @@ from services.common.profile_job_matching import rank_job, unique_terms
 from services.common.search_preferences import preference_reason
 from services.common.config import database_dsn
 
-DSN = database_dsn()
-
-
 def approved_terms(cur) -> list[str]:
     """Read the approved-only terms view; drafts are intentionally excluded."""
     cur.execute("SELECT term FROM v_profile_search_terms ORDER BY term;")
@@ -142,7 +139,7 @@ def main() -> int:
     rank.add_argument("--exclude-immigration-blocked", action="store_true",
                       help="Hide only JDs with an explicit incompatible immigration policy; unknown remains visible.")
     args = parser.parse_args()
-    with psycopg.connect(DSN, autocommit=True) as conn:
+    with psycopg.connect(database_dsn(), autocommit=True) as conn:
         with conn.cursor() as cur:
             return {"terms": cmd_terms, "queries": cmd_queries, "rank": cmd_rank}[args.command](cur, args)
 

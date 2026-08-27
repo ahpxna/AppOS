@@ -17,9 +17,6 @@ COMPONENT_NAME = "portfolio_asset_compiler"
 TASK_TYPE = "compile_source_document_profile_asset"
 COMPILER_VERSION = "portfolio_asset_compiler_v1_source_preserving_2026_04_27"
 
-DSN = database_dsn()
-
-
 IMPORTANT_SECTION_PATTERNS = [
     "purpose",
     "master tool narrative",
@@ -565,7 +562,7 @@ def main() -> int:
 
     compiled = []
 
-    with psycopg.connect(DSN) as conn:
+    with psycopg.connect(database_dsn()) as conn:
         with conn.cursor() as cur:
             rows = fetch_files(cur, args)
             print(f"Files selected: {len(rows)}")

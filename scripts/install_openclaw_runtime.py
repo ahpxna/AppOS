@@ -92,7 +92,14 @@ def safe_extract(archive: Path, destination: Path) -> None:
                 link_target = (link_base / member.linkname).resolve()
                 if link_target != root and root not in link_target.parents:
                     raise RuntimeInstallError("Refusing a Node archive link that escapes its extraction root.")
-        tar.extractall(destination)
+        # We already validate every member/link above. Explicitly request the
+        # legacy fully-trusted extraction semantics on Python versions that
+        # support extraction filters so Python 3.14 cannot silently change the
+        # archive layout; retain compatibility with older supported Pythons.
+        try:
+            tar.extractall(destination, filter="fully_trusted")
+        except TypeError:  # Python without tarfile extraction filters.
+            tar.extractall(destination)
 
 
 def install_node(version: str, runtime_root: Path) -> Path:

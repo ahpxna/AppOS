@@ -34,7 +34,6 @@ from services.review.review_service_v1 import (
 from services.review.approval_context_v1 import NAN, build_envelope, context_files, snapshot_context
 
 load_repo_env()
-DSN = database_dsn()
 BOT_KEY = "review_bot"
 
 
@@ -1374,7 +1373,7 @@ def main() -> int:
     token, allowed_user_id, chat_id = _required_env()
     me = api(token, "getMe", data={})
     print(f"Telegram bot: @{me['result'].get('username', 'unknown')} | chat={chat_id} | allowed_user={allowed_user_id}")
-    with psycopg.connect(DSN, autocommit=False) as conn:
+    with psycopg.connect(database_dsn(), autocommit=False) as conn:
         while True:
             dashboard = dispatch_dashboard(conn, token, allowed_user_id, chat_id)
             urgent = dispatch_pending(conn, token, allowed_user_id, chat_id, limit=3, urgent_only=True)

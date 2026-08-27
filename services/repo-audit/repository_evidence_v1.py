@@ -22,8 +22,6 @@ from psycopg.types.json import Jsonb
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from services.common.config import database_dsn
 
-DSN = database_dsn()
-
 IMPORT_VERSION = "repository_evidence_v1_2026_08_20"
 ASSET_COMPILER_VERSION = "repository_evidence_asset_compiler_v1_2026_08_20"
 
@@ -404,7 +402,7 @@ def main() -> int:
         command.add_argument("--apply", action="store_true", help="Commit this change; otherwise rollback after preview.")
     args = parser.parse_args()
 
-    with psycopg.connect(DSN, autocommit=False) as conn:
+    with psycopg.connect(database_dsn(), autocommit=False) as conn:
         with conn.cursor() as cur:
             try:
                 if args.command == "review":

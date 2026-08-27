@@ -15,9 +15,6 @@ from psycopg.types.json import Jsonb
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from services.common.config import database_dsn
 
-DSN = database_dsn()
-
-
 def db_value(value):
     if isinstance(value, dict):
         return Jsonb(value)
@@ -313,7 +310,7 @@ def main() -> int:
     print(f"Files:       {len(files)}")
     print("")
 
-    with psycopg.connect(DSN) as conn:
+    with psycopg.connect(database_dsn()) as conn:
         with conn.cursor() as cur:
             raw_cols = table_columns(cur, "raw_files")
             chunk_cols = table_columns(cur, "profile_chunks")

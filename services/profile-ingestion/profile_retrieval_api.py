@@ -24,9 +24,6 @@ EMBED_DIM = int(os.getenv("PROFILE_EMBED_DIM", "768"))
 COMPONENT_NAME = "profile_retrieval_api"
 TASK_TYPE = "retrieve_profile_chunks"
 
-DSN = database_dsn()
-
-
 def vector_literal(vec: List[float]) -> str:
     return "[" + ",".join(str(float(x)) for x in vec) + "]"
 
@@ -561,7 +558,7 @@ def main() -> int:
 
     query_embedding = embed_query(query_text)
 
-    with psycopg.connect(DSN) as conn:
+    with psycopg.connect(database_dsn()) as conn:
         with conn.cursor() as cur:
             raw_results = retrieve_chunks(
                 cur=cur,

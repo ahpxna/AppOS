@@ -18,8 +18,6 @@ from services.common.llm_gateway import chat_text  # noqa: E402
 from services.common.config import database_dsn  # noqa: E402
 
 
-DSN = database_dsn()
-
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
 DEFAULT_MODEL = get_model("profile_asset_auditor")
 
@@ -462,7 +460,7 @@ def main() -> int:
     print(f"Fallback:      {args.allow_fallback}")
     print("")
 
-    with psycopg.connect(DSN) as conn:
+    with psycopg.connect(database_dsn()) as conn:
         with conn.cursor() as cur:
             assets = fetch_assets(cur, args.limit, args.force)
             print(f"Assets selected: {len(assets)}")

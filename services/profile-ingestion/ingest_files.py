@@ -35,9 +35,6 @@ from services.common.config import database_dsn
 
 RAW_DIR = PROJECT_ROOT / "data" / "profile_raw"
 PARSED_DIR = PROJECT_ROOT / "data" / "profile_parsed"
-DSN = database_dsn()
-
-
 SUPPORTED_EXTENSIONS = {
     ".pdf",
     ".docx",
@@ -613,7 +610,7 @@ def main() -> int:
 
     summary = []
 
-    with psycopg.connect(DSN, autocommit=False) as conn:
+    with psycopg.connect(database_dsn(), autocommit=False) as conn:
         for path in files:
             print("")
             print(f"--- Ingesting: {path.name} ---")

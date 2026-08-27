@@ -67,8 +67,6 @@ from services.common.document_prompt_templates_v1 import (
 )
 from services.common.config import database_dsn
 
-DSN = database_dsn()
-
 VERIFIER_VERSION = "truth_quality_checker_v5_selected_fit_soft_degrade_2026_08_25"
 DEFAULT_OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
 DEFAULT_MODEL = get_model("verifier")
@@ -958,7 +956,7 @@ def main() -> int:
     print(f"Mode:     {'APPLY' if args.apply else 'DRY RUN'}")
     print(f"Model:    {args.model}")
 
-    with psycopg.connect(DSN, autocommit=False) as conn:
+    with psycopg.connect(database_dsn(), autocommit=False) as conn:
         with conn.cursor() as cur:
             ids = ([args.document_id] if args.document_id
                    else fetch_pending_documents(cur))

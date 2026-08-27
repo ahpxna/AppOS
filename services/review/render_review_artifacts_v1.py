@@ -25,7 +25,6 @@ sys.path.insert(0, str(ROOT))
 from services.common.config import database_dsn, load_repo_env
 
 load_repo_env()
-DSN = database_dsn()
 OUTPUT_ROOT = Path(os.getenv("JOBOS_REVIEW_ARTIFACT_DIR", ROOT / "data/review-artifacts"))
 TEMPLATE = Path(os.getenv("JOBOS_RESUME_TEMPLATE_PATH", ROOT / "data/resume-template/VU PHAN AN NGUYEN-official_For_all.docx"))
 from services.common.canonical_resume_artifact_v1 import render_canonical_resume
@@ -108,7 +107,7 @@ def main() -> int:
     group.add_argument("--document-id")
     group.add_argument("--application-id")
     args = parser.parse_args()
-    with psycopg.connect(DSN, autocommit=False) as conn, conn.cursor() as cur:
+    with psycopg.connect(database_dsn(), autocommit=False) as conn, conn.cursor() as cur:
         if args.document_id:
             paths = [render_document_pdf(cur, args.document_id)]
         else:

@@ -55,8 +55,6 @@ from psycopg.types.json import Jsonb
 from services.common.observability import emit_trace, make_trace_id
 from services.common.config import database_dsn
 
-DSN = database_dsn()
-
 from services.common.openclaw_runtime import resolve_openclaw_binary
 
 OPENCLAW_BIN = resolve_openclaw_binary()
@@ -435,7 +433,7 @@ def main() -> int:
     print(f"===== COMPANY RESEARCH ({RESEARCH_VERSION}) =====")
     print(f"Mode: {'APPLY' if args.apply else 'DRY RUN'}")
 
-    with psycopg.connect(DSN, autocommit=False) as conn:
+    with psycopg.connect(database_dsn(), autocommit=False) as conn:
         if args.list_stale:
             return cmd_list_stale(conn)
 

@@ -33,9 +33,6 @@ BASE_PACK_PURPOSES = (
     "base_message_reply",
 )
 
-DSN = database_dsn()
-
-
 def profile_state(cur) -> dict[str, Any]:
     """Read only the approval and pack state needed by deterministic builders."""
     cur.execute("SELECT count(*) FROM profile_assets WHERE status = 'approved';")
@@ -108,7 +105,7 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
-        with psycopg.connect(DSN, autocommit=False) as conn:
+        with psycopg.connect(database_dsn(), autocommit=False) as conn:
             with conn.cursor() as cur:
                 before = profile_state(cur)
                 missing = validate_build_inputs(before)

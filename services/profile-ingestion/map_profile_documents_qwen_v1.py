@@ -20,8 +20,6 @@ from services.common.llm_gateway import chat_text  # noqa: E402
 from services.common.config import database_dsn  # noqa: E402
 
 
-DSN = database_dsn()
-
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
 MODEL = get_model("profile_document_mapper")
 VERSION = "profile_document_mapper_qwen_v1_source_preserving_2026_04_27"
@@ -356,7 +354,7 @@ def main() -> int:
     print(f"Document type: {args.document_type}")
     print("")
 
-    with psycopg.connect(DSN) as conn:
+    with psycopg.connect(database_dsn()) as conn:
         with conn.cursor() as cur:
             docs = fetch_docs(cur, args.limit, args.smoke, args.document_type)
 

@@ -111,12 +111,14 @@ raw task counts. CI/core verification không phụ thuộc Telegram/Gmail produc
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements.txt -c constraints-v1.txt
 ```
 
 File `requirements.txt` ở root là install path Python được hỗ trợ: nó gộp các
 service requirements đang dùng cùng migration/test/runtime tools, nên không cần
-cài từng service riêng. Không coi một `pip freeze` ngẫu nhiên từ máy dev là lockfile.
+cài từng service riêng. `constraints-v1.txt` khóa direct release/test dependencies
+vào compatibility set của V1; thay constraint phải đi cùng một vòng regression/verify
+mới trên môi trường đích. Không coi một `pip freeze` ngẫu nhiên từ máy dev là lockfile.
 
 ### Binary hệ thống cho OCR (poppler, tesseract)
 

@@ -14,8 +14,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from services.common.config import database_dsn  # noqa: E402
 
 
-DSN = database_dsn()
-
 VERSION = "profile_document_map_quality_gate_v1_2026_04_27"
 
 
@@ -316,7 +314,7 @@ def main() -> int:
     print(f"Limit:   {args.limit}")
     print("")
 
-    with psycopg.connect(DSN) as conn:
+    with psycopg.connect(database_dsn()) as conn:
         with conn.cursor() as cur:
             rows = fetch_rows(cur, args.limit)
 

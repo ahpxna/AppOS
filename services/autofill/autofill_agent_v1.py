@@ -66,8 +66,6 @@ from services.common.openclaw_runtime import resolve_openclaw_binary
 from services.common.config import database_dsn
 from services.common.autofill_field_registry import PROFILE_PATH_TO_FIELD
 
-DSN = database_dsn()
-
 OPENCLAW_BIN = resolve_openclaw_binary()
 # browser.defaultProfile does not propagate into tool/CLI calls, so the
 # profile is always passed explicitly.
@@ -280,9 +278,8 @@ def check_domain(cur, url: str, *, application_id: str | None = None,
     if host_is_authorized(cur, url, application_id=application_id, purpose=purpose):
         return
     raise AutofillError(
-        f"Domain '{host}' is not in allowed_domains. Add it deliberately:\n"
-        f"  INSERT INTO allowed_domains (domain, category) "
-        f"VALUES ('{host}', 'ats');"
+        f"Domain '{host}' is not globally authorized and has no live application-scoped trust. "
+        "Use the privileged trust-domain approval for this application; do not promote ATS catalog domains to global authority."
     )
 
 
@@ -709,7 +706,7 @@ def main() -> int:
     print(f"===== AUTOFILL AGENT ({AGENT_VERSION}) =====")
     print(f"Browser profile: {BROWSER_PROFILE}")
 
-    with psycopg.connect(DSN, autocommit=False) as conn:
+    with psycopg.connect(database_dsn(), autocommit=False) as conn:
         try:
             return {
                 "probe": cmd_probe, "inspect": cmd_inspect, "plan": cmd_plan,

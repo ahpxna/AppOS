@@ -29,8 +29,6 @@ from services.common.llm_gateway import LLMGatewayError, resolve_config
 from services.runtime.process_runner import DEFAULT_PROCESS_RUNNER
 from services.common.config import database_dsn
 
-DSN = database_dsn()
-
 REPO_ROOT = Path(__file__).resolve().parents[2]
 BROWSER_WORKER = REPO_ROOT / "services" / "browser-controller" / "browser_queue_worker.py"
 BASE_PACK_PURPOSES = (
@@ -125,7 +123,7 @@ def database_report() -> list[dict[str, Any]]:
     """Collect schema and state counts with read-only SQL queries."""
     checks: list[dict[str, Any]] = []
     try:
-        with psycopg.connect(DSN, autocommit=True) as conn:
+        with psycopg.connect(database_dsn(), autocommit=True) as conn:
             with conn.cursor() as cur:
                 missing, relation_checks = relation_status(cur)
                 checks.extend(relation_checks)
