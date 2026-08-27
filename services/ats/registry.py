@@ -1,4 +1,4 @@
-"""Canonical ATS/candidate-system registry for JobOS V1.0.
+"""Canonical ATS/candidate-system registry for JobOS v0.1.0.
 
 The registry is intentionally independent from browser execution.  It gives
 all intake/application paths one vocabulary for ATS identity, URL/signature

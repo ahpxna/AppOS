@@ -1272,9 +1272,9 @@ def durable_finish_execution(task: Dict[str, Any], binding: Dict[str, Any], resu
         cur.execute(
             """UPDATE browser_tasks
                   SET execution_state=%s, pinned_target_id=%s,
-                      error_message=CASE WHEN %s IS NULL THEN error_message ELSE %s END
+                      error_message=COALESCE(%s::text, error_message)
                 WHERE id=%s;""",
-            (terminal_task_state, result.target_id, reconcile_reason, reconcile_reason, task["id"]),
+            (terminal_task_state, result.target_id, reconcile_reason, task["id"]),
         )
         cur.execute(
             """UPDATE application_attempts

@@ -9,11 +9,11 @@ import json
 import subprocess
 import sys
 import shutil
-import shlex
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+RELEASE_PROFILE = "v0.1.0"
 sys.path.insert(0, str(ROOT))
 
 from services.common.config import database_dsn, load_repo_env
@@ -201,12 +201,11 @@ def doctor(*, check_browser: bool, strict: bool = False, require_autofill: bool 
 
 
 def verify_release(*, profile: str) -> int:
-    """Fail closed on every V1 release contract; never silently skip live gates."""
-    if profile != "v1":
+    """Fail closed on every v0.1.0 release contract; never silently skip live gates."""
+    if profile != RELEASE_PROFILE:
         raise RuntimeError(f"Unsupported release profile: {profile}")
     load_repo_env()
     db_enabled = os.getenv("JOBOS_RUN_DB_INTEGRATION") == "1" and bool(os.getenv("JOBOS_TEST_DSN", "").strip())
-    cdp_command = os.getenv("JOBOS_RELEASE_CDP_SMOKE_CMD", "").strip()
     stages: list[tuple[str, list[str], int]] = [
         ("compile/import", [sys.executable, "-m", "compileall", "-q", "."], 180),
         ("non-DB regression", [sys.executable, "-m", "pytest", "-q", "--ignore=tests/integration"], 900),
@@ -232,10 +231,7 @@ def verify_release(*, profile: str) -> int:
     if not db_enabled:
         print("RELEASE BLOCKED: set JOBOS_RUN_DB_INTEGRATION=1 and JOBOS_TEST_DSN to a disposable database.")
         return 2
-    if not cdp_command:
-        print("RELEASE BLOCKED: set JOBOS_RELEASE_CDP_SMOKE_CMD to the controlled local ATS/CDP fixture command.")
-        return 2
-    stages.append(("controlled CDP fixture", shlex.split(cdp_command), 300))
+    stages.append(("controlled CDP fixture", [sys.executable, "scripts/release_cdp_smoke.py"], 300))
     for name, argv, timeout_s in stages:
         result = DEFAULT_PROCESS_RUNNER.run(argv, cwd=ROOT, timeout_s=timeout_s)
         if not result.ok:
@@ -248,7 +244,7 @@ def verify_release(*, profile: str) -> int:
         if not status.ok or status.stdout.strip():
             print("RELEASE BLOCKED: release tree is not clean.")
             return 1
-    print("V1 RELEASE VERIFICATION: PASS")
+    print("V0.1.0 RELEASE VERIFICATION: PASS")
     return 0
 
 
@@ -717,8 +713,8 @@ def main() -> int:
     doctor_parser.add_argument("--strict", action="store_true", help="Exit non-zero unless the selected readiness profile is ready.")
     doctor_parser.add_argument("--profile", choices=("core","documents","browser","production"), default="production", help="Readiness lane to enforce; production includes optional operational channels.")
     doctor_parser.add_argument("--require-autofill", action="store_true", help="Exit non-zero unless deterministic form-fill readiness is ready.")
-    verify_parser = commands.add_parser("verify-release", help="Run the fail-closed V1 release gate, including DB and controlled CDP acceptance.")
-    verify_parser.add_argument("--profile", choices=("v1",), default="v1")
+    verify_parser = commands.add_parser("verify-release", help="Run the fail-closed v0.1.0 release gate, including DB and controlled CDP acceptance.")
+    verify_parser.add_argument("--profile", choices=(RELEASE_PROFILE,), default=RELEASE_PROFILE)
     build_parser = commands.add_parser("build-release", help="Build a deterministic tracked-source ZIP with an internal SHA-256 manifest.")
     build_parser.add_argument("--output", required=True, help="Destination .zip path (prefer outside the repository).")
     autofill_parser = commands.add_parser("autofill", help="Prepare a deterministic, approval-bound form session.")

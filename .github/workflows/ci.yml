@@ -33,8 +33,8 @@ jobs:
       - name: Run non-DB regression suite
         run: python -m pytest -q --ignore=tests/integration
       - name: Build deterministic source release
-        run: python scripts/build_release.py --output dist/jobos-v1-source.zip
+        run: python scripts/build_release.py --output dist/jobos-v0.1.0-source.zip
       - name: Verify packaged release manifest
         run: |
-          unzip -q dist/jobos-v1-source.zip -d dist/jobos-v1-source
-          python scripts/build_release.py --verify-manifest dist/jobos-v1-source
+          unzip -q dist/jobos-v0.1.0-source.zip -d dist/jobos-v0.1.0-source
+          python scripts/build_release.py --verify-manifest dist/jobos-v0.1.0-source

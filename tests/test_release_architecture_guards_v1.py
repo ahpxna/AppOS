@@ -126,3 +126,20 @@ def test_v1_constraints_cover_direct_python_runtime_dependencies():
     }
     missing = sorted(name for name in required if name not in constraints)
     assert missing == [], f"missing V1 release constraints: {missing}"
+
+
+def test_release_identity_is_v0_1_0_and_cli_uses_the_policy_profile():
+    policy = json.loads((ROOT / "RELEASE_MANIFEST.json").read_text(encoding="utf-8"))
+    assert policy["release"]["line"] == "V0.1"
+    assert policy["release"]["version"] == "0.1.0"
+    assert any("jobos-v0.1.0-source.zip" in gate for gate in policy["release_gates"])
+
+    jobos = (ROOT / "scripts" / "jobos.py").read_text(encoding="utf-8")
+    assert 'RELEASE_PROFILE = "v0.1.0"' in jobos
+    assert 'choices=(RELEASE_PROFILE,)' in jobos
+    assert 'default=RELEASE_PROFILE' in jobos
+    assert 'V0.1.0 RELEASE VERIFICATION: PASS' in jobos
+
+    ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    assert "jobos-v0.1.0-source.zip" in ci
+    assert "jobos-v1-source.zip" not in ci
