@@ -16,6 +16,7 @@ class FormField:
     selected: bool | None = None
     options: tuple[str, ...] = ()
     document_hint: str | None = None
+    input_type: str = ""
 
 
 @dataclass(frozen=True)
@@ -58,6 +59,7 @@ def inspect_nodes(nodes: Iterable[dict[str, Any]]) -> list[FormField]:
             selected=node.get("selected") if isinstance(node.get("selected"), bool) else None,
             options=tuple(str(item) for item in (node.get("options") or ())),
             document_hint=document_hint(label, role),
+            input_type=str(node.get("type") or "").casefold(),
         ))
     return fields
 

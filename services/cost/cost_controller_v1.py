@@ -40,6 +40,7 @@ import psycopg
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from services.common.config import database_dsn
+from services.control_plane.budget_admissions import admit
 
 DSN = database_dsn()
 
@@ -62,7 +63,7 @@ def ensure_today_budget(cur) -> None:
               SET current_cost_usd = GREATEST(
                     COALESCE(d.current_cost_usd,0),
                     COALESCE((SELECT SUM(estimated_cost_usd) FROM cost_ledger
-                               WHERE created_at::date=CURRENT_DATE),0))
+                               WHERE COALESCE(budget_date, created_at::date)=CURRENT_DATE),0))
             WHERE d.date=CURRENT_DATE;"""
     )
 
@@ -236,45 +237,69 @@ def cmd_report(conn, args) -> int:
 def cmd_check(conn, args) -> int:
     """Returns exit 0 if the work may proceed, 1 if the budget refuses it."""
     with conn.cursor() as cur:
+        # The budget row is the admission mutex.  Do not commit the setup
+        # before this lock: two independently admitted applications must not
+        # both observe the final remaining quota slot.
         ensure_today_budget(cur)
-        conn.commit()
+        cur.execute(
+            """SELECT max_cost_usd, max_jobs_full_pipeline, max_browser_tasks,
+                      current_jobs_full_pipeline, current_browser_tasks, current_cost_usd
+                 FROM daily_budgets WHERE date = CURRENT_DATE FOR UPDATE;"""
+        )
+        budget_row = cur.fetchone()
+        if not budget_row:
+            raise RuntimeError("Today's budget row was not materialized.")
 
         cur.execute("SELECT spent_usd FROM v_cost_today;")
         ledger_spent = Decimal(cur.fetchone()[0] or 0)
-
-        cur.execute(
-            """
-            SELECT max_cost_usd, max_jobs_full_pipeline, max_browser_tasks,
-                   current_jobs_full_pipeline, current_browser_tasks, current_cost_usd
-            FROM daily_budgets WHERE date = CURRENT_DATE;
-            """
-        )
-        max_usd, max_jobs, max_tasks, cur_jobs, cur_tasks, current_cost = cur.fetchone()
+        max_usd, max_jobs, max_tasks, cur_jobs, cur_tasks, current_cost = budget_row
         spent = max(ledger_spent, Decimal(current_cost or 0))
+
+        already_admitted = False
+        # A retry of an already-admitted subject must remain allowed even if
+        # the daily count is now at its cap.  Paid-dollar admission remains
+        # separately enforced by llm_cost_accounting_v1.
+        if args.increment and args.subject_id and args.task in {"full_pipeline", "browser_task"}:
+            cur.execute(
+                """SELECT 1 FROM budget_admissions
+                     WHERE budget_date=CURRENT_DATE AND task_kind=%s
+                       AND subject_type=%s AND subject_id=%s;""",
+                (args.task, args.subject_type, args.subject_id),
+            )
+            already_admitted = bool(cur.fetchone())
 
         reasons = []
         if max_usd is not None and spent >= Decimal(max_usd):
             reasons.append(f"daily spend ${spent:.4f} has reached ${max_usd:.2f}")
-        if args.task == "full_pipeline" and max_jobs and cur_jobs >= max_jobs:
+        if args.task == "full_pipeline" and max_jobs and cur_jobs >= max_jobs and (not args.subject_id or not already_admitted):
             reasons.append(f"full-pipeline runs {cur_jobs} has reached {max_jobs}")
-        if args.task == "browser_task" and max_tasks and cur_tasks >= max_tasks:
+        if args.task == "browser_task" and max_tasks and cur_tasks >= max_tasks and (not args.subject_id or not already_admitted):
             reasons.append(f"browser tasks {cur_tasks} has reached {max_tasks}")
 
         if reasons:
+            conn.rollback()
             print("  BLOCKED: " + "; ".join(reasons))
             print("  Raise the limit with set-budget, or wait until tomorrow.")
             return 1
+
+        newly_admitted = False
+        if args.increment and args.subject_id and args.task in {"full_pipeline", "browser_task"}:
+            admission = admit(
+                cur, task_kind=args.task, subject_type=args.subject_type,
+                subject_id=args.subject_id,
+            )
+            newly_admitted = admission.newly_admitted
 
         print(f"  OK: ${spent:.4f} spent of ${max_usd:.2f}; {args.task} allowed")
 
         if args.increment:
             col = {"full_pipeline": "current_jobs_full_pipeline",
                    "browser_task": "current_browser_tasks"}.get(args.task)
-            if col:
+            if col and (not args.subject_id or newly_admitted):
                 cur.execute(
                     f"UPDATE daily_budgets SET {col} = {col} + 1 WHERE date = CURRENT_DATE;"
                 )
-                conn.commit()
+            conn.commit()
     return 0
 
 
@@ -343,6 +368,8 @@ def main() -> int:
     pk = sub.add_parser("check")
     pk.add_argument("--task", default="single_call", choices=TASK_KINDS)
     pk.add_argument("--increment", action="store_true")
+    pk.add_argument("--subject-type", default="application")
+    pk.add_argument("--subject-id", help="Stable retry identity for quota admission.")
 
     ps = sub.add_parser("set-budget")
     ps.add_argument("--max-usd", type=float)

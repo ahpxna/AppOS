@@ -43,6 +43,7 @@ from services.common.config import database_dsn, load_repo_env
 from services.common.autofill_identity import canonical_page_url
 from services.common.autofill_action_scope import autofill_plan_key
 from services.autofill.autofill_context_v1 import load_autofill_context
+from services.control_plane.pipeline_state import DEFAULT_PIPELINE_STATE_STORE, PipelineStateError
 
 load_repo_env()
 
@@ -60,6 +61,37 @@ APPROVAL_TYPES = (
 )
 
 DEFAULT_TTL_MINUTES = 60
+
+
+def _resolve_fit_review_transition(cur, *, application_id: str | None, request_id: str,
+                                   approved: bool, actor: str) -> None:
+    """Consume a borderline-fit decision in the same transaction as redemption.
+
+    The orchestrator intentionally cannot claim human-gated rows, so putting
+    this transition behind a later orchestrator pass creates a permanent
+    liveness hole.  A stale application makes the entire redemption rollback;
+    an approval row can never be committed without its matching state event.
+    """
+    if not application_id:
+        raise RuntimeError("fit_review is missing its application binding")
+    target = "fit_analyzed" if approved else "fit_rejected"
+    try:
+        # Lock before changing the capability.  The ensuing transition is
+        # therefore inseparable from the redemption: a competing lifecycle
+        # actor cannot leave a terminal approval attached to a stale app.
+        cur.execute("SELECT current_step FROM applications WHERE id=%s FOR UPDATE;", (application_id,))
+        row = cur.fetchone()
+        if not row or str(row[0]) != "awaiting_fit_review":
+            raise PipelineStateError("application is no longer awaiting this fit review")
+        DEFAULT_PIPELINE_STATE_STORE.transition(
+            cur, application_id=application_id, expected_from="awaiting_fit_review",
+            to=target, actor=actor,
+            reason="Human resolved the borderline fit review.",
+            detail={"approval_request_id": request_id, "decision": "approved" if approved else "denied"},
+            require_automated=False,
+        )
+    except PipelineStateError as exc:
+        raise RuntimeError(f"fit review is stale or cannot transition: {exc}") from exc
 
 
 def hash_token(token: str) -> str:
@@ -462,23 +494,22 @@ def _close_delegated_children_for_parent(cur, *, application_id: str, plan_key: 
 def _restore_autofill_ready_after_terminal_parent(cur, *, application_id: str, plan_key: str, reason: str, parent_request_id: str | None = None) -> None:
     """CAS-safe recovery when an autofill approval ends before browser I/O."""
     _close_delegated_children_for_parent(cur, application_id=application_id, plan_key=plan_key, reason=reason, parent_request_id=parent_request_id)
-    cur.execute(
-        """UPDATE applications SET current_step='application_form_ready', updated_at=now()
-             WHERE id=%s AND current_step='awaiting_approval'
-               AND NOT EXISTS (
-                   SELECT 1 FROM approval_requests ar
-                    WHERE ar.application_id=applications.id AND ar.type='autofill_form'
-                      AND ar.status IN ('pending','approved','executing')
-                      AND ar.token_expires_at > now()
-               );""",
-        (application_id,),
-    )
-    if cur.rowcount == 1:
-        cur.execute(
-            """INSERT INTO pipeline_events(application_id,from_step,to_step,actor,reason,detail_json)
-               VALUES (%s,'awaiting_approval','application_form_ready','approval-service',%s,%s);""",
-            (application_id, reason[:500], Jsonb({"autofill_plan_key": plan_key})),
+    try:
+        DEFAULT_PIPELINE_STATE_STORE.transition(
+            cur, application_id=application_id, expected_from="awaiting_approval",
+            to="application_form_ready", actor="approval-service", reason=reason[:500],
+            detail={"autofill_plan_key": plan_key},
+            guard_sql="""NOT EXISTS (
+                SELECT 1 FROM approval_requests ar
+                 WHERE ar.application_id=applications.id AND ar.type='autofill_form'
+                   AND ar.status IN ('pending','approved','executing')
+                   AND ar.token_expires_at > now()
+            )""",
         )
+    except PipelineStateError:
+        # A surviving capability or concurrent lifecycle owner deliberately
+        # keeps the form in its current state; no synthetic event is emitted.
+        return
 
 
 def _reject_email_candidate_for_denied_request(cur, *, application_id: str | None,
@@ -768,18 +799,12 @@ def cmd_create(conn, args) -> int:
         # actually created. Existing flows already at awaiting_approval remain
         # unchanged.
         if args.apply and args.type == "autofill_form" and args.application_id:
-            cur.execute(
-                """UPDATE applications SET current_step='awaiting_approval', updated_at=now()
-                     WHERE id=%s AND current_step='application_form_ready';""",
-                (args.application_id,),
+            DEFAULT_PIPELINE_STATE_STORE.transition(
+                cur, application_id=args.application_id, expected_from="application_form_ready",
+                to="awaiting_approval", actor=args.requested_by,
+                reason="Exact form packaged for human autofill approval.",
+                detail={"approval_request_id": request_id},
             )
-            if cur.rowcount == 1:
-                cur.execute(
-                    """INSERT INTO pipeline_events(application_id, from_step, to_step, actor, reason, detail_json)
-                       VALUES (%s,'application_form_ready','awaiting_approval',%s,
-                               'Exact form packaged for human autofill approval.',%s);""",
-                    (args.application_id, args.requested_by, Jsonb({"approval_request_id": request_id})),
-                )
 
         if not args.apply:
             conn.rollback()
@@ -830,18 +855,15 @@ def _stop_application_for_denied_privileged(cur, *, application_id: str | None,
     cur.execute("SELECT 1 FROM pipeline_transitions WHERE from_step=%s AND to_step='abandoned';", (current,))
     if not cur.fetchone():
         return False
-    cur.execute(
-        "UPDATE applications SET current_step='abandoned',status='abandoned',updated_at=now() "
-        "WHERE id=%s AND current_step=%s;",
-        (application_id, current),
-    )
-    if cur.rowcount != 1:
+    try:
+        DEFAULT_PIPELINE_STATE_STORE.transition(
+            cur, application_id=application_id, expected_from=current, to="abandoned",
+            actor=actor, status="abandoned",
+            reason="Human stopped the application by denying an application-level privileged gate.",
+            detail={"approval_type": atype},
+        )
+    except PipelineStateError:
         return False
-    cur.execute(
-        """INSERT INTO pipeline_events(application_id,from_step,to_step,actor,reason,detail_json)
-           VALUES (%s,%s,'abandoned',%s,'Human stopped the application by denying an application-level privileged gate.',%s);""",
-        (application_id, current, actor, Jsonb({'approval_type': atype})),
-    )
     cur.execute(
         """UPDATE approval_requests SET status='expired',executing_task_id=NULL,
                   action_note=coalesce(action_note,'') || ' Application stopped by human.'
@@ -952,6 +974,12 @@ def redeem(conn, token: str, *, decision: str, note: str, actor: str) -> int:
             print("  Request changed state concurrently. Nothing done.")
             return 1
 
+        if atype == "fit_review":
+            _resolve_fit_review_transition(
+                cur, application_id=application_id, request_id=request_id,
+                approved=(new_status == "approved"), actor=actor,
+            )
+
         if new_status == "denied":
             denied_payload = payload_request["payload_json"] if isinstance(payload_request.get("payload_json"), dict) else {}
             _reject_email_candidate_for_denied_request(
@@ -1053,6 +1081,11 @@ def decide_request_by_id(conn, request_id: str, *, decision: str, note: str,
         )
         if cur.rowcount != 1:
             return {"ok": False, "error": "Approval request changed state concurrently."}
+        if atype == "fit_review":
+            _resolve_fit_review_transition(
+                cur, application_id=application_id, request_id=rid,
+                approved=(new_status == "approved"), actor=actor,
+            )
         if new_status == "denied":
             denied_payload = request["payload_json"] if isinstance(request.get("payload_json"), dict) else {}
             _reject_email_candidate_for_denied_request(

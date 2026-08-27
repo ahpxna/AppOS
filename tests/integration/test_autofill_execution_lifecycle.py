@@ -749,3 +749,57 @@ def test_parent_approved_child_approved_queues_exactly_one_parent_task(db):
         cur.execute("SELECT payload_json->>'parent_approval_request_id', status FROM approval_requests WHERE id=%s", (child_id,))
         assert cur.fetchone() == (task["approval_request_id"], "approved")
         conn.commit()
+
+
+def test_fit_review_redemption_transitions_atomically_and_replay_is_terminal(db):
+    from services.approval import approval_service_v1 as approval
+    with db.connect(TEST_DSN) as conn, conn.cursor() as cur:
+        cur.execute(
+            """INSERT INTO applications(company,job_title,current_step,status)
+                 VALUES ('Fit Gate Co','Role','awaiting_fit_review','active') RETURNING id::text"""
+        )
+        app_id = cur.fetchone()[0]
+        cur.execute(
+            """INSERT INTO approval_requests(type,application_id,payload_json,status,approval_token_hash,token_expires_at)
+                 VALUES ('fit_review',%s,'{}'::jsonb,'pending','fit-review-token',now()+interval '5 minutes')
+                 RETURNING id::text""",
+            (app_id,),
+        )
+        request_id = cur.fetchone()[0]
+        conn.commit()
+    with db.connect(TEST_DSN) as conn:
+        outcome = approval.decide_request_by_id(conn, request_id, decision="approve", note="go", actor="db-test")
+        assert outcome["ok"] is True
+        replay = approval.decide_request_by_id(conn, request_id, decision="approve", note="again", actor="db-test")
+        assert replay["ok"] is False
+    with db.connect(TEST_DSN) as conn, conn.cursor() as cur:
+        cur.execute("SELECT current_step FROM applications WHERE id=%s", (app_id,))
+        assert cur.fetchone() == ("fit_analyzed",)
+        cur.execute("SELECT count(*) FROM pipeline_events WHERE application_id=%s AND to_step='fit_analyzed'", (app_id,))
+        assert cur.fetchone() == (1,)
+
+
+def test_document_generation_attempt_reuses_completed_and_blocks_uncertain_replay(db):
+    from services.control_plane.document_attempts import (
+        DocumentAttemptError, claim, complete, fail,
+    )
+    manifest = {"generator_version": "db-fixture", "jd_sha256": "f" * 64, "asset_ids": []}
+    with db.connect(TEST_DSN) as conn, conn.cursor() as cur:
+        cur.execute("INSERT INTO applications(company,job_title,current_step) VALUES ('Doc Attempt Co','Role','fit_analyzed') RETURNING id::text")
+        app_id = cur.fetchone()[0]
+        cur.execute("INSERT INTO generated_documents(application_id,doc_type,content) VALUES (%s,'resume','fixture') RETURNING id::text", (app_id,))
+        document_id = cur.fetchone()[0]
+        first = claim(cur, application_id=app_id, doc_type="resume", request_kind="generation", input_manifest=manifest)
+        complete(cur, attempt_id=first.id, document_id=document_id)
+        conn.commit()
+    with db.connect(TEST_DSN) as conn, conn.cursor() as cur:
+        reused = claim(cur, application_id=app_id, doc_type="resume", request_kind="generation", input_manifest=manifest)
+        assert reused.id == first.id and reused.completed_document_id == document_id
+        uncertain = claim(cur, application_id=app_id, doc_type="cover_letter", request_kind="generation",
+                          input_manifest={**manifest, "doc_type": "cover_letter"})
+        fail(cur, attempt_id=uncertain.id, error="simulated uncertain provider outcome", uncertain=True)
+        conn.commit()
+    with db.connect(TEST_DSN) as conn, conn.cursor() as cur:
+        with pytest.raises(DocumentAttemptError, match="uncertain external outcome"):
+            claim(cur, application_id=app_id, doc_type="cover_letter", request_kind="generation",
+                  input_manifest={**manifest, "doc_type": "cover_letter"})

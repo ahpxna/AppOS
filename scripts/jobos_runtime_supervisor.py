@@ -16,18 +16,37 @@ import signal
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from services.common.config import load_repo_env
+from services.runtime.process_runner import DEFAULT_PROCESS_RUNNER
 
 RUN_DIR = ROOT / ".jobos" / "run"
 LOG_DIR = ROOT / ".jobos" / "logs"
 SUPERVISOR_PID = RUN_DIR / "supervisor.pid"
 STATE_FILE = RUN_DIR / "runtime.json"
 STOP = False
+MAX_LOG_BYTES = 10 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class RestartPolicy:
+    initial_backoff_seconds: float = 5.0
+    max_backoff_seconds: float = 60.0
+    max_restarts: int = 5
+    window_seconds: float = 300.0
+
+
+@dataclass(frozen=True)
+class WorkerSpec:
+    name: str
+    argv: tuple[str, ...]
+    required: bool = True
+    restart: RestartPolicy = RestartPolicy()
 
 
 def _truthy(name: str, default: bool = False) -> bool:
@@ -54,41 +73,57 @@ def _read_pid() -> int | None:
         return None
 
 
-def _specs() -> dict[str, list[str]]:
-    specs: dict[str, list[str]] = {
-        "orchestrator": [sys.executable, "-m", "services.orchestrator.orchestrator_worker_v1", "--poll-seconds", "15"],
-        "privileged-actions": [sys.executable, "-m", "services.application_actions.privileged_action_v1", "worker", "--poll-seconds", "5"],
-        "browser-worker": [sys.executable, str(ROOT / "services" / "browser-controller" / "browser_queue_worker.py"), "--poll-seconds", "5"],
-        "browser-state-watcher": [sys.executable, "-m", "services.auth.browser_state_watcher_v1", "--poll-seconds", "5"],
-        "document-revision": [sys.executable, "-m", "services.review.document_revision_worker_v1", "--poll-seconds", "5"],
+def _specs() -> dict[str, WorkerSpec]:
+    specs: dict[str, WorkerSpec] = {
+        "orchestrator": WorkerSpec("orchestrator", (sys.executable, "-m", "services.orchestrator.orchestrator_worker_v1", "--poll-seconds", "15")),
+        "privileged-actions": WorkerSpec("privileged-actions", (sys.executable, "-m", "services.application_actions.privileged_action_v1", "worker", "--poll-seconds", "5")),
+        "browser-worker": WorkerSpec("browser-worker", (sys.executable, str(ROOT / "services" / "browser-controller" / "browser_queue_worker.py"), "--poll-seconds", "5")),
+        "browser-state-watcher": WorkerSpec("browser-state-watcher", (sys.executable, "-m", "services.auth.browser_state_watcher_v1", "--poll-seconds", "5")),
+        "document-revision": WorkerSpec("document-revision", (sys.executable, "-m", "services.review.document_revision_worker_v1", "--poll-seconds", "5")),
     }
     if (os.getenv("JOBOS_TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")) and (
         os.getenv("JOBOS_TELEGRAM_ALLOWED_USER_ID") or os.getenv("TELEGRAM_ALLOWED_USER_ID")
     ):
-        specs["telegram"] = [sys.executable, "-m", "services.telegram.telegram_review_bot_v1"]
+        specs["telegram"] = WorkerSpec("telegram", (sys.executable, "-m", "services.telegram.telegram_review_bot_v1"))
     if os.getenv("JOBOS_GMAIL_ACCOUNT") or os.getenv("GMAIL_ACCOUNT"):
-        specs["gmail-watcher"] = [sys.executable, "-m", "services.auth.gmail_verification_watcher_v1", "--interval-seconds", "10"]
+        specs["gmail-watcher"] = WorkerSpec("gmail-watcher", (sys.executable, "-m", "services.auth.gmail_verification_watcher_v1", "--interval-seconds", "10"))
     return specs
 
 
-def _write_state(children: dict[str, subprocess.Popen[Any]], restarts: dict[str, int]) -> None:
+def _write_state(children: dict[str, subprocess.Popen[Any]], restarts: dict[str, int],
+                 specs: dict[str, WorkerSpec], degraded: dict[str, str]) -> None:
     data = {
         "supervisor_pid": os.getpid(),
         "updated_at_unix": int(time.time()),
         "services": {
-            name: {"pid": proc.pid, "running": proc.poll() is None, "restarts": restarts.get(name, 0),
-                   "log": str(LOG_DIR / f"{name}.log")}
-            for name, proc in children.items()
+            name: {
+                "pid": children[name].pid if name in children else None,
+                "running": bool(name in children and children[name].poll() is None),
+                "required": spec.required, "restarts": restarts.get(name, 0),
+                "degraded": degraded.get(name), "log": str(LOG_DIR / f"{name}.log"),
+            }
+            for name, spec in specs.items()
         },
     }
-    STATE_FILE.write_text(json.dumps(data, indent=2))
+    temporary = STATE_FILE.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(data, indent=2))
+    os.replace(temporary, STATE_FILE)
 
 
-def _spawn(name: str, argv: list[str]) -> subprocess.Popen[Any]:
+def _rotate_log(name: str) -> Path:
+    path = LOG_DIR / f"{name}.log"
+    if path.exists() and path.stat().st_size >= MAX_LOG_BYTES:
+        previous = path.with_suffix(".log.1")
+        previous.unlink(missing_ok=True)
+        os.replace(path, previous)
+    return path
+
+
+def _spawn(spec: WorkerSpec) -> subprocess.Popen[Any]:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    stream = (LOG_DIR / f"{name}.log").open("ab", buffering=0)
+    stream = _rotate_log(spec.name).open("ab", buffering=0)
     try:
-        return subprocess.Popen(argv, cwd=ROOT, stdout=stream, stderr=subprocess.STDOUT,
+        return subprocess.Popen(spec.argv, cwd=ROOT, stdout=stream, stderr=subprocess.STDOUT,
                                 start_new_session=False, close_fds=True)
     finally:
         # The child inherited its descriptor.  Keeping a parent descriptor open
@@ -125,23 +160,43 @@ def daemon() -> int:
     children: dict[str, subprocess.Popen[Any]] = {}
     restarts: dict[str, int] = {}
     last_start: dict[str, float] = {}
+    restart_times: dict[str, list[float]] = {}
+    degraded: dict[str, str] = {}
     try:
         while not STOP:
             specs = _specs()
             for stale in set(children) - set(specs):
                 proc = children.pop(stale)
+                degraded.pop(stale, None)
+                restart_times.pop(stale, None)
                 if proc.poll() is None:
                     proc.terminate()
-            for name, argv in specs.items():
+            for name, spec in specs.items():
                 proc = children.get(name)
                 if proc is None or proc.poll() is not None:
-                    # Avoid a tight crash loop while still self-healing.
-                    if time.time() - last_start.get(name, 0) < 5:
+                    now = time.time()
+                    history = [at for at in restart_times.get(name, []) if now - at <= spec.restart.window_seconds]
+                    restart_times[name] = history
+                    if name in degraded:
                         continue
-                    children[name] = _spawn(name, argv)
-                    last_start[name] = time.time()
-                    restarts[name] = restarts.get(name, 0) + (1 if proc is not None else 0)
-            _write_state(children, restarts)
+                    if proc is not None:
+                        delay = min(
+                            spec.restart.max_backoff_seconds,
+                            spec.restart.initial_backoff_seconds * (2 ** max(0, len(history) - 1)),
+                        )
+                        if now - last_start.get(name, 0) < delay:
+                            continue
+                        if len(history) >= spec.restart.max_restarts:
+                            degraded[name] = (
+                                f"restart circuit open after {len(history)} failures in "
+                                f"{int(spec.restart.window_seconds)}s"
+                            )
+                            continue
+                        history.append(now)
+                        restarts[name] = restarts.get(name, 0) + 1
+                    children[name] = _spawn(spec)
+                    last_start[name] = now
+            _write_state(children, restarts, specs, degraded)
             time.sleep(2)
     finally:
         _shutdown(children)
@@ -158,11 +213,10 @@ def _start_infra() -> None:
     if not docker:
         return
     if _truthy("JOBOS_RUNTIME_START_POSTGRES", True):
-        subprocess.run([docker, "compose", "up", "-d", "postgres"], cwd=ROOT, check=False,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        DEFAULT_PROCESS_RUNNER.run([docker, "compose", "up", "-d", "postgres"], cwd=ROOT, timeout_s=120)
     if _truthy("JOBOS_RUNTIME_START_OPENCLAW", False):
-        subprocess.run([docker, "compose", "-f", "docker-compose.openclaw.yml", "up", "-d", "openclaw", "browser"],
-                       cwd=ROOT, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        DEFAULT_PROCESS_RUNNER.run([docker, "compose", "-f", "docker-compose.openclaw.yml", "up", "-d", "openclaw", "browser"],
+                                   cwd=ROOT, timeout_s=120)
 
 
 def start() -> int:
@@ -173,6 +227,8 @@ def start() -> int:
     if _alive(pid):
         print(f"JobOS is already running (supervisor pid {pid}).")
         return 0
+    SUPERVISOR_PID.unlink(missing_ok=True)
+    STATE_FILE.unlink(missing_ok=True)
     _start_infra()
     log = (LOG_DIR / "supervisor.log").open("ab", buffering=0)
     try:
@@ -180,7 +236,7 @@ def start() -> int:
                                 stdout=log, stderr=subprocess.STDOUT, start_new_session=True, close_fds=True)
     finally:
         log.close()
-    expected = set(_specs())
+    expected = {name for name, spec in _specs().items() if spec.required}
     deadline = time.time() + 8
     while time.time() < deadline:
         try:
@@ -213,8 +269,15 @@ def status() -> int:
         pass
     state["running"] = running
     state["supervisor_pid"] = pid
+    services = state.get("services") if isinstance(state.get("services"), dict) else {}
+    required_failures = [
+        name for name, service in services.items()
+        if isinstance(service, dict) and service.get("required") and not service.get("running")
+    ]
+    state["required_failures"] = required_failures
+    state["ready"] = running and not required_failures
     print(json.dumps(state, indent=2))
-    return 0 if running else 1
+    return 0 if state["ready"] else 1
 
 
 def stop() -> int:

@@ -19,7 +19,6 @@ import argparse
 import json
 import os
 from pathlib import Path
-import subprocess
 import sys
 from typing import Any
 
@@ -27,6 +26,7 @@ import psycopg
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from services.common.llm_gateway import LLMGatewayError, resolve_config
+from services.runtime.process_runner import DEFAULT_PROCESS_RUNNER
 from services.common.config import database_dsn
 
 DSN = database_dsn()
@@ -208,16 +208,12 @@ def llm_config_report() -> dict[str, Any]:
 
 def browser_report() -> dict[str, Any]:
     """Run only the worker's no-task health probe and retain bounded output."""
-    try:
-        proc = subprocess.run(
-            [sys.executable, str(BROWSER_WORKER), "--health"],
-            cwd=REPO_ROOT, capture_output=True, text=True, timeout=50,
-        )
-    except subprocess.TimeoutExpired:
-        return item("browser_runtime", "blocked", "Browser health check timed out.")
-    output = ((proc.stdout or "") + (proc.stderr or "")).strip()[-1200:]
+    proc = DEFAULT_PROCESS_RUNNER.run(
+        [sys.executable, str(BROWSER_WORKER), "--health"], cwd=REPO_ROOT, timeout_s=50,
+    )
+    output = (proc.output + (f"\n{proc.start_error}" if proc.start_error else "")).strip()[-1200:]
     return item(
-        "browser_runtime", "pass" if proc.returncode == 0 else "blocked",
+        "browser_runtime", "pass" if proc.ok else "blocked",
         output or f"health command exited {proc.returncode}",
     )
 

@@ -47,19 +47,13 @@ def test_safe_extract_rejects_symlink_escape():
         raise AssertionError("unsafe archive link was accepted")
 
 
-def test_empty_openclaw_bin_prefers_private_runtime():
-    with tempfile.TemporaryDirectory() as tmp:
-        binary = Path(tmp) / "openclaw"
-        binary.write_text("#!/bin/sh\n", encoding="utf-8")
-        original = runtime.PRIVATE_OPENCLAW_BIN
-        old_env = os.environ.get("OPENCLAW_BIN")
-        try:
-            runtime.PRIVATE_OPENCLAW_BIN = binary
-            os.environ["OPENCLAW_BIN"] = ""
-            assert runtime.resolve_openclaw_binary() == str(binary)
-        finally:
-            runtime.PRIVATE_OPENCLAW_BIN = original
-            if old_env is None:
-                os.environ.pop("OPENCLAW_BIN", None)
-            else:
-                os.environ["OPENCLAW_BIN"] = old_env
+def test_empty_openclaw_bin_resolves_only_the_managed_runtime():
+    old_env = os.environ.get("OPENCLAW_BIN")
+    try:
+        os.environ["OPENCLAW_BIN"] = ""
+        assert Path(runtime.resolve_openclaw_binary()).resolve() == runtime.PRIVATE_OPENCLAW_BIN.resolve()
+    finally:
+        if old_env is None:
+            os.environ.pop("OPENCLAW_BIN", None)
+        else:
+            os.environ["OPENCLAW_BIN"] = old_env

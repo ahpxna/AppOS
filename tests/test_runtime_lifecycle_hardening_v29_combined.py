@@ -187,7 +187,7 @@ def test_untrusted_application_form_materializes_trust_before_autofill(monkeypat
         lambda _cur, **kwargs: created.append(kwargs) or "trust-request",
     )
     monkeypatch.setattr(
-        action.subprocess,
+        action.DEFAULT_PROCESS_RUNNER,
         "run",
         lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("autofill must not run before trust")),
     )

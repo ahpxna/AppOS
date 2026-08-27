@@ -2,13 +2,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import re
 from typing import Any, Mapping
 
 from services.autofill.field_matcher_v1 import FieldClass, FieldMatch, match_field
 from services.autofill.form_inspector_v1 import FormField, QuestionGroup
 from services.common.immigration_semantics import classify_immigration_question
 from services.common.question_memory import normalize_question
+from services.autofill.value_normalization import equivalent_value, resolve_select_option
 
 
 @dataclass(frozen=True)
@@ -42,8 +42,10 @@ def _answer_for_question(question: str, answers: Mapping[str, Any]) -> str | Non
 
 
 def _option_for_value(group: QuestionGroup, value: Any):
-    wanted = str(value).strip().casefold()
-    return next((item for item in group.options if item.label.casefold() == wanted), None)
+    resolution = resolve_select_option((item.label for item in group.options), value)
+    if resolution.status not in {"exact", "unique_alias"} or not resolution.value:
+        return None
+    return next((item for item in group.options if item.label == resolution.value), None)
 
 
 def _remembered_value(value: Any) -> str | None:
@@ -55,16 +57,8 @@ def _remembered_value(value: Any) -> str | None:
 
 def _already_matches(field: FormField, value: Any) -> bool:
     """Skip a redundant write when an ATS already holds the approved value."""
-    actual, expected = str(field.value or "").strip(), str(value or "").strip()
-    if not actual or not expected:
-        return False
-    if field.role in {"combobox", "listbox", "select"}:
-        aliases = {"nj": "new jersey", "ny": "new york", "ca": "california", "tx": "texas"}
-        a, e = actual.casefold(), expected.casefold()
-        return a == e or aliases.get(a) == e or aliases.get(e) == a
-    if "phone" in field.label.casefold():
-        return re.sub(r"\D", "", actual) == re.sub(r"\D", "", expected)
-    return " ".join(actual.casefold().split()) == " ".join(expected.casefold().split())
+    return equivalent_value(actual=field.value, expected=value, role=field.role,
+                            label=field.label, input_type=field.input_type)
 
 
 def plan_autofill(
@@ -130,7 +124,12 @@ def plan_autofill(
         elif match.profile_key.startswith("documents."):
             actions.append(PlannedAction("upload", field.ref, str(value), match.profile_key, match.reason, field.label))
         elif field.role in {"combobox", "listbox", "select"}:
-            actions.append(PlannedAction("select", field.ref, str(value), match.profile_key, match.reason, field.label))
+            resolution = resolve_select_option(field.options, value)
+            if resolution.status in {"exact", "unique_alias"} and resolution.value:
+                actions.append(PlannedAction("select", field.ref, resolution.value, match.profile_key, match.reason, field.label))
+            else:
+                actions.append(PlannedAction("pause", field.ref, None, match.profile_key,
+                                             "Select/combobox options are missing or ambiguous; choose explicitly.", field.label))
         elif field.role in {"checkbox", "radio"}:
             actions.append(PlannedAction("pause", field.ref, None, match.profile_key, "Control is missing an explicit question-group model.", field.label))
         else:

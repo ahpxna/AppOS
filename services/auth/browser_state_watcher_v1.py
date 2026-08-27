@@ -18,6 +18,7 @@ from services.application_actions.privileged_action_v1 import (
     _snapshot,
     _transport,
     _update_auth_session,
+    canonical_pipeline_step_for_browser_state,
     detect_page_state,
     detect_platform,
 )
@@ -33,7 +34,7 @@ def observe_once(conn, *, limit: int = 20) -> list[dict[str, Any]]:
     """Observe exact bound auth targets; return only applications that changed."""
     with conn.cursor() as cur:
         cur.execute(
-            """SELECT a.id::text,a.current_step,s.current_url,s.page_fingerprint,s.detail_json
+            """SELECT a.id::text,a.current_step,s.current_url,s.page_fingerprint,s.auth_state,s.detail_json
                  FROM applications a
                  JOIN application_auth_sessions s ON s.application_id=a.id
                 WHERE a.current_step = ANY(%s)
@@ -42,13 +43,16 @@ def observe_once(conn, *, limit: int = 20) -> list[dict[str, Any]]:
                 LIMIT %s;""",
             (list(WATCH_STEPS), max(1, min(int(limit), 100))),
         )
-        seeds = [(str(r[0]), str(r[1]), str(r[2] or ""), str(r[3] or ""), dict(r[4] or {})) for r in cur.fetchall()]
+        seeds = [
+            (str(r[0]), str(r[1]), str(r[2] or ""), str(r[3] or ""), str(r[4] or ""), dict(r[5] or {}))
+            for r in cur.fetchall()
+        ]
 
     if not seeds:
         return []
     transport = _transport()
     changed: list[dict[str, Any]] = []
-    for application_id, expected_step, old_url, _old_fp, detail in seeds:
+    for application_id, expected_step, old_url, old_fp, old_auth_state, detail in seeds:
         target_id = str(detail.get("target_id") or "")
         if not target_id:
             continue
@@ -63,14 +67,15 @@ def observe_once(conn, *, limit: int = 20) -> list[dict[str, Any]]:
                 conn.rollback()
                 continue
             live_state, live_detail = detect_page_state(live_url, snap, nodes)
-            if live_state not in {
-                "application_form_ready", "authenticated", "needs_account_auth",
-                "needs_email_verification", "needs_mfa", "needs_human_checkpoint",
-                "needs_manual_sso",
-            }:
+            canonical_step = canonical_pipeline_step_for_browser_state(live_state)
+            if not canonical_step:
                 conn.rollback()
                 continue
-            if live_state == expected_step:
+            if (canonical_step == expected_step and live_url == old_url and fp == old_fp
+                    and live_state == old_auth_state):
+                # No new semantic event and no redirect/fingerprint update:
+                # remain genuinely read-only instead of rewriting an auth
+                # session on every polling tick.
                 conn.rollback()
                 continue
             cur.execute(
@@ -87,12 +92,18 @@ def observe_once(conn, *, limit: int = 20) -> list[dict[str, Any]]:
                 conn.rollback()
                 continue
             platform = detect_platform(live_url, snap)
+            # Keep the exact target binding fresh through legitimate same-tab
+            # login redirects even when the canonical application state has
+            # not changed (manual SSO and account auth are the same durable
+            # state).  It is an observation only, not a repeated follow-up.
             _update_auth_session(
                 cur, application_id=application_id, url=live_url, fingerprint=fp,
                 state=live_state, platform=platform,
                 detail={**live_detail, "target_id": target_id, "observed_by": "browser_state_watcher_v1"},
             )
         conn.commit()
+        if canonical_step == expected_step:
+            continue
         result = {"target_id": target_id, "url": live_url, "page_fingerprint": fp,
                   "state": live_state, "platform": platform, "followup": "state_observed"}
         try:

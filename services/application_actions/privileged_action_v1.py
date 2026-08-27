@@ -14,7 +14,6 @@ import hashlib
 import json
 import os
 import re
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -33,6 +32,8 @@ from services.autofill.autofill_executor_v1 import OpenClawTransport, TransportE
 from services.common.autofill_identity import canonical_page_url, page_fingerprint
 from services.common.config import database_dsn, load_repo_env
 from services.common.openclaw_runtime import resolve_openclaw_binary
+from services.control_plane.pipeline_state import DEFAULT_PIPELINE_STATE_STORE, PipelineStateError
+from services.runtime.process_runner import DEFAULT_PROCESS_RUNNER
 from services.security.credential_vault_v1 import (
     VaultError, generate_password, mask_entry, read_secret, store_secret,
 )
@@ -354,23 +355,33 @@ def _transition_application_step(cur, *, application_id: str, to_step: str, acto
     current = _application_step(cur, application_id, for_update=True)
     if current == to_step:
         return False
-    cur.execute("SELECT 1 FROM pipeline_transitions WHERE from_step=%s AND to_step=%s;", (current, to_step))
-    if not cur.fetchone():
-        raise PrivilegedActionError(f"illegal pipeline transition {current!r} -> {to_step!r}")
-    if status is None:
-        cur.execute("UPDATE applications SET current_step=%s, updated_at=now() WHERE id=%s AND current_step=%s;",
-                    (to_step, application_id, current))
-    else:
-        cur.execute("UPDATE applications SET current_step=%s, status=%s, updated_at=now() WHERE id=%s AND current_step=%s;",
-                    (to_step, status, application_id, current))
-    if cur.rowcount != 1:
-        raise PrivilegedActionError("application pipeline state changed concurrently")
-    cur.execute(
-        """INSERT INTO pipeline_events(application_id, from_step, to_step, actor, reason, detail_json)
-           VALUES (%s,%s,%s,%s,%s,%s);""",
-        (application_id, current, to_step, actor, reason, Jsonb(detail or {})),
-    )
+    try:
+        DEFAULT_PIPELINE_STATE_STORE.transition(
+            cur, application_id=application_id, expected_from=current, to=to_step,
+            actor=actor, reason=reason, detail=detail, status=status,
+        )
+    except PipelineStateError as exc:
+        raise PrivilegedActionError(str(exc)) from exc
     return True
+
+
+def canonical_pipeline_step_for_browser_state(state: str) -> str | None:
+    """Map browser classifier vocabulary to the durable pipeline vocabulary.
+
+    Browser evidence deliberately distinguishes e.g. manual SSO from a
+    password page.  Applications do not: both are ``needs_account_auth``.
+    Keeping the translation here prevents every observer from comparing two
+    incompatible state machines and repeatedly materializing the same gate.
+    """
+    return {
+        "needs_account_auth": "needs_account_auth",
+        "needs_email_verification": "needs_email_verification",
+        "needs_mfa": "needs_mfa",
+        "needs_human_checkpoint": "needs_human_checkpoint",
+        "needs_manual_sso": "needs_account_auth",
+        "application_form_ready": "application_form_ready",
+        "authenticated": "application_form_ready",
+    }.get(str(state or ""))
 
 
 def _update_auth_session(cur, *, application_id: str, url: str, fingerprint: str,
@@ -387,14 +398,8 @@ def _update_auth_session(cur, *, application_id: str, url: str, fingerprint: str
                detail_json=EXCLUDED.detail_json, updated_at=now();""",
         (application_id, _origin(url), platform, state, url, fingerprint, state, Jsonb(detail)),
     )
-    step_map = {
-        "needs_account_auth": "needs_account_auth", "needs_email_verification": "needs_email_verification",
-        "needs_mfa": "needs_mfa", "needs_human_checkpoint": "needs_human_checkpoint",
-        "needs_manual_sso": "needs_account_auth", "application_form_ready": "application_form_ready",
-        "authenticated": "application_form_ready",
-    }
-    if state in step_map:
-        target_step = step_map[state]
+    target_step = canonical_pipeline_step_for_browser_state(state)
+    if target_step:
         current = _application_step(cur, application_id)
         if current != target_step:
             _transition_application_step(
@@ -1311,9 +1316,10 @@ def _post_commit_followup(conn, application_id: str, result: dict[str, Any]) -> 
             # executor. Materialize the next human autofill package only now.
             command = [sys.executable, str(ROOT / "scripts" / "jobos.py"), "autofill", "prepare",
                        "--application-id", application_id, "--create", "--yes"]
-            proc = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, timeout=150)
-            return {"kind": "autofill_prepare", "ok": proc.returncode == 0,
-                    "detail": (proc.stdout or proc.stderr or "")[-1200:]}
+            proc = DEFAULT_PROCESS_RUNNER.run(command, cwd=ROOT, timeout_s=150)
+            detail = proc.output + (f"\n{proc.start_error}" if proc.start_error else "")
+            return {"kind": "autofill_prepare", "ok": proc.ok, "detail": detail[-1200:],
+                    "transient": proc.transient}
         before_count = 0
         cur.execute("SELECT count(*) FROM approval_requests WHERE application_id=%s AND status='pending';", (application_id,))
         before_count = int(cur.fetchone()[0])

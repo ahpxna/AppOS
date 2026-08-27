@@ -106,7 +106,9 @@ def test_privileged_upload_and_state_machine_are_wired_in_source():
 
     assert '"privileged_upload_document"' in action_request
     assert 'elif atype == "privileged_upload_document"' in executor
-    assert "pipeline_transitions" in executor and "pipeline_events" in executor
+    assert "DEFAULT_PIPELINE_STATE_STORE.transition" in executor
+    state_store = (root / "services/control_plane/pipeline_state.py").read_text()
+    assert "pipeline_transitions" in state_store and "pipeline_events" in state_store
     assert '_require_application_step(cur, application_id, "application_ready")' in executor
     assert "_document_bindings_still_current" in executor
     assert "privileged_execution_id" in review and "allowed_outcomes" in review

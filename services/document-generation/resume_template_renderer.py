@@ -12,12 +12,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import shutil
-import subprocess
 from typing import Any
 
 from docx import Document
 from services.common.resume_project_header_audit import HEADER_SLOTS, subtitle_bounds
 from services.common.resume_experience_bullet_audit import experience_bullet_indices
+from services.runtime.process_runner import DEFAULT_PROCESS_RUNNER
 
 
 PROJECTS_HEADING = "PROJECTS"
@@ -273,18 +273,22 @@ def export_pdf(docx_path: Path, output_dir: Path) -> Path:
     if not soffice:
         raise ResumeTemplateError("LibreOffice is required for PDF export (install libreoffice).")
     output_dir.mkdir(parents=True, exist_ok=True)
-    proc = subprocess.run(
+    proc = DEFAULT_PROCESS_RUNNER.run(
         [soffice, "--headless", "--convert-to", "pdf", "--outdir", str(output_dir), str(docx_path)],
-        text=True, capture_output=True, timeout=120,
+        timeout_s=120,
     )
     pdf_path = output_dir / f"{docx_path.stem}.pdf"
-    if proc.returncode or not pdf_path.is_file():
-        detail = (proc.stderr or proc.stdout).strip()[-500:]
+    if not proc.ok or not pdf_path.is_file():
+        detail = (proc.output + (f"\n{proc.start_error}" if proc.start_error else "")).strip()[-500:]
         raise ResumeTemplateError(f"LibreOffice PDF export failed: {detail or 'no output'}")
     pdfinfo = shutil.which("pdfinfo")
     if not pdfinfo:
         raise ResumeTemplateError("Poppler pdfinfo is required for one-page validation (install poppler-utils).")
-    info = subprocess.run([pdfinfo, str(pdf_path)], text=True, capture_output=True, timeout=30, check=True).stdout
+    info_result = DEFAULT_PROCESS_RUNNER.run([pdfinfo, str(pdf_path)], timeout_s=30)
+    if not info_result.ok:
+        detail = (info_result.output + (f"\n{info_result.start_error}" if info_result.start_error else "")).strip()[-500:]
+        raise ResumeTemplateError(f"pdfinfo validation failed: {detail or 'no output'}")
+    info = info_result.stdout
     pages = next((line.split(":", 1)[1].strip() for line in info.splitlines() if line.startswith("Pages:")), "0")
     if pages != "1":
         raise ResumeTemplateError(
@@ -303,7 +307,7 @@ def _arial_font() -> Path:
             return candidate
     fc_match = shutil.which("fc-match")
     if fc_match:
-        found = subprocess.run([fc_match, "-f", "%{file}", "Arial"], text=True, capture_output=True).stdout.strip()
+        found = DEFAULT_PROCESS_RUNNER.run([fc_match, "-f", "%{file}", "Arial"], timeout_s=15).stdout.strip()
         if found and Path(found).is_file() and "arial" in Path(found).name.lower():
             return Path(found)
     raise ResumeTemplateError("Arial TTF is required for pixel-stable PDF output. Set JOBOS_RESUME_ARIAL_TTF or install msttcorefonts.")

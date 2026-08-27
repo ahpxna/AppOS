@@ -53,10 +53,12 @@ def test_migration_076_removes_legacy_docs_bypass_and_adds_orchestrator_lease():
 
 def test_orchestrator_completion_is_claim_and_state_cas_bound():
     source = (ROOT / "services/orchestrator/orchestrator_v1.py").read_text()
+    state_store = (ROOT / "services/control_plane/pipeline_state.py").read_text()
     assert "def claim_application" in source
-    assert "processing_run_id=%s::uuid" in source
-    assert "processing_lease_expires_at>now()" in source
-    assert "WHERE id=%s AND current_step=%s" in source
+    assert "DEFAULT_PIPELINE_STATE_STORE.transition" in source
+    assert "processing_run_id=%s::uuid" in state_store
+    assert "processing_lease_expires_at>now()" in state_store
+    assert "WHERE id=%s AND current_step=%s" in state_store
     assert "refusing stale completion" in source
 
 

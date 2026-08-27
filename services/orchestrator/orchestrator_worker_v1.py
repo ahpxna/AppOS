@@ -7,17 +7,24 @@ do not have to run `filter --all` / `advance --all` manually.
 from __future__ import annotations
 
 import argparse
-import subprocess
 import sys
 import time
 from pathlib import Path
+from services.runtime.process_runner import DEFAULT_PROCESS_RUNNER
 
 ROOT = Path(__file__).resolve().parents[2]
 ORCHESTRATOR = "services.orchestrator.orchestrator_v1"
 
 
 def _run(*args: str) -> int:
-    return subprocess.run([sys.executable, "-m", ORCHESTRATOR, *args], cwd=ROOT, check=False).returncode
+    result = DEFAULT_PROCESS_RUNNER.run(
+        [sys.executable, "-m", ORCHESTRATOR, *args], cwd=ROOT, timeout_s=1800,
+    )
+    if not result.ok:
+        detail = (result.output + (f"\n{result.start_error}" if result.start_error else "")).strip()
+        if detail:
+            print(detail[-2000:], file=sys.stderr)
+    return int(result.returncode if result.returncode is not None else 1)
 
 
 def cycle() -> bool:

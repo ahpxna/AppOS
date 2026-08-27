@@ -34,7 +34,6 @@ import os
 import re
 import secrets
 import uuid
-import subprocess
 import sys
 from typing import Any, Dict, List, Optional
 
@@ -44,6 +43,9 @@ from psycopg.types.json import Jsonb
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from services.discovery.immigration_intelligence import record_jd_immigration_assessment
 from services.common.config import database_dsn
+from services.control_plane.pipeline_state import DEFAULT_PIPELINE_STATE_STORE, PipelineStateError
+from services.runtime.process_runner import DEFAULT_PROCESS_RUNNER
+from services.ats.contracts import canonical_job_url
 
 DSN = database_dsn()
 
@@ -73,9 +75,7 @@ def transition(
     reason: str = "", detail: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Validated state change. Raises if the edge is not declared."""
-    cur.execute(
-        "SELECT current_step FROM applications WHERE id = %s;", (application_id,)
-    )
+    cur.execute("SELECT current_step FROM applications WHERE id = %s;", (application_id,))
     row = cur.fetchone()
     if not row:
         raise RuntimeError(f"Application not found: {application_id}")
@@ -94,49 +94,14 @@ def transition(
     if from_step == to_step:
         return
 
-    cur.execute(
-        "SELECT automated FROM pipeline_transitions WHERE from_step = %s AND to_step = %s;",
-        (from_step, to_step),
-    )
-    edge = cur.fetchone()
-    if not edge:
-        raise RuntimeError(
-            f"Illegal transition {from_step!r} -> {to_step!r}. "
-            "Not declared in pipeline_transitions."
+    try:
+        DEFAULT_PIPELINE_STATE_STORE.transition(
+            cur, application_id=application_id, expected_from=str(from_step), to=to_step,
+            actor=actor, reason=reason, detail=detail,
+            require_automated=(actor == "orchestrator"), lease_run_id=_ACTIVE_PROCESSING_RUN_ID,
         )
-    if not edge[0] and actor == "orchestrator":
-        raise RuntimeError(
-            f"Transition {from_step!r} -> {to_step!r} requires a human actor. "
-            "The orchestrator may not perform it."
-        )
-
-    if _ACTIVE_PROCESSING_RUN_ID is not None:
-        cur.execute(
-            """UPDATE applications
-                  SET current_step=%s, updated_at=now()
-                WHERE id=%s AND current_step=%s
-                  AND processing_run_id=%s::uuid
-                  AND processing_step=%s
-                  AND processing_lease_expires_at>now();""",
-            (to_step, application_id, from_step, _ACTIVE_PROCESSING_RUN_ID, from_step),
-        )
-    else:
-        cur.execute(
-            "UPDATE applications SET current_step=%s, updated_at=now() WHERE id=%s AND current_step=%s;",
-            (to_step, application_id, from_step),
-        )
-    if cur.rowcount != 1:
-        raise RuntimeError(
-            f"Application state/processing ownership changed during {from_step!r} -> {to_step!r}; refusing stale completion."
-        )
-    cur.execute(
-        """
-        INSERT INTO pipeline_events
-          (application_id, from_step, to_step, actor, reason, detail_json)
-        VALUES (%s, %s, %s, %s, %s, %s);
-        """,
-        (application_id, from_step, to_step, actor, reason, Jsonb(detail or {})),
-    )
+    except PipelineStateError as exc:
+        raise RuntimeError(str(exc)) from exc
     print(f"    {from_step} -> {to_step}  ({reason})")
 
 
@@ -145,11 +110,13 @@ def transition(
 def intake(cur, *, jd_text: str, company: str, job_title: str,
            job_url: Optional[str], source: str, channel: str) -> Optional[str]:
     jd_text = jd_text.strip()
+    job_url = canonical_job_url(job_url)
     jd_hash = hashlib.sha256(jd_text.encode("utf-8")).hexdigest()
 
     cur.execute(
-        "SELECT id::text, company, job_title FROM applications WHERE jd_hash = %s;",
-        (jd_hash,),
+        """SELECT id::text, company, job_title FROM applications
+             WHERE jd_hash = %s AND coalesce(job_url,'') = %s;""",
+        (jd_hash, job_url),
     )
     existing = cur.fetchone()
     if existing:
@@ -276,24 +243,18 @@ TRANSIENT_MARKERS = (
 
 def run_step(script: str, args: List[str]) -> tuple[bool, str, bool]:
     """Run a legacy script path from the repository root."""
-    proc = subprocess.run(
-        [PYTHON, script, *args], cwd=REPO_ROOT, env=_subprocess_env(args), capture_output=True, text=True, timeout=1800
+    result = DEFAULT_PROCESS_RUNNER.run(
+        [PYTHON, script, *args], cwd=REPO_ROOT, env=_subprocess_env(args), timeout_s=1800,
     )
-    out = (proc.stdout or "") + (proc.stderr or "")
-    ok = proc.returncode == 0
-    transient = (not ok) and any(m in out for m in TRANSIENT_MARKERS)
-    return ok, out, transient
+    return result.ok, result.output + (f"\n{result.start_error}" if result.start_error else ""), result.transient
 
 
 def run_module(module: str, args: List[str]) -> tuple[bool, str, bool]:
     """Run internal package entrypoints with import semantics intact."""
-    proc = subprocess.run(
-        [PYTHON, "-m", module, *args], cwd=REPO_ROOT, env=_subprocess_env(args), capture_output=True, text=True, timeout=1800
+    result = DEFAULT_PROCESS_RUNNER.run(
+        [PYTHON, "-m", module, *args], cwd=REPO_ROOT, env=_subprocess_env(args), timeout_s=1800,
     )
-    out = (proc.stdout or "") + (proc.stderr or "")
-    ok = proc.returncode == 0
-    transient = (not ok) and any(m in out for m in TRANSIENT_MARKERS)
-    return ok, out, transient
+    return result.ok, result.output + (f"\n{result.start_error}" if result.start_error else ""), result.transient
 def record_failure(cur, application_id: str, step: str, output: str,
                    *, transient: bool) -> None:
     cur.execute(
@@ -327,15 +288,14 @@ def record_failure(cur, application_id: str, step: str, output: str,
 
 # ---------------------------------------------------------------- cost gate
 
-def check_cost_budget(task: str) -> tuple[bool, str]:
+def check_cost_budget(task: str, *, application_id: str | None = None) -> tuple[bool, str]:
     """Ask the cost controller whether this task type may run right now,
     and increment its counter if so. Returns (allowed, output_tail)."""
-    proc = subprocess.run(
-        [PYTHON, COST_SCRIPT, "check", "--task", task, "--increment"],
-        capture_output=True, text=True, timeout=30,
-    )
-    out = (proc.stdout or "") + (proc.stderr or "")
-    return proc.returncode == 0, out
+    argv = [PYTHON, COST_SCRIPT, "check", "--task", task, "--increment"]
+    if application_id and task == "full_pipeline":
+        argv.extend(["--subject-type", "application", "--subject-id", application_id])
+    result = DEFAULT_PROCESS_RUNNER.run(argv, timeout_s=30)
+    return result.ok, result.output + (f"\n{result.start_error}" if result.start_error else "")
 
 
 def profile_prerequisite_blockers(cur) -> list[str]:
@@ -493,7 +453,7 @@ def advance_one(cur, application_id: str, *, apply: bool) -> None:
         # point of a *pre*-spend gate. A budget block is treated as
         # transient: the application just waits at 'screened' until the
         # daily budget resets or is raised, rather than erroring out.
-        cost_ok, cost_out = check_cost_budget("full_pipeline")
+        cost_ok, cost_out = check_cost_budget("full_pipeline", application_id=application_id)
         if not cost_ok:
             tail = cost_out.strip().splitlines()[-1] if cost_out.strip() else "budget refused"
             print(f"    cost gate: {tail}")

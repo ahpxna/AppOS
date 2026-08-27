@@ -65,8 +65,6 @@ import json
 import os
 import re
 import sys
-import urllib.error
-import urllib.request
 from html.parser import HTMLParser
 from typing import Any, Dict, List, Optional
 from services.discovery.captcha_detector import analyze_captcha_risk
@@ -76,6 +74,8 @@ import psycopg
 from psycopg.types.json import Jsonb
 from services.discovery.immigration_intelligence import record_jd_immigration_assessment
 from services.common.config import database_dsn
+from services.ats.contracts import canonical_job_url, jd_is_complete, normalize_work_mode
+from services.ats.http_client import DiscoveryHttpError, get_json
 
 DSN = database_dsn()
 
@@ -83,6 +83,7 @@ DISCOVERY_VERSION = "ats_discovery_v1_2026_07_31"
 USER_AGENT = "jobos-ats-discovery/1 (personal job search tool, contact via GitHub repo)"
 REQUEST_TIMEOUT = 30
 STALE_CLOSE_DAYS = max(1, int(os.getenv("JOBOS_STALE_CLOSE_DAYS", "14")))
+DETAIL_REQUEST_BUDGET = max(1, int(os.getenv("JOBOS_ATS_DETAIL_REQUEST_BUDGET", "100")))
 
 PLATFORMS = (
     "greenhouse", "lever", "ashby", "smartrecruiters", "recruitee",
@@ -99,24 +100,18 @@ class DiscoveryError(Exception):
 from services.discovery.captcha_detector import analyze_captcha_risk
 
 def http_get_json(url: str) -> Any:
-    req = urllib.request.Request(
-        url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
-    )
     try:
-        with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
-            body = resp.read().decode("utf-8", errors="replace")
-    except urllib.error.HTTPError as e:
-        raise DiscoveryError(f"HTTP {e.code} fetching {url}") from e
-    except urllib.error.URLError as e:
-        raise DiscoveryError(f"Request failed for {url}: {e}") from e
-    try:
-        return json.loads(body)
-    except json.JSONDecodeError as e:
-        # [THÊM MỚI] Check CAPTCHA nếu API trả về HTML thay vì JSON
-        is_blocked, reason = analyze_captcha_risk(body, url)
-        if is_blocked:
-            raise DiscoveryError(f"Bị chặn bởi Anti-Bot/CAPTCHA: {reason}")
-        raise DiscoveryError(f"Non-JSON response from {url}: {body[:200]!r}") from e
+        return get_json(url=url, user_agent=USER_AGENT, timeout_seconds=REQUEST_TIMEOUT)
+    except DiscoveryHttpError as e:
+        # The HTML/CAPTCHA distinction is still useful to the existing
+        # adapters; typed retryability remains available to callers through
+        # the exception cause without changing their public CLI contract.
+        if e.kind == "invalid_json":
+            is_blocked, reason = analyze_captcha_risk(e.body_preview, url)
+            if is_blocked:
+                raise DiscoveryError(f"Bị chặn bởi Anti-Bot/CAPTCHA: {reason}") from e
+            raise DiscoveryError(f"Non-JSON response from {url}: {e.body_preview[:200]!r}") from e
+        raise DiscoveryError(str(e)) from e
 
 
 class _TextExtractor(HTMLParser):
@@ -255,7 +250,7 @@ def fetch_ashby(slug: str) -> List[Dict[str, Any]]:
 def fetch_smartrecruiters(slug: str, *, with_details: bool = False) -> List[Dict[str, Any]]:
     data = http_get_json(f"https://api.smartrecruiters.com/v1/companies/{slug}/postings")
     out = []
-    for j in data.get("content", []) or []:
+    for position, j in enumerate(data.get("content", []) or []):
         loc = j.get("location") or {}
         location = ", ".join(p for p in (loc.get("city"), loc.get("region"), loc.get("country")) if p)
         department = ((j.get("department") or {}).get("label")
@@ -263,7 +258,7 @@ def fetch_smartrecruiters(slug: str, *, with_details: bool = False) -> List[Dict
         job_id = j.get("id", "")
         url = j.get("applyUrl") or j.get("postingUrl") or ""
         body = ""
-        if with_details and job_id:
+        if with_details and job_id and position < DETAIL_REQUEST_BUDGET:
             try:
                 detail = http_get_json(
                     f"https://api.smartrecruiters.com/v1/companies/{slug}/postings/{job_id}"
@@ -317,7 +312,7 @@ def fetch_recruitee(slug: str) -> List[Dict[str, Any]]:
 def fetch_workable(slug: str, *, with_details: bool = False) -> List[Dict[str, Any]]:
     data = http_get_json(f"https://apply.workable.com/api/v1/widget/accounts/{slug}")
     out = []
-    for j in data.get("jobs", []) or []:
+    for position, j in enumerate(data.get("jobs", []) or []):
         loc = j.get("location") or {}
         location = ", ".join(
             p for p in (loc.get("city"), loc.get("region"), loc.get("country")) if p
@@ -325,7 +320,7 @@ def fetch_workable(slug: str, *, with_details: bool = False) -> List[Dict[str, A
         department = j.get("department", "") or ""
         shortcode = j.get("shortcode", "")
         body = ""
-        if with_details and shortcode:
+        if with_details and shortcode and position < DETAIL_REQUEST_BUDGET:
             try:
                 detail = http_get_json(
                     f"https://apply.workable.com/api/v1/widget/accounts/{slug}/jobs/{shortcode}"
@@ -399,6 +394,7 @@ def intake_job(cur, *, jd_text: str, company: str, job_title: str, job_url: str,
                ats_company_id: str, ats_external_id: str) -> Optional[str]:
     """Create or refresh one source-stable discovered posting."""
     jd_text = jd_text.strip()
+    job_url = canonical_job_url(job_url)
     jd_hash = hashlib.sha256(jd_text.encode("utf-8")).hexdigest()
 
     cur.execute(
@@ -417,7 +413,7 @@ def intake_job(cur, *, jd_text: str, company: str, job_title: str, job_url: str,
                    stale_at = NULL, closed_at = NULL, updated_at = now()
              WHERE id = %s;""",
             (job_title, job_url, jd_text, jd_hash, location,
-             ("remote" if work_mode else None), changed, existing[0]),
+             normalize_work_mode(work_mode).value, changed, existing[0]),
         )
         return None
     cur.execute(
@@ -432,7 +428,7 @@ def intake_job(cur, *, jd_text: str, company: str, job_title: str, job_url: str,
         RETURNING id::text;
         """,
         (ats_type, company, job_title, job_url, jd_text, jd_hash,
-         ats_type, location, ("remote" if work_mode else None),
+         ats_type, location, normalize_work_mode(work_mode).value,
          ats_company_id, ats_external_id, ats_external_id),
     )
     app_id = cur.fetchone()[0]
@@ -528,11 +524,13 @@ def poll_company(conn, cid, name, platform, slug, *, apply: bool, with_details: 
     seen = new = dup = 0
     ok = True
     err = None
+    error_kind: str | None = None
+    transient_failure = False
     try:
         jobs = fetch_jobs(platform, slug, with_details=with_details)
         seen = len(jobs)
         for j in jobs:
-            if not j["title"] or not j["jd_text"].strip():
+            if not j["title"] or not jd_is_complete(j.get("jd_text")):
                 continue
             with conn.cursor() as cur:
                 app_id = None
@@ -540,7 +538,7 @@ def poll_company(conn, cid, name, platform, slug, *, apply: bool, with_details: 
                     app_id = intake_job(
                         cur, jd_text=j["jd_text"], company=name, job_title=j["title"],
                         job_url=j["url"], location=j["location"],
-                        work_mode="remote" if j["remote"] else "",
+                        work_mode=str(j.get("work_mode") or ("remote" if j.get("remote") else "unknown")),
                         ats_type=platform, ats_company_id=cid,
                         ats_external_id=j["external_id"],
                     )
@@ -556,6 +554,12 @@ def poll_company(conn, cid, name, platform, slug, *, apply: bool, with_details: 
     except DiscoveryError as e:
         ok = False
         err = str(e)
+        cause = e.__cause__
+        if isinstance(cause, DiscoveryHttpError):
+            error_kind = cause.kind
+            transient_failure = cause.transient
+        else:
+            error_kind = "adapter"
         conn.rollback()
 
     with conn.cursor() as cur:
@@ -576,10 +580,18 @@ def poll_company(conn, cid, name, platform, slug, *, apply: bool, with_details: 
                     last_success_at = CASE WHEN %s THEN now() ELSE last_success_at END,
                     last_job_count = %s,
                     consecutive_failures = CASE WHEN %s THEN 0 ELSE consecutive_failures + 1 END,
+                    last_error_kind = CASE WHEN %s THEN NULL ELSE %s END,
+                    next_retry_at = CASE
+                        WHEN %s THEN NULL
+                        WHEN %s THEN now() + make_interval(
+                            secs => LEAST(3600, 15 * power(2, LEAST(consecutive_failures, 8))::int)
+                        )
+                        ELSE now() + interval '24 hours'
+                    END,
                     updated_at = now()
                 WHERE id = %s;
                 """,
-                (ok, seen, ok, cid),
+                (ok, seen, ok, ok, error_kind, ok, transient_failure, cid),
             )
             if ok:
                 cur.execute(
@@ -619,10 +631,10 @@ def cmd_poll(conn, args) -> int:
                 """
                 SELECT id::text, company_name, ats_platform, slug
                 FROM ats_companies
-                WHERE enabled = true AND consecutive_failures < %s
+                WHERE enabled = true
+                  AND (next_retry_at IS NULL OR next_retry_at <= now())
                 ORDER BY last_polled_at NULLS FIRST;
                 """,
-                (args.max_consecutive_failures,),
             )
         rows = cur.fetchall()
 
@@ -657,8 +669,11 @@ def main() -> int:
     pt = sub.add_parser("test", help="Fetch one company, print results, write nothing.")
     pt.add_argument("--platform", required=True, choices=PLATFORMS)
     pt.add_argument("--slug", required=True)
-    pt.add_argument("--with-details", action="store_true",
-                    help="Fetch full JD per posting (SmartRecruiters/Workable only; slower, more requests).")
+    test_detail_mode = pt.add_mutually_exclusive_group()
+    test_detail_mode.add_argument("--with-details", dest="with_details", action="store_true", default=True,
+                                  help="Fetch full JDs (the default; retained for script compatibility).")
+    test_detail_mode.add_argument("--summary-only", dest="with_details", action="store_false",
+                                  help="Inspect listing summaries only; never suitable for --apply intake.")
     pt.add_argument("--limit", type=int, default=10)
 
     pa = sub.add_parser("add", help="Add or update a company to poll.")
@@ -672,8 +687,13 @@ def main() -> int:
 
     pp = sub.add_parser("poll", help="Fetch postings for configured companies and intake new ones.")
     pp.add_argument("--company-id")
-    pp.add_argument("--with-details", action="store_true")
-    pp.add_argument("--max-consecutive-failures", type=int, default=5)
+    poll_detail_mode = pp.add_mutually_exclusive_group()
+    poll_detail_mode.add_argument("--with-details", dest="with_details", action="store_true", default=True,
+                                  help="Fetch full JDs (the default; retained for script compatibility).")
+    poll_detail_mode.add_argument("--summary-only", dest="with_details", action="store_false",
+                                  help="Inspect listing summaries only; incomplete JDs are refused at intake.")
+    pp.add_argument("--max-consecutive-failures", type=int, default=5,
+                    help="Deprecated compatibility option; retries now use bounded cooldowns instead of permanent automatic suppression.")
     pp.add_argument("--apply", action="store_true")
 
     args = p.parse_args()

@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import re
 from typing import Callable
 from urllib.parse import urlsplit
 
@@ -10,6 +9,7 @@ from services.autofill.autofill_executor_v1 import AutofillTransport, BrowserTar
 from services.autofill.autofill_planner_v1 import PlannedAction
 from services.autofill.form_inspector_v1 import FormField, QuestionGroup
 from services.common.autofill_identity import canonical_page_url
+from services.autofill.value_normalization import equivalent_value, normal_text
 
 
 class SessionError(RuntimeError):
@@ -45,7 +45,7 @@ def _filename(value: str) -> str:
 
 
 def _normal_text(value: str) -> str:
-    return " ".join((value or "").casefold().split())
+    return normal_text(value)
 
 
 def _equivalent_value(action: PlannedAction, observed: str, role: str) -> bool:
@@ -53,15 +53,8 @@ def _equivalent_value(action: PlannedAction, observed: str, role: str) -> bool:
         return False
     if action.action == "upload":
         return _filename(observed) == _filename(action.value)
-    if action.profile_key and action.profile_key.endswith("phone"):
-        return re.sub(r"\D", "", observed) == re.sub(r"\D", "", action.value)
-    # Select controls sometimes expose the state abbreviation as a value and
-    # the full state name as accessible text; accepting only exact text would
-    # be a safe but unnecessarily common false-negative. Preserve exactness
-    # for all other values.
-    aliases = {"nj": "new jersey", "ny": "new york", "ca": "california", "tx": "texas"}
-    actual, expected = _normal_text(observed), _normal_text(action.value)
-    return actual == expected or role in {"select", "combobox", "listbox"} and aliases.get(actual) == expected or aliases.get(expected) == actual
+    return equivalent_value(actual=observed, expected=action.value, role=role,
+                            label=action.question_label or "")
 
 
 def action_identity(action: PlannedAction) -> tuple[str, str | None, str | None, str | None]:

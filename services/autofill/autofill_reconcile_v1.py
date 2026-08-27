@@ -8,6 +8,7 @@ import psycopg
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 from services.common.config import database_dsn
+from services.control_plane.pipeline_state import DEFAULT_PIPELINE_STATE_STORE, PipelineStateError
 
 def show(cur, task_id: str) -> None:
     cur.execute(
@@ -112,23 +113,18 @@ def close(cur, task_id: str) -> None:
     app_row = cur.fetchone()
     if app_row and app_row[0]:
         application_id = app_row[0]
-        cur.execute(
-            """UPDATE applications
-                  SET current_step = 'application_form_ready', updated_at = now()
-                WHERE id = %s AND current_step = 'autofill_executing'
-                RETURNING id""",
-            (application_id,),
-        )
-        if cur.fetchone() is not None:
-            cur.execute(
-                """INSERT INTO pipeline_events(
-                           application_id, from_step, to_step, actor, reason, detail_json)
-                   VALUES (%s, 'autofill_executing', 'application_form_ready',
-                           'autofill-reconciliation',
-                           'Human closed uncertain autofill reconciliation; a fresh approval is required.',
-                           '{"replay": false, "fresh_approval_required": true}'::jsonb)""",
-                (application_id,),
+        try:
+            DEFAULT_PIPELINE_STATE_STORE.transition(
+                cur, application_id=application_id, expected_from="autofill_executing",
+                to="application_form_ready", actor="autofill-reconciliation",
+                reason="Human closed uncertain autofill reconciliation; a fresh approval is required.",
+                detail={"replay": False, "fresh_approval_required": True},
+                allow_already_target=False,
             )
+        except PipelineStateError:
+            # A concurrent stop/advance is authoritative.  Closing this
+            # uncertainty may never pull an application back to an older step.
+            pass
     print("Closed non-replayable capability. Inspect the form, then issue a fresh approval if needed.")
 
 def main() -> int:

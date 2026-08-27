@@ -981,11 +981,12 @@ def _restore_form_ready_after_human_input(cur, *, application_id: str, browser_t
 
 def prepare_fresh_autofill_after_human_input(application_id: str) -> dict[str, Any]:
     """Create a fresh exact plan after human input; never reuse the old capability."""
-    import subprocess
+    from services.runtime.process_runner import DEFAULT_PROCESS_RUNNER
     command = [sys.executable, str(ROOT / 'scripts' / 'jobos.py'), 'autofill', 'prepare',
                '--application-id', application_id, '--create', '--yes']
-    proc = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, timeout=180)
-    return {"ok": proc.returncode == 0, "detail": (proc.stdout or proc.stderr or '')[-1600:]}
+    proc = DEFAULT_PROCESS_RUNNER.run(command, cwd=ROOT, timeout_s=180)
+    detail = proc.output + (f"\n{proc.start_error}" if proc.start_error else "")
+    return {"ok": proc.ok, "detail": detail[-1600:], "transient": proc.transient}
 
 
 def _sensitive_question_completed(cur, *, application_id: str, browser_task_id: str, question: str) -> bool:
@@ -1615,16 +1616,18 @@ def decide_item(conn, item_id: str, *, decision: str, actor: str, note: str = ""
                     screenshot_path = Path(screenshot[0]).expanduser()
                     if not screenshot_path.is_file() or _sha256_file(screenshot_path) != screenshot[1]:
                         raise ReviewError("Autofill screenshot artifact changed after review creation; capture a fresh artifact or remove the stale binding.")
-                cur.execute("UPDATE applications SET current_step = 'application_ready', updated_at = now() WHERE id = %s AND current_step = 'form_filled';", (app_id,))
-                if cur.rowcount != 1:
-                    raise ReviewError("Application is no longer at form_filled; a fresh human review is required.")
-                cur.execute(
-                    """INSERT INTO pipeline_events(application_id, from_step, to_step, actor, reason, detail_json)
-                       VALUES (%s, 'form_filled', 'application_ready', %s,
-                               'Human approved deterministic post-autofill state; every subsequent browser action requires a separate privileged approval.', %s);""",
-                    (app_id, actor, Jsonb({"review_item_id": item_id, "browser_task_id": browser_task_id,
-                                          "screenshot_present": bool(screenshot)})),
-                )
+                from services.control_plane.pipeline_state import DEFAULT_PIPELINE_STATE_STORE, PipelineStateError
+                try:
+                    DEFAULT_PIPELINE_STATE_STORE.transition(
+                        cur, application_id=app_id, expected_from="form_filled", to="application_ready",
+                        actor=actor,
+                        reason="Human approved deterministic post-autofill state; every subsequent browser action requires a separate privileged approval.",
+                        detail={"review_item_id": item_id, "browser_task_id": browser_task_id,
+                                "screenshot_present": bool(screenshot)},
+                        require_automated=False, allow_already_target=False,
+                    )
+                except PipelineStateError as exc:
+                    raise ReviewError("Application is no longer at form_filled; a fresh human review is required.") from exc
                 from services.application_actions.privileged_action_v1 import materialize_application_ready_gate
                 try:
                     materialized_approval_ids = materialize_application_ready_gate(cur, app_id)

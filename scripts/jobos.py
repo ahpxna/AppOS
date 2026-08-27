@@ -9,6 +9,7 @@ import json
 import subprocess
 import sys
 import shutil
+import shlex
 from pathlib import Path
 
 
@@ -17,7 +18,8 @@ sys.path.insert(0, str(ROOT))
 
 from services.common.config import database_dsn, load_repo_env
 from services.common.autofill_identity import canonical_page_url, page_fingerprint
-from services.common.openclaw_runtime import resolve_openclaw_binary
+from services.common.openclaw_runtime import find_global_openclaw_conflicts, resolve_openclaw_binary
+from services.runtime.process_runner import DEFAULT_PROCESS_RUNNER
 
 
 def mark(results: list[tuple[str, bool, str]], name: str, ok: bool, detail: str = "") -> None:
@@ -53,6 +55,11 @@ def doctor(*, check_browser: bool, strict: bool = False, require_autofill: bool 
         mark(results, "OpenClaw runtime", Path(binary).is_file() or bool(os.path.basename(binary)), binary)
     except RuntimeError as exc:
         mark(results, "OpenClaw runtime", False, str(exc))
+    global_conflicts = find_global_openclaw_conflicts()
+    mark(
+        results, "No global OpenClaw conflict", not global_conflicts,
+        "none" if not global_conflicts else ", ".join(str(path) for path in global_conflicts),
+    )
 
     gog = shutil.which((os.getenv("JOBOS_GOG_BIN") or "gog").strip())
     mark(results, "Gmail gog reader", bool(gog), gog or "install/authenticate gog before email verification")
@@ -98,11 +105,12 @@ def doctor(*, check_browser: bool, strict: bool = False, require_autofill: bool 
     if check_browser:
         # Health only: it validates gateway/CDP availability but does not list
         # tabs, read a page, run an agent, or issue a browser write.
-        import subprocess
-        result = subprocess.run([sys.executable, str(ROOT / "services" / "browser-controller" / "browser_queue_worker.py"), "--health"],
-                                capture_output=True, text=True, timeout=30)
-        mark(results, "Gateway and CDP health", result.returncode == 0,
-             (result.stdout or result.stderr).strip().replace("\n", " ")[:180])
+        result = DEFAULT_PROCESS_RUNNER.run(
+            [sys.executable, str(ROOT / "services" / "browser-controller" / "browser_queue_worker.py"), "--health"],
+            cwd=ROOT, timeout_s=30,
+        )
+        detail = (result.output + (f" {result.start_error}" if result.start_error else "")).strip()
+        mark(results, "Gateway and CDP health", result.ok, detail.replace("\n", " ")[:180])
 
     print("JOBOS DOCTOR\n")
     for name, ok, detail in results:
@@ -112,7 +120,7 @@ def doctor(*, check_browser: bool, strict: bool = False, require_autofill: bool 
     document_ready = core and checks.get("Resume template", False)
     form_fill_ready = core and all(checks.get(name, False) for name in (
         "Autofill action journal", "No unresolved browser action", "Immigration profile confirmed",
-        "OpenClaw runtime", "Managed upload root", "Human Review Hub", "Human Approval Bus",
+        "OpenClaw runtime", "No global OpenClaw conflict", "Managed upload root", "Human Review Hub", "Human Approval Bus",
     ))
     auth_flow_ready = form_fill_ready and checks.get("Credential vault key", False)
     privileged_ready = form_fill_ready and checks.get("Telegram approval channel", False)
@@ -144,6 +152,48 @@ def doctor(*, check_browser: bool, strict: bool = False, require_autofill: bool 
     if require_autofill:
         return 0 if form_fill_ready else 1
     return 0 if profile_targets[profile] else 1
+
+
+def verify_release(*, profile: str) -> int:
+    """Fail closed on every V1 release contract; never silently skip live gates."""
+    if profile != "v1":
+        raise RuntimeError(f"Unsupported release profile: {profile}")
+    load_repo_env()
+    db_enabled = os.getenv("JOBOS_RUN_DB_INTEGRATION") == "1" and bool(os.getenv("JOBOS_TEST_DSN", "").strip())
+    cdp_command = os.getenv("JOBOS_RELEASE_CDP_SMOKE_CMD", "").strip()
+    stages: list[tuple[str, list[str], int]] = [
+        ("compile/import", [sys.executable, "-m", "compileall", "-q", "."], 180),
+        ("non-DB regression", [sys.executable, "-m", "pytest", "-q", "--ignore=tests/integration"], 900),
+        ("migration lint", [sys.executable, "scripts/migration_lint.py"], 120),
+        ("fresh DB lifecycle", [sys.executable, "-m", "pytest", "-q",
+                                 "tests/integration/test_autofill_execution_lifecycle.py",
+                                 "tests/integration/test_human_review_hub.py",
+                                 "test_autofill_execution_db_integration.py"], 900),
+        ("frozen-feature invariants", [sys.executable, "-m", "pytest", "-q",
+                                        "tests/test_runtime_lifecycle_hardening_v29_combined.py",
+                                        "tests/test_final_pipeline_integrity_v45.py"], 300),
+        ("release diff check", ["git", "diff", "--check"], 60),
+    ]
+    if not db_enabled:
+        print("RELEASE BLOCKED: set JOBOS_RUN_DB_INTEGRATION=1 and JOBOS_TEST_DSN to a disposable database.")
+        return 2
+    if not cdp_command:
+        print("RELEASE BLOCKED: set JOBOS_RELEASE_CDP_SMOKE_CMD to the controlled local ATS/CDP fixture command.")
+        return 2
+    stages.append(("controlled CDP fixture", shlex.split(cdp_command), 300))
+    for name, argv, timeout_s in stages:
+        result = DEFAULT_PROCESS_RUNNER.run(argv, cwd=ROOT, timeout_s=timeout_s)
+        if not result.ok:
+            detail = (result.output + (f"\n{result.start_error}" if result.start_error else "")).strip()
+            print(f"RELEASE BLOCKED at {name}:\n{detail[-4000:]}")
+            return 1
+        print(f"✓ {name}")
+    status = DEFAULT_PROCESS_RUNNER.run(["git", "status", "--porcelain"], cwd=ROOT, timeout_s=30)
+    if not status.ok or status.stdout.strip():
+        print("RELEASE BLOCKED: release tree is not clean.")
+        return 1
+    print("V1 RELEASE VERIFICATION: PASS")
+    return 0
 
 
 def _origin(url: str) -> str:
@@ -439,6 +489,12 @@ def status() -> int:
                 pid = runtime.get("supervisor_pid")
             runtime["supervisor_pid"] = pid
             runtime["running"] = pid_alive(pid)
+            services = runtime.get("services") if isinstance(runtime.get("services"), dict) else {}
+            runtime["required_failures"] = [
+                name for name, service in services.items()
+                if isinstance(service, dict) and service.get("required") and not service.get("running")
+            ]
+            runtime["ready"] = runtime["running"] and not runtime["required_failures"]
             if not runtime["running"]:
                 runtime["status"] = "stale_runtime_state"
     except Exception:
@@ -601,6 +657,8 @@ def main() -> int:
     doctor_parser.add_argument("--strict", action="store_true", help="Exit non-zero unless the selected readiness profile is ready.")
     doctor_parser.add_argument("--profile", choices=("core","documents","browser","production"), default="production", help="Readiness lane to enforce; production includes optional operational channels.")
     doctor_parser.add_argument("--require-autofill", action="store_true", help="Exit non-zero unless deterministic form-fill readiness is ready.")
+    verify_parser = commands.add_parser("verify-release", help="Run the fail-closed V1 release gate, including DB and controlled CDP acceptance.")
+    verify_parser.add_argument("--profile", choices=("v1",), default="v1")
     autofill_parser = commands.add_parser("autofill", help="Prepare a deterministic, approval-bound form session.")
     autofill_subcommands = autofill_parser.add_subparsers(dest="autofill_command", required=True)
     prepare_parser = autofill_subcommands.add_parser("prepare", help="Inspect the pinned application tab and optionally create its exact approval.")
@@ -670,6 +728,8 @@ def main() -> int:
         return runtime_supervisor_command(args.command)
     if args.command == "doctor":
         return doctor(check_browser=args.check_browser, strict=args.strict, require_autofill=args.require_autofill, profile=args.profile)
+    if args.command == "verify-release":
+        return verify_release(profile=args.profile)
     if args.command == "status":
         return status()
     if args.command == "saved":

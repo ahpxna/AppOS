@@ -114,7 +114,7 @@ class AutofillError(Exception):
 
 def run_browser(args: List[str], *, timeout: int = 120) -> subprocess.CompletedProcess:
     if shutil.which(OPENCLAW_BIN) is None:
-        raise AutofillError(f"'{OPENCLAW_BIN}' not on PATH.")
+        raise AutofillError("JobOS managed OpenClaw runtime is unavailable; run the managed runtime setup.")
     cmd = [OPENCLAW_BIN, "browser", "--browser-profile", BROWSER_PROFILE, *args]
     try:
         return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)

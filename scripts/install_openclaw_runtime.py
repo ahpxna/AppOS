@@ -172,9 +172,15 @@ def main() -> int:
     parser.add_argument("--runtime-root", type=Path, default=RUNTIME_ROOT)
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
+    requested_root = args.runtime_root.expanduser().resolve()
+    managed_root = RUNTIME_ROOT.resolve()
+    if requested_root != managed_root:
+        payload = {"status": "error", "error": "--runtime-root must be JobOS's managed data/openclaw-runtime directory."}
+        print(json.dumps(payload) if args.json else f"ERROR: {payload['error']}")
+        return 1
     try:
         result = install(node_version=args.node_version, openclaw_version=args.openclaw_version,
-                         runtime_root=args.runtime_root.expanduser().resolve())
+                         runtime_root=managed_root)
     except (RuntimeInstallError, OSError, subprocess.SubprocessError, urllib.error.URLError) as exc:
         payload = {"status": "error", "error": str(exc)}
         print(json.dumps(payload) if args.json else f"ERROR: {payload['error']}")

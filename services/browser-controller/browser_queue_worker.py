@@ -79,6 +79,7 @@ from services.common.openclaw_runtime import resolve_openclaw_binary
 from services.common.immigration_semantics import classify_immigration_question
 from services.common.question_memory import normalize_question
 from services.common.autofill_action_scope import action_is_exactly_approved
+from services.control_plane.pipeline_state import DEFAULT_PIPELINE_STATE_STORE, PipelineStateError
 
 
 load_repo_env()
@@ -154,8 +155,7 @@ def openclaw_runtime_env() -> Dict[str, str]:
 def run_openclaw(args, *, timeout: int) -> subprocess.CompletedProcess:
     if shutil.which(OPENCLAW_BIN) is None:
         raise PermanentTaskError(
-            f"'{OPENCLAW_BIN}' not found on PATH. "
-            "Set OPENCLAW_BIN to the absolute path if it lives under nvm."
+            "JobOS managed OpenClaw runtime is unavailable; run the managed runtime setup."
         )
     try:
         return subprocess.run(
@@ -444,16 +444,20 @@ def _expire_bound_pre_io_approval(cur, task: Dict[str, Any], reason: str) -> Non
         ("Parent autofill capability closed before browser I/O; delegated child is not executable.",
          task.get("application_id"), str(approval_id)),
     )
-    cur.execute(
-        """UPDATE applications SET current_step='application_form_ready', updated_at=now()
-            WHERE id=%s AND current_step='awaiting_approval'
-              AND NOT EXISTS (
-                  SELECT 1 FROM approval_requests ar
-                   WHERE ar.application_id=applications.id AND ar.type='autofill_form'
-                     AND ar.status IN ('pending','approved','executing')
-                     AND ar.token_expires_at > now());""",
-        (task.get("application_id"),),
-    )
+    try:
+        DEFAULT_PIPELINE_STATE_STORE.transition(
+            cur, application_id=str(task.get("application_id") or ""),
+            expected_from="awaiting_approval", to="application_form_ready",
+            actor=WORKER_ID, reason=reason[:500], detail={"browser_task_id": task["id"]},
+            guard_sql="""NOT EXISTS (
+                SELECT 1 FROM approval_requests ar
+                 WHERE ar.application_id=applications.id AND ar.type='autofill_form'
+                   AND ar.status IN ('pending','approved','executing')
+                   AND ar.token_expires_at > now()
+            )""",
+        )
+    except PipelineStateError:
+        pass
 
 def dead_letter_exhausted(cur) -> int:
     """Archive exhausted, provably pre-I/O tasks and close their capability."""
@@ -1012,23 +1016,18 @@ def durable_begin_execution(task: Dict[str, Any], binding: Dict[str, Any], targe
         expected_step = str(binding.get("expected_application_step") or "awaiting_approval")
         if expected_step != "awaiting_approval":
             raise PermanentTaskError("Autofill capability is not bound to awaiting_approval.")
-        cur.execute(
-            """UPDATE applications SET current_step='autofill_executing', updated_at=now()
-                 WHERE id=%s AND current_step=%s
-                   AND coalesce(job_url,'')=%s AND coalesce(jd_hash,'')=%s
-                 RETURNING id;""",
-            (task["application_id"], expected_step,
-             str(binding.get("application_job_url") or ""),
-             str(binding.get("application_jd_hash") or "")),
-        )
-        if cur.fetchone() is None:
-            raise PermanentTaskError("Application lifecycle changed before browser I/O; refusing the write.")
-        cur.execute(
-            """INSERT INTO pipeline_events(application_id, from_step, to_step, actor, reason, detail_json)
-               VALUES (%s,%s,'autofill_executing',%s,
-                       'Acquired durable application execution fence immediately before deterministic browser I/O.',%s);""",
-            (task["application_id"], expected_step, WORKER_ID, Jsonb({"browser_task_id": task["id"], "target_id": target_id})),
-        )
+        try:
+            DEFAULT_PIPELINE_STATE_STORE.transition(
+                cur, application_id=task["application_id"], expected_from=expected_step,
+                to="autofill_executing", actor=WORKER_ID,
+                reason="Acquired durable application execution fence immediately before deterministic browser I/O.",
+                detail={"browser_task_id": task["id"], "target_id": target_id},
+                expected_job_url=str(binding.get("application_job_url") or ""),
+                expected_jd_hash=str(binding.get("application_jd_hash") or ""),
+                allow_already_target=False,
+            )
+        except PipelineStateError as exc:
+            raise PermanentTaskError("Application lifecycle changed before browser I/O; refusing the write.") from exc
         cur.execute(
             """
             UPDATE approval_requests
@@ -1220,48 +1219,37 @@ def durable_finish_execution(task: Dict[str, Any], binding: Dict[str, Any], resu
     reconcile_reason: str | None = None
     with _durable_connection() as conn, conn.cursor() as cur:
         if execution_state == "completed":
-            cur.execute(
-                """UPDATE applications
-                      SET current_step='form_filled', updated_at=now()
-                    WHERE id=%s AND current_step='autofill_executing'
-                      AND coalesce(job_url,'')=%s AND coalesce(jd_hash,'')=%s
-                    RETURNING id;""",
-                (task["application_id"], str(binding.get("application_job_url") or ""),
-                 str(binding.get("application_jd_hash") or "")),
-            )
-            if cur.fetchone() is None:
+            try:
+                DEFAULT_PIPELINE_STATE_STORE.transition(
+                    cur, application_id=task["application_id"], expected_from="autofill_executing",
+                    to="form_filled", actor=WORKER_ID,
+                    reason="Deterministic autofill completed under the application execution fence.",
+                    detail={"browser_task_id": task["id"]},
+                    expected_job_url=str(binding.get("application_job_url") or ""),
+                    expected_jd_hash=str(binding.get("application_jd_hash") or ""),
+                    allow_already_target=False,
+                )
+            except PipelineStateError:
                 reconcile_reason = (
                     "Application lifecycle changed after deterministic browser I/O; "
                     "browser effects require reconciliation and are not replayable."
-                )
-            else:
-                cur.execute(
-                    """INSERT INTO pipeline_events(
-                           application_id, from_step, to_step, actor, reason, detail_json)
-                       VALUES (%s,'autofill_executing','form_filled',%s,
-                               'Deterministic autofill completed under the application execution fence.',%s);""",
-                    (task["application_id"], WORKER_ID, Jsonb({"browser_task_id": task["id"]})),
                 )
         else:
             # Partial progress crossed the browser-I/O boundary. If the
             # application fence was lost concurrently, preserve the same
             # reconciliation invariant as the completed path; never leave a
             # partially-written task looking retryable.
-            cur.execute(
-                """UPDATE applications SET current_step='awaiting_approval', updated_at=now()
-                     WHERE id=%s AND current_step='autofill_executing'
-                       AND coalesce(job_url,'')=%s AND coalesce(jd_hash,'')=%s;""",
-                (task["application_id"], str(binding.get("application_job_url") or ""),
-                 str(binding.get("application_jd_hash") or "")),
-            )
-            if cur.rowcount == 1:
-                cur.execute(
-                    """INSERT INTO pipeline_events(application_id,from_step,to_step,actor,reason,detail_json)
-                       VALUES (%s,'autofill_executing','awaiting_approval',%s,
-                               'Deterministic autofill ended partial; old capability is terminal and a fresh plan is required.',%s);""",
-                    (task["application_id"], WORKER_ID, Jsonb({"browser_task_id": task["id"]})),
+            try:
+                DEFAULT_PIPELINE_STATE_STORE.transition(
+                    cur, application_id=task["application_id"], expected_from="autofill_executing",
+                    to="awaiting_approval", actor=WORKER_ID,
+                    reason="Deterministic autofill ended partial; old capability is terminal and a fresh plan is required.",
+                    detail={"browser_task_id": task["id"]},
+                    expected_job_url=str(binding.get("application_job_url") or ""),
+                    expected_jd_hash=str(binding.get("application_jd_hash") or ""),
+                    allow_already_target=False,
                 )
-            else:
+            except PipelineStateError:
                 reconcile_reason = (
                     "Application lifecycle changed after partial deterministic browser I/O; "
                     "browser effects require reconciliation and are not replayable."
@@ -1359,23 +1347,20 @@ def durable_close_unstarted_approval(task: Dict[str, Any], binding: Dict[str, An
                 ("Parent autofill closed before browser I/O; delegated child is no longer executable.",
                  task["application_id"], parent_request_id),
             )
-        cur.execute(
-            """UPDATE applications SET current_step='application_form_ready', updated_at=now()
-                 WHERE id=%s AND current_step='awaiting_approval'
-                   AND NOT EXISTS (
-                       SELECT 1 FROM approval_requests ar
-                        WHERE ar.application_id=applications.id AND ar.type='autofill_form'
-                          AND ar.status IN ('pending','approved','executing')
-                          AND ar.token_expires_at > now()
-                   );""",
-            (task["application_id"],),
-        )
-        if cur.rowcount == 1:
-            cur.execute(
-                """INSERT INTO pipeline_events(application_id,from_step,to_step,actor,reason,detail_json)
-                   VALUES (%s,'awaiting_approval','application_form_ready',%s,%s,%s);""",
-                (task["application_id"], WORKER_ID, reason[:500], Jsonb({"browser_task_id": task["id"]})),
+        try:
+            DEFAULT_PIPELINE_STATE_STORE.transition(
+                cur, application_id=task["application_id"], expected_from="awaiting_approval",
+                to="application_form_ready", actor=WORKER_ID, reason=reason[:500],
+                detail={"browser_task_id": task["id"]},
+                guard_sql="""NOT EXISTS (
+                    SELECT 1 FROM approval_requests ar
+                     WHERE ar.application_id=applications.id AND ar.type='autofill_form'
+                       AND ar.status IN ('pending','approved','executing')
+                       AND ar.token_expires_at > now()
+                )""",
             )
+        except PipelineStateError:
+            pass
 
 
 def load_allowed_domains(cur) -> list:

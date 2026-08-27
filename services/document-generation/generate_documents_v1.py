@@ -24,7 +24,6 @@ import json
 import math
 import os
 import re
-import subprocess
 import sys
 import time
 import urllib.error
@@ -64,6 +63,11 @@ from services.common.document_prompt_templates_v1 import (
     material_requirement_summary, requirement_catalog,
 )
 from services.common.config import database_dsn
+from services.control_plane.document_attempts import (
+    DocumentAttemptError, claim as claim_document_attempt,
+    complete as complete_document_attempt, fail as fail_document_attempt,
+)
+from services.runtime.process_runner import DEFAULT_PROCESS_RUNNER
 
 DSN = database_dsn()
 
@@ -987,6 +991,11 @@ def validate_and_render(
 # ---------------------------------------------------------------- persistence
 
 def next_version(cur, application_id: str, doc_type: str) -> int:
+    # Different manifests (for example a human revision arriving while a
+    # fresh-generation run is finishing) may legitimately produce different
+    # documents, but they must never race MAX(version)+1.  This transaction
+    # lock is narrow to one application/document lane and releases on commit.
+    cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s));", (f"jobos-document:{application_id}:{doc_type}",))
     cur.execute(
         "SELECT COALESCE(MAX(version), 0) + 1 FROM generated_documents "
         "WHERE application_id = %s AND doc_type = %s;",
@@ -1056,12 +1065,12 @@ def run_live_project_freshness(*, max_stale_hours: int) -> tuple[bool, str]:
     commit unnoticed.
     """
     script = Path(__file__).resolve().parents[1] / "repo-audit" / "repository_freshness_v1.py"
-    proc = subprocess.run(
+    result = DEFAULT_PROCESS_RUNNER.run(
         [sys.executable, str(script), "pre-resume", "--max-stale-hours", str(max_stale_hours)],
-        cwd=Path(__file__).resolve().parents[2], capture_output=True, text=True, timeout=600,
+        cwd=Path(__file__).resolve().parents[2], timeout_s=600,
     )
-    detail = ((proc.stdout or "") + (proc.stderr or "")).strip()[-4000:]
-    return proc.returncode == 0, detail
+    detail = (result.output + (f"\n{result.start_error}" if result.start_error else "")).strip()[-4000:]
+    return result.ok, detail
 
 
 def database_resume_freshness(cur, *, allow_last_known_good_hours: int | None = None) -> tuple[bool, dict[str, Any], list[str]]:
@@ -1215,6 +1224,57 @@ def main() -> int:
             }[args.doc_type]
             catalog = render_asset_catalog(assets, field=field)
 
+            attempt_id: str | None = None
+            if args.apply:
+                # This is intentionally before *every* model call.  A cover
+                # letter performs alignment calls before its final draft; a
+                # fence below those calls would still permit duplicate work
+                # after a crash.
+                manifest = {
+                    "application_id": app["id"], "doc_type": args.doc_type,
+                    "request_kind": "revision" if revision_context else "generation",
+                    "jd_sha256": hashlib.sha256(app["jd_text"].encode("utf-8")).hexdigest(),
+                    "asset_ids": sorted(valid_ids),
+                    # IDs alone do not identify a mutable approved asset.
+                    # Hash its exact source snapshot and all prompt-bearing
+                    # company/template inputs so changed evidence creates a
+                    # new durable generation identity.
+                    "asset_snapshot_sha256": hashlib.sha256(json.dumps(
+                        assets, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str,
+                    ).encode("utf-8")).hexdigest(),
+                    "company_context_sha256": hashlib.sha256(json.dumps(
+                        app.get("company_context") or {}, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str,
+                    ).encode("utf-8")).hexdigest(),
+                    "resume_template_sha256": hashlib.sha256(json.dumps(
+                        {"subtitles": resume_subtitle_baselines, "bullets": resume_bullet_baselines,
+                         "experience": resume_experience_baselines},
+                        sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str,
+                    ).encode("utf-8")).hexdigest(),
+                    "generator_version": GENERATOR_VERSION,
+                    "model": args.model, "max_bullets": args.max_bullets,
+                    "questions": list(args.question),
+                    "revision_source_document_id": revision_context.get("source_document_id"),
+                    "feedback_sha256": hashlib.sha256(
+                        str(revision_context.get("human_feedback") or "").encode("utf-8")
+                    ).hexdigest() if revision_context else None,
+                }
+                try:
+                    attempt = claim_document_attempt(
+                        cur, application_id=app["id"], doc_type=args.doc_type,
+                        request_kind=str(manifest["request_kind"]), input_manifest=manifest,
+                    )
+                except DocumentAttemptError as exc:
+                    print(f"ERROR: {exc}")
+                    conn.rollback()
+                    return 1
+                if attempt.completed_document_id:
+                    conn.commit()
+                    print("\n===== REUSED DURABLE GENERATION =====")
+                    print(f"generated_document_id: {attempt.completed_document_id}")
+                    return 0
+                attempt_id = attempt.id
+                conn.commit()
+
             cover_alignment_blueprint: dict[str, Any] = {}
             alignment_prompt = ""
             alignment_raw = ""
@@ -1248,6 +1308,11 @@ def main() -> int:
                 except (ValueError, json.JSONDecodeError) as exc:
                     print(f"WARNING: cover-letter alignment candidate extraction was not parseable: {exc}; continuing without a blueprint.")
                     cover_alignment_blueprint = {}
+                except Exception as exc:
+                    if attempt_id:
+                        fail_document_attempt(cur, attempt_id=attempt_id, error=str(exc), uncertain=True)
+                        conn.commit()
+                    raise
                 prompt = build_cover_letter_prompt(app, catalog, cover_alignment_blueprint)
             else:
                 prompt = build_short_answer_prompt(app, catalog, args.question)
@@ -1278,10 +1343,16 @@ def main() -> int:
                 print("===== END PROMPT =====\n")
 
             start = time.perf_counter()
-            raw = ollama_generate(
-                model=args.model, prompt=prompt, ollama_url=args.ollama_url,
-                timeout=args.timeout, temperature=args.temperature, num_ctx=args.ctx,
-            )
+            try:
+                raw = ollama_generate(
+                    model=args.model, prompt=prompt, ollama_url=args.ollama_url,
+                    timeout=args.timeout, temperature=args.temperature, num_ctx=args.ctx,
+                )
+            except Exception as exc:
+                if args.apply and attempt_id:
+                    fail_document_attempt(cur, attempt_id=attempt_id, error=str(exc), uncertain=True)
+                    conn.commit()
+                raise
             elapsed = time.perf_counter() - start
             emit_trace(
                 make_trace_id("docgen", app["id"], args.doc_type),
@@ -1347,7 +1418,12 @@ def main() -> int:
 
             if not content.strip():
                 print("\nNothing grounded survived validation. Not saving.")
-                conn.rollback()
+                if args.apply and attempt_id:
+                    fail_document_attempt(
+                        cur, attempt_id=attempt_id,
+                        error="No grounded document content survived deterministic validation.",
+                    )
+                    conn.commit()
                 return 1
 
             if not args.apply:
@@ -1361,6 +1437,8 @@ def main() -> int:
                 content=content, asset_ids=used, evidence_map=evidence,
                 model=args.model, role_family=app["role_family"], version=version,
             )
+            if attempt_id:
+                complete_document_attempt(cur, attempt_id=attempt_id, document_id=doc_id)
             insert_component_run(
                 cur,
                 component=COMPONENT_BY_DOC_TYPE[args.doc_type],

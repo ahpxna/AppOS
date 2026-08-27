@@ -28,6 +28,9 @@ from typing import Any, Iterator
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+from services.runtime.openclaw_runtime import GlobalOpenClawForbiddenError, resolve_managed_openclaw
 BOOTSTRAP_PATH = REPO_ROOT / "scripts" / "openclaw_bootstrap.py"
 RUNTIME_INSTALLER = REPO_ROOT / "scripts" / "install_openclaw_runtime.py"
 REQUIRED_AGENTS = {"main", "resume", "cover_letter", "repo_coordinator", "linkedin_discovery"}
@@ -272,7 +275,7 @@ def main() -> int:
     parser.add_argument("--env-file", type=Path, default=REPO_ROOT / ".env")
     parser.add_argument("--secrets-file", type=Path, help="Optional OpenClaw-only secrets file.")
     parser.add_argument("--cdp-url", help="Override remote Chrome CDP URL for this setup.")
-    parser.add_argument("--openclaw-bin", help="Override the private OpenClaw binary (normally unnecessary).")
+    parser.add_argument("--openclaw-bin", help="Compatibility option; it must resolve to JobOS's managed OpenClaw binary.")
     parser.add_argument("--install-runtime", action="store_true",
                         help="Download and verify the pinned private Node/OpenClaw runtime before rendering config.")
     parser.add_argument("--force", action="store_true", help="Refresh an existing generated OpenClaw home with backups.")
@@ -291,9 +294,18 @@ def main() -> int:
             print(json.dumps({"status": "error", "stage": "private_openclaw_runtime", "error": str(exc)}, indent=2))
             return 1
     private_runtime_bin = REPO_ROOT / "data" / "openclaw-runtime" / "node" / "node_modules" / ".bin" / "openclaw"
-    args.openclaw_bin = args.openclaw_bin or os.getenv("OPENCLAW_BIN") or (
-        str(private_runtime_bin) if private_runtime_bin.is_file() else "openclaw"
-    )
+    try:
+        resolved_runtime = resolve_managed_openclaw(required=False)
+        expected_runtime = (resolved_runtime or private_runtime_bin).resolve(strict=False)
+        supplied = args.openclaw_bin or os.getenv("OPENCLAW_BIN")
+        if supplied and Path(supplied).expanduser().resolve(strict=False) != expected_runtime:
+            raise GlobalOpenClawForbiddenError(
+                "--openclaw-bin/OPENCLAW_BIN must resolve to JobOS's managed runtime; global overrides are forbidden."
+            )
+        args.openclaw_bin = str(expected_runtime)
+    except GlobalOpenClawForbiddenError as exc:
+        print(json.dumps({"status": "error", "stage": "managed_openclaw_policy", "error": str(exc)}, indent=2))
+        return 1
 
     target_home = args.target_home
     if target_home is None:

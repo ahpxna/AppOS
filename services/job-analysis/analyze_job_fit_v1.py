@@ -25,6 +25,7 @@ from services.common.observability import emit_trace, make_trace_id
 from services.common.llm_gateway import generate_text
 from services.common.model_config import get_model
 from services.common.config import database_dsn
+from services.ats.contracts import canonical_job_url
 
 DSN = database_dsn()
 
@@ -166,6 +167,7 @@ def get_or_create_application(
     if not jd_text:
         raise RuntimeError("Either --application-id or --jd-file is required.")
 
+    job_url = canonical_job_url(job_url)
     jd_hash = sha256_text(jd_text)
 
     cur.execute(
@@ -235,8 +237,8 @@ def get_or_create_application(
             )
             VALUES (
               %s, %s, %s, %s, %s, %s,
-              'jd_ingested',
-              'new',
+              'intake',
+              'active',
               now(),
               now()
             )
