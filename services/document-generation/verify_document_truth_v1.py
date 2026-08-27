@@ -69,6 +69,7 @@ from services.common.document_prompt_templates_v1 import (
     requirement_catalog,
 )
 from services.common.config import database_dsn
+from services.common.value_coercion import coerce_bool
 
 VERIFIER_VERSION = "truth_quality_checker_v5_selected_fit_soft_degrade_2026_08_25"
 DEFAULT_OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
@@ -357,7 +358,7 @@ def verify_claims(
         raw_company_urls = c.get("company_source_urls") or []
         company_urls = [url for url in raw_company_urls if isinstance(url, str)] \
             if isinstance(raw_company_urls, list) else []
-        uses_company_context = bool(c.get("uses_company_context")) or bool(company_urls)
+        uses_company_context = coerce_bool(c.get("uses_company_context")) or bool(company_urls)
         company_evidence = {
             "uses_company_context": uses_company_context,
             "company_source_urls": company_urls,

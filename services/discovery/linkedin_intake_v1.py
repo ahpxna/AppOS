@@ -207,9 +207,12 @@ def cmd_ingest_task(cur, args) -> int:
         raise IntakeError("Browser task not found.")
     if row[0] != "completed":
         raise IntakeError(f"Browser task is {row[0]!r}: {row[3] or 'not completed yet'}")
-    payload = row[1] or {}
-    result = row[2] or {}
-    jd_text = extract_text(result.get("agent_response"))
+    payload = row[1] if isinstance(row[1], dict) else {}
+    # Browser result envelopes have changed shape across workers/releases.  The
+    # recursive extractor already understands text/parsed/result/payloads/meta,
+    # so feed it the entire result instead of assuming an ``agent_response``
+    # object exists at one exact level.
+    jd_text = extract_text(row[2] or {})
     if "login" in jd_text.lower() and len(jd_text) < 500:
         raise IntakeError("Browser reported a login wall; paste an exported/reviewed JD instead.")
     app_id = intake(cur, company=args.company, title=args.title,
@@ -224,22 +227,44 @@ def cmd_import(cur, args) -> int:
     """Preview or commit a user-reviewed LinkedIn JSON export."""
     if not feature_enabled("JOBOS_LINKEDIN_MANUAL_INTAKE_ENABLED"):
         raise IntakeError("LinkedIn manual/search-assisted intake is disabled by configuration.")
-    raw = json.loads(Path(args.file).read_text(encoding="utf-8"))
-    records = raw if isinstance(raw, list) else raw.get("jobs", [])
+    try:
+        raw = json.loads(Path(args.file).read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise IntakeError(f"Import file is not valid JSON: {exc.msg}.") from exc
+    if isinstance(raw, list):
+        records = raw
+    elif isinstance(raw, dict):
+        records = raw.get("jobs", [])
+    else:
+        raise IntakeError("Import file must be a JSON array or {\"jobs\": [...]} object.")
     if not isinstance(records, list):
-        raise IntakeError("Import file must be a JSON array or {\"jobs\": [...]}.")
-    created = duplicates = 0
-    for item in records:
-        app_id = intake(cur, company=item.get("company", ""), title=item.get("title", ""),
-                        url=item.get("url") or item.get("job_url", ""),
-                        jd_text=item.get("jd_text") or item.get("description", ""),
-                        location=item.get("location", ""), work_mode=item.get("work_mode", ""),
-                        source="linkedin_export_user_reviewed")
+        raise IntakeError("Import file must contain a jobs array.")
+    created = duplicates = invalid = 0
+    warnings: list[str] = []
+    for position, item in enumerate(records, start=1):
+        if not isinstance(item, dict):
+            invalid += 1
+            warnings.append(f"record {position}: expected an object")
+            continue
+        try:
+            app_id = intake(cur, company=item.get("company", ""), title=item.get("title", ""),
+                            url=item.get("url") or item.get("job_url", ""),
+                            jd_text=item.get("jd_text") or item.get("description", ""),
+                            location=item.get("location", ""), work_mode=item.get("work_mode", ""),
+                            source="linkedin_export_user_reviewed")
+        except (IntakeError, LinkedInDiscoveryError, TypeError) as exc:
+            # One incomplete reviewed record should not discard every other
+            # valid record in the same import.  Keep the safety boundary (the
+            # invalid record is never stored), report it, and continue.
+            invalid += 1
+            warnings.append(f"record {position}: {exc}")
+            continue
         if app_id:
             created += 1
         else:
             duplicates += 1
-    print(json.dumps({"created": created, "duplicates": duplicates, "apply": args.apply}, indent=2))
+    print(json.dumps({"created": created, "duplicates": duplicates, "invalid": invalid,
+                      "warnings": warnings, "apply": args.apply}, indent=2))
     return 0
 
 

@@ -58,6 +58,7 @@ from services.common.observability import emit_trace, make_trace_id
 from services.common.llm_gateway import generate_text
 from services.common.model_config import get_model
 from services.common.config import database_dsn
+from services.common.value_coercion import coerce_bool
 
 WRITER_VERSION = "reply_writer_v1_asset_grounded_2026_07_29"
 CLASSIFIER_VERSION = "message_classifier_v1_2026_07_29"
@@ -326,7 +327,8 @@ def cmd_classify(conn, args) -> int:
 
             print(f"\n  {subject or '(no subject)'}")
             print(f"    -> {label}  ({conf:.2f})  {parsed.get('reason','')[:80]}")
-            if parsed.get("contains_instructions_to_ai"):
+            contains_ai_instructions = coerce_bool(parsed.get("contains_instructions_to_ai"))
+            if contains_ai_instructions:
                 print("    NOTE: message appears to contain instructions aimed "
                       "at an AI. Treated as data; flagging for review.")
             if meta["needs_human"]:
@@ -342,7 +344,7 @@ def cmd_classify(conn, args) -> int:
                     WHERE id = %s;
                     """,
                     (label, conf, CLASSIFIER_VERSION,
-                     meta["needs_human"] or bool(parsed.get("contains_instructions_to_ai")),
+                     meta["needs_human"] or contains_ai_instructions,
                      tid),
                 )
                 cur.execute(
@@ -393,6 +395,27 @@ Rules for the reply:
 """
 
 
+def derive_reply_subject(history: List[Dict[str, Any]]) -> Tuple[str, Optional[str]]:
+    """Bind the outbound subject to an existing message instead of model prose.
+
+    Subject lines are user-visible and sent to the recruiter, so they must not
+    bypass the body truth checker.  Reuse the newest existing subject exactly
+    (apart from whitespace/control cleanup and a deterministic ``Re:`` prefix).
+    If the thread has no subject, use a neutral non-factual fallback.
+    """
+    for message in reversed(history or []):
+        raw = str(message.get("subject") or "") if isinstance(message, dict) else ""
+        subject = re.sub(r"[\r\n\t]+", " ", raw)
+        subject = re.sub(r"\s+", " ", subject).strip()
+        if not subject:
+            continue
+        subject = subject[:280].rstrip()
+        if re.match(r"^(?:re|fw|fwd)\s*:", subject, flags=re.IGNORECASE):
+            return subject, str(message.get("id") or "") or None
+        return f"Re: {subject}"[:300].rstrip(), str(message.get("id") or "") or None
+    return "Re: Application", None
+
+
 def build_reply_prompt(thread, history, assets, classification) -> str:
     catalog = "\n".join(
         f"[ASSET {a['id']}] {a['title']} ({a['type']})\n"
@@ -427,9 +450,11 @@ CONTEXT
 APPROVED ASSETS (the only support available for factual claims):
 {catalog or '(none approved)'}
 
+The outbound email subject is derived deterministically from the existing thread;
+do not create or modify a subject line.
+
 Return ONLY valid JSON:
 {{
-  "subject": "reply subject line",
   "sentences": [
     {{
       "text": "one sentence",
@@ -907,10 +932,15 @@ def cmd_draft(conn, args) -> int:
 
         parsed = extract_json_object(raw)
         body, used, evidence = validate_reply(parsed, valid_ids)
+        reply_subject, subject_source_message_id = derive_reply_subject(history)
+        evidence["subject_binding"] = {
+            "source_message_id": subject_source_message_id,
+            "mode": "thread_subject" if subject_source_message_id else "neutral_fallback",
+        }
 
         print(f"\n  elapsed: {elapsed:.1f}s   assets cited: {len(used)}   "
               f"dropped: {len(evidence['dropped_ungrounded_claims'])}")
-        print(f"\n  Subject: {parsed.get('subject','')}\n")
+        print(f"\n  Subject: {reply_subject}\n")
         print("  " + (body or "(empty -- every claim was ungrounded)"))
 
         for d in evidence["dropped_ungrounded_claims"]:
@@ -950,7 +980,7 @@ def cmd_draft(conn, args) -> int:
             RETURNING id::text;
             """,
             (args.thread_id, history[-1]["id"], thread["application_id"],
-             parsed.get("subject", ""), body, classification,
+             reply_subject, body, classification,
              Jsonb(used), Jsonb(evidence), WRITER_VERSION, args.model, version),
         )
         reply_id = cur.fetchone()[0]
@@ -972,7 +1002,7 @@ def cmd_draft(conn, args) -> int:
         create_send_message_approval(
             cur, reply_id=reply_id, thread_id=args.thread_id,
             application_id=thread["application_id"], company=thread["company"],
-            subject=parsed.get("subject", ""), body_text=body,
+            subject=reply_subject, body_text=body,
             evidence_map=evidence, asset_ids_used=used,
         )
         conn.commit()

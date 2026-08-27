@@ -66,6 +66,7 @@ from services.common.document_prompt_templates_v1 import (
     material_requirement_summary, requirement_catalog,
 )
 from services.common.config import database_dsn
+from services.common.value_coercion import coerce_bool
 from services.control_plane.document_attempts import (
     DocumentAttemptError, claim as claim_document_attempt,
     complete as complete_document_attempt, fail as fail_document_attempt,
@@ -825,7 +826,7 @@ def validate_and_render(
                     requested_urls = sentence.get("company_source_urls") or []
                     company_urls = [url for url in requested_urls if isinstance(url, str)] if isinstance(requested_urls, list) else []
                     invalid_urls = [url for url in company_urls if url not in valid_company_urls]
-                    uses_company_context = bool(sentence.get("uses_company_context")) or bool(company_urls)
+                    uses_company_context = coerce_bool(sentence.get("uses_company_context")) or bool(company_urls)
                     company_insight = " ".join(str(sentence.get("company_insight") or "").split())
                     company_evidence_quote = " ".join(str(sentence.get("company_evidence_quote") or "").split())
 
@@ -925,7 +926,7 @@ def validate_and_render(
                     requested_urls = []
                 company_urls = [url for url in requested_urls if isinstance(url, str)]
                 invalid_urls = [url for url in company_urls if url not in valid_company_urls]
-                uses_company_context = bool(p.get("uses_company_context")) or bool(company_urls)
+                uses_company_context = coerce_bool(p.get("uses_company_context")) or bool(company_urls)
                 if invalid_urls:
                     dropped.append(f"{text[:70]}... (cited unknown company URL)")
                     continue
@@ -1025,7 +1026,7 @@ def validate_and_render(
                     "missing_information": "Not enough reliable information was available to answer safely.",
                 })
                 continue
-            if not bool(answer.get("answerable", False)):
+            if not coerce_bool(answer.get("answerable", False)):
                 missing = str(answer.get("missing_information") or "").strip() or "Additional user information is required."
                 lines.append(f"### {q}\n\n[NEEDS USER INPUT] {missing}")
                 evidence["claims"].append({

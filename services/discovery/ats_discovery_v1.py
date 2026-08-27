@@ -51,6 +51,7 @@ import psycopg
 from psycopg.types.json import Jsonb
 from services.discovery.immigration_intelligence import record_jd_immigration_assessment
 from services.common.config import database_dsn
+from services.common.value_coercion import coerce_bool
 from services.ats.contracts import canonical_job_url, jd_is_complete, normalize_work_mode
 from services.ats.http_client import DiscoveryHttpError, get_json
 from services.ats.public_page import PublicPageDiscoveryError, fetch_public_job_board
@@ -165,25 +166,44 @@ def build_jd_text(*, title: str, company: str, location: str,
 # Each adapter returns a list of normalized dicts:
 #   {external_id, title, location, department, remote, url, jd_text}
 
+
+def _mapping(value: Any) -> Dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _object_list(value: Any) -> List[Dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, dict)]
+
+
+def _text(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return str(value)
+    return ""
+
+
 def fetch_greenhouse(slug: str) -> List[Dict[str, Any]]:
-    data = http_get_json(
+    data = _mapping(http_get_json(
         f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs?content=true"
-    )
+    ))
     out = []
-    for j in data.get("jobs", []) or []:
-        location = ((j.get("location") or {}).get("name") or "").strip()
-        departments = j.get("departments") or []
-        department = departments[0].get("name", "") if departments else ""
-        body = html_to_text(j.get("content", ""))
+    for j in _object_list(data.get("jobs")):
+        location = _text(_mapping(j.get("location")).get("name"))
+        departments = _object_list(j.get("departments"))
+        department = _text(departments[0].get("name")) if departments else ""
+        body = html_to_text(_text(j.get("content")))
         out.append({
-            "external_id": str(j.get("id")),
-            "title": j.get("title", "").strip(),
+            "external_id": _text(j.get("id")),
+            "title": _text(j.get("title")),
             "location": location,
             "department": department,
             "remote": "remote" in location.lower(),
-            "url": j.get("absolute_url", ""),
+            "url": _text(j.get("absolute_url")),
             "jd_text": build_jd_text(
-                title=j.get("title", ""), company=slug, location=location,
+                title=_text(j.get("title")), company=slug, location=location,
                 department=department, body=body,
             ),
         })
@@ -191,27 +211,27 @@ def fetch_greenhouse(slug: str) -> List[Dict[str, Any]]:
 
 
 def fetch_lever(slug: str) -> List[Dict[str, Any]]:
-    data = http_get_json(f"https://api.lever.co/v0/postings/{slug}?mode=json")
+    data = _object_list(http_get_json(f"https://api.lever.co/v0/postings/{slug}?mode=json"))
     out = []
-    for j in data or []:
-        categories = j.get("categories") or {}
-        location = (categories.get("location") or "").strip()
-        department = (categories.get("team") or categories.get("department") or "").strip()
-        body = j.get("descriptionPlain") or html_to_text(j.get("description", ""))
-        lists = j.get("lists") or []
+    for j in data:
+        categories = _mapping(j.get("categories"))
+        location = _text(categories.get("location"))
+        department = _text(categories.get("team") or categories.get("department"))
+        body = _text(j.get("descriptionPlain")) or html_to_text(_text(j.get("description")))
+        lists = _object_list(j.get("lists"))
         extra = "\n\n".join(
-            f"{blk.get('text', '')}\n{html_to_text(blk.get('content', ''))}"
-            for blk in lists if isinstance(blk, dict)
+            f"{_text(blk.get('text'))}\n{html_to_text(_text(blk.get('content')))}"
+            for blk in lists
         )
         out.append({
-            "external_id": str(j.get("id")),
-            "title": j.get("text", "").strip(),
+            "external_id": _text(j.get("id")),
+            "title": _text(j.get("text")),
             "location": location,
             "department": department,
             "remote": "remote" in location.lower(),
-            "url": j.get("hostedUrl", ""),
+            "url": _text(j.get("hostedUrl")),
             "jd_text": build_jd_text(
-                title=j.get("text", ""), company=slug, location=location,
+                title=_text(j.get("text")), company=slug, location=location,
                 department=department, body=(body + "\n\n" + extra).strip(),
             ),
         })
@@ -219,22 +239,22 @@ def fetch_lever(slug: str) -> List[Dict[str, Any]]:
 
 
 def fetch_ashby(slug: str) -> List[Dict[str, Any]]:
-    data = http_get_json(f"https://api.ashbyhq.com/posting-api/job-board/{slug}")
+    data = _mapping(http_get_json(f"https://api.ashbyhq.com/posting-api/job-board/{slug}"))
     out = []
-    for j in data.get("jobs", []) or []:
-        location = (j.get("location") or j.get("locationName") or "").strip()
-        department = (j.get("department") or j.get("team") or "").strip()
-        body = html_to_text(j.get("descriptionHtml", "")) or j.get("descriptionPlain", "")
-        url = j.get("jobUrl") or j.get("applyUrl", "")
+    for j in _object_list(data.get("jobs")):
+        location = _text(j.get("location") or j.get("locationName"))
+        department = _text(j.get("department") or j.get("team"))
+        body = html_to_text(_text(j.get("descriptionHtml"))) or _text(j.get("descriptionPlain"))
+        url = _text(j.get("jobUrl") or j.get("applyUrl"))
         out.append({
             "external_id": str(j.get("id", "")),
-            "title": (j.get("title") or "").strip(),
+            "title": _text(j.get("title")),
             "location": location,
             "department": department,
-            "remote": bool(j.get("isRemote")) or "remote" in location.lower(),
+            "remote": coerce_bool(j.get("isRemote")) or "remote" in location.lower(),
             "url": url,
             "jd_text": build_jd_text(
-                title=j.get("title", ""), company=slug, location=location,
+                title=_text(j.get("title")), company=slug, location=location,
                 department=department, body=body,
             ),
         })
@@ -242,38 +262,40 @@ def fetch_ashby(slug: str) -> List[Dict[str, Any]]:
 
 
 def fetch_smartrecruiters(slug: str, *, with_details: bool = False) -> List[Dict[str, Any]]:
-    data = http_get_json(f"https://api.smartrecruiters.com/v1/companies/{slug}/postings")
+    data = _mapping(http_get_json(f"https://api.smartrecruiters.com/v1/companies/{slug}/postings"))
     out = []
-    for position, j in enumerate(data.get("content", []) or []):
-        loc = j.get("location") or {}
-        location = ", ".join(p for p in (loc.get("city"), loc.get("region"), loc.get("country")) if p)
-        department = ((j.get("department") or {}).get("label")
-                     or (j.get("function") or {}).get("label") or "")
-        job_id = j.get("id", "")
-        url = j.get("applyUrl") or j.get("postingUrl") or ""
+    for position, j in enumerate(_object_list(data.get("content"))):
+        loc = _mapping(j.get("location"))
+        location = ", ".join(
+            p for p in (_text(loc.get("city")), _text(loc.get("region")), _text(loc.get("country"))) if p
+        )
+        department = (_text(_mapping(j.get("department")).get("label"))
+                     or _text(_mapping(j.get("function")).get("label")))
+        job_id = _text(j.get("id"))
+        url = _text(j.get("applyUrl") or j.get("postingUrl"))
         body = ""
         if with_details and job_id and position < DETAIL_REQUEST_BUDGET:
             try:
-                detail = http_get_json(
+                detail = _mapping(http_get_json(
                     f"https://api.smartrecruiters.com/v1/companies/{slug}/postings/{job_id}"
-                )
-                sections = (detail.get("jobAd") or {}).get("sections") or {}
+                ))
+                sections = _mapping(_mapping(detail.get("jobAd")).get("sections"))
                 body = "\n\n".join(
-                    html_to_text((sections.get(k) or {}).get("text", ""))
+                    html_to_text(_text(_mapping(sections.get(k)).get("text")))
                     for k in ("jobDescription", "qualifications", "additionalInformation")
-                    if sections.get(k)
+                    if _mapping(sections.get(k))
                 )
             except DiscoveryError:
                 body = ""
         out.append({
             "external_id": str(job_id),
-            "title": j.get("name", "").strip(),
+            "title": _text(j.get("name")),
             "location": location,
             "department": department,
-            "remote": bool(loc.get("remote")) or "remote" in location.lower(),
+            "remote": coerce_bool(loc.get("remote")) or "remote" in location.lower(),
             "url": url,
             "jd_text": build_jd_text(
-                title=j.get("name", ""), company=slug, location=location,
+                title=_text(j.get("name")), company=slug, location=location,
                 department=department,
                 body=body or "(full description not fetched -- use --with-details)",
             ),
@@ -282,21 +304,21 @@ def fetch_smartrecruiters(slug: str, *, with_details: bool = False) -> List[Dict
 
 
 def fetch_recruitee(slug: str) -> List[Dict[str, Any]]:
-    data = http_get_json(f"https://{slug}.recruitee.com/api/offers/")
+    data = _mapping(http_get_json(f"https://{slug}.recruitee.com/api/offers/"))
     out = []
-    for j in data.get("offers", []) or []:
-        location = j.get("location", "") or j.get("city", "") or ""
-        department = j.get("department", "") or ""
-        body = html_to_text(j.get("description", "")) + "\n\n" + html_to_text(j.get("requirements", ""))
+    for j in _object_list(data.get("offers")):
+        location = _text(j.get("location") or j.get("city"))
+        department = _text(j.get("department"))
+        body = html_to_text(_text(j.get("description"))) + "\n\n" + html_to_text(_text(j.get("requirements")))
         out.append({
-            "external_id": str(j.get("id")),
-            "title": j.get("title", "").strip(),
+            "external_id": _text(j.get("id")),
+            "title": _text(j.get("title")),
             "location": location,
             "department": department,
-            "remote": bool(j.get("remote")) or "remote" in location.lower(),
-            "url": j.get("careers_url", ""),
+            "remote": coerce_bool(j.get("remote")) or "remote" in location.lower(),
+            "url": _text(j.get("careers_url")),
             "jd_text": build_jd_text(
-                title=j.get("title", ""), company=slug, location=location,
+                title=_text(j.get("title")), company=slug, location=location,
                 department=department, body=body.strip(),
             ),
         })
@@ -304,33 +326,33 @@ def fetch_recruitee(slug: str) -> List[Dict[str, Any]]:
 
 
 def fetch_workable(slug: str, *, with_details: bool = False) -> List[Dict[str, Any]]:
-    data = http_get_json(f"https://apply.workable.com/api/v1/widget/accounts/{slug}")
+    data = _mapping(http_get_json(f"https://apply.workable.com/api/v1/widget/accounts/{slug}"))
     out = []
-    for position, j in enumerate(data.get("jobs", []) or []):
-        loc = j.get("location") or {}
+    for position, j in enumerate(_object_list(data.get("jobs"))):
+        loc = _mapping(j.get("location"))
         location = ", ".join(
-            p for p in (loc.get("city"), loc.get("region"), loc.get("country")) if p
+            p for p in (_text(loc.get("city")), _text(loc.get("region")), _text(loc.get("country"))) if p
         )
-        department = j.get("department", "") or ""
-        shortcode = j.get("shortcode", "")
+        department = _text(j.get("department"))
+        shortcode = _text(j.get("shortcode"))
         body = ""
         if with_details and shortcode and position < DETAIL_REQUEST_BUDGET:
             try:
-                detail = http_get_json(
+                detail = _mapping(http_get_json(
                     f"https://apply.workable.com/api/v1/widget/accounts/{slug}/jobs/{shortcode}"
-                )
-                body = html_to_text(detail.get("description", ""))
+                ))
+                body = html_to_text(_text(detail.get("description")))
             except DiscoveryError:
                 body = ""
         out.append({
-            "external_id": shortcode or j.get("title", ""),
-            "title": j.get("title", "").strip(),
+            "external_id": shortcode or _text(j.get("title")),
+            "title": _text(j.get("title")),
             "location": location,
             "department": department,
-            "remote": bool(loc.get("remote")) or "remote" in location.lower(),
-            "url": j.get("url", ""),
+            "remote": coerce_bool(loc.get("remote")) or "remote" in location.lower(),
+            "url": _text(j.get("url")),
             "jd_text": build_jd_text(
-                title=j.get("title", ""), company=slug, location=location,
+                title=_text(j.get("title")), company=slug, location=location,
                 department=department,
                 body=body or "(full description not fetched -- use --with-details)",
             ),
@@ -339,22 +361,22 @@ def fetch_workable(slug: str, *, with_details: bool = False) -> List[Dict[str, A
 
 
 def fetch_breezy(slug: str) -> List[Dict[str, Any]]:
-    data = http_get_json(f"https://{slug}.breezy.hr/json")
+    data = _object_list(http_get_json(f"https://{slug}.breezy.hr/json"))
     out = []
-    for j in data or []:
-        loc = j.get("location") or {}
-        location = loc.get("name", "") if isinstance(loc, dict) else str(loc or "")
-        department = j.get("department", "") or j.get("type", "") or ""
-        body = html_to_text(j.get("description", ""))
+    for j in data:
+        loc = _mapping(j.get("location"))
+        location = _text(loc.get("name"))
+        department = _text(j.get("department") or j.get("type"))
+        body = html_to_text(_text(j.get("description")))
         out.append({
-            "external_id": str(j.get("_id") or j.get("id", "")),
-            "title": j.get("name", "").strip(),
+            "external_id": _text(j.get("_id") or j.get("id")),
+            "title": _text(j.get("name")),
             "location": location,
             "department": department,
             "remote": "remote" in location.lower(),
-            "url": j.get("url", ""),
+            "url": _text(j.get("url")),
             "jd_text": build_jd_text(
-                title=j.get("name", ""), company=slug, location=location,
+                title=_text(j.get("name")), company=slug, location=location,
                 department=department, body=body,
             ),
         })

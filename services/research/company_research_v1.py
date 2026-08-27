@@ -48,12 +48,14 @@ import subprocess
 import sys
 import time
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlsplit
 
 import psycopg
 from psycopg.types.json import Jsonb
 
 from services.common.observability import emit_trace, make_trace_id
 from services.common.config import database_dsn
+from services.ats.registry import detect_ats_platform
 
 from services.common.openclaw_runtime import resolve_openclaw_binary
 
@@ -160,7 +162,55 @@ def extract_json_object(raw: str) -> Dict[str, Any]:
 
 # ---------------------------------------------------------------- prompt
 
+_SHARED_JOB_HOST_SUFFIXES = (
+    "linkedin.com", "indeed.com", "ziprecruiter.com", "glassdoor.com",
+    "dice.com", "wellfound.com",
+)
+
+
+def normalize_domain_hint(value: Any) -> str:
+    """Return a bare lower-case host from a user/application domain hint."""
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    parsed = urlsplit(raw if "://" in raw else f"https://{raw}")
+    host = (parsed.hostname or "").strip(".").casefold()
+    return host[4:] if host.startswith("www.") else host
+
+
+def _host_matches(host: str, suffix: str) -> bool:
+    return host == suffix or host.endswith("." + suffix)
+
+
+def company_domain_hint_from_job_url(job_url: Any) -> Optional[str]:
+    """Use a job URL as a company-domain hint only when it is employer-owned.
+
+    Shared ATS/job-board hosts identify the application system, not the
+    employer. Feeding ``boards.greenhouse.io`` or ``jobs.lever.co`` to company
+    research as the company's website steers search toward the wrong entity and
+    also corrupts the self-source risk boundary.
+    """
+    raw = str(job_url or "").strip()
+    if not raw:
+        return None
+    host = normalize_domain_hint(raw)
+    if not host:
+        return None
+    if detect_ats_platform(raw) != "custom":
+        return None
+    if any(_host_matches(host, suffix) for suffix in _SHARED_JOB_HOST_SUFFIXES):
+        return None
+    return host
+
+
+def _url_is_on_domain(url: Any, domain: str) -> bool:
+    host = normalize_domain_hint(url)
+    domain = normalize_domain_hint(domain)
+    return bool(host and domain and _host_matches(host, domain))
+
+
 def build_research_prompt(company: str, domain: Optional[str]) -> str:
+    domain = normalize_domain_hint(domain) or None
     target = f"{company}" + (f" (website: {domain})" if domain else "")
     return f"""Research this company for a job applicant: {target}
 
@@ -253,7 +303,7 @@ def _validated_field_evidence(
     return out
 
 
-def validate(parsed: Dict[str, Any]) -> Dict[str, Any]:
+def validate(parsed: Dict[str, Any], *, expected_domain: Optional[str] = None) -> Dict[str, Any]:
     """Normalize research and require per-claim provenance promised by the prompt.
 
     Source URLs alone are not evidence for a generated company fact. New
@@ -268,7 +318,8 @@ def validate(parsed: Dict[str, Any]) -> Dict[str, Any]:
     dropped: List[str] = []
     field_evidence = _validated_field_evidence(parsed, source_set, dropped)
 
-    company_domain = str(parsed.get("company_domain") or "").strip().lower()
+    expected_domain = normalize_domain_hint(expected_domain)
+    company_domain = expected_domain or normalize_domain_hint(parsed.get("company_domain"))
 
     fields: Dict[str, str] = {}
     for field in ("summary", "mission", "products"):
@@ -304,7 +355,7 @@ def validate(parsed: Dict[str, Any]) -> Dict[str, Any]:
         if url not in source_set:
             dropped.append(f"risk (unsourced): {str(item)[:80]}")
             continue
-        if company_domain and company_domain in url.lower():
+        if company_domain and _url_is_on_domain(url, company_domain):
             dropped.append(f"risk (self-sourced to {company_domain}): {item.get('risk','')}")
             continue
         quote = " ".join(str(item.get("supporting_quote") or "").split())
@@ -390,12 +441,7 @@ def company_for_application(cur, application_id: str) -> tuple:
     r = cur.fetchone()
     if not r:
         raise RuntimeError(f"Application not found: {application_id}")
-    domain = None
-    if r[1]:
-        m = re.search(r"https?://([^/]+)", r[1])
-        if m:
-            domain = m.group(1)
-    return r[0], domain
+    return r[0], company_domain_hint_from_job_url(r[1])
 
 
 # ---------------------------------------------------------------- main
@@ -434,7 +480,7 @@ def research_company(conn, company: str, domain: Optional[str], args) -> int:
         )
 
         parsed = extract_json_object(raw)
-        data = validate(parsed)
+        data = validate(parsed, expected_domain=domain)
 
         print(f"\n  elapsed:  {elapsed:.1f}s")
         print(f"  domain:   {data['company_domain'] or '(none)'}")

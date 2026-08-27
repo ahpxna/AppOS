@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 
 from services.common.company_research_sources import company_research_source_urls
@@ -333,3 +334,206 @@ def test_company_research_generated_fields_require_quote_bindings_but_degrade_in
     })
     assert grounded["summary"] == "Grounded summary"
     assert grounded["field_evidence"]["summary"][0]["source_url"] == source
+
+
+def test_external_boolean_coercion_does_not_treat_string_false_as_true():
+    from services.common.value_coercion import coerce_bool
+
+    assert coerce_bool(False) is False
+    assert coerce_bool("false") is False
+    assert coerce_bool("0") is False
+    assert coerce_bool("no") is False
+    assert coerce_bool(True) is True
+    assert coerce_bool("true") is True
+    assert coerce_bool("1") is True
+    assert coerce_bool("yes") is True
+    assert coerce_bool("definitely") is False
+
+
+def test_company_research_application_domain_ignores_shared_ats_and_binds_real_hint():
+    research = _load("audit_company_domain_binding", "services/research/company_research_v1.py")
+
+    class Cur:
+        def __init__(self, url):
+            self.url = url
+
+        def execute(self, *_args, **_kwargs):
+            return None
+
+        def fetchone(self):
+            return ("Acme Security", self.url)
+
+    assert research.company_for_application(
+        Cur("https://boards.greenhouse.io/acme/jobs/123"), "app-1"
+    ) == ("Acme Security", None)
+    assert research.company_for_application(
+        Cur("https://jobs.lever.co/acme/abc"), "app-1"
+    ) == ("Acme Security", None)
+    assert research.company_for_application(
+        Cur("https://careers.acme.example/jobs/123"), "app-1"
+    ) == ("Acme Security", "careers.acme.example")
+
+    parsed = {
+        "company_domain": "model-spoofed.example",
+        "summary": "",
+        "mission": "",
+        "products": "",
+        "sources": ["https://acme.example/blog/layoffs"],
+        "recent_news": [],
+        "risks": [{
+            "risk": "Layoffs",
+            "detail": "Reported on the company blog.",
+            "source_url": "https://acme.example/blog/layoffs",
+            "supporting_quote": "workforce reduction",
+        }],
+    }
+    validated = research.validate(parsed, expected_domain="https://www.acme.example/about")
+    assert validated["company_domain"] == "acme.example"
+    assert validated["risks"] == []
+    assert any("self-sourced" in item for item in validated["dropped_unsourced"])
+
+
+def test_reply_subject_is_derived_from_thread_and_model_cannot_invent_it():
+    messaging = _load("audit_reply_subject_binding", "services/messaging/message_reply_v1.py")
+    history = [{
+        "id": "m-1", "direction": "inbound", "sender": "recruiter@example.com",
+        "subject": "Interview next steps\r\nInjected-Header: nope", "body": "Hello", "at": "now",
+    }]
+    subject, source_id = messaging.derive_reply_subject(history)
+    assert subject == "Re: Interview next steps Injected-Header: nope"
+    assert source_id == "m-1"
+    prompt = messaging.build_reply_prompt(
+        {"company": "Acme", "person_name": "R", "person_role": "Recruiter",
+         "job_title": "Analyst"}, history, [], "general_reply",
+    )
+    assert '"subject"' not in prompt
+    assert "derived deterministically" in prompt
+
+
+def test_ats_adapters_soft_degrade_shape_drift_and_string_false_remote(monkeypatch):
+    ats = _load("audit_ats_shape_drift", "services/discovery/ats_discovery_v1.py")
+
+    monkeypatch.setattr(ats, "http_get_json", lambda _url: [])
+    assert ats.fetch_greenhouse("acme") == []
+
+    monkeypatch.setattr(ats, "http_get_json", lambda _url: {"unexpected": "shape"})
+    assert ats.fetch_lever("acme") == []
+    assert ats.fetch_breezy("acme") == []
+
+    monkeypatch.setattr(ats, "http_get_json", lambda _url: {
+        "jobs": [{
+            "id": "1", "title": "Security Analyst", "location": "New York, NY",
+            "department": "Security", "isRemote": "false",
+            "jobUrl": "https://jobs.ashbyhq.com/acme/1",
+            "descriptionPlain": "Investigate alerts and document findings. " * 10,
+        }]
+    })
+    jobs = ats.fetch_ashby("acme")
+    assert len(jobs) == 1
+    assert jobs[0]["remote"] is False
+
+
+def test_linkedin_completed_task_accepts_nested_result_envelopes(monkeypatch):
+    linkedin = _load("audit_linkedin_nested_result", "services/discovery/linkedin_intake_v1.py")
+    jd = "Security analyst responsibilities and qualifications. " * 10
+
+    class Cur:
+        def execute(self, *_args, **_kwargs):
+            return None
+
+        def fetchone(self):
+            return (
+                "completed",
+                {"url": "https://www.linkedin.com/jobs/view/123/"},
+                {"parsed": {"text": jd}},
+                None,
+            )
+
+    captured = {}
+
+    def fake_intake(_cur, **kwargs):
+        captured.update(kwargs)
+        return "app-1"
+
+    monkeypatch.setattr(linkedin, "intake", fake_intake)
+    args = type("Args", (), {
+        "task_id": "task-1", "company": "Acme", "title": "Analyst",
+        "location": "", "work_mode": "",
+    })()
+    assert linkedin.cmd_ingest_task(Cur(), args) == 0
+    assert captured["jd_text"] == jd.strip()
+    assert captured["url"] == "https://www.linkedin.com/jobs/view/123/"
+
+
+def test_linkedin_import_skips_bad_records_without_discarding_valid_records(monkeypatch, tmp_path, capsys):
+    linkedin = _load("audit_linkedin_mixed_import", "services/discovery/linkedin_intake_v1.py")
+    path = tmp_path / "jobs.json"
+    path.write_text(json.dumps([
+        "not-an-object",
+        {"company": "Acme", "title": "Analyst", "url": "https://www.linkedin.com/jobs/view/123/",
+         "jd_text": "Security analyst responsibilities and qualifications. " * 10},
+    ]), encoding="utf-8")
+
+    monkeypatch.setattr(linkedin, "intake", lambda _cur, **_kwargs: "app-1")
+    args = type("Args", (), {"file": path, "apply": False})()
+    assert linkedin.cmd_import(object(), args) == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["created"] == 1
+    assert output["invalid"] == 1
+    assert output["duplicates"] == 0
+
+
+def test_short_answer_string_false_is_not_promoted_to_answerable():
+    generator = _load("audit_short_answer_bool", "services/document-generation/generate_documents_v1.py")
+    question = "Are you willing to relocate?"
+    parsed = {"answers": [{
+        "question": question,
+        "answerable": "false",
+        "text": "Yes, I am willing to relocate.",
+        "source_asset_id": "asset-1",
+        "missing_information": "User relocation preference is not known.",
+    }]}
+    content, used, evidence, _dropped = generator.validate_and_render(
+        "short_answers", parsed, {"asset-1"}, expected_questions=[question]
+    )
+    assert "[NEEDS USER INPUT]" in content
+    assert "Yes, I am willing to relocate." not in content
+    assert used == []
+    assert evidence["claims"][0]["answerable"] is False
+
+
+def test_ats_adapters_soft_degrade_nested_shape_drift(monkeypatch):
+    ats = _load("audit_ats_nested_shape_drift", "services/discovery/ats_discovery_v1.py")
+
+    payloads = {
+        "greenhouse": {"jobs": [{
+            "id": 1, "title": "Analyst", "location": "not-an-object",
+            "departments": ["bad"], "content": {"bad": "html"},
+            "absolute_url": ["bad"],
+        }]},
+        "lever": [{
+            "id": 2, "text": "Analyst", "categories": "bad",
+            "lists": ["bad"], "description": {"bad": "html"},
+            "hostedUrl": {"bad": "url"},
+        }],
+        "smart": {"content": [{
+            "id": "3", "name": "Analyst", "location": "bad",
+            "department": "bad", "function": ["bad"],
+        }]},
+        "workable": {"jobs": [{
+            "shortcode": "4", "title": "Analyst", "location": "bad",
+            "department": {"bad": "dept"},
+        }]},
+    }
+
+    monkeypatch.setattr(ats, "http_get_json", lambda _url: payloads["greenhouse"])
+    assert ats.fetch_greenhouse("acme")[0]["location"] == ""
+
+    monkeypatch.setattr(ats, "http_get_json", lambda _url: payloads["lever"])
+    assert ats.fetch_lever("acme")[0]["department"] == ""
+
+    monkeypatch.setattr(ats, "http_get_json", lambda _url: payloads["smart"])
+    assert ats.fetch_smartrecruiters("acme")[0]["location"] == ""
+
+    monkeypatch.setattr(ats, "http_get_json", lambda _url: payloads["workable"])
+    assert ats.fetch_workable("acme")[0]["department"] == ""
