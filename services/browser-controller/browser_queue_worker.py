@@ -788,7 +788,8 @@ def require_bound_approval(cur, task: Dict[str, Any]) -> Dict[str, Any]:
             or str(app_row[0] or "") != str(approval_payload.get("application_job_url") or "")
             or str(app_row[1] or "") != str(approval_payload.get("application_jd_hash") or "")
             or str(app_row[2] or "") != str(approval_payload.get("expected_application_step") or "")
-            or int(app_row[3] or 0) != int(bound_pipeline_version or -1)):
+            or bound_pipeline_version is None
+            or int(app_row[3] or 0) != int(bound_pipeline_version)):
         raise PermanentTaskError("Autofill application job/JD/pipeline version binding changed after approval.")
     expected_target_id = str(typed_target_id or approval_payload.get("expected_target_id") or "").strip()
     if not expected_target_id:

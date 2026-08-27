@@ -95,6 +95,83 @@ def db():
     return psycopg
 
 
+def _fixture_plan_key(value: str) -> str:
+    raw = str(value or "")
+    return raw if len(raw) == 64 else hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _insert_first_class_autofill_plan(
+    cur, *, application_id, plan_key: str, target_id: str, page_url: str,
+    fingerprint: str, input_hash: str, action_scope: dict, approval_status: str = "pending",
+    generated_document_id=None, artifact_id=None, artifact_sha256: str | None = None,
+) -> tuple[str, str, int]:
+    """Seed the same typed immutable plan contract production approvals require."""
+    canonical_key = _fixture_plan_key(plan_key)
+    cur.execute("SELECT pipeline_version FROM applications WHERE id=%s", (application_id,))
+    row = cur.fetchone()
+    assert row is not None
+    pipeline_version = int(row[0] or 0)
+    action_scope_sha256 = hashlib.sha256(
+        json.dumps(action_scope, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+    plan_status = {
+        "pending": "awaiting_approval",
+        "approved": "approved",
+        "executing": "executing",
+        "consumed": "completed",
+        "denied": "cancelled",
+        "expired": "cancelled",
+    }.get(approval_status, "awaiting_approval")
+    cur.execute(
+        """INSERT INTO autofill_plans(
+               application_id,plan_key,pipeline_version,target_id,page_url,origin,page_fingerprint,
+               input_sha256,action_scope_sha256,action_scope_json,generated_document_id,artifact_id,
+               artifact_sha256,status)
+           VALUES (%s,%s,%s,%s,%s,'https://jobs.example.test',%s,%s,%s,%s::jsonb,%s,%s,%s,%s)
+           RETURNING id::text""",
+        (application_id, canonical_key, pipeline_version, target_id, page_url, fingerprint,
+         input_hash, action_scope_sha256, json.dumps(action_scope), generated_document_id,
+         artifact_id, artifact_sha256, plan_status),
+    )
+    plan_id = cur.fetchone()[0]
+    for sequence_no, action in enumerate(action_scope.get("actions") or [], 1):
+        cur.execute(
+            """INSERT INTO autofill_plan_actions(
+                   autofill_plan_id,sequence_no,action_kind,field_ref,field_registry_key,
+                   value_sha256,document_artifact_id,action_json)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s::jsonb)""",
+            (plan_id, sequence_no, str(action.get("action") or ""), str(action.get("ref") or ""),
+             action.get("profile_key"), str(action.get("value_sha256") or ""),
+             artifact_id if action.get("action") == "upload" else None, json.dumps(action)),
+        )
+    return str(plan_id), canonical_key, pipeline_version
+
+
+def _insert_fixture_document_artifact(cur, *, application_id, label: str = "fixture"):
+    content = f"{label} verified resume"
+    content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    cur.execute(
+        """INSERT INTO generated_documents(
+               application_id,doc_type,content,qa_status,approved,source_jd_hash)
+           SELECT %s,'resume',%s,'pass',true,coalesce(jd_hash,'') FROM applications WHERE id=%s
+           RETURNING id""",
+        (application_id, content, application_id),
+    )
+    document_id = cur.fetchone()[0]
+    artifact_bytes = f"{label} deterministic artifact\n".encode("utf-8")
+    artifact_hash = hashlib.sha256(artifact_bytes).hexdigest()
+    artifact_path = ROOT / "data" / "generated-resumes" / "test-fixtures" / f"{label}-resume.docx"
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    artifact_path.write_bytes(artifact_bytes)
+    cur.execute(
+        """INSERT INTO generated_document_artifacts(
+               generated_document_id,application_id,artifact_type,file_path,filename,sha256)
+           VALUES (%s,%s,'resume',%s,%s,%s) RETURNING id""",
+        (document_id, application_id, str(artifact_path), artifact_path.name, artifact_hash),
+    )
+    return document_id, cur.fetchone()[0], content_hash, artifact_hash, artifact_path.name
+
+
 def _record(db, *, approval_status: str = "approved", expires: str = "now() + interval '5 minutes'",
             idempotency_key: str | None = None, task_status: str = "running"):
     """Create the exact synthetic application/document/artifact/capability graph."""
@@ -145,6 +222,12 @@ def _record(db, *, approval_status: str = "approved", expires: str = "now() + in
             application_id=str(application_id), page_url=page_url,
             page_fingerprint=fingerprint, input_hash=input_hash, action_scope=action_scope,
         )
+        autofill_plan_id, plan_key, pipeline_version = _insert_first_class_autofill_plan(
+            cur, application_id=application_id, plan_key=plan_key, target_id=target_id,
+            page_url=page_url, fingerprint=fingerprint, input_hash=input_hash, action_scope=action_scope,
+            approval_status=approval_status, generated_document_id=document_id, artifact_id=artifact_id,
+            artifact_sha256=artifact_hash,
+        )
         approval_payload = {
             "application_job_url": page_url,
             "application_jd_hash": "fixture-jd",
@@ -161,21 +244,25 @@ def _record(db, *, approval_status: str = "approved", expires: str = "now() + in
             "artifact_filename": "fixture-resume.docx",
             "autofill_action_scope": action_scope,
             "autofill_plan_key": plan_key,
+            "autofill_plan_id": autofill_plan_id,
+            "expected_pipeline_version": pipeline_version,
             "expected_upload_capabilities": [],
             "delegated_upload_packages": [],
         }
         cur.execute(
             f"""INSERT INTO approval_requests
                 (type, application_id, payload_json, status, approval_token_hash, token_expires_at,
-                 target_action, bound_document_id, bound_document_sha256, expected_origin,
+                 target_action, bound_document_id, bound_document_sha256, expected_origin, expected_target_id,
                  bound_artifact_id, bound_artifact_sha256, bound_artifact_filename,
                  expected_initial_url, expected_page_fingerprint, bound_autofill_input_hash,
-                 bound_autofill_action_scope, idempotency_key)
+                 bound_autofill_action_scope, idempotency_key, bound_pipeline_version,
+                 bound_autofill_plan_key, bound_autofill_plan_id)
                VALUES ('autofill_form', %s, %s::jsonb, %s, 'fixture-token', {expires},
-                       'fill_application_form', %s, %s, 'https://jobs.example.test', %s, %s, 'fixture-resume.docx',
-                       %s, %s, %s, %s::jsonb, %s) RETURNING id""",
-            (application_id, json.dumps(approval_payload), approval_status, document_id, content_hash, artifact_id, artifact_hash,
-             page_url, fingerprint, input_hash, json.dumps(action_scope), idempotency_key),
+                       'fill_application_form', %s, %s, 'https://jobs.example.test', %s, %s, %s, 'fixture-resume.docx',
+                       %s, %s, %s, %s::jsonb, %s, %s, %s, %s) RETURNING id""",
+            (application_id, json.dumps(approval_payload), approval_status, document_id, content_hash, target_id,
+             artifact_id, artifact_hash, page_url, fingerprint, input_hash, json.dumps(action_scope),
+             idempotency_key, pipeline_version, plan_key, autofill_plan_id),
         )
         approval_id = cur.fetchone()[0]
         cur.execute(
@@ -183,12 +270,12 @@ def _record(db, *, approval_status: str = "approved", expires: str = "now() + in
                (task_type, requested_by, application_id, status, approval_request_id,
                 generated_document_id, document_sha256, expected_origin, bound_artifact_id,
                 artifact_sha256, artifact_filename, expected_initial_url, expected_page_fingerprint,
-                autofill_input_hash, autofill_action_scope, lease_expires_at)
+                autofill_input_hash, autofill_action_scope, autofill_plan_id, lease_expires_at)
                VALUES ('fill_application_form', 'fixture', %s, %s, %s, %s, %s,
                        'https://jobs.example.test', %s, %s, 'fixture-resume.docx', %s, %s, %s,
-                       %s::jsonb, now() + interval '5 minutes') RETURNING id""",
+                       %s::jsonb, %s, now() + interval '5 minutes') RETURNING id""",
             (application_id, task_status, approval_id, document_id, content_hash, artifact_id, artifact_hash,
-             page_url, fingerprint, input_hash, json.dumps(action_scope)),
+             page_url, fingerprint, input_hash, json.dumps(action_scope), autofill_plan_id),
         )
         task_id = cur.fetchone()[0]
     return {
@@ -199,9 +286,41 @@ def _record(db, *, approval_status: str = "approved", expires: str = "now() + in
         "expected_target_id": target_id,
         "expected_initial_url": page_url, "expected_page_fingerprint": fingerprint,
         "autofill_input_hash": input_hash, "autofill_action_scope": action_scope,
+        "autofill_plan_id": autofill_plan_id, "autofill_plan_key": plan_key,
+        "bound_pipeline_version": pipeline_version,
         "input_json": {}, "timeout_seconds": 30,
         "retry_count": 0, "max_retries": 2,
     }
+
+
+def _insert_typed_delegated_child(cur, *, task: dict, parent_request_id: str, plan_key: str,
+                                  child_status: str, field_ref: str = "resume-upload") -> str:
+    """Seed a delegated upload child using the same typed authority columns as production."""
+    child_payload = {
+        "field_ref": field_ref,
+        "document_type": "resume",
+        "artifact_id": task["bound_artifact_id"],
+        "sha256": task["artifact_sha256"],
+        "parent_approval_request_id": str(parent_request_id),
+        "delegated_to_autofill": True,
+        "autofill_plan_key": plan_key,
+        "autofill_plan_id": task["autofill_plan_id"],
+        "expected_pipeline_version": task["bound_pipeline_version"],
+        "expected_target_id": task["expected_target_id"],
+    }
+    cur.execute(
+        """INSERT INTO approval_requests(
+               type,application_id,payload_json,status,approval_token_hash,token_expires_at,
+               parent_approval_request_id,bound_pipeline_version,bound_autofill_plan_key,
+               bound_autofill_plan_id,expected_target_id)
+           VALUES ('privileged_upload_document',%s,%s::jsonb,%s,%s,now()+interval '5 minutes',
+                   %s::uuid,%s,%s,%s,%s)
+           RETURNING id::text""",
+        (task["application_id"], json.dumps(child_payload), child_status, f"child-{child_status}",
+         parent_request_id, task["bound_pipeline_version"], plan_key, task["autofill_plan_id"],
+         task["expected_target_id"]),
+    )
+    return str(cur.fetchone()[0])
 
 
 class FakeTransport:
@@ -647,12 +766,11 @@ def test_denied_parent_restores_form_ready_and_closes_delegated_children(db):
         cur.execute("SELECT set_config('jobos.pipeline_transition_authorized','on',true);")
         cur.execute("UPDATE applications SET current_step='awaiting_approval' WHERE id=%s", (task["application_id"],))
         cur.execute("SELECT set_config('jobos.pipeline_transition_authorized','off',true);")
-        plan_key = "plan-fixture"
-        cur.execute("UPDATE approval_requests SET payload_json = payload_json || jsonb_build_object('autofill_plan_key',%s::text) WHERE id=%s", (plan_key, task["approval_request_id"]))
-        cur.execute("""INSERT INTO approval_requests(type,application_id,payload_json,status,approval_token_hash,token_expires_at)
-                       VALUES ('privileged_upload_document',%s,%s,'approved','child-token',now()+interval '5 minutes') RETURNING id""",
-                    (task["application_id"], json.dumps({"delegated_to_autofill": True, "autofill_plan_key": plan_key, "parent_approval_request_id": task["approval_request_id"]})))
-        child_id = cur.fetchone()[0]
+        plan_key = task["autofill_plan_key"]
+        child_id = _insert_typed_delegated_child(
+            cur, task=task, parent_request_id=task["approval_request_id"],
+            plan_key=plan_key, child_status="approved", field_ref="resume",
+        )
         conn.commit()
     with db.connect(TEST_DSN) as conn:
         out = approval.decide_request_by_id(conn, task["approval_request_id"], decision="deny", note="no", actor="test")
@@ -671,44 +789,67 @@ def test_missing_delegated_child_is_repaired_and_bound_to_exact_parent(db):
     with db.connect(TEST_DSN) as conn, conn.cursor() as cur:
         cur.execute("INSERT INTO applications(company,job_title,current_step,job_url,jd_hash) VALUES ('Repair Co','Role','awaiting_approval','https://jobs.example.test/apply','jd-repair') RETURNING id")
         app_id = cur.fetchone()[0]
+        document_id, artifact_id, document_hash, artifact_hash, artifact_filename = _insert_fixture_document_artifact(
+            cur, application_id=app_id, label="repair"
+        )
+        plan_key = _fixture_plan_key("repair-plan")
         package = {
             "field_ref": "resume", "field_label": "Resume", "document_type": "resume",
-            "generated_document_id": "00000000-0000-0000-0000-000000000001",
-            "artifact_id": "00000000-0000-0000-0000-000000000002",
-            "file_path": "/tmp/resume.pdf", "filename": "resume.pdf", "sha256": "a" * 64,
+            "generated_document_id": str(document_id), "artifact_id": str(artifact_id),
+            "file_path": "/tmp/resume.pdf", "filename": artifact_filename, "sha256": artifact_hash,
             "source_jd_hash": "jd-repair", "application_jd_hash": "jd-repair",
-            "autofill_plan_key": "repair-plan", "delegated_to_autofill": True,
+            "autofill_plan_key": plan_key, "delegated_to_autofill": True,
             "target_id": "tab", "expected_url": "https://jobs.example.test/apply",
             "expected_origin": "https://jobs.example.test", "expected_page_fingerprint": "b" * 64,
         }
         parent_scope = build_exact_action_scope([])
+        plan_id, plan_key, pipeline_version = _insert_first_class_autofill_plan(
+            cur, application_id=app_id, plan_key=plan_key, target_id="tab",
+            page_url="https://jobs.example.test/apply", fingerprint="b" * 64,
+            input_hash="c" * 64, action_scope=parent_scope, approval_status="pending",
+            generated_document_id=document_id, artifact_id=artifact_id, artifact_sha256=artifact_hash,
+        )
+        package["autofill_plan_key"] = plan_key
+        package["autofill_plan_id"] = plan_id
         parent_payload = {
             "application_job_url": "https://jobs.example.test/apply",
             "application_jd_hash": "jd-repair",
             "expected_application_step": "awaiting_approval",
-            "autofill_plan_key": "repair-plan",
+            "autofill_plan_key": plan_key,
+            "autofill_plan_id": plan_id,
+            "expected_pipeline_version": pipeline_version,
             "expected_target_id": "tab",
+            "expected_origin": "https://jobs.example.test",
             "expected_initial_url": "https://jobs.example.test/apply",
             "expected_page_fingerprint": "b" * 64,
             "autofill_input_hash": "c" * 64,
             "autofill_action_scope": parent_scope,
-            "expected_upload_capabilities": [{"field_ref": "resume", "document_type": "resume", "artifact_id": package["artifact_id"], "sha256": "a" * 64}],
+            "document_id": str(document_id),
+            "document_sha256": document_hash,
+            "artifact_id": str(artifact_id),
+            "artifact_sha256": artifact_hash,
+            "artifact_filename": artifact_filename,
+            "expected_upload_capabilities": [{"field_ref": "resume", "document_type": "resume", "artifact_id": str(artifact_id), "sha256": artifact_hash}],
             "delegated_upload_packages": [package],
         }
         cur.execute("""INSERT INTO approval_requests(
                            type,application_id,payload_json,status,approval_token_hash,token_expires_at,
-                           expected_initial_url,expected_page_fingerprint,bound_autofill_input_hash,
-                           bound_autofill_action_scope)
+                           bound_document_id,bound_document_sha256,bound_artifact_id,bound_artifact_sha256,bound_artifact_filename,
+                           expected_target_id,expected_origin,expected_initial_url,expected_page_fingerprint,bound_autofill_input_hash,
+                           bound_autofill_action_scope,bound_pipeline_version,bound_autofill_plan_key,bound_autofill_plan_id)
                        VALUES ('autofill_form',%s,%s::jsonb,'pending','parent-token',now()+interval '5 minutes',
-                               'https://jobs.example.test/apply',%s,%s,%s::jsonb) RETURNING id::text""",
-                    (app_id, json.dumps(parent_payload), "b" * 64, "c" * 64, json.dumps(parent_scope)))
+                               %s,%s,%s,%s,%s,'tab','https://jobs.example.test','https://jobs.example.test/apply',%s,%s,%s::jsonb,%s,%s,%s)
+                       RETURNING id::text""",
+                    (app_id, json.dumps(parent_payload), document_id, document_hash, artifact_id, artifact_hash, artifact_filename,
+                     "b" * 64, "c" * 64, json.dumps(parent_scope), pipeline_version, plan_key, plan_id))
         parent_id = cur.fetchone()[0]
-        assert approval.queue_ready_autofill_for_plan(cur, application_id=str(app_id), plan_key="repair-plan", actor="test") is False
-        cur.execute("""SELECT payload_json->>'parent_approval_request_id' FROM approval_requests
+        assert approval.queue_ready_autofill_for_plan(cur, application_id=str(app_id), plan_key=plan_key, actor="test") is False
+        cur.execute("""SELECT payload_json->>'parent_approval_request_id', parent_approval_request_id::text,
+                              bound_autofill_plan_key, bound_pipeline_version, bound_autofill_plan_id::text
+                       FROM approval_requests
                        WHERE application_id=%s AND type='privileged_upload_document'""", (app_id,))
-        assert cur.fetchone() == (parent_id,)
+        assert cur.fetchone() == (parent_id, parent_id, plan_key, pipeline_version, plan_id)
         conn.commit()
-
 
 def test_same_plan_new_parent_gets_distinct_upload_child(db):
     from services.approval import approval_service_v1 as approval
@@ -716,33 +857,57 @@ def test_same_plan_new_parent_gets_distinct_upload_child(db):
     with db.connect(TEST_DSN) as conn, conn.cursor() as cur:
         cur.execute("INSERT INTO applications(company,job_title,current_step,job_url,jd_hash) VALUES ('Parent Co','Role','awaiting_approval','https://jobs.example.test/apply','jd-parent') RETURNING id")
         app_id = cur.fetchone()[0]
+        document_id, artifact_id, document_hash, artifact_hash, artifact_filename = _insert_fixture_document_artifact(
+            cur, application_id=app_id, label="same-plan"
+        )
+        plan_key = _fixture_plan_key("same-plan")
         base_package = {
-            "field_ref": "resume", "document_type": "resume", "artifact_id": "art",
-            "sha256": "a" * 64, "autofill_plan_key": "same-plan", "filename": "resume.pdf",
+            "field_ref": "resume", "document_type": "resume", "artifact_id": str(artifact_id),
+            "generated_document_id": str(document_id), "sha256": artifact_hash,
+            "autofill_plan_key": plan_key, "filename": artifact_filename,
         }
         parent_scope = build_exact_action_scope([])
+        plan_id, plan_key, pipeline_version = _insert_first_class_autofill_plan(
+            cur, application_id=app_id, plan_key=plan_key, target_id="tab",
+            page_url="https://jobs.example.test/apply", fingerprint="b" * 64,
+            input_hash="c" * 64, action_scope=parent_scope, approval_status="denied",
+            generated_document_id=document_id, artifact_id=artifact_id, artifact_sha256=artifact_hash,
+        )
+        base_package["autofill_plan_key"] = plan_key
+        base_package["autofill_plan_id"] = plan_id
         payload = {
             "delegated_upload_packages": [base_package], "expected_upload_capabilities": [],
-            "expected_target_id": "tab", "expected_initial_url": "https://jobs.example.test/apply",
+            "expected_target_id": "tab", "expected_origin": "https://jobs.example.test",
+            "expected_initial_url": "https://jobs.example.test/apply",
             "expected_page_fingerprint": "b" * 64, "autofill_input_hash": "c" * 64,
-            "autofill_action_scope": parent_scope,
+            "autofill_action_scope": parent_scope, "autofill_plan_key": plan_key,
+            "autofill_plan_id": plan_id, "expected_pipeline_version": pipeline_version,
+            "document_id": str(document_id), "document_sha256": document_hash,
+            "artifact_id": str(artifact_id), "artifact_sha256": artifact_hash,
+            "artifact_filename": artifact_filename,
         }
-        cur.execute("""INSERT INTO approval_requests(
-                           type,application_id,payload_json,status,approval_token_hash,token_expires_at,created_at,
-                           expected_initial_url,expected_page_fingerprint,bound_autofill_input_hash,bound_autofill_action_scope)
-                       VALUES ('autofill_form',%s,%s::jsonb,'denied','p1',now()+interval '5 minutes',now()-interval '1 minute',
-                               'https://jobs.example.test/apply',%s,%s,%s::jsonb) RETURNING id::text""",
-                    (app_id, json.dumps({**payload, "autofill_plan_key": "same-plan"}),
-                     "b" * 64, "c" * 64, json.dumps(parent_scope)))
+        columns = """type,application_id,payload_json,status,approval_token_hash,token_expires_at,created_at,
+                     bound_document_id,bound_document_sha256,bound_artifact_id,bound_artifact_sha256,bound_artifact_filename,
+                     expected_target_id,expected_origin,expected_initial_url,expected_page_fingerprint,bound_autofill_input_hash,
+                     bound_autofill_action_scope,bound_pipeline_version,bound_autofill_plan_key,bound_autofill_plan_id"""
+        common = (app_id, json.dumps(payload), document_id, document_hash, artifact_id, artifact_hash, artifact_filename,
+                  "b" * 64, "c" * 64, json.dumps(parent_scope), pipeline_version, plan_key, plan_id)
+        cur.execute(
+            f"""INSERT INTO approval_requests({columns})
+                VALUES ('autofill_form',%s,%s::jsonb,'denied','p1',now()+interval '5 minutes',clock_timestamp()-interval '1 minute',
+                        %s,%s,%s,%s,%s,'tab','https://jobs.example.test','https://jobs.example.test/apply',%s,%s,%s::jsonb,%s,%s,%s)
+                RETURNING id::text""",
+            common,
+        )
         parent_a = cur.fetchone()[0]
         approval._repair_delegated_children_for_parent(cur, application_id=str(app_id), parent_request_id=parent_a, payload=payload)
-        cur.execute("""INSERT INTO approval_requests(
-                           type,application_id,payload_json,status,approval_token_hash,token_expires_at,
-                           expected_initial_url,expected_page_fingerprint,bound_autofill_input_hash,bound_autofill_action_scope)
-                       VALUES ('autofill_form',%s,%s::jsonb,'pending','p2',now()+interval '5 minutes',
-                               'https://jobs.example.test/apply',%s,%s,%s::jsonb) RETURNING id::text""",
-                    (app_id, json.dumps({**payload, "autofill_plan_key": "same-plan"}),
-                     "b" * 64, "c" * 64, json.dumps(parent_scope)))
+        cur.execute(
+            f"""INSERT INTO approval_requests({columns})
+                VALUES ('autofill_form',%s,%s::jsonb,'pending','p2',now()+interval '5 minutes',clock_timestamp(),
+                        %s,%s,%s,%s,%s,'tab','https://jobs.example.test','https://jobs.example.test/apply',%s,%s,%s::jsonb,%s,%s,%s)
+                RETURNING id::text""",
+            common,
+        )
         parent_b = cur.fetchone()[0]
         approval._repair_delegated_children_for_parent(cur, application_id=str(app_id), parent_request_id=parent_b, payload=payload)
         cur.execute("""SELECT payload_json->>'parent_approval_request_id', count(*) FROM approval_requests
@@ -752,16 +917,10 @@ def test_same_plan_new_parent_gets_distinct_upload_child(db):
         assert rows == sorted([(parent_a, 1), (parent_b, 1)])
         conn.commit()
 
-
-
 def _configure_delegated_gate(db, *, child_status: str):
     """Seed one exact approved parent and one exact child without a queued browser task."""
     task = _record(db, approval_status="approved", task_status="queued")
-    plan_key = autofill_plan_key(
-        application_id=task["application_id"], page_url=task["expected_initial_url"],
-        page_fingerprint=task["expected_page_fingerprint"], input_hash=task["autofill_input_hash"],
-        action_scope=task["autofill_action_scope"],
-    )
+    plan_key = task["autofill_plan_key"]
     spec = {
         "field_ref": "resume-upload", "document_type": "resume",
         "artifact_id": task["bound_artifact_id"], "sha256": task["artifact_sha256"],
@@ -795,12 +954,10 @@ def _configure_delegated_gate(db, *, child_status: str):
     with db.connect(TEST_DSN) as conn, conn.cursor() as cur:
         cur.execute("DELETE FROM browser_tasks WHERE id=%s", (task["id"],))
         cur.execute("UPDATE approval_requests SET payload_json=%s::jsonb WHERE id=%s", (json.dumps(payload), task["approval_request_id"]))
-        cur.execute(
-            """INSERT INTO approval_requests(type,application_id,payload_json,status,approval_token_hash,token_expires_at)
-               VALUES ('privileged_upload_document',%s,%s::jsonb,%s,%s,now()+interval '5 minutes') RETURNING id::text""",
-            (task["application_id"], json.dumps(child_payload), child_status, f"child-{child_status}"),
+        child_id = _insert_typed_delegated_child(
+            cur, task=task, parent_request_id=task["approval_request_id"],
+            plan_key=plan_key, child_status=child_status, field_ref=spec["field_ref"],
         )
-        child_id = cur.fetchone()[0]
         conn.commit()
     return task, plan_key, child_id
 

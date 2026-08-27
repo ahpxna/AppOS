@@ -326,10 +326,9 @@ def log_event(cur, request_id: Optional[str], event: str,
         """
         INSERT INTO approval_events (approval_request_id, event, actor, detail_json, binding_sha256)
         VALUES (%s, %s, %s, %s,
-                CASE WHEN %s IS NULL THEN NULL
-                     ELSE (SELECT binding_sha256 FROM approval_requests WHERE id=%s) END);
+                (SELECT binding_sha256 FROM approval_requests WHERE id=%s::uuid));
         """,
-        (request_id, event, actor, Jsonb(detail or {}), request_id, request_id),
+        (request_id, event, actor, Jsonb(detail or {}), request_id),
     )
 
 

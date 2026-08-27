@@ -7,6 +7,7 @@ The test never falls back to the developer's JobOS database.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 
 import pytest
@@ -26,8 +27,10 @@ def test_migrations_054_058_support_one_durable_autofill_lifecycle():
     with psycopg.connect(TEST_DSN) as conn, conn.cursor() as cur:
         cur.execute("SELECT 1 FROM schema_migrations WHERE migration_id = '058_autofill_exact_action_scope.sql'")
         assert cur.fetchone(), "apply all migrations through 058 before this test"
+        cur.execute("SELECT 1 FROM schema_migrations WHERE migration_id = '096_db_authority_final_invariants.sql'")
+        assert cur.fetchone(), "apply all migrations through 096 before this DB-authority lifecycle test"
         cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name = 'browser_tasks'")
-        assert {"execution_state", "pinned_target_id"} <= {row[0] for row in cur.fetchall()}
+        assert {"execution_state", "pinned_target_id", "autofill_plan_id"} <= {row[0] for row in cur.fetchall()}
 
         cur.execute("INSERT INTO applications (company, job_title) VALUES ('Test Company', 'Test Role') RETURNING id")
         application_id = cur.fetchone()[0]
@@ -45,26 +48,54 @@ def test_migrations_054_058_support_one_durable_autofill_lifecycle():
             (document_id, application_id, "a" * 64),
         )
         artifact_id = cur.fetchone()[0]
-        action_scope = """
-        {
-          "profile_keys": ["personal.first_name"],
-          "document_types": [],
-          "sensitive_classes": [],
-          "remembered_questions": []
+
+        action_scope_obj = {
+            "profile_keys": ["personal.first_name"],
+            "document_types": [],
+            "sensitive_classes": [],
+            "remembered_questions": [],
         }
-        """
+        action_scope = json.dumps(action_scope_obj, sort_keys=True, separators=(",", ":"))
+        cur.execute("SELECT pipeline_version FROM applications WHERE id=%s", (application_id,))
+        pipeline_version = int(cur.fetchone()[0] or 0)
+        plan_key = hashlib.sha256(b"root-db-integration-plan").hexdigest()
+        action_scope_hash = hashlib.sha256(action_scope.encode("utf-8")).hexdigest()
+        cur.execute(
+            """INSERT INTO autofill_plans(
+                   application_id,plan_key,pipeline_version,target_id,page_url,origin,page_fingerprint,
+                   input_sha256,action_scope_sha256,action_scope_json,generated_document_id,artifact_id,
+                   artifact_sha256,status)
+               VALUES (%s,%s,%s,'target-1','https://jobs.example.test/job-1/apply','https://jobs.example.test',%s,
+                       %s,%s,%s::jsonb,%s,%s,%s,'approved') RETURNING id""",
+            (application_id, plan_key, pipeline_version, "b" * 64, "c" * 64, action_scope_hash,
+             action_scope, document_id, artifact_id, "a" * 64),
+        )
+        plan_id = cur.fetchone()[0]
+        payload = json.dumps({
+            "autofill_plan_key": plan_key,
+            "autofill_plan_id": str(plan_id),
+            "expected_pipeline_version": pipeline_version,
+            "expected_target_id": "target-1",
+            "expected_origin": "https://jobs.example.test",
+            "expected_initial_url": "https://jobs.example.test/job-1/apply",
+            "expected_page_fingerprint": "b" * 64,
+            "autofill_input_hash": "c" * 64,
+            "document_id": str(document_id),
+            "document_sha256": content_hash,
+        })
         cur.execute(
             """INSERT INTO approval_requests
                (type, application_id, payload_json, status, approval_token_hash, token_expires_at,
-                target_action, bound_document_id, bound_document_sha256, expected_origin,
+                target_action, bound_document_id, bound_document_sha256, expected_origin, expected_target_id,
                 bound_artifact_id, bound_artifact_sha256, bound_artifact_filename,
                 expected_initial_url, expected_page_fingerprint, bound_autofill_input_hash,
-                bound_autofill_action_scope)
-               VALUES ('autofill_form', %s, '{}'::jsonb, 'approved', 'test-token', now() + interval '5 minutes',
-                       'fill_application_form', %s, %s, 'https://jobs.example.test', %s, %s, 'test-resume.docx',
-                       'https://jobs.example.test/job-1/apply', %s, %s, %s::jsonb)
+                bound_autofill_action_scope, bound_pipeline_version, bound_autofill_plan_key, bound_autofill_plan_id)
+               VALUES ('autofill_form', %s, %s::jsonb, 'approved', 'test-token', now() + interval '5 minutes',
+                       'fill_application_form', %s, %s, 'https://jobs.example.test', 'target-1', %s, %s, 'test-resume.docx',
+                       'https://jobs.example.test/job-1/apply', %s, %s, %s::jsonb, %s, %s, %s)
                RETURNING id""",
-            (application_id, document_id, content_hash, artifact_id, "a" * 64, "b" * 64, "c" * 64, action_scope),
+            (application_id, payload, document_id, content_hash, artifact_id, "a" * 64,
+             "b" * 64, "c" * 64, action_scope, pipeline_version, plan_key, plan_id),
         )
         approval_id = cur.fetchone()[0]
         cur.execute(
@@ -72,12 +103,12 @@ def test_migrations_054_058_support_one_durable_autofill_lifecycle():
                (task_type, requested_by, application_id, status, approval_request_id,
                 generated_document_id, document_sha256, expected_origin, bound_artifact_id,
                 artifact_sha256, artifact_filename, expected_initial_url,
-                expected_page_fingerprint, autofill_input_hash, autofill_action_scope)
+                expected_page_fingerprint, autofill_input_hash, autofill_action_scope, autofill_plan_id)
                VALUES ('fill_application_form', 'integration-test', %s, 'running', %s, %s, %s, 'https://jobs.example.test',
-                       %s, %s, 'test-resume.docx', 'https://jobs.example.test/job-1/apply', %s, %s, %s::jsonb)
+                       %s, %s, 'test-resume.docx', 'https://jobs.example.test/job-1/apply', %s, %s, %s::jsonb, %s)
                RETURNING id""",
             (application_id, approval_id, document_id, content_hash, artifact_id, "a" * 64,
-             "b" * 64, "c" * 64, action_scope),
+             "b" * 64, "c" * 64, action_scope, plan_id),
         )
         task_id = cur.fetchone()[0]
 
