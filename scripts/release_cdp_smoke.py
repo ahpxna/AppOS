@@ -3,8 +3,9 @@
 
 This script is deliberately narrow:
 - serves only the tracked local fake ATS fixture on loopback;
-- uses only JobOS's managed OpenClaw browser transport;
-- opens one new tab, pins its exact target id, snapshots it, fills one harmless
+- creates the tracked fixture tab only through the already-configured loopback CDP endpoint;
+- uses JobOS's managed OpenClaw transport for tab focus/snapshot/write/verification;
+- pins the exact target id, snapshots it, fills one harmless
   text field, verifies the written value from a fresh snapshot, and closes it;
 - never calls an agent/model, uploads a file, clicks submit, handles auth, or
   interacts with CAPTCHA/checkpoints.
@@ -14,14 +15,19 @@ from __future__ import annotations
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+import ipaddress
 from threading import Thread
 import json
 import os
 import sys
 import urllib.error
 import urllib.request
+from urllib.parse import quote, urlparse
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 FIXTURE_DIR = REPO_ROOT / "tests" / "browser_fixtures"
 FIXTURE_FILE = FIXTURE_DIR / "basic_form.html"
 SMOKE_VALUE = "JobOS CDP Smoke"
@@ -40,8 +46,23 @@ def _cdp_base_url() -> str:
     ).rstrip("/")
 
 
+def _assert_loopback_cdp() -> str:
+    base_url = _cdp_base_url()
+    parsed = urlparse(base_url)
+    host = (parsed.hostname or "").casefold()
+    if parsed.scheme != "http" or not host:
+        raise RuntimeError("Release CDP smoke requires an HTTP loopback CDP endpoint.")
+    if host != "localhost":
+        try:
+            if not ipaddress.ip_address(host).is_loopback:
+                raise RuntimeError("Release CDP smoke refuses a non-loopback CDP endpoint.")
+        except ValueError as exc:
+            raise RuntimeError("Release CDP smoke refuses a non-loopback CDP endpoint.") from exc
+    return base_url
+
+
 def _assert_cdp_ready() -> None:
-    url = _cdp_base_url() + "/json/version"
+    url = _assert_loopback_cdp() + "/json/version"
     try:
         request = urllib.request.Request(url, headers={"Accept": "application/json"})
         with urllib.request.urlopen(request, timeout=5) as response:
@@ -54,6 +75,30 @@ def _assert_cdp_ready() -> None:
         ) from exc
     if not isinstance(payload, dict) or not payload.get("Browser") or not payload.get("webSocketDebuggerUrl"):
         raise RuntimeError("Chrome CDP /json/version returned an incomplete payload.")
+
+
+def _open_fixture_via_loopback_cdp(fixture_url: str) -> str:
+    """Create only the controlled fixture tab without weakening OpenClaw SSRF policy.
+
+    OpenClaw correctly blocks browser navigation to loopback/private destinations in
+    strict mode.  The release fixture itself is operator-controlled and served on
+    loopback, so seed that single tab through Chrome's loopback DevTools endpoint,
+    then exercise OpenClaw for the actual focus/snapshot/fill/verify/close path.
+    """
+    endpoint = _assert_loopback_cdp() + "/json/new?" + quote(fixture_url, safe="")
+    try:
+        request = urllib.request.Request(
+            endpoint, headers={"Accept": "application/json"}, method="PUT"
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            payload = json.loads(response.read().decode("utf-8", errors="replace"))
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError,
+            ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError("Could not create the controlled fixture tab through loopback CDP.") from exc
+    target_id = str(payload.get("id") or "") if isinstance(payload, dict) else ""
+    if not target_id:
+        raise RuntimeError("Chrome CDP /json/new did not return a target id.")
+    return target_id
 
 
 def _field(snapshot: dict, label: str) -> dict:
@@ -85,9 +130,9 @@ def run_smoke() -> None:
     transport = OpenClawTransport(profile=os.getenv("JOBOS_BROWSER_PROFILE", "remote"), timeout=45)
     target_id: str | None = None
     try:
-        target = transport.open(fixture_url)
-        target_id = target.target_id
-        if transport.current_url(target_id) != fixture_url:
+        target_id = _open_fixture_via_loopback_cdp(fixture_url)
+        target = transport.focus(target_id)
+        if target.url != fixture_url or transport.current_url(target_id) != fixture_url:
             raise RuntimeError("Pinned release-smoke tab did not stay on the exact local ATS fixture URL.")
 
         before = transport.snapshot(target_id)
