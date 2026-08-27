@@ -23,6 +23,9 @@ from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 from services.common.config import database_dsn, load_repo_env
+from services.common.artifact_registry_v1 import (
+    begin_render_run, fail_render_run, finish_render_run, register_artifact as register_canonical_artifact,
+)
 
 load_repo_env()
 OUTPUT_ROOT = Path(os.getenv("JOBOS_REVIEW_ARTIFACT_DIR", ROOT / "data/review-artifacts"))
@@ -38,15 +41,25 @@ def _sha(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _register(cur, *, document_id: str, application_id: str, doc_type: str, path: Path) -> None:
+def _register(cur, *, document_id: str, application_id: str, doc_type: str, path: Path) -> str:
     cur.execute(
         """INSERT INTO generated_document_artifacts(
                generated_document_id, application_id, artifact_type, file_path, filename, sha256)
            VALUES (%s, %s, %s, %s, %s, %s)
            ON CONFLICT (generated_document_id, artifact_type, sha256) DO UPDATE
-             SET file_path = EXCLUDED.file_path, filename = EXCLUDED.filename;""",
+             SET file_path = EXCLUDED.file_path, filename = EXCLUDED.filename
+           RETURNING id::text;""",
         (document_id, application_id, doc_type, str(path.resolve()), path.name, _sha(path)),
     )
+    generated_artifact_id = str(cur.fetchone()[0])
+    artifact_id = register_canonical_artifact(
+        cur, application_id=application_id, artifact_kind=f"{doc_type}_review_pdf", path=path,
+        mime_type="application/pdf",
+        provenance={"generated_document_id": document_id, "generated_document_artifact_id": generated_artifact_id},
+    )
+    cur.execute("UPDATE generated_document_artifacts SET artifact_id=%s WHERE id=%s;",
+                (artifact_id, generated_artifact_id))
+    return artifact_id
 
 
 def _plain_cover_letter_pdf(content: str, output: Path) -> None:
@@ -87,18 +100,36 @@ def render_document_pdf(cur, document_id: str) -> Path:
     if qa_status != "pass":
         raise ReviewArtifactError("Review PDF is emitted only after QA pass.")
     out_dir = OUTPUT_ROOT / application_id / document_id
+    input_manifest = {"document_id": document_id, "doc_type": doc_type, "content": content or "",
+                      "evidence_map": evidence_map or {}}
+    render_claim = begin_render_run(
+        document_id=document_id, input_manifest=input_manifest,
+        template=(TEMPLATE if doc_type == "resume" else None), claimed_by="render-review-artifacts-v1",
+    )
     out_dir.mkdir(parents=True, exist_ok=True)
-    if doc_type == "resume":
-        tailoring = (evidence_map or {}).get("resume_template") or {}
-        _docx, pdf = render_canonical_resume(
-            template=TEMPLATE, output_dir=out_dir, tailoring=tailoring
-        )
-    else:
-        pdf = out_dir / "cover_letter.pdf"
-        _plain_cover_letter_pdf(content or "", pdf)
-    _register(cur, document_id=document_id, application_id=application_id,
-              doc_type=doc_type, path=pdf)
-    return pdf
+    docx_artifact_id = None
+    try:
+        if doc_type == "resume":
+            tailoring = (evidence_map or {}).get("resume_template") or {}
+            docx, pdf = render_canonical_resume(
+                template=TEMPLATE, output_dir=out_dir, tailoring=tailoring
+            )
+            docx_artifact_id = register_canonical_artifact(
+                cur, application_id=application_id, artifact_kind="resume_docx", path=docx,
+                mime_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                provenance={"generated_document_id": document_id, "render_run_id": render_claim.run_id},
+            )
+        else:
+            pdf = out_dir / "cover_letter.pdf"
+            _plain_cover_letter_pdf(content or "", pdf)
+        pdf_artifact_id = _register(cur, document_id=document_id, application_id=application_id,
+                                    doc_type=doc_type, path=pdf)
+        finish_render_run(render_claim, docx_artifact_id=docx_artifact_id,
+                          pdf_artifact_id=pdf_artifact_id)
+        return pdf
+    except Exception as exc:
+        fail_render_run(render_claim, exc, uncertain=bool(out_dir.exists()))
+        raise
 
 
 def main() -> int:

@@ -436,7 +436,7 @@ def _expire_bound_pre_io_approval(cur, task: Dict[str, Any], reason: str) -> Non
               SET status='expired', executing_task_id=NULL,
                   action_note=COALESCE(action_note,%s)
             WHERE application_id=%s AND type='privileged_upload_document'
-              AND payload_json->>'parent_approval_request_id'=%s
+              AND parent_approval_request_id=%s::uuid
               AND payload_json->>'delegated_to_autofill'='true'
               AND status IN ('pending','approved','executing')
               AND consumed_at IS NULL;""",
@@ -761,7 +761,8 @@ def require_bound_approval(cur, task: Dict[str, Any]) -> Dict[str, Any]:
         SELECT id::text, target_action, bound_document_id::text,
                bound_document_sha256, expected_origin, bound_artifact_id::text,
                bound_artifact_sha256, bound_artifact_filename, expected_initial_url,
-               expected_page_fingerprint, bound_autofill_input_hash, bound_autofill_action_scope, payload_json
+               expected_page_fingerprint, bound_autofill_input_hash, bound_autofill_action_scope, payload_json,
+               bound_pipeline_version, bound_autofill_plan_key, expected_target_id, bound_autofill_plan_id::text
         FROM approval_requests
         WHERE id = %s
           AND application_id = %s
@@ -776,17 +777,20 @@ def require_bound_approval(cur, task: Dict[str, Any]) -> Dict[str, Any]:
         raise PermanentTaskError(
             "No valid unused approval exists for this exact application capability."
         )
-    approved_id, target_action, bound_doc, bound_hash, bound_origin, artifact_id, artifact_hash, artifact_filename, page_url, page_fingerprint_sha, input_hash, action_scope, approval_payload = row
+    (approved_id, target_action, bound_doc, bound_hash, bound_origin, artifact_id, artifact_hash, artifact_filename,
+     page_url, page_fingerprint_sha, input_hash, action_scope, approval_payload, bound_pipeline_version,
+     bound_plan_key, typed_target_id, bound_plan_id) = row
     approval_payload = dict(approval_payload or {})
-    cur.execute("SELECT coalesce(job_url,''), coalesce(jd_hash,''), current_step FROM applications WHERE id=%s;",
+    cur.execute("SELECT coalesce(job_url,''), coalesce(jd_hash,''), current_step, pipeline_version FROM applications WHERE id=%s;",
                 (application_id,))
     app_row = cur.fetchone()
     if (not app_row
             or str(app_row[0] or "") != str(approval_payload.get("application_job_url") or "")
             or str(app_row[1] or "") != str(approval_payload.get("application_jd_hash") or "")
-            or str(app_row[2] or "") != str(approval_payload.get("expected_application_step") or "")):
-        raise PermanentTaskError("Autofill application job/JD/pipeline binding changed after approval.")
-    expected_target_id = str(approval_payload.get("expected_target_id") or "").strip()
+            or str(app_row[2] or "") != str(approval_payload.get("expected_application_step") or "")
+            or int(app_row[3] or 0) != int(bound_pipeline_version or -1)):
+        raise PermanentTaskError("Autofill application job/JD/pipeline version binding changed after approval.")
+    expected_target_id = str(typed_target_id or approval_payload.get("expected_target_id") or "").strip()
     if not expected_target_id:
         raise PermanentTaskError("Autofill approval lacks an exact browser target id; prepare a fresh capability.")
     if target_action != "fill_application_form":
@@ -810,12 +814,16 @@ def require_bound_approval(cur, task: Dict[str, Any]) -> Dict[str, Any]:
         or (action_scope or {}) != (task.get("autofill_action_scope") or {})
     ):
         raise PermanentTaskError("Approval page/input binding does not match this task.")
+    if bound_plan_id and task.get("autofill_plan_id") and str(bound_plan_id) != str(task.get("autofill_plan_id")):
+        raise PermanentTaskError("Browser task references a different durable autofill plan than its approval.")
     return {"id": approved_id, "document_id": document_id, "expected_origin": origin,
             "artifact_id": artifact_id, "artifact_sha256": artifact_hash, "artifact_filename": artifact_filename,
             "expected_target_id": expected_target_id,
             "expected_initial_url": page_url, "expected_page_fingerprint": page_fingerprint_sha,
             "autofill_input_hash": input_hash, "autofill_action_scope": action_scope or {},
-            "autofill_plan_key": str(approval_payload.get("autofill_plan_key") or ""),
+            "autofill_plan_key": str(bound_plan_key or approval_payload.get("autofill_plan_key") or ""),
+            "autofill_plan_id": str(bound_plan_id or ""),
+            "bound_pipeline_version": bound_pipeline_version,
             "expected_upload_capabilities": approval_payload.get("expected_upload_capabilities") or [],
             "application_job_url": str(approval_payload.get("application_job_url") or ""),
             "application_jd_hash": str(approval_payload.get("application_jd_hash") or ""),
@@ -885,7 +893,7 @@ def durable_invalidate_delegated_upload(application_id: str, request_id: str, re
 
 def _child_application_binding_matches(cur, application_id: str, payload: dict[str, Any], *,
                                        allowed_steps: set[str] | None = None) -> bool:
-    cur.execute("SELECT coalesce(job_url,''), coalesce(jd_hash,''), current_step FROM applications WHERE id=%s;",
+    cur.execute("SELECT coalesce(job_url,''), coalesce(jd_hash,''), current_step, pipeline_version FROM applications WHERE id=%s;",
                 (application_id,))
     row = cur.fetchone()
     if not row:
@@ -895,6 +903,12 @@ def _child_application_binding_matches(cur, application_id: str, payload: dict[s
             or str(payload.get("jd_hash") or "") != str(row[1] or "")):
         return False
     current_step = str(row[2] or "")
+    # A delegated upload belongs to the exact parent pipeline incarnation.
+    # ``current_step`` alone is vulnerable to ABA (leave a step, later return).
+    current_version = int(row[3] if len(row) > 3 and row[3] is not None else payload.get("expected_pipeline_version") or 0)
+    expected_version = payload.get("expected_pipeline_version")
+    if expected_version is None or int(expected_version) != current_version:
+        return False
     if allowed_steps is not None:
         return current_step in allowed_steps
     return str(payload.get("expected_application_step") or "") == current_step
@@ -920,8 +934,8 @@ def load_delegated_upload_capabilities(cur, task: Dict[str, Any], binding: Dict[
              FROM approval_requests
             WHERE application_id=%s AND type='privileged_upload_document'
               AND status='approved' AND consumed_at IS NULL AND token_expires_at > now()
-              AND payload_json->>'autofill_plan_key'=%s
-              AND payload_json->>'parent_approval_request_id'=%s
+              AND bound_autofill_plan_key=%s
+              AND parent_approval_request_id=%s::uuid
               AND payload_json->>'delegated_to_autofill'='true'
             ORDER BY created_at;""",
         (task["application_id"], plan_key, str(binding.get("id") or "")),
@@ -1344,7 +1358,7 @@ def durable_close_unstarted_approval(task: Dict[str, Any], binding: Dict[str, An
                 """UPDATE approval_requests SET status='expired', executing_task_id=NULL,
                            action_note=COALESCE(action_note,%s)
                      WHERE application_id=%s AND type='privileged_upload_document'
-                       AND payload_json->>'parent_approval_request_id'=%s
+                       AND parent_approval_request_id=%s::uuid
                        AND payload_json->>'delegated_to_autofill'='true'
                        AND status IN ('pending','approved');""",
                 ("Parent autofill closed before browser I/O; delegated child is no longer executable.",

@@ -622,7 +622,10 @@ def test_post_io_lifecycle_race_becomes_reconciliation_not_completed(db):
     binding = _binding(worker, db, task)
     worker.durable_begin_execution(task, binding, "fixture-tab")
     with db.connect(TEST_DSN) as conn, conn.cursor() as cur:
+        # Deliberate fixture-only state mutation: production code must use the DB transition function.
+        cur.execute("SELECT set_config('jobos.pipeline_transition_authorized','on',true);")
         cur.execute("UPDATE applications SET current_step='abandoned', status='abandoned' WHERE id=%s", (task["application_id"],))
+        cur.execute("SELECT set_config('jobos.pipeline_transition_authorized','off',true);")
         conn.commit()
     result = SimpleNamespace(status="completed", target_id="fixture-tab", verified_refs=("first",), failed_refs=())
     with pytest.raises(worker.PermanentTaskError, match="lifecycle changed after deterministic browser I/O"):
@@ -640,7 +643,10 @@ def test_denied_parent_restores_form_ready_and_closes_delegated_children(db):
     from services.approval import approval_service_v1 as approval
     task = _record(db, approval_status="pending")
     with db.connect(TEST_DSN) as conn, conn.cursor() as cur:
+        # Deliberate fixture-only state mutation: production code must use the DB transition function.
+        cur.execute("SELECT set_config('jobos.pipeline_transition_authorized','on',true);")
         cur.execute("UPDATE applications SET current_step='awaiting_approval' WHERE id=%s", (task["application_id"],))
+        cur.execute("SELECT set_config('jobos.pipeline_transition_authorized','off',true);")
         plan_key = "plan-fixture"
         cur.execute("UPDATE approval_requests SET payload_json = payload_json || jsonb_build_object('autofill_plan_key',%s::text) WHERE id=%s", (plan_key, task["approval_request_id"]))
         cur.execute("""INSERT INTO approval_requests(type,application_id,payload_json,status,approval_token_hash,token_expires_at)

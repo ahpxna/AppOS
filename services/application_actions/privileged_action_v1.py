@@ -60,6 +60,75 @@ def _transport() -> OpenClawTransport:
                              profile=os.getenv("JOBOS_BROWSER_PROFILE", "remote"), timeout=90)
 
 
+def _effect_sha(value: Any) -> str:
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"),
+                                     ensure_ascii=False, default=str).encode("utf-8")).hexdigest()
+
+
+def _journal_prepare_effect(*, execution_id: str, sequence_no: int, effect_kind: str,
+                            target_id: str | None, target_ref: str | None, request: Any) -> str:
+    """Commit intent before crossing the browser/network side-effect boundary."""
+    with psycopg.connect(database_dsn(), autocommit=True) as jconn, jconn.cursor() as jcur:
+        jcur.execute(
+            """INSERT INTO privileged_action_journal(
+                   execution_id,sequence_no,effect_kind,target_id,target_ref,request_sha256,status)
+               VALUES (%s,%s,%s,%s,%s,%s,'prepared') RETURNING id::text;""",
+            (execution_id, sequence_no, effect_kind, target_id, target_ref, _effect_sha(request)),
+        )
+        return str(jcur.fetchone()[0])
+
+
+def _journal_effect_executed(journal_id: str) -> None:
+    with psycopg.connect(database_dsn(), autocommit=True) as jconn, jconn.cursor() as jcur:
+        jcur.execute(
+            """UPDATE privileged_action_journal SET status='executed',executed_at=now()
+                 WHERE id=%s AND status='prepared';""", (journal_id,),
+        )
+        if jcur.rowcount != 1:
+            raise PrivilegedActionError("privileged effect journal changed unexpectedly after browser I/O")
+
+
+def _journal_effect_uncertain(journal_id: str, error: BaseException) -> None:
+    try:
+        with psycopg.connect(database_dsn(), autocommit=True) as jconn, jconn.cursor() as jcur:
+            jcur.execute(
+                """UPDATE privileged_action_journal
+                      SET status='uncertain',executed_at=coalesce(executed_at,now()),
+                          evidence_json=jsonb_build_object('error',%s)
+                    WHERE id=%s AND status IN ('prepared','executed');""",
+                (str(error)[:1000], journal_id),
+            )
+    except Exception:
+        # The outer execution fence still prevents replay even if journaling itself
+        # becomes unavailable after an external effect.
+        pass
+
+
+def _journal_verify_execution(execution_id: str, evidence: Any) -> None:
+    with psycopg.connect(database_dsn(), autocommit=True) as jconn, jconn.cursor() as jcur:
+        jcur.execute(
+            """UPDATE privileged_action_journal
+                  SET status='verified',verified_at=now(),
+                      evidence_json=coalesce(evidence_json,'{}'::jsonb) || jsonb_build_object('result_sha256',%s)
+                WHERE execution_id=%s AND status IN ('prepared','executed');""",
+            (_effect_sha(evidence), execution_id),
+        )
+
+
+def _journal_uncertain_open_effects(execution_id: str, error: BaseException) -> None:
+    try:
+        with psycopg.connect(database_dsn(), autocommit=True) as jconn, jconn.cursor() as jcur:
+            jcur.execute(
+                """UPDATE privileged_action_journal
+                      SET status='uncertain',evidence_json=coalesce(evidence_json,'{}'::jsonb) ||
+                          jsonb_build_object('error',%s)
+                    WHERE execution_id=%s AND status IN ('prepared','executed');""",
+                (str(error)[:1000], execution_id),
+            )
+    except Exception:
+        pass
+
+
 def _origin(url: str) -> str:
     p = urlsplit(url)
     if p.scheme not in {"http", "https"} or not p.netloc:
@@ -1365,10 +1434,29 @@ def execute_one(conn, request_id: str) -> dict[str, Any]:
         if not created:
             raise PrivilegedActionError("this approval already has an execution record; never replay it")
         execution_id = str(created[0]); conn.commit()
+    effect_sequence = 0
+
+    def perform_effect(effect_kind: str, target_id: str | None, target_ref: str | None,
+                       request: Any, callback):
+        nonlocal effect_sequence, io_started
+        effect_sequence += 1
+        journal_id = _journal_prepare_effect(
+            execution_id=str(execution_id), sequence_no=effect_sequence, effect_kind=effect_kind,
+            target_id=target_id, target_ref=target_ref, request=request,
+        )
+        io_started = True
+        try:
+            value = callback()
+        except Exception as effect_exc:
+            _journal_effect_uncertain(journal_id, effect_exc)
+            raise
+        _journal_effect_executed(journal_id)
+        return value
+
     try:
         with conn.cursor() as cur:
             payload = dict(payload or {})
-            cur.execute("SELECT coalesce(job_url,''), coalesce(jd_hash,''), current_step FROM applications WHERE id=%s FOR UPDATE;", (app_id,))
+            cur.execute("SELECT coalesce(job_url,''), coalesce(jd_hash,''), current_step, pipeline_version FROM applications WHERE id=%s FOR UPDATE;", (app_id,))
             current_app = cur.fetchone()
             if not current_app:
                 raise PrivilegedActionError("application no longer exists")
@@ -1380,6 +1468,8 @@ def execute_one(conn, request_id: str) -> dict[str, Any]:
                 raise PrivilegedActionError("application JD changed after approval")
             if str(payload.get("expected_application_step") or "") != str(current_app[2] or ""):
                 raise PrivilegedActionError("application pipeline step changed after approval")
+            if int(payload.get("expected_pipeline_version") if payload.get("expected_pipeline_version") is not None else -1) != int(current_app[3] or 0):
+                raise PrivilegedActionError("application pipeline version changed after approval")
             if atype == "privileged_choose_navigation_target":
                 live_url, live_snap, live_nodes, live_fp = _revalidate(transport, dict(payload or {}))
                 platform = detect_platform(live_url, live_snap)
@@ -1500,7 +1590,9 @@ def execute_one(conn, request_id: str) -> dict[str, Any]:
                 if atype == "privileged_begin_application":
                     _require_application_step(cur, app_id, "docs_verified")
                     _persist_pre_io_target_catalog(execution_id, _pre_io_target_catalog(transport, before_tabs))
-                    io_started = True; _click(transport, target_id, str(payload["control_ref"]))
+                    perform_effect("click", target_id, str(payload["control_ref"]),
+                                   {"control_ref": payload["control_ref"], "action_type": atype},
+                                   lambda: _click(transport, target_id, str(payload["control_ref"])))
                     _transition_application_step(
                         cur, application_id=app_id, to_step="application_entrypoint_ready",
                         actor="privileged-action-executor",
@@ -1515,8 +1607,12 @@ def execute_one(conn, request_id: str) -> dict[str, Any]:
                         raise PrivilegedActionError("account registration has unapproved terms/consent controls; approve those separately first")
                     resolved_plan = [(item, _resolve_plan_value(cur, item)) for item in (payload.get("field_plan") or [])]
                     for item, value in resolved_plan:
-                        io_started = True; _fill(transport, target_id, str(item["ref"]), value)
-                    io_started = True; _click(transport, target_id, str(payload["control_ref"]))
+                        perform_effect("fill", target_id, str(item["ref"]),
+                                       {"field_ref": item["ref"], "value_sha256": _effect_sha(value)},
+                                       lambda item=item, value=value: _fill(transport, target_id, str(item["ref"]), value))
+                    perform_effect("click", target_id, str(payload["control_ref"]),
+                                   {"control_ref": payload["control_ref"], "action_type": atype},
+                                   lambda: _click(transport, target_id, str(payload["control_ref"])))
                     result = _after_navigation(cur, transport, app_id, target_id, before_tabs)
                     if not _observable_page_change(before_target=target_id, before_url=url, before_snapshot=snap, after=result):
                         raise PrivilegedActionError("employer account action produced no observable browser change")
@@ -1539,8 +1635,9 @@ def execute_one(conn, request_id: str) -> dict[str, Any]:
                     # checkbox must not retroactively make a valid consent look
                     # uncertain and force unnecessary reconciliation.
                     for item in toggle_items:
-                        io_started = True
-                        _click(transport, target_id, str(item["ref"]))
+                        perform_effect("check", target_id, str(item["ref"]),
+                                       {"consent_ref": item["ref"], "label": item.get("label")},
+                                       lambda item=item: _click(transport, target_id, str(item["ref"])))
                         time.sleep(0.2)
                         live_toggle_snapshot = transport.snapshot(target_id)
                         live_toggle_items = _consent_items(parse_snapshot(live_toggle_snapshot))
@@ -1552,8 +1649,9 @@ def execute_one(conn, request_id: str) -> dict[str, Any]:
 
                     if button_items:
                         button = button_items[0]
-                        io_started = True
-                        _click(transport, target_id, str(button["ref"]))
+                        perform_effect("click", target_id, str(button["ref"]),
+                                       {"consent_button_ref": button["ref"], "label": button.get("label")},
+                                       lambda: _click(transport, target_id, str(button["ref"])))
                         result = _after_navigation(cur, transport, app_id, target_id, before_tabs)
                         changed = _observable_page_change(before_target=target_id, before_url=url,
                                                           before_snapshot=snap, after=result)
@@ -1571,7 +1669,9 @@ def execute_one(conn, request_id: str) -> dict[str, Any]:
                     current_digest, _fields, blockers = _field_state(nodes)
                     if blockers or current_digest != payload.get("field_state_sha256"):
                         raise PrivilegedActionError("form fields changed after application-step approval")
-                    io_started = True; _click(transport, target_id, str(payload["control_ref"]))
+                    perform_effect("click", target_id, str(payload["control_ref"]),
+                                   {"control_ref": payload["control_ref"], "action_type": atype},
+                                   lambda: _click(transport, target_id, str(payload["control_ref"])))
                     result = _after_navigation(cur, transport, app_id, target_id, before_tabs)
                     if not _observable_page_change(before_target=target_id, before_url=url, before_snapshot=snap, after=result):
                         raise PrivilegedActionError("application wizard step click produced no observable page change")
@@ -1593,13 +1693,18 @@ def execute_one(conn, request_id: str) -> dict[str, Any]:
                     if cand[2] == "numeric_code":
                         ref = str(payload.get("field_ref") or "")
                         if not ref or ref == "NaN": raise PrivilegedActionError("verification code field was not bound")
-                        io_started = True; _fill(transport, target_id, ref, secret)
+                        perform_effect("fill", target_id, ref,
+                                       {"field_ref": ref, "secret_sha256": str(cand[3])},
+                                       lambda: _fill(transport, target_id, ref, secret))
                         control = str(payload.get("control_ref") or "")
-                        if control and control != "NaN": io_started = True; _click(transport, target_id, control)
+                        if control and control != "NaN":
+                            perform_effect("click", target_id, control, {"control_ref": control, "verification": True},
+                                           lambda: _click(transport, target_id, control))
                         result = _after_navigation(cur, transport, app_id, target_id, before_tabs)
                     else:
                         _require_trusted_target(cur, secret, application_id=app_id, purpose="gmail_magic_link")
-                        io_started = True; transport._run(["open", secret])
+                        perform_effect("open", target_id, None, {"url_sha256": _effect_sha(secret)},
+                                       lambda: transport._run(["open", secret]))
                         result = _after_navigation(cur, transport, app_id, target_id, before_tabs)
                     if not _observable_page_change(before_target=target_id, before_url=url, before_snapshot=snap, after=result):
                         raise PrivilegedActionError("email verification browser I/O produced no observable page change")
@@ -1628,8 +1733,9 @@ def execute_one(conn, request_id: str) -> dict[str, Any]:
                         profile=os.getenv("JOBOS_BROWSER_PROFILE", "remote"), timeout=90,
                         approved_upload_hashes={str(path): str(approved["sha256"])},
                     )
-                    io_started = True
-                    upload_transport.execute(target_id, {"action": "upload", "target": field_ref, "value": str(path)})
+                    perform_effect("upload", target_id, field_ref,
+                                   {"field_ref": field_ref, "artifact_sha256": approved["sha256"], "filename": approved.get("filename")},
+                                   lambda: upload_transport.execute(target_id, {"action": "upload", "target": field_ref, "value": str(path)}))
                     time.sleep(0.8)
                     observed = upload_transport.snapshot(target_id)
                     if not _upload_effect_verified(before_snapshot=snap, after_snapshot=observed,
@@ -1649,7 +1755,9 @@ def execute_one(conn, request_id: str) -> dict[str, Any]:
                         raise PrivilegedActionError("final Submit requires an exact approved resume artifact binding")
                     if not _document_bindings_still_current(cur, app_id, bindings, required_types={"resume"}):
                         raise PrivilegedActionError("approved resume artifact pointer, JD provenance, or bytes changed")
-                    io_started = True; _click(transport, target_id, str(payload["control_ref"]))
+                    perform_effect("click", target_id, str(payload["control_ref"]),
+                                   {"control_ref": payload["control_ref"], "action_type": atype},
+                                   lambda: _click(transport, target_id, str(payload["control_ref"])))
                     time.sleep(2.0)
                     observed_url = transport.current_url(target_id)
                     observed = transport.snapshot(target_id)
@@ -1665,6 +1773,8 @@ def execute_one(conn, request_id: str) -> dict[str, Any]:
                     result = {"submitted": True, "confirmation_url": observed_url}
                 else:
                     raise PrivilegedActionError(f"unimplemented privileged type: {atype}")
+            if io_started:
+                _journal_verify_execution(str(execution_id), result)
             cur.execute("""UPDATE privileged_action_executions SET status='completed', result_json=%s, finished_at=now()
                            WHERE id=%s;""", (Jsonb(result), execution_id))
             cur.execute("""UPDATE approval_requests SET status='consumed', consumed_at=now(), consumed_by='privileged-action-executor'
@@ -1685,6 +1795,8 @@ def execute_one(conn, request_id: str) -> dict[str, Any]:
                 "result": result, "followup": followup}
     except Exception as exc:
         conn.rollback()
+        if execution_id and io_started:
+            _journal_uncertain_open_effects(str(execution_id), exc)
         with conn.cursor() as cur:
             state = "needs_reconciliation" if io_started else "failed"
             cur.execute("""UPDATE privileged_action_executions SET status=%s, error_message=%s, finished_at=now()
@@ -1721,7 +1833,15 @@ def recover_stale_executions(conn) -> int:
                           error_message=coalesce(error_message, 'Executor lease/staleness timeout; reconcile before any new approval.')
                     WHERE e.status='running'
                       AND e.started_at < now() - make_interval(secs => %s)
-                  RETURNING e.approval_request_id, e.application_id, e.action_type
+                  RETURNING e.id, e.approval_request_id, e.application_id, e.action_type
+               ), journaled AS (
+                   UPDATE privileged_action_journal j
+                      SET status='uncertain',
+                          evidence_json=coalesce(j.evidence_json,'{}'::jsonb) ||
+                            jsonb_build_object('reason','stale_execution_reaper')
+                     FROM stale s
+                    WHERE j.execution_id=s.id AND j.status IN ('prepared','executed')
+                  RETURNING j.id
                ), consumed AS (
                    UPDATE approval_requests ar
                       SET status='consumed', consumed_at=coalesce(consumed_at, now()),

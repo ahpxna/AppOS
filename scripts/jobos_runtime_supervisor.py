@@ -13,16 +13,18 @@ import json
 import os
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from services.common.config import load_repo_env
+from services.common.config import database_dsn, load_repo_env
 from services.runtime.process_runner import DEFAULT_PROCESS_RUNNER
 
 RUN_DIR = ROOT / ".jobos" / "run"
@@ -106,10 +108,72 @@ def _specs() -> dict[str, WorkerSpec]:
     return specs
 
 
+def _db_runtime_start(runtime_instance_id: str) -> None:
+    try:
+        import psycopg
+        with psycopg.connect(database_dsn(), autocommit=True) as conn, conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO runtime_instances(id,hostname,pid,release_version,git_commit,status,started_at,heartbeat_at)
+                   VALUES (%s::uuid,%s,%s,%s,%s,'running',now(),now())
+                   ON CONFLICT (id) DO UPDATE SET status='running',heartbeat_at=now();""",
+                (runtime_instance_id,socket.gethostname(),os.getpid(),os.getenv("JOBOS_RELEASE_VERSION"),
+                 os.getenv("JOBOS_GIT_COMMIT")),
+            )
+    except Exception:
+        # Runtime DB history is durable telemetry; OS PID/process state remains
+        # the immediate liveness authority and must still work during DB repair.
+        pass
+
+
+def _db_runtime_heartbeat(runtime_instance_id: str, children: dict[str, subprocess.Popen[Any]],
+                          restarts: dict[str, int], specs: dict[str, WorkerSpec], degraded: dict[str, str]) -> None:
+    try:
+        import psycopg
+        with psycopg.connect(database_dsn(), autocommit=False) as conn, conn.cursor() as cur:
+            cur.execute(
+                """UPDATE runtime_instances SET status=%s,heartbeat_at=now() WHERE id=%s::uuid;""",
+                ("degraded" if degraded else "running", runtime_instance_id),
+            )
+            for name,spec in specs.items():
+                proc=children.get(name)
+                running=bool(proc is not None and proc.poll() is None)
+                cur.execute(
+                    """INSERT INTO runtime_services(runtime_instance_id,service_key,pid,required,status,restart_count,heartbeat_at,last_error)
+                       VALUES (%s::uuid,%s,%s,%s,%s,%s,now(),%s)
+                       ON CONFLICT (runtime_instance_id,service_key) DO UPDATE SET
+                         pid=EXCLUDED.pid,required=EXCLUDED.required,status=EXCLUDED.status,
+                         restart_count=EXCLUDED.restart_count,heartbeat_at=now(),last_error=EXCLUDED.last_error;""",
+                    (runtime_instance_id,name,proc.pid if proc else None,spec.required,
+                     "running" if running else ("degraded" if name in degraded else "stopped"),
+                     restarts.get(name,0),degraded.get(name)),
+                )
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _db_runtime_stop(runtime_instance_id: str) -> None:
+    try:
+        import psycopg
+        with psycopg.connect(database_dsn(), autocommit=True) as conn, conn.cursor() as cur:
+            cur.execute(
+                """UPDATE runtime_instances SET status='stopped',heartbeat_at=now(),stopped_at=now()
+                    WHERE id=%s::uuid;""", (runtime_instance_id,),
+            )
+            cur.execute(
+                """UPDATE runtime_services SET status='stopped',heartbeat_at=now()
+                    WHERE runtime_instance_id=%s::uuid;""", (runtime_instance_id,),
+            )
+    except Exception:
+        pass
+
+
 def _write_state(children: dict[str, subprocess.Popen[Any]], restarts: dict[str, int],
-                 specs: dict[str, WorkerSpec], degraded: dict[str, str]) -> None:
+                 specs: dict[str, WorkerSpec], degraded: dict[str, str],
+                 runtime_instance_id: str | None = None) -> None:
     data = {
         "supervisor_pid": os.getpid(),
+        "runtime_instance_id": runtime_instance_id,
         "updated_at_unix": int(time.time()),
         "services": {
             name: {
@@ -171,6 +235,8 @@ def daemon() -> int:
     RUN_DIR.mkdir(parents=True, exist_ok=True)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     SUPERVISOR_PID.write_text(str(os.getpid()))
+    runtime_instance_id = str(uuid.uuid4())
+    _db_runtime_start(runtime_instance_id)
     signal.signal(signal.SIGTERM, lambda *_: globals().__setitem__("STOP", True))
     signal.signal(signal.SIGINT, lambda *_: globals().__setitem__("STOP", True))
     children: dict[str, subprocess.Popen[Any]] = {}
@@ -212,10 +278,12 @@ def daemon() -> int:
                         restarts[name] = restarts.get(name, 0) + 1
                     children[name] = _spawn(spec)
                     last_start[name] = now
-            _write_state(children, restarts, specs, degraded)
+            _write_state(children, restarts, specs, degraded, runtime_instance_id)
+            _db_runtime_heartbeat(runtime_instance_id, children, restarts, specs, degraded)
             time.sleep(2)
     finally:
         _shutdown(children)
+        _db_runtime_stop(runtime_instance_id)
         try:
             STATE_FILE.unlink(missing_ok=True)
             SUPERVISOR_PID.unlink(missing_ok=True)
@@ -292,7 +360,20 @@ def status() -> int:
     ]
     state["required_failures"] = required_failures
     state["ready"] = running and not required_failures
-    print(json.dumps(state, indent=2))
+    try:
+        import psycopg
+        with psycopg.connect(database_dsn(), autocommit=True) as conn, conn.cursor() as cur:
+            cur.execute(
+                """SELECT id::text,hostname,pid,status,started_at,heartbeat_at,stopped_at
+                     FROM runtime_instances ORDER BY heartbeat_at DESC LIMIT 1;"""
+            )
+            row=cur.fetchone()
+            if row:
+                state["database_runtime"]={"id":row[0],"hostname":row[1],"pid":row[2],"status":row[3],
+                                           "started_at":row[4],"heartbeat_at":row[5],"stopped_at":row[6]}
+    except Exception as exc:
+        state["database_runtime"]={"available":False,"error":str(exc)[:300]}
+    print(json.dumps(state, indent=2, default=str))
     return 0 if state["ready"] else 1
 
 

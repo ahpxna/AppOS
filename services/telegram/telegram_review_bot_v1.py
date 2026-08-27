@@ -122,16 +122,17 @@ def _callback_token(cur, item_id: str, action: str, allowed_user_id: int,
                     payload: dict[str, Any] | None = None) -> str:
     raw = secrets.token_urlsafe(18)
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
-    cur.execute("SELECT source_sha256 FROM human_review_items WHERE id=%s;", (item_id,))
+    cur.execute("SELECT source_sha256,current_revision_id::text FROM human_review_items WHERE id=%s;", (item_id,))
     row = cur.fetchone()
-    source_sha256 = str(row[0]) if row and row[0] else None
+    source_sha256 = str(row[0]) if row and len(row) > 0 and row[0] else None
+    review_revision_id = str(row[1]) if row and len(row) > 1 and row[1] else None
     cur.execute(
         """INSERT INTO telegram_callback_tokens(
                review_item_id, token_sha256, action, allowed_user_id, expires_at,
-               source_sha256, context_sha256, payload_json)
-           VALUES (%s, %s, %s, %s, now() + make_interval(hours => %s), %s, %s, %s);""",
+               source_sha256, context_sha256, payload_json, review_revision_id)
+           VALUES (%s, %s, %s, %s, now() + make_interval(hours => %s), %s, %s, %s, %s);""",
         (item_id, digest, action, allowed_user_id, ttl_hours, source_sha256, context_sha256,
-         Jsonb(payload or {})),
+         Jsonb(payload or {}), review_revision_id),
     )
     return raw
 
@@ -444,65 +445,187 @@ def _detail_text(row: tuple[Any, ...], envelope: dict[str, Any] | None = None,
     return "\n".join(lines)[:3900]
 
 
-def _record_delivery(cur, item_id: str, chat_id: int, message_id: int | None,
-                     kind: str, *, status: str = "sent", error: str | None = None,
-                     artifact_sha256: str | None = None, context_sha256: str | None = None) -> None:
+def _delivery_dedupe(*, item_id: str, chat_id: int, kind: str, method: str,
+                     context_sha256: str | None = None, artifact_sha256: str | None = None,
+                     force_nonce: str | None = None) -> str:
+    raw = {"item_id": item_id, "chat_id": chat_id, "kind": kind, "method": method,
+           "context_sha256": context_sha256, "artifact_sha256": artifact_sha256,
+           "force_nonce": force_nonce}
+    return hashlib.sha256(json.dumps(raw, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _redact_telegram_outbox_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Return an audit-safe payload that never persists Telegram capabilities.
+
+    ``callback_data`` contains single-use bearer tokens. The actual request is
+    hashed separately, while the durable JSON keeps only a digest of each
+    callback value so operators can compare requests without recovering a live
+    capability from PostgreSQL.
+    """
+    def scrub(value: Any, *, key: str | None = None) -> Any:
+        if key == "callback_data" and isinstance(value, str):
+            digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
+            return {"redacted": "callback_data", "sha256": digest}
+        if isinstance(value, dict):
+            return {str(k): scrub(v, key=str(k)) for k, v in value.items()}
+        if isinstance(value, list):
+            return [scrub(v) for v in value]
+        return value
+
+    safe = dict(payload)
+    markup = safe.get("reply_markup")
+    if isinstance(markup, str):
+        try:
+            parsed = json.loads(markup)
+        except Exception:
+            # Fail closed: an opaque markup string could contain callback data.
+            safe["reply_markup"] = {
+                "redacted": "opaque_reply_markup",
+                "sha256": hashlib.sha256(markup.encode("utf-8")).hexdigest(),
+            }
+        else:
+            safe["reply_markup"] = scrub(parsed)
+    elif markup is not None:
+        safe["reply_markup"] = scrub(markup)
+    return scrub(safe)
+
+
+def _prepare_delivery(cur, *, item_id: str, chat_id: int, kind: str, method: str,
+                      payload: dict[str, Any], artifact_sha256: str | None = None,
+                      context_sha256: str | None = None, force_nonce: str | None = None) -> str | None:
+    """Persist the Telegram send intent before network I/O.
+
+    A pre-existing dedupe row is never blindly resent: ``sending``/``uncertain``
+    means Telegram may already have accepted it.
+    """
+    dedupe = _delivery_dedupe(item_id=item_id, chat_id=chat_id, kind=kind, method=method,
+                              context_sha256=context_sha256, artifact_sha256=artifact_sha256,
+                              force_nonce=force_nonce)
+    request_sha = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str).encode("utf-8")
+    ).hexdigest()
+    stored_payload = _redact_telegram_outbox_payload(payload)
     cur.execute(
         """INSERT INTO telegram_review_deliveries(
-               review_item_id, chat_id, message_id, delivery_kind, status, error_message, artifact_sha256, context_sha256)
-           VALUES (%s, %s, %s, %s, %s, %s, %s, %s);""",
-        (item_id, chat_id, message_id, kind, status, error, artifact_sha256, context_sha256),
+               review_item_id,chat_id,message_id,delivery_kind,status,error_message,
+               artifact_sha256,context_sha256,dedupe_key,method,payload_json,request_sha256,
+               payload_redaction_version,attempt_count,lease_expires_at,delivered_at,updated_at)
+           VALUES (%s,%s,NULL,%s,'sending',NULL,%s,%s,%s,%s,%s,%s,1,1,now()+interval '5 minutes',NULL,now())
+           ON CONFLICT (dedupe_key) WHERE dedupe_key IS NOT NULL DO NOTHING
+           RETURNING id::text;""",
+        (item_id, chat_id, kind, artifact_sha256, context_sha256, dedupe, method,
+         Jsonb(stored_payload), request_sha),
     )
+    row = cur.fetchone()
+    if not row:
+        return None
+    delivery_id = str(row[0])
+    cur.execute(
+        """INSERT INTO telegram_delivery_attempts(delivery_id,attempt_no,status)
+           VALUES (%s,1,'started');""", (delivery_id,),
+    )
+    # Correctness boundary: intent/attempt must survive a process death during api().
+    cur.connection.commit()
+    return delivery_id
+
+
+def _reap_stale_transport(cur) -> None:
+    """Turn ambiguous expired transport leases into reconciliation state.
+
+    Telegram cannot participate in our PostgreSQL transaction. A dead sender or
+    update handler therefore leaves an ambiguity boundary, not a retryable row.
+    """
+    cur.execute(
+        """WITH stale AS (
+               UPDATE telegram_review_deliveries
+                  SET status='uncertain',lease_expires_at=NULL,updated_at=now(),
+                      error_message=coalesce(error_message,'Telegram send lease expired; delivery may have occurred. Do not resend blindly.')
+                WHERE status='sending' AND lease_expires_at IS NOT NULL AND lease_expires_at <= now()
+                RETURNING id
+           )
+           UPDATE telegram_delivery_attempts a
+              SET status='uncertain',finished_at=coalesce(finished_at,now()),
+                  error_message=coalesce(error_message,'Telegram send lease expired before local acknowledgement.')
+             FROM stale s WHERE a.delivery_id=s.id AND a.status='started';"""
+    )
+    cur.execute(
+        """UPDATE telegram_updates
+              SET status='uncertain',lease_expires_at=NULL,
+                  error_message=coalesce(error_message,'Telegram update processing lease expired; local effects may have occurred.')
+            WHERE status='processing' AND lease_expires_at IS NOT NULL AND lease_expires_at <= now();"""
+    )
+
+
+def _finish_delivery(cur, delivery_id: str, message_id: int) -> None:
+    cur.execute(
+        """UPDATE telegram_review_deliveries
+              SET status='sent',message_id=%s,delivered_at=now(),updated_at=now(),lease_expires_at=NULL
+            WHERE id=%s AND status='sending';""", (message_id, delivery_id),
+    )
+    cur.execute(
+        """UPDATE telegram_delivery_attempts
+              SET status='sent',telegram_message_id=%s,finished_at=now()
+            WHERE delivery_id=%s AND attempt_no=1 AND status='started';""", (message_id, delivery_id),
+    )
+    cur.connection.commit()
+
+
+def _uncertain_delivery(cur, delivery_id: str, exc: BaseException) -> None:
+    error = str(exc)[:1000]
+    cur.execute(
+        """UPDATE telegram_review_deliveries
+              SET status='uncertain',error_message=%s,updated_at=now(),lease_expires_at=NULL
+            WHERE id=%s AND status='sending';""", (error, delivery_id),
+    )
+    cur.execute(
+        """UPDATE telegram_delivery_attempts SET status='uncertain',error_message=%s,finished_at=now()
+            WHERE delivery_id=%s AND attempt_no=1 AND status='started';""", (error, delivery_id),
+    )
+    cur.connection.commit()
 
 
 def _deliver_artifact(cur, token: str, *, item_id: str, chat_id: int,
                       artifact: dict[str, Any]) -> bool:
-    """Best-effort exact artifact delivery. Failure never suppresses summary/approval."""
+    """Best-effort artifact delivery with a durable pre-send outbox row."""
     path = Path(artifact["file_path"]).expanduser()
     if not path.is_file():
         return False
-    cur.execute(
-        """SELECT 1 FROM telegram_review_deliveries
-             WHERE review_item_id = %s AND chat_id = %s AND delivery_kind = 'artifact'
-               AND artifact_sha256 = %s AND status = 'sent' LIMIT 1;""",
-        (item_id, chat_id, artifact["sha256"]),
-    )
-    if cur.fetchone():
-        return False
     method = "sendPhoto" if artifact["mime_type"].startswith("image/") else "sendDocument"
     field = "photo" if method == "sendPhoto" else "document"
+    data = {"chat_id": str(chat_id), "caption": artifact["filename"]}
+    delivery_id = _prepare_delivery(
+        cur, item_id=item_id, chat_id=chat_id, kind="artifact", method=method, payload=data,
+        artifact_sha256=artifact["sha256"],
+    )
+    if not delivery_id:
+        return False
     try:
         with path.open("rb") as stream:
-            sent = api(token, method, data={"chat_id": str(chat_id), "caption": artifact["filename"]},
+            sent = api(token, method, data=data,
                        files={field: (artifact["filename"], stream, artifact["mime_type"])})
-        _record_delivery(cur, item_id, chat_id, int(sent["result"]["message_id"]), "artifact",
-                         artifact_sha256=artifact["sha256"])
+        _finish_delivery(cur, delivery_id, int(sent["result"]["message_id"]))
         return True
     except Exception as exc:
-        _record_delivery(cur, item_id, chat_id, None, "artifact", status="failed",
-                         error=str(exc)[:1000], artifact_sha256=artifact.get("sha256"))
+        _uncertain_delivery(cur, delivery_id, exc)
         return False
 
 
 def _deliver_memory_artifact(cur, token: str, *, item_id: str, chat_id: int,
                              filename: str, payload: bytes, mime_type: str) -> bool:
     digest = hashlib.sha256(payload).hexdigest()
-    cur.execute("""SELECT 1 FROM telegram_review_deliveries
-                    WHERE review_item_id=%s AND chat_id=%s AND delivery_kind='artifact'
-                      AND artifact_sha256=%s AND status='sent' LIMIT 1;""", (item_id, chat_id, digest))
-    if cur.fetchone():
+    data = {"chat_id": str(chat_id), "caption": filename}
+    delivery_id = _prepare_delivery(cur, item_id=item_id, chat_id=chat_id, kind="artifact",
+                                    method="sendDocument", payload=data, artifact_sha256=digest)
+    if not delivery_id:
         return False
     try:
-        sent = api(token, "sendDocument", data={"chat_id": str(chat_id), "caption": filename},
+        sent = api(token, "sendDocument", data=data,
                    files={"document": (filename, io.BytesIO(payload), mime_type)})
-        _record_delivery(cur, item_id, chat_id, int(sent["result"]["message_id"]), "artifact",
-                         artifact_sha256=digest)
+        _finish_delivery(cur, delivery_id, int(sent["result"]["message_id"]))
         return True
     except Exception as exc:
-        _record_delivery(cur, item_id, chat_id, None, "artifact", status="failed",
-                         error=str(exc)[:1000], artifact_sha256=digest)
+        _uncertain_delivery(cur, delivery_id, exc)
         return False
-
 
 def _ui_token(cur, action: str, allowed_user_id: int, *, payload: dict[str, Any] | None = None,
               ttl_minutes: int = 30) -> str:
@@ -786,6 +909,7 @@ def dispatch_pending(conn, token: str, allowed_user_id: int, chat_id: int, *, li
                      force: bool = False, urgent_only: bool = False) -> int:
     """Deliver compact actionable cards; full artifacts are progressive disclosure."""
     with conn.cursor() as cur:
+        _reap_stale_transport(cur)
         sync_inbox(cur)
         conn.commit()
         where = "WHERE v.priority='urgent'" if urgent_only else ""
@@ -852,11 +976,22 @@ def dispatch_pending(conn, token: str, allowed_user_id: int, chat_id: int, *, li
             data: dict[str, Any] = {"chat_id": str(chat_id), "text": _message_text(row, envelope, diff)}
             if keyboard:
                 data["reply_markup"] = keyboard
-            sent = api(token, "sendMessage", data=data)
-            _record_delivery(cur, item_id, chat_id, int(sent["result"]["message_id"]), "summary",
-                             context_sha256=context_sha)
-            conn.commit()
-            delivered += 1
+            delivery_id = _prepare_delivery(
+                cur, item_id=item_id, chat_id=chat_id, kind="summary", method="sendMessage",
+                payload=data, context_sha256=context_sha,
+                force_nonce=(secrets.token_hex(8) if force else None),
+            )
+            if not delivery_id:
+                continue
+            try:
+                sent = api(token, "sendMessage", data=data)
+                _finish_delivery(cur, delivery_id, int(sent["result"]["message_id"]))
+                delivered += 1
+            except Exception as exc:
+                _uncertain_delivery(cur, delivery_id, exc)
+                # Do not blind-replay an ambiguous Telegram send. The durable
+                # outbox row is intentionally left for operator reconciliation.
+                continue
         return delivered
 
 
@@ -944,7 +1079,7 @@ def handle_callback(conn, token: str, allowed_user_id: int, callback: dict[str, 
     with conn.cursor() as cur:
         cur.execute(
             """SELECT id::text, review_item_id::text, action, allowed_user_id,
-                      expires_at, used_at, source_sha256, context_sha256, payload_json
+                      expires_at, used_at, source_sha256, context_sha256, payload_json, review_revision_id::text
                  FROM telegram_callback_tokens WHERE token_sha256 = %s FOR UPDATE;""",
             (digest,),
         )
@@ -963,11 +1098,13 @@ def handle_callback(conn, token: str, allowed_user_id: int, callback: dict[str, 
         item_id, action = str(row[1]), str(row[2])
         token_context = str(row[7]) if row[7] else None
         callback_payload = dict(row[8] or {})
-        cur.execute("SELECT source_sha256,status,item_type FROM human_review_items WHERE id=%s;", (item_id,))
+        cur.execute("SELECT source_sha256,status,item_type,current_revision_id::text FROM human_review_items WHERE id=%s;", (item_id,))
         current_item = cur.fetchone()
         current_source = str(current_item[0]) if current_item and current_item[0] else None
         token_source = str(row[6]) if row[6] else None
-        if token_source != current_source:
+        token_revision = str(row[9]) if row[9] else None
+        current_revision = str(current_item[3]) if current_item and current_item[3] else None
+        if token_source != current_source or token_revision != current_revision:
             cur.execute("UPDATE telegram_callback_tokens SET used_at=now() WHERE id=%s;", (row[0],))
             conn.commit()
             api(token, "answerCallbackQuery", data={"callback_query_id": callback_id,
@@ -1358,27 +1495,89 @@ def handle_message(conn, token: str, allowed_user_id: int, message: dict[str, An
 
 def poll_once(conn, token: str, allowed_user_id: int, *, timeout_seconds: int = 50) -> int:
     with conn.cursor() as cur:
+        _reap_stale_transport(cur)
         offset = _load_offset(cur)
+    conn.commit()
     payload = api(token, "getUpdates", data={"offset": str(offset),
                   "timeout": str(timeout_seconds),
                   "allowed_updates": json.dumps(["callback_query", "message"])},
                   timeout=timeout_seconds + 15)
     next_offset = offset
     updates = _result_list(payload)
+    handled = 0
     for update in updates:
         update_id = _safe_int(update.get("update_id"))
-        callback = update.get("callback_query")
-        message = update.get("message")
-        if isinstance(callback, dict):
-            handle_callback(conn, token, allowed_user_id, callback)
-        if isinstance(message, dict):
-            handle_message(conn, token, allowed_user_id, message)
+        if update_id <= 0:
+            continue
+        update_sha = hashlib.sha256(
+            json.dumps(update, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str).encode("utf-8")
+        ).hexdigest()
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO telegram_updates(bot_key,update_id,payload_sha256,payload_json,status)
+                   VALUES (%s,%s,%s,%s,'received')
+                   ON CONFLICT (bot_key,update_id) DO NOTHING
+                   RETURNING status;""",
+                (BOT_KEY, update_id, update_sha, Jsonb(_redact_telegram_outbox_payload(update))),
+            )
+            inserted = cur.fetchone()
+            if inserted is None:
+                cur.execute(
+                    "SELECT payload_sha256,status FROM telegram_updates WHERE bot_key=%s AND update_id=%s;",
+                    (BOT_KEY, update_id),
+                )
+                prior = cur.fetchone()
+                if not prior or str(prior[0]) != update_sha:
+                    conn.rollback()
+                    raise TelegramError(f"Telegram update {update_id} changed bytes for an existing identity")
+                if str(prior[1]) in {"processed", "processing", "uncertain"}:
+                    next_offset = max(next_offset, update_id + 1)
+                    continue
+            cur.execute(
+                """UPDATE telegram_updates SET status='processing',claimed_by='telegram-review-bot',
+                          lease_expires_at=now()+interval '5 minutes',error_message=NULL
+                    WHERE bot_key=%s AND update_id=%s AND status IN ('received','failed')
+                    RETURNING update_id;""",
+                (BOT_KEY, update_id),
+            )
+            if cur.fetchone() is None:
+                next_offset = max(next_offset, update_id + 1)
+                conn.commit()
+                continue
+        # Commit the durable inbox claim before callback/reply side effects.
+        conn.commit()
+        try:
+            callback = update.get("callback_query")
+            message = update.get("message")
+            if isinstance(callback, dict):
+                handle_callback(conn, token, allowed_user_id, callback)
+            if isinstance(message, dict):
+                handle_message(conn, token, allowed_user_id, message)
+        except Exception as exc:
+            conn.rollback()
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE telegram_updates SET status='uncertain',error_message=%s,lease_expires_at=NULL
+                        WHERE bot_key=%s AND update_id=%s;""",
+                    (str(exc)[:1000], BOT_KEY, update_id),
+                )
+            conn.commit()
+            raise
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE telegram_updates SET status='processed',processed_at=now(),lease_expires_at=NULL
+                    WHERE bot_key=%s AND update_id=%s;""",
+                (BOT_KEY, update_id),
+            )
+            _save_offset(cur, update_id + 1)
+        conn.commit()
+        handled += 1
         next_offset = max(next_offset, update_id + 1)
     if next_offset != offset:
         with conn.cursor() as cur:
             _save_offset(cur, next_offset)
         conn.commit()
-    return len(updates)
+    return handled
 
 
 def main() -> int:

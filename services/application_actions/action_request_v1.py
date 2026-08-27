@@ -49,7 +49,7 @@ def create_privileged_request(cur, *, application_id: str, action_type: str,
                               requested_by: str = "jobos", ttl_minutes: int = 60) -> str:
     if action_type not in PRIVILEGED_TYPES:
         raise RuntimeError(f"unsupported privileged action: {action_type}")
-    cur.execute("SELECT company, job_title, coalesce(job_url,''), coalesce(jd_hash,''), current_step FROM applications WHERE id = %s;", (application_id,))
+    cur.execute("SELECT company, job_title, coalesce(job_url,''), coalesce(jd_hash,''), current_step, pipeline_version FROM applications WHERE id = %s;", (application_id,))
     app = cur.fetchone()
     if not app:
         raise RuntimeError("application not found")
@@ -58,6 +58,7 @@ def create_privileged_request(cur, *, application_id: str, action_type: str,
         "action_type": action_type, "company": app[0], "job_title": app[1],
         "application_id": application_id, "job_url": str(app[2] or ""),
         "jd_hash": str(app[3] or ""), "expected_application_step": str(app[4] or ""),
+        "expected_pipeline_version": int(app[5] or 0),
     })
     body["binding_sha256"] = _hash_json(_authorization_payload(body))
     idem = _hash_json({"type": action_type, "application_id": application_id,
@@ -85,15 +86,23 @@ def create_privileged_request(cur, *, application_id: str, action_type: str,
         """INSERT INTO approval_requests(
                type, application_id, payload_json, status, approval_channel,
                approval_token_hash, token_expires_at, requested_by, summary_text,
-               max_attempts, idempotency_key, target_action, created_at)
+               max_attempts, idempotency_key, target_action,
+               parent_approval_request_id,bound_pipeline_version,bound_autofill_plan_key,
+               binding_sha256,expected_target_id,application_job_url,application_jd_hash,
+               bound_email_candidate_id,bound_autofill_plan_id,created_at)
            VALUES (%s,%s,%s,'pending','telegram',%s,
-                   now() + make_interval(mins => %s),%s,%s,1,%s,%s,now())
+                   now() + make_interval(mins => %s),%s,%s,1,%s,%s,
+                   %s,%s,%s,%s,%s,%s,%s,%s,%s,now())
            ON CONFLICT (idempotency_key)
              WHERE idempotency_key IS NOT NULL AND status IN ('pending','approved','executing')
            DO NOTHING
            RETURNING id::text;""",
         (action_type, application_id, Jsonb(body), token_hash, ttl_minutes,
-         requested_by, summary, idem, action_type),
+         requested_by, summary, idem, action_type,
+         body.get("parent_approval_request_id"), body.get("expected_pipeline_version"),
+         body.get("autofill_plan_key"), body.get("binding_sha256"),
+         body.get("expected_target_id") or body.get("target_id"), body.get("job_url"), body.get("jd_hash"),
+         body.get("candidate_id"), body.get("autofill_plan_id")),
     )
     inserted = cur.fetchone()
     if inserted:
@@ -111,9 +120,10 @@ def create_privileged_request(cur, *, application_id: str, action_type: str,
             raise RuntimeError("privileged approval materialization raced without a reusable winner")
         return str(winner[0])
     cur.execute(
-        """INSERT INTO approval_events(approval_request_id, event, actor, detail_json)
-           VALUES (%s,'created',%s,%s);""",
-        (request_id, requested_by, Jsonb({"action_type": action_type, "binding_sha256": body["binding_sha256"]})),
+        """INSERT INTO approval_events(approval_request_id, event, actor, detail_json, binding_sha256)
+           VALUES (%s,'created',%s,%s,%s);""",
+        (request_id, requested_by, Jsonb({"action_type": action_type, "binding_sha256": body["binding_sha256"]}),
+         body["binding_sha256"]),
     )
     ensure_approval_review_item(cur, request_id)
     return request_id

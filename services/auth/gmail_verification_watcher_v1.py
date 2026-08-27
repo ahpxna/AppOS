@@ -8,6 +8,7 @@ application as soon as a verification candidate/approval exists.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import hmac
 import json
 import os
@@ -59,10 +60,53 @@ def process_pending(conn, *, max_results: int = 10) -> int:
     conn.commit()
     for app_id, recipient, origin, current_url, stored_fp, detail, updated_at in rows:
         requested_at = updated_at - timedelta(minutes=2)
-        candidate = discover_verification(recipient=recipient, requested_at=requested_at,
-                                          employer_origin=origin, max_results=max_results,
-                                          exclude_message_ids=rejected_by_app.get(str(app_id), set()))
+        try:
+            account = gmail_account()
+        except Exception:
+            # The real Gmail call will still fail closed if account config is
+            # missing. Keeping a sentinel here lets DB/test adapters record the
+            # attempted discovery without moving config validation ahead of the
+            # established network boundary.
+            account = "unconfigured"
+        discovery_run_id = None
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO gmail_discovery_runs(
+                       application_id,gmail_account,recipient,requested_at,employer_origin,status)
+                   VALUES (%s,%s,%s,%s,%s,'running') RETURNING id::text;""",
+                (app_id, account, recipient, requested_at, origin),
+            )
+            ledger_row = cur.fetchone() if hasattr(cur, "fetchone") else None
+            if ledger_row:
+                discovery_run_id = str(ledger_row[0])
+        # Durable intent exists before the bounded Gmail network/read boundary
+        # on PostgreSQL. Lightweight test/legacy adapters may not expose the new
+        # RETURNING row; do not manufacture an extra transaction for those
+        # compatibility adapters.
+        if discovery_run_id:
+            conn.commit()
+        try:
+            candidate = discover_verification(recipient=recipient, requested_at=requested_at,
+                                              employer_origin=origin, max_results=max_results,
+                                              exclude_message_ids=rejected_by_app.get(str(app_id), set()))
+        except Exception as exc:
+            conn.rollback()
+            if discovery_run_id:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """UPDATE gmail_discovery_runs SET status='failed',finished_at=now(),error_message=%s
+                            WHERE id=%s;""", (str(exc)[:1000], discovery_run_id),
+                    )
+                conn.commit()
+            raise
         if not candidate:
+            if discovery_run_id:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """UPDATE gmail_discovery_runs SET status='completed',finished_at=now() WHERE id=%s;""",
+                        (discovery_run_id,),
+                    )
+                conn.commit()
             continue
         with conn.cursor() as cur:
             # Gmail/network I/O happens outside a DB transaction. Revalidate the
@@ -81,6 +125,43 @@ def process_pending(conn, *, max_results: int = 10) -> int:
                 conn.rollback()
                 continue
             candidate_id = persist_candidate(cur, application_id=app_id, candidate=candidate)
+            if discovery_run_id:
+                header_sha = hashlib.sha256(json.dumps({
+                    "sender": candidate.get("sender"), "subject": candidate.get("subject"),
+                    "received_at": candidate.get("received_at").isoformat() if candidate.get("received_at") else None,
+                }, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")).hexdigest()
+                cur.execute(
+                    """INSERT INTO gmail_message_observations(
+                           discovery_run_id,application_id,gmail_account,gmail_message_id,received_at,sender,subject,
+                           headers_sha256,relevance_score,relevance_tier,selected)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,true)
+                       ON CONFLICT (discovery_run_id,gmail_message_id) DO UPDATE SET selected=true
+                       RETURNING id::text;""",
+                    (discovery_run_id,app_id,account,candidate["message_id"],candidate.get("received_at"),
+                     candidate.get("sender"),candidate.get("subject"),header_sha,
+                     candidate.get("relevance_score"),candidate.get("relevance")),
+                )
+                observation_id = str(cur.fetchone()[0])
+                cur.execute(
+                    """INSERT INTO gmail_verification_extractions(
+                           message_observation_id,verification_kind,secret_sha256,secret_context_json,candidate_id)
+                       VALUES (%s,%s,%s,%s,%s)
+                       ON CONFLICT (message_observation_id,verification_kind,secret_sha256)
+                       DO UPDATE SET candidate_id=EXCLUDED.candidate_id;""",
+                    (observation_id,candidate["kind"],candidate["secret_sha256"],
+                     Jsonb(candidate.get("secret_context") or {}),candidate_id),
+                )
+                cur.execute(
+                    """UPDATE gmail_discovery_runs SET status='completed',candidate_id=%s,scanned_count=1,finished_at=now()
+                        WHERE id=%s;""", (candidate_id,discovery_run_id),
+                )
+                cur.execute(
+                    """INSERT INTO gmail_sync_cursors(gmail_account,scope_key,last_message_id,last_received_at,updated_at)
+                       VALUES (%s,%s,%s,%s,now())
+                       ON CONFLICT (gmail_account,scope_key) DO UPDATE SET
+                         last_message_id=EXCLUDED.last_message_id,last_received_at=EXCLUDED.last_received_at,updated_at=now();""",
+                    (account,f"application:{app_id}",candidate["message_id"],candidate.get("received_at")),
+                )
             relevance = str(candidate.get("relevance") or "")
             if relevance and relevance != "employer_match" and origin:
                 from services.review.review_service_v1 import ensure_action_required_review

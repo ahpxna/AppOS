@@ -22,6 +22,7 @@ OpenAI) for the ``embed`` role when the chat provider lacks embeddings.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import json
 import math
 import os
@@ -202,10 +203,18 @@ def _max_output_tokens() -> int:
     return max(1, int(os.getenv("JOBOS_LLM_MAX_OUTPUT_TOKENS", "4096")))
 
 
+def _sha_payload(value: Any) -> str:
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"),
+                                     ensure_ascii=False, default=str).encode("utf-8")).hexdigest()
+
+
 def generate_result(*, role: str, prompt: str, model: str | None = None,
                     local_url: str | None = None, timeout: int = 300,
                     temperature: float = 0.2, num_ctx: int | None = None) -> LLMResult:
     config = resolve_config(role=role, model=model, local_url=local_url)
+    request_sha256 = _sha_payload({"kind": "generate", "role": role, "provider": config.provider,
+                                   "model": config.model, "prompt": prompt, "temperature": temperature,
+                                   "num_ctx": num_ctx, "max_output_tokens": _max_output_tokens()})
     input_est = _estimate_tokens(prompt)
     reservation = None
     if config.backend == "api":
@@ -213,6 +222,7 @@ def generate_result(*, role: str, prompt: str, model: str | None = None,
         reservation = reserve_paid_call(
             role=role, provider=config.provider, model=config.model,
             estimated_input_tokens=input_est, max_output_tokens=_max_output_tokens(),
+            request_sha256=request_sha256, request_kind='generate',
         )
     try:
         if config.backend == "ollama":
@@ -252,11 +262,14 @@ def generate_result(*, role: str, prompt: str, model: str | None = None,
         from .llm_cost_accounting_v1 import settle_paid_call
         cost = float(settle_paid_call(reservation, role=role, configured_model=config.model,
                                       resolved_model=resolved_model, input_tokens=input_tokens,
-                                      output_tokens=output_tokens, request_id=request_id))
+                                      output_tokens=output_tokens, request_id=request_id,
+                                      response_sha256=_sha_payload({"text": text})))
     else:
         from .llm_cost_accounting_v1 import record_local_call
         record_local_call(role=role, provider="ollama", model=resolved_model,
-                          input_tokens=input_tokens, output_tokens=output_tokens, request_id=request_id)
+                          input_tokens=input_tokens, output_tokens=output_tokens, request_id=request_id,
+                          request_sha256=request_sha256, response_sha256=_sha_payload({"text": text}),
+                          request_kind='generate')
     return LLMResult(text=text, provider=config.provider,
                      model=resolved_model, tokens_input=input_tokens, tokens_output=output_tokens,
                      estimated_cost_usd=cost, request_id=request_id)
@@ -275,12 +288,18 @@ def chat_result(*, role: str, messages: Sequence[dict[str, str]], model: str | N
                 temperature: float = 0.2, num_ctx: int | None = None,
                 json_mode: bool = False, json_schema: dict[str, Any] | None = None) -> LLMResult:
     config = resolve_config(role=role, model=model, local_url=local_url)
+    request_sha256 = _sha_payload({"kind": "chat", "role": role, "provider": config.provider,
+                                   "model": config.model, "messages": list(messages),
+                                   "temperature": temperature, "num_ctx": num_ctx,
+                                   "json_mode": json_mode, "json_schema": json_schema,
+                                   "max_output_tokens": _max_output_tokens()})
     input_est = _estimate_tokens(json.dumps(list(messages), ensure_ascii=False))
     reservation = None
     if config.backend == "api":
         from .llm_cost_accounting_v1 import reserve_paid_call
         reservation = reserve_paid_call(role=role, provider=config.provider, model=config.model,
-                                        estimated_input_tokens=input_est, max_output_tokens=_max_output_tokens())
+                                        estimated_input_tokens=input_est, max_output_tokens=_max_output_tokens(),
+                                        request_sha256=request_sha256, request_kind='chat')
     try:
         if config.backend == "ollama":
             options: dict[str, Any] = {"temperature": temperature}
@@ -322,11 +341,14 @@ def chat_result(*, role: str, messages: Sequence[dict[str, str]], model: str | N
         from .llm_cost_accounting_v1 import settle_paid_call
         cost = float(settle_paid_call(reservation, role=role, configured_model=config.model,
                                       resolved_model=resolved_model, input_tokens=input_tokens,
-                                      output_tokens=output_tokens, request_id=request_id))
+                                      output_tokens=output_tokens, request_id=request_id,
+                                      response_sha256=_sha_payload({"text": text})))
     else:
         from .llm_cost_accounting_v1 import record_local_call
         record_local_call(role=role, provider="ollama", model=resolved_model,
-                          input_tokens=input_tokens, output_tokens=output_tokens, request_id=request_id)
+                          input_tokens=input_tokens, output_tokens=output_tokens, request_id=request_id,
+                          request_sha256=request_sha256, response_sha256=_sha_payload({"text": text}),
+                          request_kind='chat')
     return LLMResult(text=text, provider=config.provider,
                      model=resolved_model, tokens_input=input_tokens, tokens_output=output_tokens,
                      estimated_cost_usd=cost, request_id=request_id)
@@ -363,13 +385,16 @@ def embed_texts(*, texts: Sequence[str], model: str | None = None,
         raise LLMGatewayError(
             "DeepSeek API style is not an embedding-capable endpoint; configure an embedding-capable provider for role='embed'."
         )
+    request_sha256 = _sha_payload({"kind": "embed", "provider": config.provider,
+                                   "model": config.model, "texts": list(texts)})
     input_est = sum(_estimate_tokens(text) for text in texts)
     reservation = None
     if config.backend == "api":
         from .llm_cost_accounting_v1 import reserve_paid_call
         # Embeddings have no completion tokens.
         reservation = reserve_paid_call(role="embed", provider=config.provider, model=config.model,
-                                        estimated_input_tokens=input_est, max_output_tokens=0)
+                                        estimated_input_tokens=input_est, max_output_tokens=0,
+                                        request_sha256=request_sha256, request_kind='embed')
     try:
         if config.backend == "ollama":
             response = _post_json(config.base_url + "/api/embed", {"model": config.model, "input": list(texts)}, timeout=timeout)
@@ -411,9 +436,12 @@ def embed_texts(*, texts: Sequence[str], model: str | None = None,
     if reservation is not None:
         from .llm_cost_accounting_v1 import settle_paid_call
         settle_paid_call(reservation, role="embed", configured_model=config.model, resolved_model=resolved_model,
-                         input_tokens=input_tokens, output_tokens=0, request_id=request_id)
+                         input_tokens=input_tokens, output_tokens=0, request_id=request_id,
+                         response_sha256=_sha_payload({"embeddings": embeddings}))
     else:
         from .llm_cost_accounting_v1 import record_local_call
         record_local_call(role="embed", provider="ollama", model=resolved_model,
-                          input_tokens=input_tokens, output_tokens=0, request_id=request_id)
+                          input_tokens=input_tokens, output_tokens=0, request_id=request_id,
+                          request_sha256=request_sha256, response_sha256=_sha_payload({"embeddings": embeddings}),
+                          request_kind='embed')
     return embeddings

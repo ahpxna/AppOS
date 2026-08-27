@@ -261,6 +261,9 @@ def assert_binding_matches(cur, request_row: Dict[str, Any]) -> None:
     elif atype == "autofill_form":
         if not application_id:
             raise RuntimeError("Autofill approval request missing application_id.")
+        # Preserve the cheap/stable step guard first: stale-step approvals fail
+        # before any document/page queries. Version is then checked separately
+        # to close the ABA case where the application later re-enters this step.
         cur.execute("SELECT coalesce(job_url,''), coalesce(jd_hash,''), current_step FROM applications WHERE id=%s;",
                     (application_id,))
         app = cur.fetchone()
@@ -272,6 +275,14 @@ def assert_binding_matches(cur, request_row: Dict[str, Any]) -> None:
             raise RuntimeError("Autofill approval JD changed after preview; prepare a fresh plan.")
         if str(payload.get("expected_application_step") or "") != str(app[2] or ""):
             raise RuntimeError("Autofill approval pipeline step changed; prepare a fresh plan.")
+        expected_version = request_row.get("bound_pipeline_version")
+        if expected_version is None:
+            expected_version = payload.get("expected_pipeline_version")
+        cur.execute("SELECT pipeline_version FROM applications WHERE id=%s AND current_step=%s;",
+                    (application_id, str(app[2] or "")))
+        version_row = cur.fetchone()
+        if not version_row or expected_version is None or int(expected_version) != int(version_row[0] or 0):
+            raise RuntimeError("Autofill approval pipeline version changed; prepare a fresh plan.")
         if not str(payload.get("expected_target_id") or "").strip():
             raise RuntimeError("Autofill approval predates exact browser-target binding; prepare a fresh plan.")
         document_id = payload.get("document_id")
@@ -313,10 +324,12 @@ def log_event(cur, request_id: Optional[str], event: str,
               actor: str, detail: Optional[Dict[str, Any]] = None) -> None:
     cur.execute(
         """
-        INSERT INTO approval_events (approval_request_id, event, actor, detail_json)
-        VALUES (%s, %s, %s, %s);
+        INSERT INTO approval_events (approval_request_id, event, actor, detail_json, binding_sha256)
+        VALUES (%s, %s, %s, %s,
+                CASE WHEN %s IS NULL THEN NULL
+                     ELSE (SELECT binding_sha256 FROM approval_requests WHERE id=%s) END);
         """,
-        (request_id, event, actor, Jsonb(detail or {})),
+        (request_id, event, actor, Jsonb(detail or {}), request_id, request_id),
     )
 
 
@@ -346,15 +359,15 @@ def _queue_autofill_task(cur, *, request_id: str, application_id: str, payload: 
               input_json, approval_request_id, expected_origin, generated_document_id,
               document_sha256, timeout_seconds, bound_artifact_id, artifact_sha256,
               artifact_filename, expected_initial_url, expected_page_fingerprint,
-              autofill_input_hash, autofill_action_scope, idempotency_key, created_at)
+              autofill_input_hash, autofill_action_scope, idempotency_key, autofill_plan_id, created_at)
            VALUES ('fill_application_form', %s, %s, 'queued', 'high', '{}'::jsonb,
-                   %s, %s, %s, %s, 300, %s, %s, %s, %s, %s, %s, %s, %s, now())
+                   %s, %s, %s, %s, 300, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
            ON CONFLICT (approval_request_id) WHERE approval_request_id IS NOT NULL DO NOTHING;""",
         (actor, application_id, request_id, payload["expected_origin"], payload["document_id"],
          payload["document_sha256"], payload.get("artifact_id"), payload.get("artifact_sha256"),
          payload.get("artifact_filename"), payload["expected_initial_url"],
          payload["expected_page_fingerprint"], payload["autofill_input_hash"],
-         Jsonb(payload.get("autofill_action_scope") or {}), f"autofill:{request_id}"),
+         Jsonb(payload.get("autofill_action_scope") or {}), f"autofill:{request_id}", payload.get("autofill_plan_id")),
     )
     if cur.rowcount == 1:
         log_event(cur, request_id, "autofill_task_queued", actor,
@@ -402,9 +415,10 @@ def queue_ready_autofill_for_plan(cur, *, application_id: str, plan_key: str, ac
     if not application_id or not plan_key:
         return False
     cur.execute(
-        """SELECT id::text, payload_json, status FROM approval_requests
+        """SELECT id::text, payload_json, status, bound_pipeline_version, bound_autofill_plan_id::text
+              FROM approval_requests
               WHERE application_id=%s AND type='autofill_form'
-                AND payload_json->>'autofill_plan_key'=%s
+                AND bound_autofill_plan_key=%s
               ORDER BY created_at DESC LIMIT 1 FOR UPDATE;""",
         (application_id, plan_key),
     )
@@ -412,6 +426,10 @@ def queue_ready_autofill_for_plan(cur, *, application_id: str, plan_key: str, ac
     if not parent:
         return False
     request_id, raw_payload, parent_status = str(parent[0]), dict(parent[1] or {}), str(parent[2] or "")
+    parent_pipeline_version = (parent[3] if len(parent) > 3 else raw_payload.get("expected_pipeline_version"))
+    parent_plan_id = (str(parent[4]) if len(parent) > 4 and parent[4] else raw_payload.get("autofill_plan_id"))
+    if parent_plan_id:
+        raw_payload["autofill_plan_id"] = parent_plan_id
 
     # Self-heal the historical parent-commit/child-materialization crash window.
     if parent_status in {"pending", "approved"}:
@@ -422,7 +440,7 @@ def queue_ready_autofill_for_plan(cur, *, application_id: str, plan_key: str, ac
     cur.execute(
         """UPDATE approval_requests SET status='expired'
               WHERE application_id=%s AND type='privileged_upload_document'
-                AND payload_json->>'parent_approval_request_id'=%s
+                AND parent_approval_request_id=%s::uuid
                 AND payload_json->>'delegated_to_autofill'='true'
                 AND status='pending' AND token_expires_at <= now();""",
         (application_id, request_id),
@@ -442,7 +460,7 @@ def queue_ready_autofill_for_plan(cur, *, application_id: str, plan_key: str, ac
               FROM approval_requests ar
               LEFT JOIN privileged_action_executions pae ON pae.approval_request_id=ar.id
              WHERE ar.application_id=%s AND ar.type='privileged_upload_document'
-               AND ar.payload_json->>'parent_approval_request_id'=%s
+               AND ar.parent_approval_request_id=%s::uuid
                AND ar.payload_json->>'delegated_to_autofill'='true';""",
         (application_id, request_id),
     )
@@ -458,7 +476,9 @@ def queue_ready_autofill_for_plan(cur, *, application_id: str, plan_key: str, ac
         if matches[0][3] == "needs_reconciliation":
             return False
     assert_binding_matches(cur, {"type": "autofill_form", "application_id": application_id,
-                                 "payload_json": raw_payload, "status": "approved"})
+                                 "payload_json": raw_payload, "status": "approved",
+                                 "bound_pipeline_version": parent_pipeline_version,
+                                 "bound_autofill_plan_id": parent_plan_id})
     return _queue_autofill_task(cur, request_id=request_id, application_id=application_id,
                                 payload=raw_payload, actor=actor)
 
@@ -472,7 +492,7 @@ def _close_delegated_children_for_parent(cur, *, application_id: str, plan_key: 
                   SET status='expired', executing_task_id=NULL,
                       action_note=COALESCE(action_note,%s)
                 WHERE application_id=%s AND type='privileged_upload_document'
-                  AND payload_json->>'parent_approval_request_id'=%s
+                  AND parent_approval_request_id=%s::uuid
                   AND payload_json->>'delegated_to_autofill'='true'
                   AND status IN ('pending','approved');""",
             (reason[:500], application_id, parent_request_id),
@@ -483,7 +503,7 @@ def _close_delegated_children_for_parent(cur, *, application_id: str, plan_key: 
                   SET status='expired', executing_task_id=NULL,
                       action_note=COALESCE(action_note,%s)
                 WHERE application_id=%s AND type='privileged_upload_document'
-                  AND payload_json->>'autofill_plan_key'=%s
+                  AND bound_autofill_plan_key=%s
                   AND payload_json->>'delegated_to_autofill'='true'
                   AND status IN ('pending','approved');""",
             (reason[:500], application_id, plan_key),
@@ -553,19 +573,19 @@ def cmd_create(conn, args) -> int:
         )
         if args.application_id:
             cur.execute(
-                "SELECT company, job_title, current_step, coalesce(job_url,''), coalesce(jd_hash,'') FROM applications WHERE id = %s;",
+                "SELECT company, job_title, current_step, coalesce(job_url,''), coalesce(jd_hash,''), pipeline_version FROM applications WHERE id = %s;",
                 (args.application_id,),
             )
             row = cur.fetchone()
             if not row:
                 print(f"ERROR: application not found: {args.application_id}")
                 return 1
-            company, job_title, step, application_job_url, application_jd_hash = row
+            company, job_title, step, application_job_url, application_jd_hash, pipeline_version = row
             summary = args.summary or (
                 f"{args.type}: {company} / {job_title} (currently at {step})"
             )
         else:
-            company = job_title = step = application_job_url = application_jd_hash = None
+            company = job_title = step = application_job_url = application_jd_hash = pipeline_version = None
             summary = args.summary or args.type
 
         payload = {"company": company, "job_title": job_title,
@@ -691,6 +711,10 @@ def cmd_create(conn, args) -> int:
                 # Creation normalizes application_form_ready -> awaiting_approval.
                 # Bind redemption/execution to the post-creation authoritative step.
                 "expected_application_step": "awaiting_approval",
+                # The transition below is committed atomically with request creation.
+                # Bind the capability to that exact post-transition version so a
+                # later return to awaiting_approval cannot revive this approval.
+                "expected_pipeline_version": int(pipeline_version or 0) + 1,
             })
             idempotency_key = hash_json({
                 "type": args.type, "application_id": args.application_id,
@@ -706,7 +730,9 @@ def cmd_create(conn, args) -> int:
                 "delegated_upload_packages": delegated_upload_packages,
                 "application_job_url": str(application_job_url or ""),
                 "application_jd_hash": str(application_jd_hash or ""),
+                "expected_pipeline_version": int(pipeline_version or 0) + 1,
             })
+            payload["binding_sha256"] = idempotency_key
         elif args.type == "fit_review" and args.application_id:
             payload["content_hash"] = hash_json({
                 "application_id": args.application_id,
@@ -740,6 +766,64 @@ def cmd_create(conn, args) -> int:
                 print(f"  summary:          {existing[2]}")
                 return 0
 
+        autofill_plan_id = None
+        if args.type == "autofill_form":
+            action_scope_sha256 = hash_json(payload.get("autofill_action_scope") or {})
+            plan_values = (
+                args.application_id,payload["autofill_plan_key"],payload["expected_pipeline_version"],
+                payload["expected_target_id"],payload["expected_initial_url"],payload["expected_origin"],
+                payload["expected_page_fingerprint"],payload["autofill_input_hash"],action_scope_sha256,
+                Jsonb(payload.get("autofill_action_scope") or {}),payload["document_id"],
+                payload.get("artifact_id"),payload.get("artifact_sha256"),
+            )
+            cur.execute(
+                """INSERT INTO autofill_plans(
+                       application_id,plan_key,pipeline_version,target_id,page_url,origin,
+                       page_fingerprint,input_sha256,action_scope_sha256,action_scope_json,
+                       generated_document_id,artifact_id,artifact_sha256,status)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'awaiting_approval')
+                   ON CONFLICT (plan_key) DO NOTHING
+                   RETURNING id::text;""", plan_values,
+            )
+            inserted_plan = cur.fetchone()
+            if inserted_plan:
+                autofill_plan_id = str(inserted_plan[0])
+            else:
+                # ``plan_key`` is a content/capability identity, not merely a
+                # dedupe hint. Reuse is legal only when every immutable binding
+                # is byte-for-byte equivalent; a hash collision or stale caller
+                # must fail closed rather than rewrite/relabel the existing plan.
+                cur.execute(
+                    """SELECT id::text FROM autofill_plans
+                        WHERE plan_key=%s AND application_id=%s AND pipeline_version=%s
+                          AND target_id=%s AND page_url=%s AND origin=%s AND page_fingerprint=%s
+                          AND input_sha256=%s AND action_scope_sha256=%s AND action_scope_json=%s
+                          AND generated_document_id IS NOT DISTINCT FROM %s::uuid
+                          AND artifact_id IS NOT DISTINCT FROM %s::uuid
+                          AND artifact_sha256 IS NOT DISTINCT FROM %s;""",
+                    (payload["autofill_plan_key"],args.application_id,payload["expected_pipeline_version"],
+                     payload["expected_target_id"],payload["expected_initial_url"],payload["expected_origin"],
+                     payload["expected_page_fingerprint"],payload["autofill_input_hash"],action_scope_sha256,
+                     Jsonb(payload.get("autofill_action_scope") or {}),payload["document_id"],
+                     payload.get("artifact_id"),payload.get("artifact_sha256")),
+                )
+                exact_plan = cur.fetchone()
+                if not exact_plan:
+                    raise RuntimeError("autofill plan_key already exists with different immutable bindings")
+                autofill_plan_id = str(exact_plan[0])
+            payload["autofill_plan_id"] = autofill_plan_id
+            for sequence_no, action in enumerate((payload.get("autofill_action_scope") or {}).get("actions") or [], 1):
+                cur.execute(
+                    """INSERT INTO autofill_plan_actions(
+                           autofill_plan_id,sequence_no,action_kind,field_ref,field_registry_key,
+                           value_sha256,document_artifact_id,action_json)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                       ON CONFLICT (autofill_plan_id,sequence_no) DO NOTHING;""",
+                    (autofill_plan_id,sequence_no,str(action.get("action") or ""),str(action.get("ref") or ""),
+                     action.get("profile_key"),str(action.get("value_sha256") or ""),
+                     payload.get("artifact_id") if action.get("action") == "upload" else None,Jsonb(action)),
+                )
+
         cur.execute(
             """
             INSERT INTO approval_requests
@@ -748,10 +832,13 @@ def cmd_create(conn, args) -> int:
                max_attempts, idempotency_key, target_action, bound_document_id,
                bound_document_sha256, expected_origin, bound_artifact_id,
                bound_artifact_sha256, bound_artifact_filename, expected_initial_url,
-               expected_page_fingerprint, bound_autofill_input_hash, bound_autofill_action_scope, created_at)
+               expected_page_fingerprint, bound_autofill_input_hash, bound_autofill_action_scope,
+               bound_pipeline_version, bound_autofill_plan_key, binding_sha256, expected_target_id,
+               application_job_url, application_jd_hash, bound_autofill_plan_id, created_at)
             VALUES (%s, %s, %s, 'pending', %s, %s,
                     now() + make_interval(mins => %s), %s, %s, %s, %s,
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s, %s, now())
             ON CONFLICT (idempotency_key)
               WHERE idempotency_key IS NOT NULL
                 AND status IN ('pending', 'approved', 'executing')
@@ -767,6 +854,9 @@ def cmd_create(conn, args) -> int:
                 payload.get("artifact_id"), payload.get("artifact_sha256"), payload.get("artifact_filename"),
                 payload.get("expected_initial_url"), payload.get("expected_page_fingerprint"), payload.get("autofill_input_hash"),
                 Jsonb(payload.get("autofill_action_scope") or {}),
+                payload.get("expected_pipeline_version"), payload.get("autofill_plan_key"), payload.get("binding_sha256"),
+                payload.get("expected_target_id"), payload.get("application_job_url"), payload.get("application_jd_hash"),
+                autofill_plan_id,
             ),
         )
         inserted = cur.fetchone()
@@ -920,7 +1010,8 @@ def redeem(conn, token: str, *, decision: str, note: str, actor: str) -> int:
 
         cur.execute(
             """
-            SELECT type, application_id::text, payload_json, status, summary_text
+            SELECT type, application_id::text, payload_json, status, summary_text,
+                   bound_pipeline_version, bound_autofill_plan_key, binding_sha256, bound_autofill_plan_id::text
             FROM approval_requests
             WHERE id = %s;
             """,
@@ -937,6 +1028,10 @@ def redeem(conn, token: str, *, decision: str, note: str, actor: str) -> int:
             "payload_json": request_row[2] or {},
             "status": request_row[3],
             "summary_text": request_row[4],
+            "bound_pipeline_version": request_row[5],
+            "bound_autofill_plan_key": request_row[6],
+            "binding_sha256": request_row[7],
+            "bound_autofill_plan_id": request_row[8],
         }
         # A positive authorization must still bind to the exact current state.
         # A denial is always safe to record even when the underlying document,

@@ -9,6 +9,7 @@ import json
 import subprocess
 import sys
 import shutil
+import uuid
 from pathlib import Path
 
 
@@ -501,7 +502,7 @@ def autofill_prepare(application_id: str, *, create: bool, yes: bool) -> int:
             upload_cur.execute(
                 """SELECT id::text FROM approval_requests
                      WHERE application_id=%s AND type='autofill_form'
-                       AND payload_json->>'autofill_plan_key'=%s
+                       AND bound_autofill_plan_key=%s
                      ORDER BY created_at DESC LIMIT 1;""",
                 (application_id, plan_key),
             )
@@ -510,7 +511,7 @@ def autofill_prepare(application_id: str, *, create: bool, yes: bool) -> int:
             upload_cur.execute(
                 """SELECT id::text FROM approval_requests
                      WHERE application_id=%s AND type='privileged_upload_document'
-                       AND payload_json->>'parent_approval_request_id'=%s
+                       AND parent_approval_request_id=%s::uuid
                      ORDER BY created_at;""",
                 (application_id, parent_request_id),
             )
@@ -602,8 +603,19 @@ def status() -> int:
                    "age_seconds":int(r[4] or 0),"processing_run_id":r[5],
                    "processing_lease_expires_at":str(r[6]) if r[6] else None,
                    "last_error":r[7],"next_action":r[8]} for r in cur.fetchall()]
+        cur.execute("""SELECT id::text,hostname,pid,status,started_at,heartbeat_at,stopped_at
+                         FROM runtime_instances ORDER BY heartbeat_at DESC LIMIT 1;""")
+        rr=cur.fetchone()
+        database_runtime = ({"id":rr[0],"hostname":rr[1],"pid":rr[2],"status":rr[3],
+                             "started_at":str(rr[4]),"heartbeat_at":str(rr[5]),
+                             "stopped_at":str(rr[6]) if rr[6] else None} if rr else None)
+        cur.execute("SELECT status,count(*) FROM workflow_runs GROUP BY status ORDER BY status;")
+        workflow_runs = {str(k):int(v) for k,v in cur.fetchall()}
+        cur.execute("SELECT status,count(*) FROM control_commands GROUP BY status ORDER BY status;")
+        control_commands = {str(k):int(v) for k,v in cur.fetchall()}
     print(json.dumps({
-        "runtime": runtime,
+        "runtime": runtime, "database_runtime": database_runtime,
+        "workflow_runs": workflow_runs, "control_commands": control_commands,
         "applications_by_status": applications, "applications_by_step": steps, "applications_by_source": sources,
         "browser_tasks": browser_tasks, "attempts": attempts, "pending_human_reviews": pending_reviews,
         "needs_reconciliation": reconciliation,
@@ -703,6 +715,104 @@ def runtime_supervisor_command(command: str) -> int:
     return subprocess.call([sys.executable, str(ROOT / "scripts" / "jobos_runtime_supervisor.py"), command], cwd=ROOT)
 
 
+def _command_kind(args) -> str:
+    nested = None
+    for name in ("autofill_command","saved_command","review_command","telegram_command",
+                 "action_command","vault_command","gmail_command"):
+        value = getattr(args,name,None)
+        if value:
+            nested = str(value); break
+    return f"{args.command}:{nested}" if nested else str(args.command)
+
+
+def _begin_control_command(args) -> tuple[str | None, str | None]:
+    if args.command == "status":
+        return None,None
+    try:
+        import psycopg
+        from psycopg.types.json import Jsonb
+        load_repo_env()
+        workflow_id=str(uuid.uuid4())
+        command_id=str(uuid.uuid4())
+        arguments={k:v for k,v in vars(args).items() if k != "command"}
+        kind=_command_kind(args)
+        with psycopg.connect(database_dsn(),autocommit=False) as conn, conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO workflow_runs(id,workflow_kind,subject_type,subject_id,status,requested_by,started_at)
+                   VALUES (%s::uuid,'operator_command','control_command',%s,'running',%s,now());""",
+                (workflow_id,command_id,os.getenv("USER") or "jobos-operator"),
+            )
+            cur.execute(
+                """INSERT INTO control_commands(id,command_kind,arguments_json,requested_by,workflow_run_id,status)
+                   VALUES (%s::uuid,%s,%s,%s,%s::uuid,'running');""",
+                (command_id,kind,Jsonb(arguments),os.getenv("USER") or "jobos-operator",workflow_id),
+            )
+            conn.commit()
+        return workflow_id,command_id
+    except Exception:
+        # start/doctor must remain usable while PostgreSQL itself is being repaired.
+        return None,None
+
+
+def _finish_control_command(ids: tuple[str | None,str | None], *, rc: int, error: str | None = None) -> None:
+    workflow_id,command_id=ids
+    if not workflow_id or not command_id:
+        return
+    try:
+        import psycopg
+        status_value="completed" if rc == 0 and not error else "failed"
+        with psycopg.connect(database_dsn(),autocommit=True) as conn, conn.cursor() as cur:
+            cur.execute(
+                """UPDATE control_commands SET status=%s,exit_code=%s,finished_at=now() WHERE id=%s::uuid;""",
+                (status_value,rc,command_id),
+            )
+            cur.execute(
+                """UPDATE workflow_runs SET status=%s,error_message=%s,finished_at=now() WHERE id=%s::uuid;""",
+                (status_value,error[:2000] if error else None,workflow_id),
+            )
+    except Exception:
+        pass
+
+
+def _dispatch(args) -> int:
+    if args.command in {"start", "stop"}:
+        return runtime_supervisor_command(args.command)
+    if args.command == "doctor":
+        return doctor(check_browser=args.check_browser, strict=args.strict, require_autofill=args.require_autofill, profile=args.profile)
+    if args.command == "verify-release":
+        return verify_release(profile=args.profile)
+    if args.command == "build-release":
+        return subprocess.call([sys.executable, str(ROOT / "scripts" / "build_release.py"),
+                                "--output", str(Path(args.output).expanduser())], cwd=ROOT)
+    if args.command == "status":
+        return status()
+    if args.command == "saved":
+        return saved_sync(args.limit, args.timeout)
+    if args.command == "review":
+        return review_command(args.review_command, getattr(args, "item_id", None),
+                              getattr(args, "note", ""), getattr(args, "text", ""),
+                              getattr(args, "scope", "company"))
+    if args.command == "telegram":
+        if args.telegram_command == "discover-id":
+            return telegram_start(discover_id=True)
+        return telegram_start(once=args.once, dispatch_only=args.dispatch_only)
+    if args.command == "action":
+        return action_command(args.action_command, application_id=getattr(args, "application_id", ""),
+                              action=getattr(args, "action", ""), candidate_id=getattr(args, "candidate_id", "") or "",
+                              request_id=getattr(args, "request_id", ""), poll_seconds=getattr(args, "poll_seconds", 5))
+    if args.command == "vault":
+        return vault_command(args.vault_command, origin=getattr(args, "origin", ""), account=getattr(args, "account", ""),
+                             kind=getattr(args, "kind", "password"), length=getattr(args, "length", 28))
+    if args.command == "gmail":
+        if args.gmail_command == "watch":
+            return gmail_watch_command(once=args.once, wake_listen=args.wake_listen,
+                                       wake_host=args.wake_host, wake_port=args.wake_port,
+                                       interval_seconds=args.interval_seconds, max_results=args.max_results)
+        return gmail_verify_command(application_id=args.application_id, recipient=args.recipient,
+                                    employer_origin=args.employer_origin, since_seconds=args.since_seconds, max_results=args.max_results)
+    return autofill_prepare(args.application_id, create=args.create, yes=args.yes)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="JobOS operator commands.")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -782,42 +892,14 @@ def main() -> int:
     gw.add_argument("--interval-seconds", type=int, default=10); gw.add_argument("--max-results", type=int, default=10)
 
     args = parser.parse_args()
-    if args.command in {"start", "stop"}:
-        return runtime_supervisor_command(args.command)
-    if args.command == "doctor":
-        return doctor(check_browser=args.check_browser, strict=args.strict, require_autofill=args.require_autofill, profile=args.profile)
-    if args.command == "verify-release":
-        return verify_release(profile=args.profile)
-    if args.command == "build-release":
-        return subprocess.call([sys.executable, str(ROOT / "scripts" / "build_release.py"),
-                                "--output", str(Path(args.output).expanduser())], cwd=ROOT)
-    if args.command == "status":
-        return status()
-    if args.command == "saved":
-        return saved_sync(args.limit, args.timeout)
-    if args.command == "review":
-        return review_command(args.review_command, getattr(args, "item_id", None),
-                              getattr(args, "note", ""), getattr(args, "text", ""),
-                              getattr(args, "scope", "company"))
-    if args.command == "telegram":
-        if args.telegram_command == "discover-id":
-            return telegram_start(discover_id=True)
-        return telegram_start(once=args.once, dispatch_only=args.dispatch_only)
-    if args.command == "action":
-        return action_command(args.action_command, application_id=getattr(args, "application_id", ""),
-                              action=getattr(args, "action", ""), candidate_id=getattr(args, "candidate_id", "") or "",
-                              request_id=getattr(args, "request_id", ""), poll_seconds=getattr(args, "poll_seconds", 5))
-    if args.command == "vault":
-        return vault_command(args.vault_command, origin=getattr(args, "origin", ""), account=getattr(args, "account", ""),
-                             kind=getattr(args, "kind", "password"), length=getattr(args, "length", 28))
-    if args.command == "gmail":
-        if args.gmail_command == "watch":
-            return gmail_watch_command(once=args.once, wake_listen=args.wake_listen,
-                                       wake_host=args.wake_host, wake_port=args.wake_port,
-                                       interval_seconds=args.interval_seconds, max_results=args.max_results)
-        return gmail_verify_command(application_id=args.application_id, recipient=args.recipient,
-                                    employer_origin=args.employer_origin, since_seconds=args.since_seconds, max_results=args.max_results)
-    return autofill_prepare(args.application_id, create=args.create, yes=args.yes)
+    command_ids = _begin_control_command(args)
+    try:
+        rc = int(_dispatch(args))
+    except Exception as exc:
+        _finish_control_command(command_ids, rc=1, error=str(exc))
+        raise
+    _finish_control_command(command_ids, rc=rc)
+    return rc
 
 
 if __name__ == "__main__":

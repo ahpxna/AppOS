@@ -65,6 +65,7 @@ MARKET_INTELLIGENCE_SCRIPT = os.path.join(
 FIT_REVIEW_TTL_HOURS = 48  # long on purpose: a human sleeps (see architecture review)
 ORCHESTRATOR_LEASE_SECONDS = int(os.getenv("JOBOS_ORCHESTRATOR_LEASE_SECONDS", "7200"))
 _ACTIVE_PROCESSING_RUN_ID: str | None = None
+_ACTIVE_WORKFLOW_STEP_RUN_ID: str | None = None
 
 
 # ---------------------------------------------------------------- transitions
@@ -98,6 +99,7 @@ def transition(
             cur, application_id=application_id, expected_from=str(from_step), to=to_step,
             actor=actor, reason=reason, detail=detail,
             require_automated=(actor == "orchestrator"), lease_run_id=_ACTIVE_PROCESSING_RUN_ID,
+            workflow_run_id=_ACTIVE_PROCESSING_RUN_ID,
         )
     except PipelineStateError as exc:
         raise RuntimeError(str(exc)) from exc
@@ -638,7 +640,7 @@ def advance_one(cur, application_id: str, *, apply: bool) -> None:
 
 # ---------------------------------------------------------------- durable orchestration claim
 
-def claim_application(cur, application_id: str) -> tuple[str, str] | None:
+def claim_application(cur, application_id: str) -> tuple[str, str, str] | None:
     run_id = str(uuid.uuid4())
     cur.execute(
         """UPDATE applications a
@@ -653,16 +655,45 @@ def claim_application(cur, application_id: str) -> tuple[str, str] | None:
         (run_id, ORCHESTRATOR_LEASE_SECONDS, application_id),
     )
     row = cur.fetchone()
-    return (run_id, str(row[0])) if row else None
+    if not row:
+        return None
+    step = str(row[0])
+    cur.execute(
+        """INSERT INTO workflow_runs(
+               id,workflow_kind,application_id,subject_type,subject_id,idempotency_key,status,requested_by,started_at)
+           VALUES (%s::uuid,'orchestrator_advance',%s,'application',%s,%s,'running','orchestrator',now());""",
+        (run_id,application_id,application_id,f"orchestrator:{run_id}"),
+    )
+    cur.execute(
+        """INSERT INTO workflow_step_runs(
+               workflow_run_id,step_key,sequence_no,attempt_no,status,claimed_by,lease_expires_at,started_at)
+           VALUES (%s::uuid,%s,1,1,'running','orchestrator',now()+make_interval(secs => %s),now())
+           RETURNING id::text;""",
+        (run_id,step,ORCHESTRATOR_LEASE_SECONDS),
+    )
+    step_run_id = str(cur.fetchone()[0])
+    return (run_id, step, step_run_id)
 
 
-def release_application_claim(cur, application_id: str, run_id: str) -> None:
+def release_application_claim(cur, application_id: str, run_id: str, *,
+                              status: str = "completed", error: str | None = None) -> None:
+    if status not in {"completed","failed","uncertain","needs_reconciliation"}:
+        raise ValueError(f"invalid workflow terminal status: {status}")
     cur.execute(
         """UPDATE applications
               SET processing_run_id=NULL, processing_step=NULL, processing_started_at=NULL,
                   processing_lease_expires_at=NULL
             WHERE id=%s AND processing_run_id=%s::uuid;""",
         (application_id, run_id),
+    )
+    cur.execute(
+        """UPDATE workflow_step_runs SET status=%s,finished_at=now(),lease_expires_at=NULL,error_message=%s
+            WHERE workflow_run_id=%s::uuid AND status IN ('pending','claimed','running');""",
+        (status,error[:2000] if error else None,run_id),
+    )
+    cur.execute(
+        """UPDATE workflow_runs SET status=%s,finished_at=now(),error_message=%s WHERE id=%s::uuid;""",
+        (status,error[:2000] if error else None,run_id),
     )
 
 
@@ -673,6 +704,10 @@ def _subprocess_env(args: List[str]) -> dict[str, str]:
             env["JOBOS_APPLICATION_ID"] = str(args[args.index("--application-id") + 1])
         except (ValueError, IndexError):
             pass
+    if _ACTIVE_PROCESSING_RUN_ID:
+        env["JOBOS_WORKFLOW_RUN_ID"] = _ACTIVE_PROCESSING_RUN_ID
+    if _ACTIVE_WORKFLOW_STEP_RUN_ID:
+        env["JOBOS_WORKFLOW_STEP_RUN_ID"] = _ACTIVE_WORKFLOW_STEP_RUN_ID
     return env
 
 # ---------------------------------------------------------------- commands
@@ -731,7 +766,7 @@ def cmd_filter(conn, args) -> int:
 
 
 def cmd_advance(conn, args) -> int:
-    global _ACTIVE_PROCESSING_RUN_ID
+    global _ACTIVE_PROCESSING_RUN_ID, _ACTIVE_WORKFLOW_STEP_RUN_ID
     with conn.cursor() as cur:
         if args.application_id:
             ids = [args.application_id]
@@ -760,9 +795,10 @@ def cmd_advance(conn, args) -> int:
                         conn.rollback()
                         print(f"  {app_id}: already claimed, terminal, or waiting on a human; skipped")
                         continue
-                    run_id, _claimed_step = claimed
+                    run_id, _claimed_step, step_run_id = claimed
                     conn.commit()  # claim is durable before any long external work
                     _ACTIVE_PROCESSING_RUN_ID = run_id
+                    _ACTIVE_WORKFLOW_STEP_RUN_ID = step_run_id
                 advance_one(cur, app_id, apply=args.apply)
                 if args.apply and run_id:
                     release_application_claim(cur, app_id, run_id)
@@ -771,13 +807,14 @@ def cmd_advance(conn, args) -> int:
                 conn.rollback()
                 if args.apply and run_id:
                     try:
-                        release_application_claim(cur, app_id, run_id)
+                        release_application_claim(cur, app_id, run_id, status="failed", error=str(e))
                         conn.commit()
                     except Exception:
                         conn.rollback()
                 print(f"    error: {type(e).__name__}: {e}")
             finally:
                 _ACTIVE_PROCESSING_RUN_ID = None
+                _ACTIVE_WORKFLOW_STEP_RUN_ID = None
 
         if not args.apply:
             conn.rollback()
