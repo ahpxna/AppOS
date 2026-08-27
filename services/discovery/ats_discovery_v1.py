@@ -76,6 +76,10 @@ from services.discovery.immigration_intelligence import record_jd_immigration_as
 from services.common.config import database_dsn
 from services.ats.contracts import canonical_job_url, jd_is_complete, normalize_work_mode
 from services.ats.http_client import DiscoveryHttpError, get_json
+from services.ats.public_page import PublicPageDiscoveryError, fetch_public_job_board
+from services.ats.registry import (
+    DiscoveryStrategy, discovery_platform_keys, get_definition, normalize_ats_key,
+)
 
 DSN = database_dsn()
 
@@ -85,10 +89,7 @@ REQUEST_TIMEOUT = 30
 STALE_CLOSE_DAYS = max(1, int(os.getenv("JOBOS_STALE_CLOSE_DAYS", "14")))
 DETAIL_REQUEST_BUDGET = max(1, int(os.getenv("JOBOS_ATS_DETAIL_REQUEST_BUDGET", "100")))
 
-PLATFORMS = (
-    "greenhouse", "lever", "ashby", "smartrecruiters", "recruitee",
-    "workable", "breezy",
-)
+PLATFORMS = discovery_platform_keys()
 
 
 class DiscoveryError(Exception):
@@ -378,13 +379,36 @@ ADAPTERS = {
 }
 
 
-def fetch_jobs(platform: str, slug: str, *, with_details: bool = False) -> List[Dict[str, Any]]:
+def fetch_jobs(platform: str, slug: str, *, with_details: bool = False,
+               source_url: str | None = None, company: str | None = None) -> List[Dict[str, Any]]:
+    platform = normalize_ats_key(platform)
     adapter = ADAPTERS.get(platform)
-    if not adapter:
-        raise DiscoveryError(f"Unsupported platform: {platform!r}. Supported: {', '.join(PLATFORMS)}")
-    if platform in ("smartrecruiters", "workable"):
-        return adapter(slug, with_details=with_details)
-    return adapter(slug)
+    if adapter is not None:
+        if platform in ("smartrecruiters", "workable"):
+            return adapter(slug, with_details=with_details)
+        return adapter(slug)
+
+    definition = get_definition(platform)
+    if definition.discovery_strategy == DiscoveryStrategy.EXTERNAL_SOURCE:
+        raise DiscoveryError(
+            f"{definition.display_name} is modeled as an external-source platform; "
+            "use its dedicated intake path instead of ATS polling."
+        )
+    career_url = str(source_url or "").strip()
+    if not career_url:
+        raise DiscoveryError(
+            f"{definition.display_name} has no stable native public list adapter. "
+            "Configure --source-url with the employer's official careers page so JobOS can "
+            "use deterministic schema.org JobPosting discovery."
+        )
+    try:
+        return fetch_public_job_board(
+            career_url=career_url, platform=platform, company_hint=str(company or slug or platform),
+            user_agent=USER_AGENT, timeout_seconds=REQUEST_TIMEOUT,
+            max_details=DETAIL_REQUEST_BUDGET,
+        )
+    except PublicPageDiscoveryError as exc:
+        raise DiscoveryError(str(exc)) from exc
 
 
 # ---------------------------------------------------------------- db
@@ -449,14 +473,14 @@ def cmd_add(conn, args) -> int:
     with conn.cursor() as cur:
         cur.execute(
             """
-            INSERT INTO ats_companies (company_name, ats_platform, slug, notes)
-            VALUES (%s, %s, %s, %s)
+            INSERT INTO ats_companies (company_name, ats_platform, slug, source_url, notes)
+            VALUES (%s, %s, %s, %s, %s)
             ON CONFLICT (ats_platform, slug) DO UPDATE
-            SET company_name = EXCLUDED.company_name, notes = EXCLUDED.notes,
-                updated_at = now()
+            SET company_name = EXCLUDED.company_name, source_url = EXCLUDED.source_url,
+                notes = EXCLUDED.notes, updated_at = now()
             RETURNING id::text;
             """,
-            (args.company, args.platform, args.slug, args.notes),
+            (args.company, normalize_ats_key(args.platform), args.slug, args.source_url, args.notes),
         )
         company_id = cur.fetchone()[0]
         if not args.apply:
@@ -472,7 +496,7 @@ def cmd_list(conn, args) -> int:
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT id::text, company_name, ats_platform, slug, enabled,
+            SELECT id::text, company_name, ats_platform, slug, source_url, enabled,
                    last_polled_at, last_success_at, last_job_count, consecutive_failures
             FROM ats_companies ORDER BY company_name;
             """
@@ -485,7 +509,7 @@ def cmd_list(conn, args) -> int:
             return 0
         print(f"\n{'COMPANY':<28} {'PLATFORM':<16} {'SLUG':<20} {'EN':<4} "
               f"{'LAST POLL':<20} {'JOBS':<6} FAILS")
-        for cid, name, plat, slug, en, polled, success, jobs, fails in rows:
+        for cid, name, plat, slug, source_url, en, polled, success, jobs, fails in rows:
             print(f"{(name or '?')[:28]:<28} {plat:<16} {slug:<20} "
                   f"{'y' if en else 'n':<4} {str(polled)[:19] if polled else '-':<20} "
                   f"{jobs if jobs is not None else '-':<6} {fails}")
@@ -495,7 +519,7 @@ def cmd_list(conn, args) -> int:
 def cmd_test(conn, args) -> int:
     print(f"  fetching {args.platform}:{args.slug} (no DB writes) ...")
     try:
-        jobs = fetch_jobs(args.platform, args.slug, with_details=args.with_details)
+        jobs = fetch_jobs(args.platform, args.slug, with_details=args.with_details, source_url=args.source_url, company=args.company)
     except DiscoveryError as e:
         print(f"\n  ERROR: {e}")
         return 1
@@ -511,7 +535,7 @@ def cmd_test(conn, args) -> int:
     return 0
 
 
-def poll_company(conn, cid, name, platform, slug, *, apply: bool, with_details: bool):
+def poll_company(conn, cid, name, platform, slug, source_url, *, apply: bool, with_details: bool):
     with conn.cursor() as cur:
         cur.execute(
             "INSERT INTO ats_discovery_runs (ats_company_id, started_at) "
@@ -527,7 +551,7 @@ def poll_company(conn, cid, name, platform, slug, *, apply: bool, with_details: 
     error_kind: str | None = None
     transient_failure = False
     try:
-        jobs = fetch_jobs(platform, slug, with_details=with_details)
+        jobs = fetch_jobs(platform, slug, with_details=with_details, source_url=source_url, company=name)
         seen = len(jobs)
         for j in jobs:
             if not j["title"] or not jd_is_complete(j.get("jd_text")):
@@ -622,14 +646,14 @@ def cmd_poll(conn, args) -> int:
     with conn.cursor() as cur:
         if args.company_id:
             cur.execute(
-                "SELECT id::text, company_name, ats_platform, slug "
+                "SELECT id::text, company_name, ats_platform, slug, source_url "
                 "FROM ats_companies WHERE id = %s;",
                 (args.company_id,),
             )
         else:
             cur.execute(
                 """
-                SELECT id::text, company_name, ats_platform, slug
+                SELECT id::text, company_name, ats_platform, slug, source_url
                 FROM ats_companies
                 WHERE enabled = true
                   AND (next_retry_at IS NULL OR next_retry_at <= now())
@@ -644,10 +668,10 @@ def cmd_poll(conn, args) -> int:
         return 0
 
     total_new = 0
-    for cid, name, platform, slug in rows:
+    for cid, name, platform, slug, source_url in rows:
         print(f"\n  polling {name} ({platform}:{slug}) ...")
         ok, seen, new, dup, err = poll_company(
-            conn, cid, name, platform, slug,
+            conn, cid, name, platform, slug, source_url,
             apply=args.apply, with_details=args.with_details,
         )
         if ok:
@@ -669,6 +693,8 @@ def main() -> int:
     pt = sub.add_parser("test", help="Fetch one company, print results, write nothing.")
     pt.add_argument("--platform", required=True, choices=PLATFORMS)
     pt.add_argument("--slug", required=True)
+    pt.add_argument("--source-url", help="Official careers URL for structured-web fallback.")
+    pt.add_argument("--company", help="Company name for structured-web normalization.")
     test_detail_mode = pt.add_mutually_exclusive_group()
     test_detail_mode.add_argument("--with-details", dest="with_details", action="store_true", default=True,
                                   help="Fetch full JDs (the default; retained for script compatibility).")
@@ -680,6 +706,7 @@ def main() -> int:
     pa.add_argument("--company", required=True)
     pa.add_argument("--platform", required=True, choices=PLATFORMS)
     pa.add_argument("--slug", required=True)
+    pa.add_argument("--source-url", help="Official careers URL; required for non-native ATS polling.")
     pa.add_argument("--notes")
     pa.add_argument("--apply", action="store_true")
 

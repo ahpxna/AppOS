@@ -25,6 +25,19 @@ def normalize_work_mode(value: str | None) -> WorkMode:
     return WorkMode.UNKNOWN
 
 
+def infer_work_mode(*values: object) -> WorkMode:
+    """Infer only explicit work-mode language from normalized source fields."""
+    text = " ".join(str(v or "") for v in values)
+    normalized = re.sub(r"[\s_-]+", " ", text.casefold()).strip()
+    if re.search(r"\bhybrid\b", normalized):
+        return WorkMode.HYBRID
+    if re.search(r"\b(remote|work from home|fully remote)\b", normalized):
+        return WorkMode.REMOTE
+    if re.search(r"\b(on site|onsite|in office)\b", normalized):
+        return WorkMode.ON_SITE
+    return WorkMode.UNKNOWN
+
+
 def canonical_job_url(value: str | None) -> str:
     """Preserve a job's identifying query while removing presentation drift.
 
