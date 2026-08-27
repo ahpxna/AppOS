@@ -17,7 +17,7 @@
 
 services:
   openclaw:
-    image: ${OPENCLAW_IMAGE:-khal3d/openclaw:2026.2.12}
+    image: ${OPENCLAW_IMAGE:-khal3d/openclaw:2026.2.12@sha256:cdcf12dc0ab3c97518c47a9a205d3fbe65b4b65a787bc5900172c9a462fc3bda}
     container_name: jobos-openclaw
     restart: unless-stopped
     ports:
@@ -64,7 +64,7 @@ services:
     # CDP endpoint, not a visible desktop. This sacrifices the noVNC
     # manual-login desktop (port 6901, VNC_PW) on purpose, same tradeoff
     # already agreed: CDP first, VNC later if actually needed.
-    image: ${JOBOS_BROWSER_IMAGE:-kasmweb/chrome:1.16.0}
+    image: ${JOBOS_BROWSER_IMAGE:-kasmweb/chrome:1.16.0@sha256:2cd8a277420207135903ef3315f763d1ed943679330baa78b017d43257da1b4b}
     container_name: jobos-browser
     restart: unless-stopped
     user: root

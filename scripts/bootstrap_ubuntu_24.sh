@@ -63,7 +63,9 @@ if [[ ! -x .venv/bin/python ]]; then
   python3 -m venv .venv
 fi
 .venv/bin/python -m pip install --upgrade pip
-.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python -m pip install \
+  -r requirements.txt \
+  -c constraints-v1.txt
 
 compose_services=(postgres)
 if [[ "${1:-}" == "--with-n8n" ]]; then

@@ -1,0 +1,27 @@
+{
+  "format": 1,
+  "manifest_kind": "release_policy",
+  "product": "JobOS",
+  "release": {
+    "line": "V1",
+    "version": "1.0.0",
+    "channel": "stable"
+  },
+  "python": {
+    "minimum": "3.11",
+    "requirements": "requirements.txt",
+    "constraints": "constraints-v1.txt",
+    "install_command": ".venv/bin/python -m pip install -r requirements.txt -c constraints-v1.txt"
+  },
+  "release_gates": [
+    "python -m compileall -q scripts services",
+    "python scripts/migration_lint.py",
+    "python -m pytest -q --ignore=tests/integration",
+    "JOBOS_RUN_DB_INTEGRATION=1 JOBOS_TEST_DSN=<disposable-test-dsn> python -m pytest -q tests/integration test_autofill_execution_db_integration.py",
+    "python scripts/build_release.py --output dist/jobos-v1-source.zip"
+  ],
+  "container_policy": {
+    "require_digest_pinning": true,
+    "allow_tag_only_overrides": false
+  }
+}

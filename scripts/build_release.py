@@ -44,10 +44,27 @@ def _tracked_files() -> list[Path]:
         if not raw:
             continue
         rel = Path(os.fsdecode(raw))
+        # The source-tree manifest is release policy.  The archive receives a
+        # freshly generated integrity manifest at the same path below; keeping
+        # both would create duplicate ZIP entries and unverifiable provenance.
+        if rel.as_posix() == MANIFEST_NAME:
+            continue
         path = ROOT / rel
         if path.is_file():
             paths.append(rel)
     return sorted(paths, key=lambda p: p.as_posix())
+
+
+def _release_policy() -> dict[str, object]:
+    """Load the committed policy that accompanies every generated manifest."""
+    path = ROOT / MANIFEST_NAME
+    try:
+        policy = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ReleaseBuildError(f"{MANIFEST_NAME} must be a valid committed release policy.") from exc
+    if not isinstance(policy, dict) or policy.get("manifest_kind") != "release_policy":
+        raise ReleaseBuildError(f"{MANIFEST_NAME} is not a valid release policy.")
+    return policy
 
 
 def _source_commit() -> str:
@@ -109,8 +126,10 @@ def build(output: Path) -> Path:
     entries = _manifest_entries(files)
     manifest = {
         "format": 1,
+        "manifest_kind": "integrity",
         "product": "JobOS",
         "source_commit": _source_commit(),
+        "release_policy": _release_policy(),
         "files": entries,
     }
     manifest_bytes = (json.dumps(manifest, sort_keys=True, indent=2) + "\n").encode("utf-8")

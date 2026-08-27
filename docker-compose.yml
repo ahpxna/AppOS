@@ -1,6 +1,6 @@
 services:
   postgres:
-    image: pgvector/pgvector:pg16
+    image: pgvector/pgvector:pg16@sha256:ccc6e83d6e35e931dc7c5def2022729d5a6c370318d099181995567ff1fb4d6b
     container_name: jobos-postgres
     restart: unless-stopped
     environment:
@@ -18,7 +18,7 @@ services:
     # keeping n8n behind an explicit profile prevents an unused service from
     # becoming part of default production readiness while preserving the feature.
     profiles: ["legacy-n8n"]
-    image: ${JOBOS_N8N_IMAGE:-n8nio/n8n:2.32.6}
+    image: ${JOBOS_N8N_IMAGE:-n8nio/n8n:2.32.6@sha256:5f7856f4fc7cd935230f7596e39fdb3d5eda0e379c5b40b699b9c0eb35ebd0bf}
     container_name: jobos-n8n
     restart: unless-stopped
     depends_on:

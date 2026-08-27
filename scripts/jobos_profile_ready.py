@@ -46,6 +46,7 @@ SOURCE_ROOT = ROOT / "data" / "profile_sources_v2"
 PARSED_ROOT = ROOT / "data" / "profile_parsed_v2"
 VENV_PYTHON = ROOT / ".venv" / "bin" / "python"
 REQUIREMENTS = ROOT / "requirements.txt"
+CONSTRAINTS = ROOT / "constraints-v1.txt"
 MANIFEST_PATH = SOURCE_ROOT / ".jobos_profile_ready_manifest.json"
 TEMPLATE = ROOT / "data" / "resume-template" / "VU PHAN AN NGUYEN-official_For_all.docx"
 
@@ -73,6 +74,22 @@ STRUCTURED_ASSET_VERSION = "structured_tool_workflow_asset_synthesizer_qwen_v1_2
 
 class PipelineError(RuntimeError):
     pass
+
+
+INSTALL_REQUIREMENTS_COMMAND = ".venv/bin/python -m pip install -r requirements.txt -c constraints-v1.txt"
+
+
+def constrained_install_command(python: str | Path) -> list[str]:
+    """Return the single supported dependency-install command for this pipeline."""
+    if not REQUIREMENTS.is_file() or not CONSTRAINTS.is_file():
+        raise PipelineError(
+            "Missing requirements.txt or constraints-v1.txt; cannot install the supported dependency set."
+        )
+    return [
+        str(python), "-m", "pip", "install",
+        "-r", str(REQUIREMENTS),
+        "-c", str(CONSTRAINTS),
+    ]
 
 
 def emit(event: str, **payload: Any) -> None:
@@ -276,7 +293,7 @@ def ensure_venv_and_reexec(*, no_install: bool) -> None:
         if missing:
             raise PipelineError(
                 "Missing Python dependencies inside .venv: " + ", ".join(missing) +
-                ". Run .venv/bin/python -m pip install -r requirements.txt"
+                f". Run {INSTALL_REQUIREMENTS_COMMAND}"
             )
         return
 
@@ -285,13 +302,19 @@ def ensure_venv_and_reexec(*, no_install: bool) -> None:
         missing = import_probe()
         if missing:
             if no_install:
-                raise PipelineError("Missing Python dependencies: " + ", ".join(missing))
-            run_checked([sys.executable, "-m", "pip", "install", "-r", str(REQUIREMENTS)], label="install_requirements")
+                raise PipelineError(
+                    "Missing Python dependencies: " + ", ".join(missing) +
+                    f". Run {INSTALL_REQUIREMENTS_COMMAND}"
+                )
+            run_checked(constrained_install_command(sys.executable), label="install_requirements")
         return
 
     if not VENV_PYTHON.exists():
         if no_install:
-            raise PipelineError(".venv is missing and --no-install was supplied.")
+            raise PipelineError(
+                ".venv is missing and --no-install was supplied. Create it, then run "
+                f"{INSTALL_REQUIREMENTS_COMMAND}."
+            )
         run_checked([sys.executable, "-m", "venv", str(ROOT / ".venv")], label="create_venv", cwd=ROOT)
 
     try:
@@ -303,8 +326,11 @@ def ensure_venv_and_reexec(*, no_install: bool) -> None:
         raise PipelineError("Dependency import probe timed out after 30 seconds.") from exc
     if probe.returncode != 0:
         if no_install:
-            raise PipelineError(".venv exists but required packages are missing and --no-install was supplied.")
-        run_checked([str(VENV_PYTHON), "-m", "pip", "install", "-r", str(REQUIREMENTS)], label="install_requirements", cwd=ROOT)
+            raise PipelineError(
+                ".venv exists but required packages are missing and --no-install was supplied. "
+                f"Run {INSTALL_REQUIREMENTS_COMMAND}."
+            )
+        run_checked(constrained_install_command(VENV_PYTHON), label="install_requirements", cwd=ROOT)
 
     env = os.environ.copy()
     env["JOBOS_PROFILE_READY_REEXEC"] = "1"

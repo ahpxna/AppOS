@@ -1,0 +1,40 @@
+name: JobOS CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            constraints-v1.txt
+            services/*/requirements.txt
+      - name: Install constrained dependencies
+        run: python -m pip install -r requirements.txt -c constraints-v1.txt
+      - name: Compile production code
+        run: python -m compileall -q scripts services
+      - name: Lint migrations
+        run: python scripts/migration_lint.py
+      - name: Run non-DB regression suite
+        run: python -m pytest -q --ignore=tests/integration
+      - name: Build deterministic source release
+        run: python scripts/build_release.py --output dist/jobos-v1-source.zip
+      - name: Verify packaged release manifest
+        run: |
+          unzip -q dist/jobos-v1-source.zip -d dist/jobos-v1-source
+          python scripts/build_release.py --verify-manifest dist/jobos-v1-source
