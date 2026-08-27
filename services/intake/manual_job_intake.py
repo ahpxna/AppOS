@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from datetime import date
-import hashlib
 import json
 import re
 from typing import Any
@@ -17,6 +16,7 @@ from urllib.parse import urlparse
 
 from psycopg.types.json import Jsonb
 from services.discovery.immigration_intelligence import record_jd_immigration_assessment
+from services.intake.posting_identity import build_posting_identity, find_existing_application
 
 
 MIN_JD_CHARS = 200
@@ -90,29 +90,32 @@ def create_application(cur: Any, draft: JobDraft) -> tuple[str | None, JobDraft]
     insert.  It runs independently of the later no-LLM filter and fit result.
     """
     clean = normalize_draft(draft)
-    jd_hash = hashlib.sha256(clean.jd_text.encode("utf-8")).hexdigest()
-    cur.execute("SELECT id::text FROM applications WHERE jd_hash = %s;", (jd_hash,))
-    row = cur.fetchone()
-    if row:
+    identity = build_posting_identity(
+        company=clean.company, job_title=clean.job_title, jd_text=clean.jd_text, job_url=clean.job_url,
+    )
+    existing = find_existing_application(cur, identity)
+    if existing:
         return None, clean
+    jd_hash = identity.jd_hash
     cur.execute(
         """
         INSERT INTO applications
           (source, company, job_title, job_url, jd_text, jd_hash, current_step, status,
-           intake_channel, location, work_mode, seniority_level, deadline, salary_range,
+           intake_channel, ats_type, location, work_mode, seniority_level, deadline, salary_range,
            created_at, updated_at)
         VALUES (%s, %s, %s, NULLIF(%s, ''), %s, %s, 'intake', 'active',
-                'desktop_manual_form', NULLIF(%s, ''), %s, NULLIF(%s, ''),
+                'desktop_manual_form', %s, NULLIF(%s, ''), %s, NULLIF(%s, ''),
                 NULLIF(%s, '')::date, NULLIF(%s, ''), now(), now())
         RETURNING id::text;
         """,
-        (clean.source, clean.company, clean.job_title, clean.job_url, clean.jd_text, jd_hash,
-         clean.location, clean.work_mode, clean.seniority_level, clean.deadline, clean.salary_range),
+        (clean.source, clean.company, clean.job_title, identity.canonical_url, clean.jd_text, jd_hash,
+         identity.ats_type, clean.location, clean.work_mode, clean.seniority_level, clean.deadline, clean.salary_range),
     )
     application_id = cur.fetchone()[0]
     immigration = record_jd_immigration_assessment(cur, application_id, clean.jd_text)
     event_detail = {
         "channel": "desktop_manual_form", "source": clean.source, "jd_hash": jd_hash,
+        "ats_type": identity.ats_type, "canonical_job_url": identity.canonical_url,
         "notes": clean.notes, "browser_used": False,
         "immigration_assessment": immigration,
     }

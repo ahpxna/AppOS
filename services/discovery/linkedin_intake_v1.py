@@ -29,6 +29,8 @@ from services.discovery.linkedin_discovery_v1 import (
     validate_saved_request,
 )
 from services.common.config import database_dsn
+from services.intake.posting_identity import build_posting_identity, find_existing_application
+from services.intake.source_observation import observe_existing_posting
 
 DSN = database_dsn()
 
@@ -76,7 +78,12 @@ def extract_text(value: Any) -> str:
 
 def intake(cur, *, company: str, title: str, url: str, jd_text: str,
            location: str = "", work_mode: str = "", source: str) -> str | None:
-    """Create one deduplicated application from user-reviewed JD text."""
+    """Create or observe one user-reviewed LinkedIn posting.
+
+    Source refreshes may update an application only while it remains at intake;
+    downstream evidence snapshots are immutable and receive append-only source
+    revisions instead.
+    """
     url = validate_linkedin_url(url)
     company = (company or "").strip()
     title = (title or "").strip()
@@ -85,18 +92,18 @@ def intake(cur, *, company: str, title: str, url: str, jd_text: str,
     jd_text = (jd_text or "").strip()
     if len(jd_text) < 200:
         raise IntakeError("JD text is too short; paste/review the full description first.")
-    jd_hash = hashlib.sha256(jd_text.encode("utf-8")).hexdigest()
     source_job_id = linkedin_job_id(url)
-    cur.execute("SELECT id::text FROM applications WHERE source = 'linkedin' AND source_job_id = %s;", (source_job_id,))
-    existing = cur.fetchone()
+    identity = build_posting_identity(
+        company=company, job_title=title, jd_text=jd_text, job_url=url,
+        ats_hint="linkedin_browser_linked_session",
+    )
+    existing = find_existing_application(cur, identity, source_job_id=source_job_id)
     if existing:
-        cur.execute(
-            """UPDATE applications SET company = %s, job_title = %s, job_url = %s,
-                   jd_text = %s, jd_hash = %s, location = %s, work_mode = %s,
-                   last_seen_at = now(), stale_at = NULL, closed_at = NULL,
-                   last_content_change_at = CASE WHEN jd_hash <> %s THEN now() ELSE last_content_change_at END,
-                   updated_at = now() WHERE id = %s;""",
-            (company, title, url, jd_text, jd_hash, location, work_mode, jd_hash, existing[0]),
+        observe_existing_posting(
+            cur, application_id=existing[0], source_name="linkedin", source_job_id=source_job_id,
+            company=company, job_title=title, job_url=identity.canonical_url,
+            jd_text=jd_text, jd_hash=identity.jd_hash, location=location, work_mode=work_mode,
+            metadata={"intake_channel": source},
         )
         return None
     cur.execute(
@@ -106,12 +113,18 @@ def intake(cur, *, company: str, title: str, url: str, jd_text: str,
            status, intake_channel, ats_type, location, work_mode, source_job_id,
            first_seen_at, last_seen_at, created_at, updated_at)
         VALUES ('linkedin', %s, %s, %s, %s, %s, 'intake', 'active', %s,
-                'linkedin_user_initiated', %s, %s, %s, now(), now(), now(), now())
+                'linkedin_browser_linked_session', %s, %s, %s, now(), now(), now(), now())
         RETURNING id::text;
         """,
-        (company, title, url, jd_text, jd_hash, source, location, work_mode, source_job_id),
+        (company, title, identity.canonical_url, jd_text, identity.jd_hash, source, location, work_mode, source_job_id),
     )
     app_id = cur.fetchone()[0]
+    observe_existing_posting(
+        cur, application_id=app_id, source_name="linkedin", source_job_id=source_job_id,
+        company=company, job_title=title, job_url=identity.canonical_url,
+        jd_text=jd_text, jd_hash=identity.jd_hash, location=location, work_mode=work_mode,
+        metadata={"intake_channel": source, "initial": True},
+    )
     cur.execute(
         """INSERT INTO pipeline_events
               (application_id, from_step, to_step, actor, reason, detail_json)

@@ -33,6 +33,7 @@ from services.common.autofill_identity import canonical_page_url, page_fingerpri
 from services.common.config import database_dsn, load_repo_env
 from services.common.openclaw_runtime import resolve_openclaw_binary
 from services.control_plane.pipeline_state import DEFAULT_PIPELINE_STATE_STORE, PipelineStateError
+from services.ats.registry import detect_ats_platform
 from services.runtime.process_runner import DEFAULT_PROCESS_RUNNER
 from services.security.credential_vault_v1 import (
     VaultError, generate_password, mask_entry, read_secret, store_secret,
@@ -192,24 +193,19 @@ def _value_hash(value: str) -> str:
 
 
 def detect_platform(url: str, snapshot: dict[str, Any]) -> str:
-    text = f"{url}\n{snapshot.get('snapshot') or ''}".casefold()
+    """Return the single canonical ATS key used everywhere in JobOS.
+
+    LinkedIn Easy Apply remains its intentionally separate privileged/browser
+    mode. Every employer ATS identity comes from ``services.ats.registry`` so
+    adding a vendor cannot leave browser auth on a stale hard-coded detector.
+    """
+    snapshot_text = str(snapshot.get("snapshot") or "")
+    text = f"{url}\n{snapshot_text}".casefold()
     host = (urlsplit(url).hostname or "").casefold()
     if (host == "linkedin.com" or host.endswith(".linkedin.com")) and any(
             marker in text for marker in ("easy apply", "submit application", "contact info", "additional questions")):
         return "linkedin_easy_apply"
-    for platform, markers in (
-        ("workday", ("myworkdayjobs", "workday")),
-        ("greenhouse", ("greenhouse.io", "boards.greenhouse")),
-        ("lever", ("jobs.lever.co", "lever")),
-        ("ashby", ("jobs.ashbyhq.com", "ashby")),
-        ("smartrecruiters", ("smartrecruiters",)),
-        ("oracle", ("oraclecloud", "oracle recruiting")),
-        ("successfactors", ("successfactors",)),
-        ("icims", ("icims",)),
-    ):
-        if any(marker in text for marker in markers):
-            return platform
-    return "custom"
+    return detect_ats_platform(url, snapshot_text=snapshot_text)
 
 
 def _node_text(nodes: list[dict[str, Any]]) -> str:
@@ -351,7 +347,8 @@ def _require_application_step(cur, application_id: str, required: str) -> None:
 
 def _transition_application_step(cur, *, application_id: str, to_step: str, actor: str,
                                  reason: str, detail: dict[str, Any] | None = None,
-                                 status: str | None = None) -> bool:
+                                 status: str | None = None,
+                                 required_kind: str = "privileged") -> bool:
     current = _application_step(cur, application_id, for_update=True)
     if current == to_step:
         return False
@@ -359,6 +356,7 @@ def _transition_application_step(cur, *, application_id: str, to_step: str, acto
         DEFAULT_PIPELINE_STATE_STORE.transition(
             cur, application_id=application_id, expected_from=current, to=to_step,
             actor=actor, reason=reason, detail=detail, status=status,
+            required_kind=required_kind,
         )
     except PipelineStateError as exc:
         raise PrivilegedActionError(str(exc)) from exc
@@ -402,10 +400,19 @@ def _update_auth_session(cur, *, application_id: str, url: str, fingerprint: str
     if target_step:
         current = _application_step(cur, application_id)
         if current != target_step:
+            recovery_edges = {
+                ("needs_email_verification", "needs_account_auth"),
+                ("needs_mfa", "needs_account_auth"),
+                ("needs_human_checkpoint", "needs_mfa"),
+                ("needs_human_checkpoint", "needs_email_verification"),
+                ("needs_mfa", "needs_email_verification"),
+                ("needs_email_verification", "needs_human_checkpoint"),
+            }
             _transition_application_step(
                 cur, application_id=application_id, to_step=target_step, actor="privileged-auth-state",
                 reason=f"Observed employer auth/browser state: {state}.",
                 detail={"url": url, "page_fingerprint": fingerprint, "platform": platform, "state": state},
+                required_kind="recovery" if (current, target_step) in recovery_edges else "privileged",
             )
     if platform != "custom":
         cur.execute("SELECT 1 FROM ats_capabilities WHERE ats_type=%s;", (platform,))
@@ -1050,6 +1057,7 @@ def reconcile_observed_privileged_effect(cur, *, application_id: str, approval_r
             cur, application_id=application_id, to_step="submitted", actor="privileged-reconciliation",
             reason="Human confirmed the uncertain final Submit browser effect occurred.",
             detail={"approval_request_id": approval_request_id}, status="submitted",
+            required_kind="privileged",
         )
         cur.execute("UPDATE applications SET submitted_at=coalesce(submitted_at,now()), updated_at=now() WHERE id=%s;",
                     (application_id,))
@@ -1102,7 +1110,8 @@ def reconcile_observed_privileged_effect(cur, *, application_id: str, approval_r
             cur, application_id=application_id, to_step="application_entrypoint_ready",
             actor="privileged-reconciliation",
             reason="Human confirmed the uncertain Apply/application-entrypoint effect occurred.",
-            detail={"approval_request_id": approval_request_id, "target_id": observed_target},
+            detail={"approval_request_id": approval_request_id, "target_id": observed_target,
+                    "reconciled_uncertain_effect": True}, required_kind="privileged",
         )
 
     platform = detect_platform(url, snap)

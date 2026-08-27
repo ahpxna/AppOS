@@ -65,14 +65,19 @@ Mở `.env`, đổi các giá trị đánh dấu `CHANGE_ME`. Xem chú thích tr
 API key trả phí nào bắt buộc; các key Telegram/Gmail/Google chỉ cần nếu
 bạn bật thêm tính năng đó trong OpenClaw).
 
-## 3. Khởi động Postgres + n8n
+## 3. Khởi động PostgreSQL
 
 ```bash
-docker compose up -d postgres n8n
+docker compose up -d postgres
 ```
 
-Postgres expose ở `127.0.0.1:${POSTGRES_HOST_PORT}` (mặc định `5433`), n8n ở
-`http://localhost:5678`.
+Postgres expose ở `127.0.0.1:${POSTGRES_HOST_PORT}` (mặc định `5433`).
+
+n8n là integration legacy/optional, không thuộc core runtime. Nếu vẫn cần nó:
+
+```bash
+docker compose --profile legacy-n8n up -d n8n
+```
 
 ## 4. Chạy migrations
 

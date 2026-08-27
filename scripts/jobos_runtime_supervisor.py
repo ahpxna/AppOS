@@ -80,6 +80,15 @@ def _specs() -> dict[str, WorkerSpec]:
         "browser-worker": WorkerSpec("browser-worker", (sys.executable, str(ROOT / "services" / "browser-controller" / "browser_queue_worker.py"), "--poll-seconds", "5")),
         "browser-state-watcher": WorkerSpec("browser-state-watcher", (sys.executable, "-m", "services.auth.browser_state_watcher_v1", "--poll-seconds", "5")),
         "document-revision": WorkerSpec("document-revision", (sys.executable, "-m", "services.review.document_revision_worker_v1", "--poll-seconds", "5")),
+        # Public ATS discovery is autonomous from application progression, but
+        # its lifecycle belongs to the same supervisor rather than a forgotten
+        # cron/manual command. Empty company registries simply produce a no-op.
+        "ats-discovery": WorkerSpec(
+            "ats-discovery",
+            (sys.executable, "-m", "services.runtime.periodic_tasks_v1", "ats-discovery",
+             "--interval-seconds", os.getenv("JOBOS_ATS_POLL_INTERVAL_SECONDS", "900")),
+            required=False,
+        ),
     }
     if (os.getenv("JOBOS_TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")) and (
         os.getenv("JOBOS_TELEGRAM_ALLOWED_USER_ID") or os.getenv("TELEGRAM_ALLOWED_USER_ID")
@@ -87,6 +96,13 @@ def _specs() -> dict[str, WorkerSpec]:
         specs["telegram"] = WorkerSpec("telegram", (sys.executable, "-m", "services.telegram.telegram_review_bot_v1"))
     if os.getenv("JOBOS_GMAIL_ACCOUNT") or os.getenv("GMAIL_ACCOUNT"):
         specs["gmail-watcher"] = WorkerSpec("gmail-watcher", (sys.executable, "-m", "services.auth.gmail_verification_watcher_v1", "--interval-seconds", "10"))
+    if _truthy("JOBOS_REPO_FRESHNESS_WATCH_ENABLED", False):
+        specs["repo-freshness"] = WorkerSpec(
+            "repo-freshness",
+            (sys.executable, "-m", "services.runtime.periodic_tasks_v1", "repo-freshness",
+             "--interval-seconds", os.getenv("JOBOS_REPO_FRESHNESS_INTERVAL_SECONDS", "3600")),
+            required=False,
+        )
     return specs
 
 

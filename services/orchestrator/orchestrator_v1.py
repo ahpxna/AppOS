@@ -45,7 +45,7 @@ from services.discovery.immigration_intelligence import record_jd_immigration_as
 from services.common.config import database_dsn
 from services.control_plane.pipeline_state import DEFAULT_PIPELINE_STATE_STORE, PipelineStateError
 from services.runtime.process_runner import DEFAULT_PROCESS_RUNNER
-from services.ats.contracts import canonical_job_url
+from services.intake.posting_identity import build_posting_identity, find_existing_application
 
 DSN = database_dsn()
 
@@ -110,15 +110,11 @@ def transition(
 def intake(cur, *, jd_text: str, company: str, job_title: str,
            job_url: Optional[str], source: str, channel: str) -> Optional[str]:
     jd_text = jd_text.strip()
-    job_url = canonical_job_url(job_url)
-    jd_hash = hashlib.sha256(jd_text.encode("utf-8")).hexdigest()
-
-    cur.execute(
-        """SELECT id::text, company, job_title FROM applications
-             WHERE jd_hash = %s AND coalesce(job_url,'') = %s;""",
-        (jd_hash, job_url),
+    identity = build_posting_identity(
+        company=company, job_title=job_title, jd_text=jd_text, job_url=job_url,
     )
-    existing = cur.fetchone()
+    job_url, jd_hash = identity.canonical_url, identity.jd_hash
+    existing = find_existing_application(cur, identity)
     if existing:
         print(f"  duplicate of {existing[0]} ({existing[1]} / {existing[2]}); skipped")
         return None
@@ -127,11 +123,11 @@ def intake(cur, *, jd_text: str, company: str, job_title: str,
         """
         INSERT INTO applications
           (source, company, job_title, job_url, jd_text, jd_hash,
-           current_step, status, intake_channel, created_at, updated_at)
-        VALUES (%s, %s, %s, %s, %s, %s, 'intake', 'active', %s, now(), now())
+           current_step, status, intake_channel, ats_type, created_at, updated_at)
+        VALUES (%s, %s, %s, %s, %s, %s, 'intake', 'active', %s, %s, now(), now())
         RETURNING id::text;
         """,
-        (source, company, job_title, job_url, jd_text, jd_hash, channel),
+        (source, company, job_title, job_url, jd_text, jd_hash, channel, identity.ats_type),
     )
     app_id = cur.fetchone()[0]
     immigration = record_jd_immigration_assessment(cur, app_id, jd_text)
@@ -143,6 +139,7 @@ def intake(cur, *, jd_text: str, company: str, job_title: str,
         VALUES (%s, NULL, 'intake', 'orchestrator', 'Job captured.', %s);
         """,
         (app_id, Jsonb({"channel": channel, "source": source, "jd_hash": jd_hash,
+                        "ats_type": identity.ats_type, "canonical_job_url": job_url,
                         "immigration_assessment": immigration})),
     )
     print(f"  intake: {app_id}  {company} / {job_title}")

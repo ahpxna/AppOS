@@ -1,44 +1,21 @@
 """
-L0/L1 -- ATS API DISCOVERY
+L0/L1 -- GENERALIZED ATS DISCOVERY
 
-Polls public, unauthenticated read endpoints across multiple ATS platforms
-and lands new postings in `applications` at current_step='intake', exactly
-like a hand-entered JD. Everything downstream (no_llm_filter_rules, the L5
-fit gate, cost gate, research, doc generation) applies unmodified -- this
-module's only job is filling the front door.
+All discovery paths land complete postings in ``applications`` at the same
+canonical ``intake`` boundary. Seven ATS families retain native public JSON
+adapters (Greenhouse, Lever, Ashby, SmartRecruiters, Recruitee, Workable and
+Breezy). Other registered ATS families use deterministic schema.org JobPosting
+discovery on official career pages; company pages may follow links to a known
+candidate-system host from the canonical ATS registry. Unknown/proprietary
+portals use the same ``custom`` fallback.
 
-This is an additional intake option, not a mandate to delete every other
-source of jobs. If you already have another intake path you trust, keep it;
-this module just gives you a safe public-API path that is easier to automate
-than scraping arbitrary pages.
+Structured discovery never authenticates, submits, guesses undocumented JSON
+endpoints, or treats a listing stub as a full JD. JavaScript-only boards remain
+reachable through the exact-URL/read-only browser or manual intake paths, so a
+discovery limitation does not create an unsupported application pipeline.
 
-Why not LinkedIn: automating LinkedIn violates its ToS and is detected via
-Chrome-over-CDP well enough that the realistic outcome is losing the
-account, not job leads. See the architecture review. These read APIs are
-public by design (job boards *want* postings crawled) and need no
-credential:
-
-  Greenhouse       https://boards-api.greenhouse.io/v1/boards/{slug}/jobs?content=true
-  Lever            https://api.lever.co/v0/postings/{slug}?mode=json
-  Ashby            https://api.ashbyhq.com/posting-api/job-board/{slug}
-  SmartRecruiters  https://api.smartrecruiters.com/v1/companies/{slug}/postings
-  Recruitee        https://{slug}.recruitee.com/api/offers/
-  Workable         https://apply.workable.com/api/v1/widget/accounts/{slug}
-  Breezy           https://{slug}.breezy.hr/json
-
-Platforms deliberately NOT implemented: Workday, iCIMS, Taleo,
-SuccessFactors. None of these expose a slug-based public JSON list endpoint
-the way the ones above do -- each Workday/iCIMS tenant's search API is
-usually POST-based, per-tenant, and undocumented enough that a generic
-adapter would be guesswork dressed up as support. Add those companies by
-hand with orchestrator_v1.py's `intake` command instead of trusting a
-fragile scraper for them.
-
-This module was written without live network access to any of the above
-(the environment it was built in only reaches an allowlisted set of
-domains) -- the endpoint shapes are implemented from each platform's public
-documentation, not verified against a live response. Run `test` against a
-real slug on your own machine before trusting `poll --apply`:
+LinkedIn discovery remains a separate feature with its existing safety and
+checkpoint behavior; this module does not change that surface.
 
 Usage:
   python services/discovery/ats_discovery_v1.py test --platform greenhouse --slug SLUG
@@ -78,8 +55,10 @@ from services.ats.contracts import canonical_job_url, jd_is_complete, normalize_
 from services.ats.http_client import DiscoveryHttpError, get_json
 from services.ats.public_page import PublicPageDiscoveryError, fetch_public_job_board
 from services.ats.registry import (
-    DiscoveryStrategy, discovery_platform_keys, get_definition, normalize_ats_key,
+    DiscoveryStrategy, detect_ats_platform, discovery_platform_keys, get_definition, normalize_ats_key,
 )
+from services.intake.posting_identity import build_posting_identity, find_existing_application
+from services.intake.source_observation import observe_existing_posting
 
 DSN = database_dsn()
 
@@ -93,7 +72,17 @@ PLATFORMS = discovery_platform_keys()
 
 
 class DiscoveryError(Exception):
-    pass
+    """Typed discovery failure; retryability must survive adapter wrapping."""
+
+    def __init__(self, message: str, *, kind: str = "adapter", transient: bool = False) -> None:
+        super().__init__(message)
+        self.kind = kind
+        self.transient = bool(transient)
+
+    @classmethod
+    def from_http(cls, exc: DiscoveryHttpError, *, prefix: str = "") -> "DiscoveryError":
+        message = f"{prefix}{exc}" if prefix else str(exc)
+        return cls(message, kind=exc.kind, transient=exc.transient)
 
 
 # ---------------------------------------------------------------- http
@@ -110,9 +99,14 @@ def http_get_json(url: str) -> Any:
         if e.kind == "invalid_json":
             is_blocked, reason = analyze_captcha_risk(e.body_preview, url)
             if is_blocked:
-                raise DiscoveryError(f"Bị chặn bởi Anti-Bot/CAPTCHA: {reason}") from e
-            raise DiscoveryError(f"Non-JSON response from {url}: {e.body_preview[:200]!r}") from e
-        raise DiscoveryError(str(e)) from e
+                raise DiscoveryError(
+                    f"Bị chặn bởi Anti-Bot/CAPTCHA: {reason}", kind="anti_bot", transient=False
+                ) from e
+            raise DiscoveryError(
+                f"Non-JSON response from {url}: {e.body_preview[:200]!r}",
+                kind=e.kind, transient=e.transient,
+            ) from e
+        raise DiscoveryError.from_http(e) from e
 
 
 class _TextExtractor(HTMLParser):
@@ -408,7 +402,7 @@ def fetch_jobs(platform: str, slug: str, *, with_details: bool = False,
             max_details=DETAIL_REQUEST_BUDGET,
         )
     except PublicPageDiscoveryError as exc:
-        raise DiscoveryError(str(exc)) from exc
+        raise DiscoveryError(str(exc), kind=exc.kind, transient=exc.transient) from exc
 
 
 # ---------------------------------------------------------------- db
@@ -416,28 +410,26 @@ def fetch_jobs(platform: str, slug: str, *, with_details: bool = False,
 def intake_job(cur, *, jd_text: str, company: str, job_title: str, job_url: str,
                location: str, work_mode: str, ats_type: str,
                ats_company_id: str, ats_external_id: str) -> Optional[str]:
-    """Create or refresh one source-stable discovered posting."""
-    jd_text = jd_text.strip()
-    job_url = canonical_job_url(job_url)
-    jd_hash = hashlib.sha256(jd_text.encode("utf-8")).hexdigest()
+    """Create or observe one source-stable discovered posting.
 
-    cur.execute(
-        """SELECT id::text, jd_hash FROM applications
-           WHERE source = %s AND ats_company_id = %s AND source_job_id = %s;""",
-        (ats_type, ats_company_id, ats_external_id),
+    Once an application leaves ``intake`` its evidence snapshot is immutable;
+    later board edits are recorded by ``observe_existing_posting`` rather than
+    silently rewriting the JD used by fit/docs/approval.
+    """
+    jd_text = jd_text.strip()
+    identity = build_posting_identity(
+        company=company, job_title=job_title, jd_text=jd_text, job_url=job_url, ats_hint=ats_type
     )
-    existing = cur.fetchone()
+    ats_type = identity.ats_type if identity.ats_type != "custom" else normalize_ats_key(ats_type)
+    existing = find_existing_application(
+        cur, identity, ats_company_id=ats_company_id, source_job_id=ats_external_id
+    )
     if existing:
-        changed = existing[1] != jd_hash
-        cur.execute(
-            """UPDATE applications
-               SET job_title = %s, job_url = %s, jd_text = %s, jd_hash = %s,
-                   location = %s, work_mode = %s, last_seen_at = now(),
-                   last_content_change_at = CASE WHEN %s THEN now() ELSE last_content_change_at END,
-                   stale_at = NULL, closed_at = NULL, updated_at = now()
-             WHERE id = %s;""",
-            (job_title, job_url, jd_text, jd_hash, location,
-             normalize_work_mode(work_mode).value, changed, existing[0]),
+        observe_existing_posting(
+            cur, application_id=existing[0], source_name=ats_type, source_job_id=ats_external_id,
+            company=company, job_title=job_title, job_url=identity.canonical_url,
+            jd_text=jd_text, jd_hash=identity.jd_hash, location=location, work_mode=work_mode,
+            metadata={"ats_company_id": ats_company_id, "ats_external_id": ats_external_id},
         )
         return None
     cur.execute(
@@ -451,17 +443,25 @@ def intake_job(cur, *, jd_text: str, company: str, job_title: str, job_url: str,
                 %s, %s, %s, %s, %s, %s, now(), now(), now(), now())
         RETURNING id::text;
         """,
-        (ats_type, company, job_title, job_url, jd_text, jd_hash,
+        (ats_type, company, job_title, identity.canonical_url, jd_text, identity.jd_hash,
          ats_type, location, normalize_work_mode(work_mode).value,
          ats_company_id, ats_external_id, ats_external_id),
     )
     app_id = cur.fetchone()[0]
+    # Record the first source snapshot through the same append-only boundary so
+    # subsequent polls have one provenance model rather than a special case.
+    observe_existing_posting(
+        cur, application_id=app_id, source_name=ats_type, source_job_id=ats_external_id,
+        company=company, job_title=job_title, job_url=identity.canonical_url,
+        jd_text=jd_text, jd_hash=identity.jd_hash, location=location, work_mode=work_mode,
+        metadata={"ats_company_id": ats_company_id, "ats_external_id": ats_external_id, "initial": True},
+    )
     immigration = record_jd_immigration_assessment(cur, app_id, jd_text)
     cur.execute(
         """
         INSERT INTO pipeline_events
           (application_id, from_step, to_step, actor, reason, detail_json)
-        VALUES (%s, NULL, 'intake', 'ats_discovery', 'Discovered via ATS API.', %s);
+        VALUES (%s, NULL, 'intake', 'ats_discovery', 'Discovered via ATS source.', %s);
         """,
         (app_id, Jsonb({"ats_type": ats_type, "ats_external_id": ats_external_id,
                         "immigration_assessment": immigration})),
@@ -559,11 +559,13 @@ def poll_company(conn, cid, name, platform, slug, source_url, *, apply: bool, wi
             with conn.cursor() as cur:
                 app_id = None
                 if apply:
+                    detected = detect_ats_platform(j.get("url"))
+                    job_ats_type = detected if detected != "custom" else platform
                     app_id = intake_job(
                         cur, jd_text=j["jd_text"], company=name, job_title=j["title"],
                         job_url=j["url"], location=j["location"],
                         work_mode=str(j.get("work_mode") or ("remote" if j.get("remote") else "unknown")),
-                        ats_type=platform, ats_company_id=cid,
+                        ats_type=job_ats_type, ats_company_id=cid,
                         ats_external_id=j["external_id"],
                     )
             if app_id:
@@ -578,12 +580,8 @@ def poll_company(conn, cid, name, platform, slug, source_url, *, apply: bool, wi
     except DiscoveryError as e:
         ok = False
         err = str(e)
-        cause = e.__cause__
-        if isinstance(cause, DiscoveryHttpError):
-            error_kind = cause.kind
-            transient_failure = cause.transient
-        else:
-            error_kind = "adapter"
+        error_kind = e.kind
+        transient_failure = e.transient
         conn.rollback()
 
     with conn.cursor() as cur:

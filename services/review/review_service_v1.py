@@ -21,6 +21,9 @@ from psycopg.types.json import Jsonb
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 from services.common.config import database_dsn, load_repo_env
+from services.control_plane.review_materialization import (
+    ReviewMaterializationError, ensure_review_bundle, ensure_approval_review_item,
+)
 
 load_repo_env()
 DSN = database_dsn()
@@ -113,20 +116,10 @@ def _sha256_file(path: Path) -> str:
 
 
 def ensure_bundle(cur, application_id: str, *, kind: str = "application") -> str:
-    cur.execute("SELECT company, job_title FROM applications WHERE id = %s;", (application_id,))
-    row = cur.fetchone()
-    if not row:
-        raise ReviewError(f"Application not found: {application_id}")
-    title = f"{row[0] or 'Unknown company'} — {row[1] or 'Unknown role'}"
-    cur.execute(
-        """INSERT INTO review_bundles(application_id, bundle_kind, title, status)
-           VALUES (%s, %s, %s, 'pending')
-           ON CONFLICT (application_id, bundle_kind) DO UPDATE
-             SET title = EXCLUDED.title, updated_at = now()
-           RETURNING id::text;""",
-        (application_id, kind, title),
-    )
-    return str(cur.fetchone()[0])
+    try:
+        return ensure_review_bundle(cur, application_id, kind=kind)
+    except ReviewMaterializationError as exc:
+        raise ReviewError(str(exc)) from exc
 
 
 def bind_canonical_review_pdf(cur, review_item_id: str, document_id: str, doc_type: str) -> str | None:
@@ -324,45 +317,10 @@ def ensure_document_review(cur, document_id: str) -> str | None:
     return item_id
 
 def ensure_approval_review(cur, approval_request_id: str) -> str | None:
-    cur.execute(
-        """SELECT ar.application_id::text, ar.type, ar.status, ar.summary_text,
-                  ar.token_expires_at, a.company, a.job_title, ar.payload_json
-             FROM approval_requests ar LEFT JOIN applications a ON a.id = ar.application_id
-            WHERE ar.id = %s AND ar.status = 'pending'
-              AND ar.token_expires_at > now();""",
-        (approval_request_id,),
-    )
-    row = cur.fetchone()
-    if not row or not row[0]:
-        return None
-    app_id, approval_type, _status, summary, expires, company, role, approval_payload = row
-    bundle_id = ensure_bundle(cur, app_id)
-    review_payload = {
-        "approval_type": approval_type,
-        "expires_at": expires.isoformat() if expires else None,
-        "delegated_to_autofill": bool((approval_payload or {}).get("delegated_to_autofill")),
-        "parent_approval_request_id": (approval_payload or {}).get("parent_approval_request_id"),
-    }
-    source_sha = _sha256_text(json.dumps({
-        "approval_request_id": approval_request_id,
-        "approval_type": approval_type,
-        "payload": approval_payload or {},
-    }, sort_keys=True, separators=(",", ":"), default=str))
-    cur.execute(
-        """INSERT INTO human_review_items(
-               review_bundle_id, application_id, item_type, approval_request_id,
-               title, summary_text, priority, payload_json, source_sha256)
-           VALUES (%s, %s, 'approval_request', %s, %s, %s, 'urgent', %s, %s)
-           ON CONFLICT (approval_request_id)
-             WHERE approval_request_id IS NOT NULL AND item_type = 'approval_request' AND status = 'pending'
-           DO UPDATE SET title = EXCLUDED.title, summary_text = EXCLUDED.summary_text,
-                         payload_json = EXCLUDED.payload_json, source_sha256 = EXCLUDED.source_sha256,
-                         updated_at = now()
-           RETURNING id::text;""",
-        (bundle_id, app_id, approval_request_id, f"Approval required: {approval_type}",
-         summary or f"{company or ''} — {role or ''}", Jsonb(review_payload), source_sha),
-    )
-    return str(cur.fetchone()[0])
+    try:
+        return ensure_approval_review_item(cur, approval_request_id)
+    except ReviewMaterializationError as exc:
+        raise ReviewError(str(exc)) from exc
 
 
 def ensure_autofill_review(cur, browser_task_id: str, *, screenshot_path: str | None = None,
@@ -1624,7 +1582,7 @@ def decide_item(conn, item_id: str, *, decision: str, actor: str, note: str = ""
                         reason="Human approved deterministic post-autofill state; every subsequent browser action requires a separate privileged approval.",
                         detail={"review_item_id": item_id, "browser_task_id": browser_task_id,
                                 "screenshot_present": bool(screenshot)},
-                        require_automated=False, allow_already_target=False,
+                        required_kind="human", allow_already_target=False,
                     )
                 except PipelineStateError as exc:
                     raise ReviewError("Application is no longer at form_filled; a fresh human review is required.") from exc

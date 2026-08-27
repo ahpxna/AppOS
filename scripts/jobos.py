@@ -18,7 +18,10 @@ sys.path.insert(0, str(ROOT))
 
 from services.common.config import database_dsn, load_repo_env
 from services.common.autofill_identity import canonical_page_url, page_fingerprint
-from services.common.openclaw_runtime import find_global_openclaw_conflicts, resolve_openclaw_binary
+from services.common.openclaw_runtime import (
+    find_global_openclaw_conflicts, inspect_global_openclaw_install,
+    remove_proven_global_openclaw, resolve_openclaw_binary,
+)
 from services.runtime.process_runner import DEFAULT_PROCESS_RUNNER
 
 
@@ -35,8 +38,50 @@ def _latest_migration_contract() -> tuple[str, str, str]:
     return latest.name, prefix, hashlib.sha256(latest.read_bytes()).hexdigest()
 
 
+
+def _resolve_global_openclaw_conflicts_interactively() -> tuple[list[Path], bool, str]:
+    """Offer provenance-safe global cleanup; never delete an unknown binary.
+
+    Returns ``(remaining_conflicts, interrupted, detail)``.  Non-interactive
+    doctor runs never mutate the host and therefore remain fail-closed.
+    """
+    conflicts = find_global_openclaw_conflicts()
+    if not conflicts:
+        return [], False, "none"
+    installs = [inspect_global_openclaw_install(path) for path in conflicts]
+    detail = "; ".join(
+        f"{item.path} [{item.provenance}{', removable' if item.removable else ', manual removal required'}]"
+        for item in installs
+    )
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return conflicts, False, detail + "; non-interactive doctor will not mutate the host"
+
+    print("\nGlobal OpenClaw installation(s) detected outside JobOS managed Node runtime:")
+    for item in installs:
+        print(f"  - {item.path} — {item.provenance}" + ("" if item.removable else " — cannot auto-remove safely"))
+    try:
+        answer = input("Remove package-manager-proven global OpenClaw installation(s)? [y/N] ").strip().casefold()
+    except (KeyboardInterrupt, EOFError):
+        print("\nGlobal OpenClaw cleanup cancelled; no removal command was started.")
+        return conflicts, True, detail
+    if answer not in {"y", "yes"}:
+        return conflicts, False, detail
+
+    errors: list[str] = []
+    for item in installs:
+        if not item.removable:
+            errors.append(f"{item.path}: unknown provenance; remove manually")
+            continue
+        try:
+            removed = remove_proven_global_openclaw(item.path)
+            print(f"Removed {removed.path} via {removed.provenance}.")
+        except RuntimeError as exc:
+            errors.append(str(exc))
+    remaining = find_global_openclaw_conflicts()
+    return remaining, False, ("; ".join(errors) if errors else ("none" if not remaining else ", ".join(map(str, remaining))))
+
 def doctor(*, check_browser: bool, strict: bool = False, require_autofill: bool = False, profile: str = "production") -> int:
-    """Report readiness without invoking a model, mutating data, or opening a tab."""
+    """Report readiness; only explicit ``y`` may remove a proven global OpenClaw package."""
     load_repo_env()
     results: list[tuple[str, bool, str]] = []
     mark(results, "Python 3.11+", sys.version_info >= (3, 11), sys.version.split()[0])
@@ -55,10 +100,11 @@ def doctor(*, check_browser: bool, strict: bool = False, require_autofill: bool 
         mark(results, "OpenClaw runtime", Path(binary).is_file() or bool(os.path.basename(binary)), binary)
     except RuntimeError as exc:
         mark(results, "OpenClaw runtime", False, str(exc))
-    global_conflicts = find_global_openclaw_conflicts()
+    global_conflicts, cleanup_interrupted, global_detail = _resolve_global_openclaw_conflicts_interactively()
+    if cleanup_interrupted:
+        return 130
     mark(
-        results, "No global OpenClaw conflict", not global_conflicts,
-        "none" if not global_conflicts else ", ".join(str(path) for path in global_conflicts),
+        results, "No global OpenClaw conflict", not global_conflicts, global_detail,
     )
 
     gog = shutil.which((os.getenv("JOBOS_GOG_BIN") or "gog").strip())
@@ -172,8 +218,17 @@ def verify_release(*, profile: str) -> int:
         ("frozen-feature invariants", [sys.executable, "-m", "pytest", "-q",
                                         "tests/test_runtime_lifecycle_hardening_v29_combined.py",
                                         "tests/test_final_pipeline_integrity_v45.py"], 300),
-        ("release diff check", ["git", "diff", "--check"], 60),
     ]
+    git_checkout = (ROOT / ".git").exists()
+    manifest_file = ROOT / "RELEASE_MANIFEST.json"
+    if git_checkout:
+        stages.append(("release diff check", ["git", "diff", "--check"], 60))
+    elif manifest_file.is_file():
+        stages.append(("packaged release manifest", [sys.executable, "scripts/build_release.py",
+                                                       "--verify-manifest", str(ROOT)], 120))
+    else:
+        print("RELEASE BLOCKED: run from a Git checkout or a packaged release with RELEASE_MANIFEST.json.")
+        return 2
     if not db_enabled:
         print("RELEASE BLOCKED: set JOBOS_RUN_DB_INTEGRATION=1 and JOBOS_TEST_DSN to a disposable database.")
         return 2
@@ -188,10 +243,11 @@ def verify_release(*, profile: str) -> int:
             print(f"RELEASE BLOCKED at {name}:\n{detail[-4000:]}")
             return 1
         print(f"✓ {name}")
-    status = DEFAULT_PROCESS_RUNNER.run(["git", "status", "--porcelain"], cwd=ROOT, timeout_s=30)
-    if not status.ok or status.stdout.strip():
-        print("RELEASE BLOCKED: release tree is not clean.")
-        return 1
+    if git_checkout:
+        status = DEFAULT_PROCESS_RUNNER.run(["git", "status", "--porcelain"], cwd=ROOT, timeout_s=30)
+        if not status.ok or status.stdout.strip():
+            print("RELEASE BLOCKED: release tree is not clean.")
+            return 1
     print("V1 RELEASE VERIFICATION: PASS")
     return 0
 
@@ -238,11 +294,15 @@ def autofill_prepare(application_id: str, *, create: bool, yes: bool) -> int:
                 "Resolve/close any prior approval or reconciliation first."
             )
         cur.execute("""SELECT autofill_mode, supports_static_text, supports_radio,
-                              supports_select, supports_upload
+                              supports_select, supports_upload, verification_level
                        FROM ats_capabilities WHERE ats_type = %s;""", (application[2],))
         capability = cur.fetchone()
-        if not capability or capability[0] == "review_only":
-            raise RuntimeError(f"ATS '{application[2]}' is review-only or unregistered for deterministic autofill.")
+        verification = str(capability[5]) if capability else "review_only"
+        if (not capability or capability[0] == "review_only" or
+                verification not in {"generic_accessibility", "fixture_verified", "live_verified"}):
+            raise RuntimeError(
+                f"ATS '{application[2]}' is review-only, unregistered, or lacks an approved browser verification level."
+            )
         action_capabilities = {"fill": bool(capability[1]), "check": bool(capability[2]),
                                "select": bool(capability[3]), "upload": bool(capability[4])}
         cur.execute(
@@ -652,13 +712,15 @@ def main() -> int:
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("start", help="Start the configured JobOS workers behind one local supervisor.")
     commands.add_parser("stop", help="Stop the local JobOS worker supervisor cleanly.")
-    doctor_parser = commands.add_parser("doctor", help="Read-only readiness and safety checks.")
+    doctor_parser = commands.add_parser("doctor", help="Readiness and safety checks; may remove a proven global OpenClaw package only after explicit y confirmation.")
     doctor_parser.add_argument("--check-browser", action="store_true", help="Also probe gateway and CDP health; never opens a page.")
     doctor_parser.add_argument("--strict", action="store_true", help="Exit non-zero unless the selected readiness profile is ready.")
     doctor_parser.add_argument("--profile", choices=("core","documents","browser","production"), default="production", help="Readiness lane to enforce; production includes optional operational channels.")
     doctor_parser.add_argument("--require-autofill", action="store_true", help="Exit non-zero unless deterministic form-fill readiness is ready.")
     verify_parser = commands.add_parser("verify-release", help="Run the fail-closed V1 release gate, including DB and controlled CDP acceptance.")
     verify_parser.add_argument("--profile", choices=("v1",), default="v1")
+    build_parser = commands.add_parser("build-release", help="Build a deterministic tracked-source ZIP with an internal SHA-256 manifest.")
+    build_parser.add_argument("--output", required=True, help="Destination .zip path (prefer outside the repository).")
     autofill_parser = commands.add_parser("autofill", help="Prepare a deterministic, approval-bound form session.")
     autofill_subcommands = autofill_parser.add_subparsers(dest="autofill_command", required=True)
     prepare_parser = autofill_subcommands.add_parser("prepare", help="Inspect the pinned application tab and optionally create its exact approval.")
@@ -730,6 +792,9 @@ def main() -> int:
         return doctor(check_browser=args.check_browser, strict=args.strict, require_autofill=args.require_autofill, profile=args.profile)
     if args.command == "verify-release":
         return verify_release(profile=args.profile)
+    if args.command == "build-release":
+        return subprocess.call([sys.executable, str(ROOT / "scripts" / "build_release.py"),
+                                "--output", str(Path(args.output).expanduser())], cwd=ROOT)
     if args.command == "status":
         return status()
     if args.command == "saved":

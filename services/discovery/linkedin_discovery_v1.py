@@ -15,6 +15,7 @@ from urllib.parse import urlparse
 
 from psycopg.types.json import Jsonb
 from services.discovery.immigration_intelligence import record_jd_immigration_assessment
+from services.intake.source_observation import observe_existing_posting
 
 MAX_DISCOVERY_RESULTS = 5
 MAX_SAVED_RESULTS = 20
@@ -227,15 +228,15 @@ def ingest_discovered_jobs(cur, browser_task_id: str, search_input: dict[str, An
         cur.execute("SELECT id::text FROM applications WHERE source = 'linkedin' AND source_job_id = %s;", (source_job_id,))
         existing = cur.fetchone()
         if existing:
+            observe_existing_posting(
+                cur, application_id=existing[0], source_name="linkedin", source_job_id=source_job_id,
+                company=row["company"], job_title=row["title"], job_url=row["url"],
+                jd_text=row["jd_text"], jd_hash=jd_hash, location=row["location"],
+                work_mode=row["work_mode"], metadata={"discovery_channel": "search", "browser_task_id": browser_task_id},
+            )
             cur.execute(
-                """UPDATE applications SET company = %s, job_title = %s, job_url = %s,
-                       jd_text = %s, jd_hash = %s, location = %s, work_mode = %s,
-                       discovery_channel = 'search',
-                       last_seen_at = now(), stale_at = NULL, closed_at = NULL,
-                       last_content_change_at = CASE WHEN jd_hash <> %s THEN now() ELSE last_content_change_at END,
-                       updated_at = now() WHERE id = %s;""",
-                (row["company"], row["title"], row["url"], row["jd_text"], jd_hash,
-                 row["location"], row["work_mode"], jd_hash, existing[0]),
+                "UPDATE applications SET discovery_channel='search', updated_at=now() WHERE id=%s;",
+                (existing[0],),
             )
             duplicates += 1
             continue
@@ -252,6 +253,12 @@ def ingest_discovered_jobs(cur, browser_task_id: str, search_input: dict[str, An
              row["location"], row["work_mode"], source_job_id),
         )
         application_id = cur.fetchone()[0]
+        observe_existing_posting(
+            cur, application_id=application_id, source_name="linkedin", source_job_id=source_job_id,
+            company=row["company"], job_title=row["title"], job_url=row["url"],
+            jd_text=row["jd_text"], jd_hash=jd_hash, location=row["location"],
+            work_mode=row["work_mode"], metadata={"discovery_channel": "search", "browser_task_id": browser_task_id, "initial": True},
+        )
         immigration = record_jd_immigration_assessment(cur, application_id, row["jd_text"])
         cur.execute(
             """INSERT INTO pipeline_events
@@ -286,16 +293,16 @@ def ingest_saved_jobs(cur, browser_task_id: str, saved_input: dict[str, Any],
         cur.execute("SELECT id::text FROM applications WHERE source = 'linkedin' AND source_job_id = %s;", (source_job_id,))
         existing = cur.fetchone()
         if existing:
+            observe_existing_posting(
+                cur, application_id=existing[0], source_name="linkedin", source_job_id=source_job_id,
+                company=row["company"], job_title=row["title"], job_url=row["url"],
+                jd_text=row["jd_text"], jd_hash=jd_hash, location=row["location"],
+                work_mode=row["work_mode"], metadata={"discovery_channel": "saved", "saved_sync_id": sync_id, "browser_task_id": browser_task_id},
+            )
             cur.execute(
-                """UPDATE applications SET company = %s, job_title = %s, job_url = %s,
-                       jd_text = %s, jd_hash = %s, location = %s, work_mode = %s,
-                       discovery_channel = 'saved', linkedin_saved_at = now(),
-                       linkedin_saved_sync_id = %s, last_seen_at = now(), stale_at = NULL,
-                       closed_at = NULL,
-                       last_content_change_at = CASE WHEN jd_hash <> %s THEN now() ELSE last_content_change_at END,
-                       updated_at = now() WHERE id = %s;""",
-                (row["company"], row["title"], row["url"], row["jd_text"], jd_hash,
-                 row["location"], row["work_mode"], sync_id, jd_hash, existing[0]),
+                """UPDATE applications SET discovery_channel='saved', linkedin_saved_at=now(),
+                         linkedin_saved_sync_id=%s, updated_at=now() WHERE id=%s;""",
+                (sync_id, existing[0]),
             )
             duplicates += 1
             continue
@@ -312,6 +319,12 @@ def ingest_saved_jobs(cur, browser_task_id: str, saved_input: dict[str, Any],
              row["location"], row["work_mode"], source_job_id, sync_id),
         )
         application_id = cur.fetchone()[0]
+        observe_existing_posting(
+            cur, application_id=application_id, source_name="linkedin", source_job_id=source_job_id,
+            company=row["company"], job_title=row["title"], job_url=row["url"],
+            jd_text=row["jd_text"], jd_hash=jd_hash, location=row["location"],
+            work_mode=row["work_mode"], metadata={"discovery_channel": "saved", "saved_sync_id": sync_id, "browser_task_id": browser_task_id, "initial": True},
+        )
         immigration = record_jd_immigration_assessment(cur, application_id, row["jd_text"])
         cur.execute(
             """INSERT INTO pipeline_events

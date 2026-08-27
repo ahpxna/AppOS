@@ -38,6 +38,7 @@ class PipelineStateStore:
         detail: Mapping[str, Any] | None = None,
         status: str | None = None,
         require_automated: bool | None = None,
+        required_kind: str | None = None,
         lease_run_id: str | None = None,
         expected_job_url: str | None = None,
         expected_jd_hash: str | None = None,
@@ -46,16 +47,25 @@ class PipelineStateStore:
         allow_already_target: bool = True,
     ) -> TransitionResult:
         cur.execute(
-            "SELECT automated FROM pipeline_transitions WHERE from_step=%s AND to_step=%s;",
+            "SELECT automated, coalesce(transition_kind, CASE WHEN automated THEN 'automated' ELSE 'human' END) "
+            "FROM pipeline_transitions WHERE from_step=%s AND to_step=%s;",
             (expected_from, to),
         )
         edge = cur.fetchone()
         if not edge:
             raise PipelineStateError(f"Illegal transition {expected_from!r} -> {to!r}.")
-        if require_automated is True and not bool(edge[0]):
-            raise PipelineStateError(f"Transition {expected_from!r} -> {to!r} requires a human actor.")
-        if require_automated is False and bool(edge[0]):
-            raise PipelineStateError(f"Transition {expected_from!r} -> {to!r} is automated, not a human decision.")
+        edge_kind = str(edge[1])
+        if required_kind is not None:
+            if required_kind not in {"automated", "human", "privileged", "recovery"}:
+                raise ValueError(f"unknown required transition kind: {required_kind!r}")
+            if edge_kind != required_kind:
+                raise PipelineStateError(
+                    f"Transition {expected_from!r} -> {to!r} is {edge_kind!r}, not {required_kind!r}."
+                )
+        elif require_automated is True and edge_kind != "automated":
+            raise PipelineStateError(f"Transition {expected_from!r} -> {to!r} is not an automated edge.")
+        elif require_automated is False and edge_kind != "human":
+            raise PipelineStateError(f"Transition {expected_from!r} -> {to!r} is not a human-decision edge.")
         if guard_sql and ";" in guard_sql:
             raise ValueError("pipeline transition guard must be one SQL predicate, not a statement")
         sql = (

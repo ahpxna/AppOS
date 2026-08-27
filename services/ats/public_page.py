@@ -1,10 +1,11 @@
 """Deterministic structured-web discovery fallback for ATS career pages.
 
-This module does not execute JavaScript, authenticate, click, or submit. It
-fetches public HTML, extracts schema.org JobPosting data, and can follow links
-present in HTML or JSON-LD listing structures. JavaScript-only boards can still
-be used by the rest of JobOS when an exact job URL enters through another
-intake channel.
+This module never authenticates, clicks, submits, or executes arbitrary page
+JavaScript. It extracts schema.org ``JobPosting`` records and follows only
+links that stay on the employer board or move to a *known candidate-system
+host* from the canonical ATS registry. JavaScript-only boards remain usable
+through exact-URL/manual/browser intake without turning discovery into an
+undocumented scraper.
 """
 from __future__ import annotations
 
@@ -17,13 +18,29 @@ import re
 from typing import Any, Callable, Iterable
 from urllib.parse import urljoin, urlsplit
 
-from services.ats.contracts import canonical_job_url, infer_work_mode, WorkMode
+from services.ats.contracts import (
+    JDQuality,
+    WorkMode,
+    assess_jd_quality,
+    canonical_job_url,
+    infer_work_mode,
+)
 from services.ats.http_client import DiscoveryHttpError, get_text
 from services.ats.registry import detect_ats_platform
 
 
 class PublicPageDiscoveryError(RuntimeError):
-    pass
+    """Typed structured-page failure that preserves HTTP retry semantics."""
+
+    def __init__(self, message: str, *, kind: str = "structured_page",
+                 transient: bool = False) -> None:
+        super().__init__(message)
+        self.kind = kind
+        self.transient = bool(transient)
+
+    @classmethod
+    def from_http(cls, exc: DiscoveryHttpError) -> "PublicPageDiscoveryError":
+        return cls(str(exc), kind=exc.kind, transient=exc.transient)
 
 
 @dataclass(frozen=True)
@@ -64,7 +81,7 @@ class _StructuredPageParser(HTMLParser):
         try:
             self.ld_json.append(json.loads(raw))
         except json.JSONDecodeError:
-            # Refuse to guess at malformed JSON-LD.
+            # Malformed JSON-LD is not repaired heuristically.
             return
 
 
@@ -79,16 +96,13 @@ def _walk_job_postings(value: Any) -> Iterable[dict[str, Any]]:
     types = {str(v).casefold() for v in raw_type} if isinstance(raw_type, list) else {str(raw_type or "").casefold()}
     if "jobposting" in types:
         yield value
-    for key in ("@graph", "itemListElement", "mainEntity", "hasPart"):
+    for key in ("@graph", "itemListElement", "mainEntity", "hasPart", "item"):
         child = value.get(key)
         if child is not None:
             yield from _walk_job_postings(child)
-    if value.get("item") is not None:
-        yield from _walk_job_postings(value["item"])
 
 
 def _walk_structured_urls(value: Any) -> Iterable[str]:
-    """Yield URLs embedded in JSON-LD listing containers."""
     if isinstance(value, list):
         for item in value:
             yield from _walk_structured_urls(item)
@@ -156,7 +170,8 @@ def _location_text(value: Any) -> str:
                 out.append(str(loc))
             continue
         address = loc.get("address") if isinstance(loc.get("address"), dict) else loc
-        parts = [address.get("addressLocality"), address.get("addressRegion"), address.get("postalCode"), address.get("addressCountry")]
+        parts = [address.get("addressLocality"), address.get("addressRegion"),
+                 address.get("postalCode"), address.get("addressCountry")]
         text = ", ".join(str(part).strip() for part in parts if str(part or "").strip())
         if text:
             out.append(text)
@@ -194,12 +209,16 @@ def normalize_jobposting(job: dict[str, Any], *, page_url: str, company_hint: st
     company = _organization_name(job, company_hint)
     location = _location_text(job.get("jobLocation"))
     department = _strip_html(job.get("occupationalCategory"))
-    work_mode = infer_work_mode(location, description, str(job.get("jobLocationType") or ""))
+    # Schema.org jobLocationType is more authoritative than prose; passing it
+    # first lets TELECOMMUTE win without a stray "not remote" sentence doing so.
+    work_mode = infer_work_mode(str(job.get("jobLocationType") or ""), location, description)
     header = f"{title}\nCompany: {company}"
     if location:
         header += f"\nLocation: {location}"
     if department:
         header += f"\nDepartment: {department}"
+    jd_text = f"{header}\n\n{description}".strip()
+    quality = assess_jd_quality(jd_text)
     return {
         "external_id": _identifier(job, url=url, title=title),
         "title": title,
@@ -208,7 +227,8 @@ def normalize_jobposting(job: dict[str, Any], *, page_url: str, company_hint: st
         "remote": work_mode == WorkMode.REMOTE,
         "work_mode": work_mode.value,
         "url": url,
-        "jd_text": f"{header}\n\n{description}".strip(),
+        "jd_text": jd_text,
+        "jd_quality": quality.value,
     }
 
 
@@ -220,7 +240,14 @@ def _looks_like_job_link(url: str, *, board_url: str, platform: str) -> bool:
     target_host = parsed.hostname.casefold()
     target_platform = detect_ats_platform(url)
     if target_host != board_host:
-        if platform == "custom" or target_platform != platform:
+        # Company-owned careers sites very commonly hand off to Workday/iCIMS/
+        # Oracle/etc.  Permit that exact cross-host link only when the canonical
+        # registry recognizes the target as a candidate system. Unknown external
+        # domains remain refused.
+        if platform == "custom":
+            if target_platform == "custom":
+                return False
+        elif target_platform != platform:
             return False
     path = (parsed.path or "/").casefold()
     query = (parsed.query or "").casefold()
@@ -229,30 +256,37 @@ def _looks_like_job_link(url: str, *, board_url: str, platform: str) -> bool:
         "/opportunity/", "/opportunities/", "/careersection/", "/requisition/", "/vacancy/",
         "/vacancies/", "/posting/", "/postings/", "/apply/",
     )
-    return any(signal in path for signal in signals) or any(k in query for k in ("jobid=", "job_id=", "requisitionid="))
+    return any(signal in path for signal in signals) or any(
+        key in query for key in ("jobid=", "job_id=", "requisitionid=", "requisition_id=")
+    )
 
 
 def fetch_public_job_board(*, career_url: str, platform: str, company_hint: str,
                            user_agent: str, timeout_seconds: int = 30,
                            max_details: int = 100,
                            fetcher: Callable[..., tuple[str, str]] = get_text) -> list[dict[str, Any]]:
-    """Fetch schema.org JobPosting records from a public board and detail pages."""
+    """Fetch only *complete* schema.org jobs from a public board/detail chain."""
     try:
         canonical_board = canonical_job_url(career_url)
     except ValueError as exc:
-        raise PublicPageDiscoveryError(str(exc)) from exc
+        raise PublicPageDiscoveryError(str(exc), kind="invalid_url") from exc
     try:
         body, final_url = fetcher(url=canonical_board, user_agent=user_agent, timeout_seconds=timeout_seconds)
     except DiscoveryHttpError as exc:
-        raise PublicPageDiscoveryError(str(exc)) from exc
+        raise PublicPageDiscoveryError.from_http(exc) from exc
     page = parse_structured_page(body, base_url=final_url)
 
     jobs: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
+    incomplete_urls: list[str] = []
 
     def add(raw_job: dict[str, Any], source_url: str) -> None:
         normalized = normalize_jobposting(raw_job, page_url=source_url, company_hint=company_hint)
         if not normalized:
+            return
+        if normalized["jd_quality"] != JDQuality.COMPLETE.value:
+            if normalized.get("url"):
+                incomplete_urls.append(str(normalized["url"]))
             return
         identity = (normalized["external_id"], normalized["url"])
         if identity not in seen:
@@ -261,22 +295,40 @@ def fetch_public_job_board(*, career_url: str, platform: str, company_hint: str,
 
     for raw_job in page.job_postings:
         add(raw_job, final_url)
-    if jobs:
-        return jobs
 
-    detail_urls = [link for link in page.links if _looks_like_job_link(link, board_url=final_url, platform=platform)]
+    # A board can publish listing-stub JobPosting objects *and* exact detail
+    # URLs. Do not return the stubs; follow those URLs and require complete JDs.
+    candidate_links = [*incomplete_urls, *page.links]
+    detail_urls: list[str] = []
+    detail_seen: set[str] = set()
+    for link in candidate_links:
+        if link in detail_seen:
+            continue
+        if _looks_like_job_link(link, board_url=final_url, platform=platform):
+            detail_seen.add(link)
+            detail_urls.append(link)
+
+    last_transient: DiscoveryHttpError | None = None
     for detail_url in detail_urls[:max(0, min(int(max_details), 200))]:
         try:
-            detail_body, detail_final_url = fetcher(url=detail_url, user_agent=user_agent, timeout_seconds=timeout_seconds)
-        except DiscoveryHttpError:
+            detail_body, detail_final_url = fetcher(
+                url=detail_url, user_agent=user_agent, timeout_seconds=timeout_seconds
+            )
+        except DiscoveryHttpError as exc:
+            if exc.transient:
+                last_transient = exc
             continue
         detail = parse_structured_page(detail_body, base_url=detail_final_url)
         for raw_job in detail.job_postings:
             add(raw_job, detail_final_url)
 
-    if not jobs:
-        raise PublicPageDiscoveryError(
-            f"{platform} career page exposed no deterministic schema.org JobPosting data; "
-            "use an exact job URL from another intake source or a tenant-specific adapter."
-        )
-    return jobs
+    if jobs:
+        return jobs
+    if last_transient is not None:
+        raise PublicPageDiscoveryError.from_http(last_transient) from last_transient
+    raise PublicPageDiscoveryError(
+        f"{platform} career page exposed no complete deterministic schema.org JobPosting data; "
+        "use an exact job URL from another intake source or a tenant-specific adapter.",
+        kind="incomplete_or_missing_jobposting",
+        transient=False,
+    )

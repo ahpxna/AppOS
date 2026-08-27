@@ -88,7 +88,7 @@ def _resolve_fit_review_transition(cur, *, application_id: str | None, request_i
             to=target, actor=actor,
             reason="Human resolved the borderline fit review.",
             detail={"approval_request_id": request_id, "decision": "approved" if approved else "denied"},
-            require_automated=False,
+            required_kind="human",
         )
     except PipelineStateError as exc:
         raise RuntimeError(f"fit review is stale or cannot transition: {exc}") from exc
@@ -498,7 +498,7 @@ def _restore_autofill_ready_after_terminal_parent(cur, *, application_id: str, p
         DEFAULT_PIPELINE_STATE_STORE.transition(
             cur, application_id=application_id, expected_from="awaiting_approval",
             to="application_form_ready", actor="approval-service", reason=reason[:500],
-            detail={"autofill_plan_key": plan_key},
+            detail={"autofill_plan_key": plan_key}, required_kind="recovery",
             guard_sql="""NOT EXISTS (
                 SELECT 1 FROM approval_requests ar
                  WHERE ar.application_id=applications.id AND ar.type='autofill_form'
@@ -803,7 +803,7 @@ def cmd_create(conn, args) -> int:
                 cur, application_id=args.application_id, expected_from="application_form_ready",
                 to="awaiting_approval", actor=args.requested_by,
                 reason="Exact form packaged for human autofill approval.",
-                detail={"approval_request_id": request_id},
+                detail={"approval_request_id": request_id}, required_kind="automated",
             )
 
         if not args.apply:
@@ -860,7 +860,7 @@ def _stop_application_for_denied_privileged(cur, *, application_id: str | None,
             cur, application_id=application_id, expected_from=current, to="abandoned",
             actor=actor, status="abandoned",
             reason="Human stopped the application by denying an application-level privileged gate.",
-            detail={"approval_type": atype},
+            detail={"approval_type": atype}, required_kind="human",
         )
     except PipelineStateError:
         return False

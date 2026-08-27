@@ -449,6 +449,7 @@ def _expire_bound_pre_io_approval(cur, task: Dict[str, Any], reason: str) -> Non
             cur, application_id=str(task.get("application_id") or ""),
             expected_from="awaiting_approval", to="application_form_ready",
             actor=WORKER_ID, reason=reason[:500], detail={"browser_task_id": task["id"]},
+            required_kind="recovery",
             guard_sql="""NOT EXISTS (
                 SELECT 1 FROM approval_requests ar
                  WHERE ar.application_id=applications.id AND ar.type='autofill_form'
@@ -1022,6 +1023,7 @@ def durable_begin_execution(task: Dict[str, Any], binding: Dict[str, Any], targe
                 to="autofill_executing", actor=WORKER_ID,
                 reason="Acquired durable application execution fence immediately before deterministic browser I/O.",
                 detail={"browser_task_id": task["id"], "target_id": target_id},
+                required_kind="automated",
                 expected_job_url=str(binding.get("application_job_url") or ""),
                 expected_jd_hash=str(binding.get("application_jd_hash") or ""),
                 allow_already_target=False,
@@ -1225,6 +1227,7 @@ def durable_finish_execution(task: Dict[str, Any], binding: Dict[str, Any], resu
                     to="form_filled", actor=WORKER_ID,
                     reason="Deterministic autofill completed under the application execution fence.",
                     detail={"browser_task_id": task["id"]},
+                    required_kind="automated",
                     expected_job_url=str(binding.get("application_job_url") or ""),
                     expected_jd_hash=str(binding.get("application_jd_hash") or ""),
                     allow_already_target=False,
@@ -1245,6 +1248,7 @@ def durable_finish_execution(task: Dict[str, Any], binding: Dict[str, Any], resu
                     to="awaiting_approval", actor=WORKER_ID,
                     reason="Deterministic autofill ended partial; old capability is terminal and a fresh plan is required.",
                     detail={"browser_task_id": task["id"]},
+                    required_kind="recovery",
                     expected_job_url=str(binding.get("application_job_url") or ""),
                     expected_jd_hash=str(binding.get("application_jd_hash") or ""),
                     allow_already_target=False,
@@ -1351,7 +1355,7 @@ def durable_close_unstarted_approval(task: Dict[str, Any], binding: Dict[str, An
             DEFAULT_PIPELINE_STATE_STORE.transition(
                 cur, application_id=task["application_id"], expected_from="awaiting_approval",
                 to="application_form_ready", actor=WORKER_ID, reason=reason[:500],
-                detail={"browser_task_id": task["id"]},
+                detail={"browser_task_id": task["id"]}, required_kind="recovery",
                 guard_sql="""NOT EXISTS (
                     SELECT 1 FROM approval_requests ar
                      WHERE ar.application_id=applications.id AND ar.type='autofill_form'
@@ -1407,13 +1411,19 @@ def require_ats_autofill_capability(cur, application_id: str) -> dict[str, bool]
     row = cur.fetchone()
     ats_type = str(row[0]) if row else "unknown"
     cur.execute("""SELECT autofill_mode, supports_static_text, supports_radio,
-                          supports_select, supports_upload
+                          supports_select, supports_upload, verification_level
                    FROM ats_capabilities WHERE ats_type = %s;""", (ats_type,))
     capability = cur.fetchone()
-    if not capability or capability[0] == "review_only":
+    if not capability or capability[0] == "review_only" or capability[5] == "review_only":
         raise PermanentTaskError(
-            f"ATS '{ats_type}' is review-only or unregistered. Add a proven single-page capability before browser writes."
+            f"ATS '{ats_type}' is review-only or unregistered. Browser writes require an explicit capability row."
         )
+    verification = str(capability[5])
+    if verification not in {"generic_accessibility", "fixture_verified", "live_verified"}:
+        raise PermanentTaskError(f"ATS '{ats_type}' has an invalid browser verification level: {verification!r}.")
+    # generic_accessibility authorizes only the same four deterministic
+    # primitives emitted by the form inspector/planner. It is deliberately
+    # not a claim that vendor-specific custom widgets/selectors are proven.
     return {"fill": bool(capability[1]), "check": bool(capability[2]),
             "select": bool(capability[3]), "upload": bool(capability[4])}
 

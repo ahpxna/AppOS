@@ -779,9 +779,9 @@ def test_fit_review_redemption_transitions_atomically_and_replay_is_terminal(db)
         assert cur.fetchone() == (1,)
 
 
-def test_document_generation_attempt_reuses_completed_and_blocks_uncertain_replay(db):
+def test_document_generation_attempt_reuses_completed_and_recovers_after_bounded_lease(db):
     from services.control_plane.document_attempts import (
-        DocumentAttemptError, claim, complete, fail,
+        DocumentAttemptBusyError, claim, complete, fail,
     )
     manifest = {"generator_version": "db-fixture", "jd_sha256": "f" * 64, "asset_ids": []}
     with db.connect(TEST_DSN) as conn, conn.cursor() as cur:
@@ -791,15 +791,27 @@ def test_document_generation_attempt_reuses_completed_and_blocks_uncertain_repla
         document_id = cur.fetchone()[0]
         first = claim(cur, application_id=app_id, doc_type="resume", request_kind="generation", input_manifest=manifest)
         complete(cur, attempt_id=first.id, document_id=document_id)
+        uncertain = claim(cur, application_id=app_id, doc_type="cover_letter", request_kind="generation",
+                          input_manifest={**manifest, "doc_type": "cover_letter"}, lease_seconds=300)
+        fail(cur, attempt_id=uncertain.id, error="simulated uncertain provider outcome", uncertain=True,
+             retry_delay_seconds=60)
         conn.commit()
     with db.connect(TEST_DSN) as conn, conn.cursor() as cur:
         reused = claim(cur, application_id=app_id, doc_type="resume", request_kind="generation", input_manifest=manifest)
         assert reused.id == first.id and reused.completed_document_id == document_id
-        uncertain = claim(cur, application_id=app_id, doc_type="cover_letter", request_kind="generation",
-                          input_manifest={**manifest, "doc_type": "cover_letter"})
-        fail(cur, attempt_id=uncertain.id, error="simulated uncertain provider outcome", uncertain=True)
-        conn.commit()
-    with db.connect(TEST_DSN) as conn, conn.cursor() as cur:
-        with pytest.raises(DocumentAttemptError, match="uncertain external outcome"):
+        with pytest.raises(DocumentAttemptBusyError, match="recovery lease"):
             claim(cur, application_id=app_id, doc_type="cover_letter", request_kind="generation",
                   input_manifest={**manifest, "doc_type": "cover_letter"})
+        cur.execute("UPDATE document_generation_attempts SET lease_expires_at=now()-interval '1 second' WHERE id=%s",
+                    (uncertain.id,))
+        recovered = claim(cur, application_id=app_id, doc_type="cover_letter", request_kind="generation",
+                          input_manifest={**manifest, "doc_type": "cover_letter"})
+        assert recovered.id == uncertain.id
+        assert recovered.attempt_count == 2
+        cur.execute("UPDATE document_generation_attempts SET lease_expires_at=now()-interval '1 second' WHERE id=%s",
+                    (recovered.id,))
+        recovered_again = claim(cur, application_id=app_id, doc_type="cover_letter", request_kind="generation",
+                                input_manifest={**manifest, "doc_type": "cover_letter"})
+        assert recovered_again.id == recovered.id
+        assert recovered_again.attempt_count == 3
+        conn.rollback()

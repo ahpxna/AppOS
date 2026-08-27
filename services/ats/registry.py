@@ -20,6 +20,13 @@ class DiscoveryStrategy(StrEnum):
     EXTERNAL_SOURCE = "external_source"
 
 
+class AutofillVerification(StrEnum):
+    REVIEW_ONLY = "review_only"
+    GENERIC_ACCESSIBILITY = "generic_accessibility"
+    FIXTURE_VERIFIED = "fixture_verified"
+    LIVE_VERIFIED = "live_verified"
+
+
 @dataclass(frozen=True)
 class ATSDefinition:
     key: str
@@ -29,17 +36,22 @@ class ATSDefinition:
     text_markers: tuple[str, ...] = ()
     discovery_strategy: DiscoveryStrategy = DiscoveryStrategy.STRUCTURED_WEB
     autofill_mode: str = "generic_browser"
+    autofill_verification: AutofillVerification = AutofillVerification.GENERIC_ACCESSIBILITY
     category: str = "ats"
 
 
 def _d(key: str, name: str, *, aliases=(), domains=(), markers=(),
        strategy: DiscoveryStrategy = DiscoveryStrategy.STRUCTURED_WEB,
-       mode: str = "generic_browser", category: str = "ats") -> ATSDefinition:
+       mode: str = "generic_browser", category: str = "ats",
+       verification: AutofillVerification | None = None) -> ATSDefinition:
     return ATSDefinition(
         key=key, display_name=name, aliases=tuple(aliases),
         candidate_domains=tuple(str(x).casefold().strip(".") for x in domains if x),
         text_markers=tuple(str(x).casefold() for x in markers if x),
-        discovery_strategy=strategy, autofill_mode=mode, category=category,
+        discovery_strategy=strategy, autofill_mode=mode,
+        autofill_verification=(verification if verification is not None else
+                               (AutofillVerification.REVIEW_ONLY if mode == "review_only" else AutofillVerification.GENERIC_ACCESSIBILITY)),
+        category=category,
     )
 
 
@@ -57,6 +69,9 @@ _DEFINITIONS = (
     _d("breezy", "Breezy HR", aliases=("breezy hr",), domains=("breezy.hr",), markers=("breezy",), strategy=DiscoveryStrategy.NATIVE_API),
 
     _d("workday", "Workday Recruiting", aliases=("workday recruiting",), domains=("myworkdayjobs.com",), markers=("workday", "myworkdayjobs")),
+    _d("darwinbox", "Darwinbox Recruiting", aliases=("darwinbox ats", "darwinbox recruiting"), domains=("darwinbox.in",), markers=("darwinbox",)),
+    _d("spark_hire", "Spark Hire Recruit", aliases=("spark hire", "spark hire recruit"), domains=("sparkhire.com",), markers=("spark hire",)),
+    _d("eploy", "Eploy", aliases=("eploy ats",), domains=("eploy.co.uk",), markers=("eploy",)),
     _d("icims", "iCIMS", domains=("icims.com",), markers=("icims",)),
     _d("jibe_icims", "Jibe / iCIMS Candidate Experience", aliases=("jibe", "jibe icims"), domains=("jibeapply.com",), markers=("jibe",)),
     _d("oracle_taleo", "Oracle Taleo Enterprise", aliases=("taleo", "oracle taleo", "taleo enterprise"), domains=("taleo.net",), markers=("taleo",)),
@@ -308,7 +323,7 @@ def candidate_domain_rows() -> tuple[tuple[str, str, str], ...]:
         "applicantpool.com", "hiringthing.com", "jobscore.com", "hirebridge.com",
         "recruiterbox.com", "exacthire.com", "catsone.com", "softgarden.io",
         "factorialhr.com", "join.com", "talentlyft.com", "peopleforce.io",
-        "careers-page.com",
+        "careers-page.com", "darwinbox.in", "sparkhire.com", "eploy.co.uk",
     }
     rows: list[tuple[str, str, str]] = []
     for domain in sorted(safe_domains):
@@ -330,7 +345,9 @@ def capability_rows() -> tuple[tuple[str, bool, bool, bool, bool, bool, bool, st
             browser, browser, browser, browser,
             browser and item.autofill_mode in {"multi_page", "generic_browser"},
             item.autofill_mode if browser else "review_only",
-            f"Registry-driven generic browser support; strategy={item.discovery_strategy.value}. "
-            "Writes remain page-bound, approval-bound, and safe-pause on unknown controls.",
+            f"Registry identity; discovery={item.discovery_strategy.value}; "
+            f"autofill_verification={item.autofill_verification.value}. "
+            "Generic accessibility support is not a vendor-specific selector certification; "
+            "writes remain page-bound, approval-bound, primitive-control checked, and safe-pause on unknown controls.",
         ))
     return tuple(rows)

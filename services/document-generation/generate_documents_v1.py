@@ -41,7 +41,7 @@ from psycopg.types.json import Jsonb
 # broken this way before today's fix).
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from services.common.observability import emit_trace, make_trace_id
-from services.common.llm_gateway import generate_text
+from services.common.llm_gateway import generate_text, resolve_config
 from services.common.model_config import get_model
 from services.common.project_registry import ProjectRegistryError, project_asset_terms_by_slot
 from services.common.resume_project_bullet_audit import (
@@ -71,7 +71,7 @@ from services.runtime.process_runner import DEFAULT_PROCESS_RUNNER
 
 DSN = database_dsn()
 
-GENERATOR_VERSION = "document_generator_v4_jd_first_soft_degrade_2026_08_25"
+GENERATOR_VERSION = "document_generator_v5_recoverable_attempts_2026_08_26"
 DEFAULT_OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
 DEFAULT_MODEL = get_model("docgen")
 
@@ -1230,6 +1230,11 @@ def main() -> int:
                 # letter performs alignment calls before its final draft; a
                 # fence below those calls would still permit duplicate work
                 # after a crash.
+                # Bind durable idempotency to the resolved model transport as well as
+                # prompt-bearing inputs.  API keys are deliberately excluded.
+                resolved_llm = resolve_config(
+                    role="docgen", model=args.model, local_url=args.ollama_url,
+                )
                 manifest = {
                     "application_id": app["id"], "doc_type": args.doc_type,
                     "request_kind": "revision" if revision_context else "generation",
@@ -1251,7 +1256,10 @@ def main() -> int:
                         sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str,
                     ).encode("utf-8")).hexdigest(),
                     "generator_version": GENERATOR_VERSION,
-                    "model": args.model, "max_bullets": args.max_bullets,
+                    "llm_backend": resolved_llm.backend,
+                    "llm_provider": resolved_llm.provider,
+                    "llm_api_style": resolved_llm.api_style,
+                    "model": resolved_llm.model, "max_bullets": args.max_bullets,
                     "questions": list(args.question),
                     "revision_source_document_id": revision_context.get("source_document_id"),
                     "feedback_sha256": hashlib.sha256(
@@ -1262,6 +1270,10 @@ def main() -> int:
                     attempt = claim_document_attempt(
                         cur, application_id=app["id"], doc_type=args.doc_type,
                         request_kind=str(manifest["request_kind"]), input_manifest=manifest,
+                        # Cover-letter generation can make multiple model calls.  The
+                        # lease therefore covers the configured per-call timeout plus
+                        # a bounded orchestration margin; stale leases are recoverable.
+                        lease_seconds=max(300, int(args.timeout) * 4 + 120),
                     )
                 except DocumentAttemptError as exc:
                     print(f"ERROR: {exc}")

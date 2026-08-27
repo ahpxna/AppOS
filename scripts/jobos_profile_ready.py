@@ -294,12 +294,13 @@ def ensure_venv_and_reexec(*, no_install: bool) -> None:
             raise PipelineError(".venv is missing and --no-install was supplied.")
         run_checked([sys.executable, "-m", "venv", str(ROOT / ".venv")], label="create_venv", cwd=ROOT)
 
-    probe = subprocess.run(
-        [str(VENV_PYTHON), "-c", "import psycopg,pypdf,docx,pglast"],
-        cwd=ROOT,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    try:
+        probe = subprocess.run(
+            [str(VENV_PYTHON), "-c", "import psycopg,pypdf,docx,pglast"],
+            cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise PipelineError("Dependency import probe timed out after 30 seconds.") from exc
     if probe.returncode != 0:
         if no_install:
             raise PipelineError(".venv exists but required packages are missing and --no-install was supplied.")
@@ -310,9 +311,14 @@ def ensure_venv_and_reexec(*, no_install: bool) -> None:
     os.execve(str(VENV_PYTHON), [str(VENV_PYTHON), str(Path(__file__).resolve()), *sys.argv[1:]], env)
 
 
-def run_checked(cmd: list[str], *, label: str, cwd: Path = ROOT, allow_codes: Iterable[int] = (0,)) -> subprocess.CompletedProcess[str]:
+def run_checked(cmd: list[str], *, label: str, cwd: Path = ROOT, allow_codes: Iterable[int] = (0),
+                timeout_s: int = 1800) -> subprocess.CompletedProcess[str]:
     emit("stage_start", stage=label, command=" ".join(cmd))
-    proc = subprocess.run(cmd, cwd=cwd, text=True)
+    try:
+        proc = subprocess.run(cmd, cwd=cwd, text=True, timeout=max(1, int(timeout_s)))
+    except subprocess.TimeoutExpired as exc:
+        emit("stage_timeout", stage=label, timeout_seconds=timeout_s)
+        raise PipelineError(f"Stage {label!r} timed out after {timeout_s} seconds.") from exc
     if proc.returncode not in set(allow_codes):
         raise PipelineError(f"Stage {label!r} failed with exit code {proc.returncode}.")
     emit("stage_finish", stage=label, returncode=proc.returncode)
@@ -952,14 +958,28 @@ def main() -> int:
                 cmd += ["refresh"]
                 if args.project_id:
                     cmd += ["--project-id", args.project_id]
-            return subprocess.run(cmd, cwd=ROOT).returncode
+            if args.watch:
+                # Explicit watch mode is intentionally long-lived.
+                return subprocess.run(cmd, cwd=ROOT).returncode
+            try:
+                return subprocess.run(cmd, cwd=ROOT, timeout=900).returncode
+            except subprocess.TimeoutExpired:
+                print("ERROR: repository freshness refresh timed out after 900 seconds.", file=sys.stderr)
+                return 1
         if args.command == "fixed-fields":
             cmd = [sys.executable, "services/profile-ingestion/fixed_profile_fields_v1.py", args.fixed_command]
             if args.fixed_command == "wizard":
                 cmd += ["--actor", args.actor]
                 if args.apply:
                     cmd.append("--apply")
-            return subprocess.run(cmd, cwd=ROOT).returncode
+            if args.fixed_command == "wizard":
+                # Human-interactive wizard is intentionally not time-bounded.
+                return subprocess.run(cmd, cwd=ROOT).returncode
+            try:
+                return subprocess.run(cmd, cwd=ROOT, timeout=300).returncode
+            except subprocess.TimeoutExpired:
+                print("ERROR: fixed profile field command timed out after 300 seconds.", file=sys.stderr)
+                return 1
         if args.command == "project-source":
             return configure_project_source(args.project_id, args.repo, args.branch, document_only=args.document_only)
         if args.command == "confirm-repo":

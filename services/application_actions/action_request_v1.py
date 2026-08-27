@@ -15,6 +15,8 @@ from typing import Any
 
 from psycopg.types.json import Jsonb
 
+from services.control_plane.review_materialization import ensure_approval_review_item
+
 PRIVILEGED_TYPES = {
     "privileged_begin_application",
     "privileged_trust_external_domain",
@@ -113,6 +115,5 @@ def create_privileged_request(cur, *, application_id: str, action_type: str,
            VALUES (%s,'created',%s,%s);""",
         (request_id, requested_by, Jsonb({"action_type": action_type, "binding_sha256": body["binding_sha256"]})),
     )
-    from services.review.review_service_v1 import ensure_approval_review
-    ensure_approval_review(cur, request_id)
+    ensure_approval_review_item(cur, request_id)
     return request_id

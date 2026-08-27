@@ -14,6 +14,10 @@ services:
       - ./initdb:/docker-entrypoint-initdb.d:ro
 
   n8n:
+    # Legacy/optional workflow UI. Core JobOS runtime is Python/PostgreSQL;
+    # keeping n8n behind an explicit profile prevents an unused service from
+    # becoming part of default production readiness while preserving the feature.
+    profiles: ["legacy-n8n"]
     image: n8nio/n8n:latest
     container_name: jobos-n8n
     restart: unless-stopped

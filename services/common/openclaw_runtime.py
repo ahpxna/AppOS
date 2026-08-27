@@ -6,6 +6,8 @@ from services.runtime.openclaw_runtime import (
     GlobalOpenClawForbiddenError,
     ManagedOpenClawMissingError,
     find_global_openclaw_conflicts,
+    inspect_global_openclaw_install,
+    remove_proven_global_openclaw,
     resolve_managed_openclaw,
 )
 

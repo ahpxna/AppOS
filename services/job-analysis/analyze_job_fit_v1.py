@@ -25,7 +25,8 @@ from services.common.observability import emit_trace, make_trace_id
 from services.common.llm_gateway import generate_text
 from services.common.model_config import get_model
 from services.common.config import database_dsn
-from services.ats.contracts import canonical_job_url
+from services.intake.posting_identity import build_posting_identity, find_existing_application
+from services.intake.source_observation import observe_existing_posting
 
 DSN = database_dsn()
 
@@ -127,148 +128,58 @@ def get_or_create_application(
     job_url: Optional[str],
     source: str,
 ) -> Tuple[str, Dict[str, Any]]:
+    columns = """id::text,source,company,job_title,job_url,jd_text,jd_hash,status,current_step"""
     if application_id:
-        cur.execute(
-            """
-            SELECT
-              id::text,
-              source,
-              company,
-              job_title,
-              job_url,
-              jd_text,
-              jd_hash,
-              status,
-              current_step
-            FROM applications
-            WHERE id = %s;
-            """,
-            (application_id,),
-        )
+        cur.execute(f"SELECT {columns} FROM applications WHERE id=%s;", (application_id,))
         row = cur.fetchone()
         if not row:
             raise RuntimeError(f"Application not found: {application_id}")
-
-        app = {
-            "id": row[0],
-            "source": row[1],
-            "company": row[2],
-            "job_title": row[3],
-            "job_url": row[4],
-            "jd_text": row[5],
-            "jd_hash": row[6],
-            "status": row[7],
-            "current_step": row[8],
-        }
+        app = dict(zip(("id","source","company","job_title","job_url","jd_text","jd_hash","status","current_step"), row))
         if not app["jd_text"]:
             raise RuntimeError("Application exists but jd_text is empty.")
-        return app["id"], app
+        return str(app["id"]), app
 
     if not jd_text:
         raise RuntimeError("Either --application-id or --jd-file is required.")
 
-    job_url = canonical_job_url(job_url)
-    jd_hash = sha256_text(jd_text)
-
-    cur.execute(
-        """
-        SELECT
-          id::text,
-          source,
-          company,
-          job_title,
-          job_url,
-          jd_text,
-          jd_hash,
-          status,
-          current_step
-        FROM applications
-        WHERE jd_hash = %s
-          AND COALESCE(job_url, '') = COALESCE(%s, '')
-        ORDER BY created_at DESC
-        LIMIT 1;
-        """,
-        (jd_hash, job_url),
+    identity = build_posting_identity(
+        company=company, job_title=job_title, jd_text=jd_text, job_url=job_url,
     )
-    existing = cur.fetchone()
-
+    existing = find_existing_application(cur, identity)
     if existing:
-        app_id = str(existing[0])
-        cur.execute(
-            """
-            UPDATE applications
-            SET
-              source = COALESCE(%s, source),
-              company = COALESCE(%s, company),
-              job_title = COALESCE(%s, job_title),
-              job_url = COALESCE(%s, job_url),
-              jd_text = %s,
-              jd_hash = %s,
-              updated_at = now()
-            WHERE id = %s
-            RETURNING
-              id::text,
-              source,
-              company,
-              job_title,
-              job_url,
-              jd_text,
-              jd_hash,
-              status,
-              current_step;
-            """,
-            (source, company, job_title, job_url, jd_text, jd_hash, app_id),
+        app_id, _company, _title, _old_jd_hash, _current_step = existing
+        observe_existing_posting(
+            cur, application_id=app_id, source_name=source or "fit_analyzer_cli",
+            company=company, job_title=job_title, job_url=identity.canonical_url,
+            jd_text=jd_text, jd_hash=identity.jd_hash,
+            metadata={"intake_channel": "fit_analyzer_cli"},
         )
+        cur.execute(
+            "UPDATE applications SET ats_type=coalesce(nullif(%s,'custom'),ats_type), updated_at=now() WHERE id=%s AND current_step='intake';",
+            (identity.ats_type, app_id),
+        )
+        cur.execute(f"SELECT {columns} FROM applications WHERE id=%s;", (app_id,))
         row = cur.fetchone()
     else:
         cur.execute(
-            """
-            INSERT INTO applications (
-              source,
-              company,
-              job_title,
-              job_url,
-              jd_text,
-              jd_hash,
-              current_step,
-              status,
-              created_at,
-              updated_at
-            )
-            VALUES (
-              %s, %s, %s, %s, %s, %s,
-              'intake',
-              'active',
-              now(),
-              now()
-            )
-            RETURNING
-              id::text,
-              source,
-              company,
-              job_title,
-              job_url,
-              jd_text,
-              jd_hash,
-              status,
-              current_step;
-            """,
-            (source, company, job_title, job_url, jd_text, jd_hash),
+            """INSERT INTO applications(
+                   source,company,job_title,job_url,jd_text,jd_hash,current_step,status,
+                   intake_channel,ats_type,created_at,updated_at)
+               VALUES (%s,%s,%s,nullif(%s,''),%s,%s,'intake','active',
+                       'fit_analyzer_cli',%s,now(),now())
+               RETURNING id::text,source,company,job_title,job_url,jd_text,jd_hash,status,current_step;""",
+            (source, company, job_title, identity.canonical_url, jd_text, identity.jd_hash, identity.ats_type),
         )
         row = cur.fetchone()
+        observe_existing_posting(
+            cur, application_id=str(row[0]), source_name=source or "fit_analyzer_cli",
+            company=company, job_title=job_title, job_url=identity.canonical_url,
+            jd_text=jd_text, jd_hash=identity.jd_hash,
+            metadata={"intake_channel": "fit_analyzer_cli", "initial": True},
+        )
 
-    app = {
-        "id": row[0],
-        "source": row[1],
-        "company": row[2],
-        "job_title": row[3],
-        "job_url": row[4],
-        "jd_text": row[5],
-        "jd_hash": row[6],
-        "status": row[7],
-        "current_step": row[8],
-    }
-    return app["id"], app
+    app = dict(zip(("id","source","company","job_title","job_url","jd_text","jd_hash","status","current_step"), row))
+    return str(app["id"]), app
 
 
 def build_prompt(app: Dict[str, Any], profile_pack_text: str) -> str:

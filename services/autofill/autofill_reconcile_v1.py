@@ -119,7 +119,7 @@ def close(cur, task_id: str) -> None:
                 to="application_form_ready", actor="autofill-reconciliation",
                 reason="Human closed uncertain autofill reconciliation; a fresh approval is required.",
                 detail={"replay": False, "fresh_approval_required": True},
-                allow_already_target=False,
+                required_kind="recovery", allow_already_target=False,
             )
         except PipelineStateError:
             # A concurrent stop/advance is authoritative.  Closing this

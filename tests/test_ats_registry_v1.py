@@ -1,17 +1,18 @@
 from services.ats.registry import (
-    DEFINITIONS, DiscoveryStrategy, detect_ats_platform, get_definition,
-    normalize_ats_key, platform_keys,
+    DEFINITIONS, DiscoveryStrategy, candidate_domain_rows, detect_ats_platform,
+    get_definition, normalize_ats_key, platform_keys,
 )
 
 
 def test_registry_is_broad_and_has_custom_fallback():
     keys = set(platform_keys())
-    assert len(keys) >= 150
+    assert len(keys) >= 159
     for required in {
         "workday", "icims", "oracle_hcm", "oracle_taleo", "successfactors",
         "avature", "eightfold", "adp_workforcenow", "ukg", "dayforce",
         "bamboohr", "jazzhr", "clearcompany", "teamtailor", "pinpoint",
         "jobvite", "paycom", "paylocity", "neogov", "usajobs", "custom",
+        "darwinbox", "spark_hire", "eploy",
     }:
         assert required in keys
 
@@ -36,3 +37,18 @@ def test_unknown_official_portal_is_supported_as_custom_not_rejected():
 
 def test_registry_has_unique_keys():
     assert len(DEFINITIONS) == len(platform_keys())
+
+
+def test_every_dedicated_candidate_domain_round_trips_to_its_registry_identity():
+    failures = []
+    for item in DEFINITIONS.values():
+        for domain in item.candidate_domains:
+            detected = detect_ats_platform(f"https://{domain}/jobs/fixture")
+            if detected != item.key:
+                failures.append((item.key, domain, detected))
+    assert not failures
+
+
+def test_candidate_allowlist_rows_always_resolve_to_a_known_registry_platform():
+    for domain, _category, _notes in candidate_domain_rows():
+        assert detect_ats_platform(f"https://{domain}/jobs/fixture") != "custom"
