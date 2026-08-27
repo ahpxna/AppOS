@@ -4,7 +4,7 @@
 # install release/test environments with this constraint set so a future pip
 # resolver cannot silently move JobOS onto an unverified major/minor runtime.
 # Update intentionally together with the regression suite and release notes.
-psycopg[binary]==3.3.4
+psycopg==3.3.4
 pglast==8.4
 pytest==8.4.2
 pynput==1.8.2
