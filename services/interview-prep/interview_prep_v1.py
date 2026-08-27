@@ -34,6 +34,9 @@ from services.common.observability import emit_trace, make_trace_id
 from services.common.llm_gateway import generate_text
 from services.common.model_config import get_model
 from services.common.config import database_dsn
+from services.common.company_research_sources import (
+    company_research_field_evidence, company_research_source_urls,
+)
 
 MODEL = get_model("interview_prep")
 DEFAULT_OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
@@ -50,13 +53,18 @@ def extract_json_object(raw: str) -> Dict[str, Any]:
     fence = re.search(r"```(.*?)```", cleaned, flags=re.DOTALL)
     if fence:
         try:
-            return json.loads(fence.group(1).strip())
+            parsed = json.loads(fence.group(1).strip())
+            if isinstance(parsed, dict):
+                return parsed
         except json.JSONDecodeError:
             pass
     first, last = cleaned.find("{"), cleaned.rfind("}")
     if first == -1 or last <= first:
         raise ValueError("No JSON object found in prep output.")
-    return json.loads(cleaned[first:last + 1])
+    parsed = json.loads(cleaned[first:last + 1])
+    if not isinstance(parsed, dict):
+        raise ValueError("Interview-prep output JSON must be an object.")
+    return parsed
 
 
 def ollama_generate(*, model: str, prompt: str, ollama_url: str,
@@ -83,9 +91,10 @@ def fetch_context_pack(cur) -> str:
 def fetch_research(cur, company: str) -> Dict[str, Any]:
     cur.execute(
         """
-        SELECT company_domain, summary, mission, products, recent_news, risks
+        SELECT company_domain, summary, mission, products, recent_news, risks, sources
         FROM company_research_cache
         WHERE lower(company_name) = lower(%s)
+          AND (expires_at IS NULL OR expires_at > now())
         ORDER BY last_refreshed_at DESC NULLS LAST
         LIMIT 1;
         """,
@@ -94,13 +103,26 @@ def fetch_research(cur, company: str) -> Dict[str, Any]:
     row = cur.fetchone()
     if not row:
         return {}
+    sources = sorted(company_research_source_urls(row[6]))
+    field_evidence = company_research_field_evidence(row[6])
+    evidence_aware = isinstance(row[6], dict) and "field_evidence" in row[6]
     return {
-        "company_domain": row[0],
-        "summary": row[1],
-        "mission": row[2],
-        "products": row[3],
-        "recent_news": row[4] or [],
-        "risks": row[5] or [],
+        "company_domain": row[0] or "",
+        "summary": (row[1] or "") if evidence_aware and field_evidence.get("summary") else "",
+        "mission": (row[2] or "") if evidence_aware and field_evidence.get("mission") else "",
+        "products": (row[3] or "") if evidence_aware and field_evidence.get("products") else "",
+        "recent_news": [
+            item for item in (row[4] or [])
+            if isinstance(item, dict) and item.get("source_url") in sources
+            and str(item.get("supporting_quote") or "").strip()
+        ],
+        "risks": [
+            item for item in (row[5] or [])
+            if isinstance(item, dict) and item.get("source_url") in sources
+            and str(item.get("supporting_quote") or "").strip()
+        ],
+        "sources": sources,
+        "field_evidence": field_evidence,
     }
 
 
@@ -140,6 +162,12 @@ def fetch_queue(cur, interview_id: Optional[str]) -> List[Dict[str, Any]]:
         }
         for row in rows
     ]
+
+
+def _string_list(value: Any) -> List[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
 
 
 def build_prompt(interview: Dict[str, Any], context_pack: str, research: Dict[str, Any]) -> str:
@@ -219,11 +247,11 @@ def cmd_prep(conn, args) -> int:
             if not prep_notes:
                 raise RuntimeError("Prep package did not include prep_notes.")
             prep_json = {
-                "opening_line": parsed.get("opening_line", ""),
-                "questions_to_ask": parsed.get("questions_to_ask", []),
-                "stories_to_practice": parsed.get("stories_to_practice", []),
-                "watch_outs": parsed.get("watch_outs", []),
-                "self_check": parsed.get("self_check", ""),
+                "opening_line": str(parsed.get("opening_line") or "").strip(),
+                "questions_to_ask": _string_list(parsed.get("questions_to_ask")),
+                "stories_to_practice": _string_list(parsed.get("stories_to_practice")),
+                "watch_outs": _string_list(parsed.get("watch_outs")),
+                "self_check": str(parsed.get("self_check") or "").strip(),
                 "prep_version": PREP_VERSION,
             }
 

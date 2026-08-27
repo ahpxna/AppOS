@@ -108,7 +108,9 @@ def extract_json_object(text: str) -> Dict[str, Any]:
     text = re.sub(r"```$", "", text).strip()
 
     try:
-        return json.loads(text)
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
     except Exception:
         pass
 
@@ -140,7 +142,9 @@ def extract_json_object(text: str) -> Dict[str, Any]:
                 if depth == 0:
                     candidate = text[start:end + 1]
                     try:
-                        return json.loads(candidate)
+                        parsed = json.loads(candidate)
+                        if isinstance(parsed, dict):
+                            return parsed
                     except Exception:
                         break
 

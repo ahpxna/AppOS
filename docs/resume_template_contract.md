@@ -8,9 +8,11 @@ The template has one portrait Letter section: left/right margins 1.00 in, top
 0.51 in, bottom 0.42 in. Arial is the dominant font; the template uses direct
 run formatting and must be copied rather than rebuilt.
 
-Preserve verbatim: name/contact, Education, Experience & Activities, project
-headings/dates, Certifications, all page geometry, paragraph styles, headings,
-tabs, bullets, and font sizes.
+Preserve verbatim: name/contact, Education, every experience job-block header
+(employer/job title/dates/location), project headings/dates, Certifications, all
+page geometry, paragraph styles, headings, tabs, and font sizes. Existing
+experience bullet paragraphs are editable only through the audited sparse-edit
+contract below.
 
 The renderer snapshots every protected paragraph plus every hyperlink target
 before editing and compares them after saving. A mismatch blocks the output.
@@ -19,6 +21,12 @@ date, replace your GitHub URL, or insert an arbitrary external link.
 
 Editable slots only:
 
+- Existing non-empty `List Paragraph` items inside the Experience section:
+  bullet text only. The renderer discovers these fixed slots from the template;
+  it never inserts/removes a job block or edits its employer/title/date/location
+  header. A JD-first rewrite may use the immutable job title and baseline bullet
+  without an official-resume quote, but a new precise technical/factual detail
+  still needs approved user evidence and must pass the semantic experience audit.
 - 12 existing `List Paragraph` items between `PROJECTS` and `CERTIFICATIONS`:
   project-bullet text only, in order, no inserted rows.
 - Five paragraphs directly after `SKILLS`: existing category/item rows only.

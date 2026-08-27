@@ -65,7 +65,9 @@ def extract_json_object(raw: str) -> Dict[str, Any]:
     if fence:
         candidate = fence.group(1).strip()
         try:
-            return json.loads(candidate)
+            parsed = json.loads(candidate)
+            if isinstance(parsed, dict):
+                return parsed
         except json.JSONDecodeError:
             pass
 
@@ -76,9 +78,12 @@ def extract_json_object(raw: str) -> Dict[str, Any]:
 
     candidate = cleaned[first:last + 1]
     try:
-        return json.loads(candidate)
+        parsed = json.loads(candidate)
     except json.JSONDecodeError as e:
         raise ValueError(f"Could not parse JSON object from model output: {e}") from e
+    if not isinstance(parsed, dict):
+        raise ValueError("Job-fit model output JSON must be an object.")
+    return parsed
 
 
 def ollama_generate(
@@ -193,6 +198,7 @@ Decision policy:
 - reject: serious mismatch, seniority too high, hard blocker, or fit_score below 60.
 - ask_user: fit_score 60-74, uncertain requirement, or potentially useful role requiring user decision.
 - approve_research: fit_score 75+ and no hard blocker; next step is company research.
+- When there are no hard blockers, return exactly `"hard_blockers": []`; never emit an empty placeholder object.
 - Academic/project evidence is allowed for entry-level roles, but must be labeled as academic/project-based.
 
 Return ONLY valid JSON. No markdown. No commentary.
@@ -223,12 +229,7 @@ Required JSON schema:
     }}
   ],
   "quick_learn_targets": [],
-  "hard_blockers": [
-    {{
-      "blocker": "",
-      "reason": ""
-    }}
-  ],
+  "hard_blockers": [],
   "risk_flags": [
     {{
       "risk": "",
@@ -257,19 +258,54 @@ def as_list(value: Any) -> List[Any]:
     return value if isinstance(value, list) else []
 
 
-def normalize_analysis(parsed: Dict[str, Any]) -> Dict[str, Any]:
-    score_raw = parsed.get("fit_score", 0)
+ROLE_FAMILIES = {
+    "cybersecurity_general", "soc_dfir", "network_security", "appsec_entry_level",
+    "grc_security_analytics", "software_engineering", "other",
+}
+
+
+def _normalize_fit_score(value: Any) -> int:
+    """Accept JSON numbers and numeric strings without turning 82.5 into zero."""
     try:
-        score = int(score_raw)
-    except Exception:
-        score = 0
-    score = max(0, min(100, score))
+        score = float(value)
+    except (TypeError, ValueError):
+        return 0
+    if score != score or score in (float("inf"), float("-inf")):
+        return 0
+    return max(0, min(100, int(round(score))))
+
+
+def _normalize_hard_blockers(value: Any) -> List[Any]:
+    """Discard schema placeholders/sentinels; keep only substantive blockers."""
+    if not isinstance(value, list):
+        return []
+    out: List[Any] = []
+    for item in value:
+        if isinstance(item, dict):
+            blocker = str(item.get("blocker") or "").strip()
+            reason = str(item.get("reason") or "").strip()
+            if not blocker:
+                continue
+            out.append({"blocker": blocker, "reason": reason})
+            continue
+        text = str(item or "").strip()
+        if not text or text.casefold() in {"none", "n/a", "na", "no", "no blocker", "no blockers"}:
+            continue
+        out.append({"blocker": text, "reason": ""})
+    return out
+
+
+def normalize_analysis(parsed: Dict[str, Any]) -> Dict[str, Any]:
+    score = _normalize_fit_score(parsed.get("fit_score", 0))
 
     model_decision = str(parsed.get("fit_decision", "ask_user")).strip()
     if model_decision not in {"reject", "ask_user", "approve_research"}:
         model_decision = "ask_user"
 
-    hard_blockers = as_list(parsed.get("hard_blockers"))
+    hard_blockers = _normalize_hard_blockers(parsed.get("hard_blockers"))
+    role_family = str(parsed.get("role_family") or "other").strip()
+    if role_family not in ROLE_FAMILIES:
+        role_family = "other"
 
     if hard_blockers:
         decision = "reject"
@@ -296,7 +332,7 @@ def normalize_analysis(parsed: Dict[str, Any]) -> Dict[str, Any]:
         "model_fit_decision": model_decision,
         "priority": priority,
         "decision_reason": str(parsed.get("decision_reason") or ""),
-        "role_family": str(parsed.get("role_family") or "other"),
+        "role_family": role_family,
         "seniority_level": str(parsed.get("seniority_level") or ""),
         "work_mode": str(parsed.get("work_mode") or ""),
         "location": str(parsed.get("location") or ""),
@@ -309,7 +345,7 @@ def normalize_analysis(parsed: Dict[str, Any]) -> Dict[str, Any]:
         "recommended_profile_brief_types": as_list(parsed.get("recommended_profile_brief_types")),
         "next_step": next_step,
         "extracted_job_fields": {
-            "role_family": str(parsed.get("role_family") or "other"),
+            "role_family": role_family,
             "seniority_level": str(parsed.get("seniority_level") or ""),
             "work_mode": str(parsed.get("work_mode") or ""),
             "location": str(parsed.get("location") or ""),

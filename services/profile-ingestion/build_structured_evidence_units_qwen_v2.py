@@ -147,13 +147,18 @@ def parse_json_content(content: str) -> Dict[str, Any]:
     text = re.sub(r"```$", "", text).strip()
 
     try:
-        return json.loads(text)
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
     except json.JSONDecodeError:
-        start = text.find("{")
-        end = text.rfind("}")
-        if start >= 0 and end > start:
-            return json.loads(text[start:end + 1])
-        raise
+        pass
+    start = text.find("{")
+    end = text.rfind("}")
+    if start >= 0 and end > start:
+        parsed = json.loads(text[start:end + 1])
+        if isinstance(parsed, dict):
+            return parsed
+    raise ValueError("Model output JSON must be an object.")
 
 
 def call_ollama_json(prompt: str, model: str, retries: int = 2) -> Dict[str, Any]:
@@ -356,6 +361,27 @@ def build_prompt(row: Dict[str, Any]) -> str:
     )
 
 
+
+
+def _source_contains_term(term: Any, section_title: str, section_text: str) -> bool:
+    needle = lower_norm(term)
+    if not needle:
+        return False
+    haystack = lower_norm(f"{section_title} {section_text}")
+    pattern = re.escape(needle).replace(r"\ ", r"\s+")
+    if needle[0].isalnum():
+        pattern = r"(?<![a-z0-9])" + pattern
+    if needle[-1].isalnum():
+        pattern = pattern + r"(?![a-z0-9])"
+    return re.search(pattern, haystack) is not None
+
+
+def _grounded_list(value: Any, section_title: str, section_text: str) -> List[str]:
+    return [
+        item for item in clean_list(value)
+        if _source_contains_term(item, section_title, section_text)
+    ]
+
 def normalize_unit(raw: Dict[str, Any], row: Dict[str, Any]) -> Dict[str, Any]:
     section_text = row["section_text"] or ""
     section_title = row["section_title"] or ""
@@ -380,7 +406,11 @@ def normalize_unit(raw: Dict[str, Any], row: Dict[str, Any]) -> Dict[str, Any]:
     if claim_type not in claim_type_allowed:
         claim_type = "tool_exposure"
 
-    tool_name = norm(raw.get("tool_name")) or infer_tool_name(section_title)
+    raw_tool_name = norm(raw.get("tool_name"))
+    tool_name = (
+        raw_tool_name if _source_contains_term(raw_tool_name, section_title, section_text)
+        else infer_tool_name(section_title)
+    )
     tool_category = norm(raw.get("tool_category")) or det_category
     workflow_group = norm(raw.get("workflow_group")) or det_workflow
     evidence_strength = norm(raw.get("evidence_strength")) or det_strength
@@ -409,13 +439,27 @@ def normalize_unit(raw: Dict[str, Any], row: Dict[str, Any]) -> Dict[str, Any]:
     # 3. clamp lan cuoi phong truong hop apply_downgrades bi sua sau nay
     evidence_strength = _safety.clamp_strength(evidence_strength, det_strength)
 
-    source_boundaries = raw.get("source_boundaries") if isinstance(raw.get("source_boundaries"), dict) else {}
-    source_boundaries.setdefault("document", file_name)
-    source_boundaries.setdefault("section", section_title)
-    source_boundaries.setdefault("courses", extract_courses(section_text))
-    source_boundaries.setdefault("labs", extract_labs(section_text))
-    source_boundaries.setdefault("projects", [])
-    source_boundaries.setdefault("boundary_note", evidence_strength)
+    # Provenance belongs to the deterministic section producer, not the LLM.
+    # Never let generated JSON replace the authoritative document/section or
+    # invent course/lab/project boundaries.
+    deterministic_boundary = (
+        dict(row.get("source_boundary_json") or {})
+        if isinstance(row.get("source_boundary_json"), dict) else {}
+    )
+    source_boundaries = {
+        **deterministic_boundary,
+        "document": file_name,
+        "section": section_title,
+        "tool_or_topic": deterministic_boundary.get("tool_or_topic") or infer_tool_name(section_title),
+        "courses": extract_courses(section_text),
+        "labs": extract_labs(section_text),
+        "projects": _grounded_list(
+            (raw.get("source_boundaries") or {}).get("projects")
+            if isinstance(raw.get("source_boundaries"), dict) else [],
+            section_title, section_text,
+        ),
+        "boundary_note": evidence_strength,
+    }
 
     role_relevance = clean_list(raw.get("role_relevance")) or default_role_relevance(tool_category, workflow_group)
 
@@ -478,8 +522,8 @@ def normalize_unit(raw: Dict[str, Any], row: Dict[str, Any]) -> Dict[str, Any]:
         "does_not_support_claims": does_not_support_claims,
         "role_families": role_relevance,
         "competency_tags": clean_list(raw.get("competency_tags")) or [workflow_group, tool_category],
-        "tool_tags": clean_list(raw.get("tool_tags")) or ([tool_name] if tool_name else []),
-        "project_tags": clean_list(raw.get("project_tags")) or extract_courses(section_text),
+        "tool_tags": _grounded_list(raw.get("tool_tags"), section_title, section_text) or ([tool_name] if tool_name else []),
+        "project_tags": _grounded_list(raw.get("project_tags"), section_title, section_text) or extract_courses(section_text),
         "source_confidence": clamp_float(raw.get("source_confidence"), 0.90),
         "grounding_confidence": clamp_float(raw.get("grounding_confidence"), 0.90),
         "structured_extraction_json": raw,

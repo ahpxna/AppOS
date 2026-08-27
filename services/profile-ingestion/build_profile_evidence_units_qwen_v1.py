@@ -74,13 +74,18 @@ def parse_json_content(content: str) -> Dict[str, Any]:
     text = re.sub(r"```$", "", text).strip()
 
     try:
-        return json.loads(text)
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
     except json.JSONDecodeError:
-        start = text.find("{")
-        end = text.rfind("}")
-        if start >= 0 and end > start:
-            return json.loads(text[start:end + 1])
-        raise
+        pass
+    start = text.find("{")
+    end = text.rfind("}")
+    if start >= 0 and end > start:
+        parsed = json.loads(text[start:end + 1])
+        if isinstance(parsed, dict):
+            return parsed
+    raise ValueError("Model output JSON must be an object.")
 
 
 def call_ollama_json(prompt: str, model: str, retries: int = 2) -> Dict[str, Any]:
@@ -131,6 +136,34 @@ def clamp_float(value: Any, default: float = 0.80) -> float:
         return default
 
 
+def _safe_section_index(value: Any) -> int:
+    try:
+        return max(1, int(value or 1))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _source_contains_phrase(term: Any, source: str) -> bool:
+    phrase = " ".join(str(term or "").casefold().split())
+    if not phrase:
+        return False
+    pattern = re.escape(phrase).replace(r"\ ", r"\s+")
+    if phrase[0].isalnum():
+        pattern = r"(?<![a-z0-9])" + pattern
+    if phrase[-1].isalnum():
+        pattern = pattern + r"(?![a-z0-9])"
+    return re.search(pattern, source.casefold()) is not None
+
+
+def _ground_tool_tags(unit: Dict[str, Any], section: Dict[str, Any]) -> None:
+    source = " ".join(str(section.get(key) or "") for key in ("section_title", "section_text"))
+    grounded = []
+    for tag in clean_list(unit.get("tool_tags")):
+        if _source_contains_phrase(tag, source):
+            grounded.append(tag)
+    unit["tool_tags"] = list(dict.fromkeys(grounded))
+
+
 def normalize_unit(unit: Dict[str, Any]) -> Dict[str, Any]:
     allowed_types = {
         "identity", "education", "employment_experience", "coursework", "project_scope", "methodology", "result",
@@ -143,7 +176,7 @@ def normalize_unit(unit: Dict[str, Any]) -> Dict[str, Any]:
         evidence_type = "coursework"
 
     return {
-        "section_index": int(unit.get("section_index") or 1),
+        "section_index": _safe_section_index(unit.get("section_index")),
         "evidence_type": evidence_type,
         "evidence_title": str(unit.get("evidence_title") or "Untitled evidence unit").strip()[:300],
         "direct_quote": str(unit.get("direct_quote") or "").strip()[:2000],
@@ -486,9 +519,14 @@ def main() -> int:
 
                     doc_inserted = 0
                     for raw_unit in units_raw[:8]:
+                        if not isinstance(raw_unit, dict):
+                            continue
                         unit = normalize_unit(raw_unit)
                         if not unit["evidence_summary"]:
                             continue
+                        section = section_by_index.get(unit["section_index"])
+                        if section:
+                            _ground_tool_tags(unit, section)
                         grounded, reason = validate_unit_source_grounding(unit, section_by_index)
                         if not grounded:
                             print(f"Skipped evidence unit: {reason} | {unit['evidence_title']}")

@@ -351,11 +351,13 @@ map; URL lạ hoặc claim company không có nguồn bị loại trước khi l
 
 ### Resume Word từ template local
 
-Sau khi truth checker pass, pipeline copy Word template riêng, chỉ tailor 12
-project-bullet slots, 5 skill-category rows, và subtitle nằm giữa project name
-với GitHub link. Education, experience, certifications, project name, dates,
-GitHub links, font và spacing được preserve; không tự shrink font để nhét
-trang. Template và output là local/ignored:
+Sau khi truth checker pass, pipeline copy Word template riêng và chỉ sửa các
+slot đã audit sẵn: các experience-bullet hiện có, 12 project-bullet slots, 5
+skill-category rows, và subtitle nằm giữa project name với GitHub link.
+Education, experience headers (employer/job title/dates/location),
+certifications, project name, dates, GitHub links, font và spacing được
+preserve; không tự shrink font để nhét trang. Template và output là
+local/ignored:
 
 ```bash
 python services/document-generation/render_verified_resume_v1.py \
@@ -368,9 +370,13 @@ upload lại đúng các bytes đó. Word Print/Save as PDF chỉ là bản xem/
 authorization path; nếu muốn dùng PDF từ Word phải đưa nó qua review/binding mới. Xem
 `docs/resume_template_contract.md`.
 
-Resume rules are enforced, not just prompted: only the six pre-approved project
-blocks already present in the template can be selected; their title, dates, and
-GitHub links cannot change. A primary bullet (slots 1, 3, …) is limited to 200
+Resume rules are enforced, not just prompted. Existing experience bullets may
+be rewritten JD-first while their employer/job-title/date/location header stays
+immutable; general role-aligned reframing does not require an official-resume
+quote, while new precise technical facts, tools, metrics, credentials, or
+quantified outcomes still require approved user evidence. Only the six
+pre-approved project blocks already present in the template can be selected;
+their title, dates, and GitHub links cannot change. A primary bullet (slots 1, 3, …) is limited to 200
 characters and its optional secondary bullet to 105 characters; the secondary
 cannot exist on its own. Each block can cite only that same project's approved
 profile asset, and skills are capped at five evidence-backed ranked rows. A new

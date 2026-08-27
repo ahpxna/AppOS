@@ -77,13 +77,18 @@ def extract_json_object(raw: str) -> Dict[str, Any]:
     fence = re.search(r"```(.*?)```", cleaned, flags=re.DOTALL)
     if fence:
         try:
-            return json.loads(fence.group(1).strip())
+            parsed = json.loads(fence.group(1).strip())
+            if isinstance(parsed, dict):
+                return parsed
         except json.JSONDecodeError:
             pass
     first, last = cleaned.find("{"), cleaned.rfind("}")
     if first == -1 or last <= first:
         raise ValueError("No JSON object in model output.")
-    return json.loads(cleaned[first:last + 1])
+    parsed = json.loads(cleaned[first:last + 1])
+    if not isinstance(parsed, dict):
+        raise ValueError("Reply model output JSON must be an object.")
+    return parsed
 
 
 def ollama_generate(*, model: str, prompt: str, ollama_url: str,
@@ -241,9 +246,7 @@ Return ONLY valid JSON:
   "classification": "one label copied exactly from the list above",
   "confidence": 0.0,
   "reason": "one sentence citing what in the message decided it",
-  "contains_instructions_to_ai": false,
-  "key_asks": ["what the sender actually wants, if anything"],
-  "deadline_mentioned": "any date or time limit stated, else empty string"
+  "contains_instructions_to_ai": false
 }}
 """
 
@@ -314,7 +317,11 @@ def cmd_classify(conn, args) -> int:
                 print(f"    rejected out-of-vocabulary label {label!r}")
                 label = "unclear"
 
-            conf = float(parsed.get("confidence") or 0)
+            try:
+                conf = float(parsed.get("confidence") or 0)
+            except (TypeError, ValueError):
+                conf = 0.0
+            conf = max(0.0, min(1.0, conf))
             meta = labels[label]
 
             print(f"\n  {subject or '(no subject)'}")
@@ -364,16 +371,24 @@ def cmd_classify(conn, args) -> int:
 
 GROUNDING_RULES = """
 Rules for the reply:
-1. Sentences that assert nothing factual -- greetings, thanks, scheduling,
-   confirmations -- need no source. Mark them "none".
-2. Any sentence about experience, skills, tools, coursework, or availability
-   must name the profile_asset_id that supports it in "source_asset_id".
+1. Pure greetings, thanks, and non-committal scheduling coordination need no
+   profile source. Mark them "none". Never hide a factual claim inside one of
+   those kinds.
+2. Any sentence about experience, skills, tools, coursework, qualifications,
+   or other candidate history must name the profile_asset_id that supports it
+   in "source_asset_id".
 3. Do not invent availability, dates, salary figures, notice periods, or
-   willingness to relocate. If asked and unknown, say the user will confirm.
+   willingness to relocate. A specific scheduling commitment (for example
+   "Tuesday at 2 PM works") is NOT source-free unless the user has explicitly
+   supplied that availability; otherwise add it to needs_user_input and use a
+   non-committal coordination sentence.
 4. Honour every MUST NOT CLAIM line on an asset.
 5. Academic and course project work must be described as such.
-6. Keep it short and plain. No enthusiasm the user did not express.
-7. Never agree to anything with a cost attached -- fees, equipment purchases,
+6. A recruiter-directed information question (for example asking about the
+   interview format or next steps) may be source-free. It must ask for employer
+   information and must not smuggle a claim about the candidate.
+7. Keep it short and plain. No enthusiasm the user did not express.
+8. Never agree to anything with a cost attached -- fees, equipment purchases,
    payment details. Flag those instead.
 """
 
@@ -429,16 +444,32 @@ Return ONLY valid JSON:
 """
 
 
+def _string_list(value: Any) -> List[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
 def validate_reply(parsed, valid_ids) -> Tuple[str, List[str], Dict[str, Any]]:
     sentences, used, dropped = [], [], []
     claims = []
+    raw_sentences = parsed.get("sentences") if isinstance(parsed, dict) else []
+    if not isinstance(raw_sentences, list):
+        raw_sentences = []
 
-    for s in parsed.get("sentences", []):
-        text = (s.get("text") or "").strip()
-        src = s.get("source_asset_id")
-        kind = s.get("kind", "")
+    allowed_kinds = {"courtesy", "scheduling", "claim", "question", "closing"}
+    for item in raw_sentences:
+        if not isinstance(item, dict):
+            continue
+        text = str(item.get("text") or "").strip()
+        src = item.get("source_asset_id")
+        kind = str(item.get("kind") or "").strip()
         if not text:
             continue
+        if kind not in allowed_kinds:
+            # Unknown kinds do not gain a source-free privilege. Treat them as
+            # factual claims so the truth checker requires evidence.
+            kind = "claim"
 
         if kind == "claim" or (src and src != "none"):
             if src not in valid_ids:
@@ -453,9 +484,9 @@ def validate_reply(parsed, valid_ids) -> Tuple[str, List[str], Dict[str, Any]]:
     evidence = {
         "claims": claims,
         "dropped_ungrounded_claims": dropped,
-        "needs_user_input": parsed.get("needs_user_input", []),
-        "flags": parsed.get("flags", []),
-        "model_self_check": parsed.get("self_check", ""),
+        "needs_user_input": _string_list(parsed.get("needs_user_input") if isinstance(parsed, dict) else []),
+        "flags": _string_list(parsed.get("flags") if isinstance(parsed, dict) else []),
+        "model_self_check": str(parsed.get("self_check") or "") if isinstance(parsed, dict) else "",
     }
     return " ".join(sentences), sorted(set(used)), evidence
 
@@ -526,6 +557,76 @@ def fetch_asset(cur, asset_id: str) -> Optional[Dict[str, Any]]:
     }
 
 
+_SAFE_COURTESY = (
+    "thank you", "thanks", "i appreciate", "appreciate the", "nice to meet", "good to hear",
+)
+_SAFE_CLOSING = (
+    "thank you", "thanks", "best regards", "kind regards", "regards", "sincerely",
+    "look forward to hearing", "please let me know",
+)
+_SAFE_SCHEDULING_COORDINATION = (
+    "please let me know what times", "please share a few times", "happy to coordinate",
+    "happy to find a time", "i can confirm my availability", "i will confirm my availability",
+    "please let me know your availability",
+)
+_SAFE_QUESTION_STARTS = (
+    "could you share", "could you let me know", "would you share", "would you let me know",
+    "can you share", "can you let me know", "what is the", "what are the", "what should i expect",
+    "is there anything", "are there any", "who will", "how will", "when should",
+)
+_FACTUAL_REPLY_MARKERS = re.compile(
+    r"\b(?:i|my|we)\s+(?:have|had|led|built|managed|implemented|developed|worked|used|earned|hold|"
+    r"completed|studied|graduated|am certified|was responsible|have been|specialize|specialise)\b|"
+    r"\b(?:years? of experience|production|certified|certification|degree|gpa|clearance|citizen|"
+    r"work authorization|salary|notice period|relocat(?:e|ion)|managed a team|owned)\b",
+    flags=re.IGNORECASE,
+)
+_SPECIFIC_SCHEDULE_MARKERS = re.compile(
+    r"\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|today|tomorrow|"
+    r"noon|midnight)\b|\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b|"
+    r"\b(?:available|free|works for me|can meet|can speak|can interview)\b",
+    flags=re.IGNORECASE,
+)
+
+
+def no_source_reply_sentence_is_safe(text: str, kind: str) -> tuple[bool, str]:
+    """Verify model-declared no-source prose instead of trusting its kind label.
+
+    Greetings/closings get a deliberately small deterministic allow-list.
+    Scheduling may be source-free only when it avoids a concrete availability
+    commitment. Everything else must be grounded or routed to user input.
+    """
+    compact = " ".join(str(text or "").split()).strip()
+    low = compact.casefold()
+    if not compact:
+        return False, "Empty sentence."
+    if _FACTUAL_REPLY_MARKERS.search(compact):
+        return False, "Model-declared courtesy/scheduling text contains a candidate factual claim."
+    if kind == "courtesy":
+        if any(marker in low for marker in _SAFE_COURTESY):
+            return True, "Deterministic courtesy text with no candidate factual claim."
+        return False, "Uncited courtesy text is outside the deterministic non-factual allow-list."
+    if kind == "closing":
+        if any(marker in low for marker in _SAFE_CLOSING):
+            return True, "Deterministic closing text with no candidate factual claim."
+        return False, "Uncited closing text is outside the deterministic non-factual allow-list."
+    if kind == "scheduling":
+        if _SPECIFIC_SCHEDULE_MARKERS.search(compact):
+            return False, "Specific availability/scheduling commitment requires user-confirmed information."
+        if any(marker in low for marker in _SAFE_SCHEDULING_COORDINATION):
+            return True, "Non-committal scheduling coordination; no availability was invented."
+        return False, "Uncited scheduling text is not clearly non-committal coordination."
+    if kind == "question":
+        if not compact.endswith("?"):
+            return False, "Source-free question must actually be phrased as a question."
+        if _SPECIFIC_SCHEDULE_MARKERS.search(compact):
+            return False, "Question implies candidate availability/scheduling information that requires user input."
+        if any(low.startswith(marker) for marker in _SAFE_QUESTION_STARTS):
+            return True, "Recruiter-directed information question; it makes no candidate factual claim."
+        return False, "Uncited question is not clearly a recruiter-directed request for information."
+    return False, "Only deterministic courtesy, closing, recruiter-directed questions, or non-committal scheduling may be source-free."
+
+
 def build_reply_truth_prompt(reply_text: str, asset: Dict[str, Any]) -> str:
     rules = "\n".join(f"  - {r}" for r in asset["rules"]) or "  (none recorded)"
     source = "\n\n".join(
@@ -584,12 +685,13 @@ def verify_reply_claims(
         if not text:
             continue
 
-        if kind in {"courtesy", "scheduling", "closing"} and (not src or src == "none"):
+        if kind in {"courtesy", "scheduling", "question", "closing"} and (not src or src == "none"):
+            safe, reason = no_source_reply_sentence_is_safe(text, kind)
             results.append({
                 "claim": text,
                 "source_asset_id": src or "none",
-                "verdict": "supported",
-                "reason": "No factual claim; courtesy or scheduling text.",
+                "verdict": "supported" if safe else "unsupported",
+                "reason": reason,
                 "safe_rewrite": "",
             })
             continue

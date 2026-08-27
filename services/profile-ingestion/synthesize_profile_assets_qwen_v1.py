@@ -59,17 +59,13 @@ Return JSON only:
       "do_not_overclaim_rules": ["specific boundary"],
       "confidence": 0.80,
       "evidence_links": [
-        {
-          "evidence_unit_index": 1,
-          "evidence_rank": 1,
-          "evidence_role": "primary|supporting|limitation|warning"
-        }
+        {"evidence_unit_index": 1}
       ]
     }
   ]
 }
 
-For official_resume documents, produce one source_document_asset and make resume_bullet_bank preserve the strongest employment_experience source evidence. Employer, job title, dates, and employment type are immutable source facts. Do not impose a downstream phrase/evidence lock on existing experience bullets: the resume tailoring agent may later reframe an existing bullet JD-first against the immutable job title and baseline wording. Any new precise technical/factual detail still requires approved user evidence.
+For official_resume documents, produce one source_document_asset and make resume_bullet_bank preserve the strongest employment_experience source evidence. Employer, job title, dates, and employment type are immutable source facts. Bullet language may be job-oriented: do not impose a downstream phrase/evidence lock on existing experience bullets, because the resume tailoring agent may later reframe an existing bullet JD-first against the immutable job title and baseline wording. Any new precise technical/factual detail still requires approved user evidence.
 Return 1-2 assets per document. Prefer one strong asset unless the evidence clearly supports two distinct assets.
 """
 
@@ -80,13 +76,18 @@ def parse_json_content(content: str) -> Dict[str, Any]:
     text = re.sub(r"```$", "", text).strip()
 
     try:
-        return json.loads(text)
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
     except json.JSONDecodeError:
-        start = text.find("{")
-        end = text.rfind("}")
-        if start >= 0 and end > start:
-            return json.loads(text[start:end + 1])
-        raise
+        pass
+    start = text.find("{")
+    end = text.rfind("}")
+    if start >= 0 and end > start:
+        parsed = json.loads(text[start:end + 1])
+        if isinstance(parsed, dict):
+            return parsed
+    raise ValueError("Model output JSON must be an object.")
 
 
 def call_ollama_json(prompt: str, model: str, retries: int = 2) -> Dict[str, Any]:
@@ -175,11 +176,13 @@ def employment_evidence_units(evidence_units: List[Dict[str, Any]]) -> List[Dict
 def attach_official_resume_source_quotes(
     asset: Dict[str, Any], document_type: str, evidence_units: List[Dict[str, Any]]
 ) -> Dict[str, Any]:
-    """Append immutable, verbatim employment anchors to the resume-facing catalog.
+    """Keep source-truth employment anchors without imposing a rewrite lock.
 
-    This is intentionally deterministic rather than model-authored. The document
-    generator can paraphrase a bullet for JD relevance, but its evidence quote
-    must ultimately come from text copied verbatim out of the user's resume.
+    These verbatim anchors preserve what the official resume actually said for
+    audit/review. Downstream resume tailoring may rewrite an existing experience
+    bullet JD-first against the immutable job title/baseline; it does not have to
+    quote this text. Any newly introduced precise technical/factual detail remains
+    evidence-bound elsewhere in the document pipeline.
     """
     if document_type != "official_resume":
         return asset
@@ -457,8 +460,10 @@ def build_prompt(doc_row, evidence_units: List[Dict[str, Any]]) -> str:
     resume_rule = (
         " This is the user's official resume. Preserve explicit employment facts as truth, "
         "and place source-grounded employment material into resume_bullet_bank. Do not alter "
-        "employer, job title, dates, location, or employment type. Bullet language may be "
-        "job-oriented only within supplied evidence."
+        "employer, job title, dates, location, or employment type. This asset preserves source "
+        "truth. Bullet language may be job-oriented: downstream resume tailoring may reframe an "
+        "existing bullet JD-first against its immutable job title/baseline, while new precise "
+        "technical facts still need evidence."
         if document_type == "official_resume" else ""
     )
     return (
@@ -509,6 +514,53 @@ def delete_existing_draft_assets(cur, raw_file_id, *, include_superseded: bool =
         "DELETE FROM profile_assets WHERE id = ANY(%s)",
         (ids,),
     )
+
+
+def selected_evidence_units(
+    asset: Dict[str, Any], evidence_units: List[Dict[str, Any]], *, limit: int = 10,
+) -> List[Dict[str, Any]]:
+    """Resolve model indices against the authoritative evidence-unit array.
+
+    The model may choose which units are most relevant, but it cannot author
+    persistence ranks or reference an out-of-range unit. Missing/malformed links
+    soft-degrade to the leading source units.
+    """
+    links = asset.get("evidence_links") if isinstance(asset, dict) else []
+    chosen: List[Dict[str, Any]] = []
+    seen_indexes: set[int] = set()
+    for link in links if isinstance(links, list) else []:
+        if not isinstance(link, dict):
+            continue
+        try:
+            idx = int(link.get("evidence_unit_index")) - 1
+        except (TypeError, ValueError):
+            continue
+        if 0 <= idx < len(evidence_units) and idx not in seen_indexes:
+            seen_indexes.add(idx)
+            chosen.append(evidence_units[idx])
+    if not chosen:
+        chosen = list(evidence_units[:limit])
+    return chosen[:limit]
+
+
+def ground_asset_tool_tags(
+    asset: Dict[str, Any], evidence_units: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Drop model-authored tool tags that selected source units do not support."""
+    chosen = selected_evidence_units(asset, evidence_units)
+    canonical: Dict[str, str] = {}
+    for unit in chosen:
+        for tag in clean_list(unit.get("tool_tags")):
+            canonical.setdefault(tag.casefold(), tag)
+    grounded = []
+    seen: set[str] = set()
+    for tag in clean_list(asset.get("tool_tags")):
+        key = tag.casefold()
+        if key in canonical and key not in seen:
+            seen.add(key)
+            grounded.append(canonical[key])
+    asset["tool_tags"] = grounded
+    return asset
 
 
 def insert_asset(cur, doc_row, asset: Dict[str, Any], evidence_units: List[Dict[str, Any]]):
@@ -582,26 +634,12 @@ def insert_asset(cur, doc_row, asset: Dict[str, Any], evidence_units: List[Dict[
     )
     asset_id = cur.fetchone()[0]
 
-    links = asset.get("evidence_links") or []
-    chosen = []
+    chosen = selected_evidence_units(asset, evidence_units)
 
-    for link in links:
-        try:
-            idx = int(link.get("evidence_unit_index")) - 1
-            if 0 <= idx < len(evidence_units):
-                chosen.append((int(link.get("evidence_rank") or len(chosen) + 1), evidence_units[idx]))
-        except Exception:
-            continue
-
-    if not chosen:
-        chosen = [(i + 1, e) for i, e in enumerate(evidence_units[:8])]
-
-    seen = set()
-    for rank, e in sorted(chosen, key=lambda x: x[0])[:10]:
-        key = e["evidence_unit_id"]
-        if key in seen:
-            continue
-        seen.add(key)
+    # Rank is a persistence invariant, not model-authored data. Sequentialize
+    # after deduplication so duplicate/malformed model ranks can never violate
+    # the unique (profile_asset_id, evidence_rank) contract.
+    for rank, e in enumerate(chosen[:10], start=1):
 
         evidence_text = e["evidence_summary"] or e["direct_quote"] or e["evidence_title"]
 
@@ -695,11 +733,16 @@ def main() -> int:
 
                     assets_raw = result.get("assets", [])
                     if not isinstance(assets_raw, list):
-                        raise RuntimeError("Model output does not contain assets list.")
+                        print("Model output has no usable assets list; keeping source/evidence and continuing.")
+                        assets_raw = []
 
                     doc_assets = 0
                     for raw_asset in assets_raw[:max(1, min(args.max_assets_per_doc, 2))]:
+                        if not isinstance(raw_asset, dict):
+                            print("Skipped malformed non-object asset payload.")
+                            continue
                         asset = normalize_asset(raw_asset, fallback_type)
+                        asset = ground_asset_tool_tags(asset, evidence_units)
                         asset = attach_official_resume_source_quotes(asset, doc_type, evidence_units)
                         if not asset["canonical_narrative"]:
                             continue

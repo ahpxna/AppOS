@@ -140,7 +140,9 @@ def extract_json_object(raw: str) -> Dict[str, Any]:
     fence = re.search(r"```(.*?)```", inner, flags=re.DOTALL)
     if fence:
         try:
-            return json.loads(fence.group(1).strip())
+            parsed = json.loads(fence.group(1).strip())
+            if isinstance(parsed, dict):
+                return parsed
         except json.JSONDecodeError:
             pass
 
@@ -150,7 +152,10 @@ def extract_json_object(raw: str) -> Dict[str, Any]:
             "Agent replied without a JSON object. Reply began: "
             + inner.strip()[:200]
         )
-    return json.loads(inner[first:last + 1])
+    parsed = json.loads(inner[first:last + 1])
+    if not isinstance(parsed, dict):
+        raise ValueError("Research output JSON must be an object.")
+    return parsed
 
 
 # ---------------------------------------------------------------- prompt
@@ -172,10 +177,15 @@ Gather:
 
 Rules:
 - Every claim must come from a page you actually fetched. Record its URL.
+- For summary, mission, and products, include at least one field_evidence item
+  with the exact fetched source_url and a short verbatim supporting_quote. If a
+  field has no such evidence, leave that field empty.
+- Every recent_news item must also include a short verbatim supporting_quote.
 - If you cannot find something, use an empty string or empty list. Do not guess.
 - Do not infer headcount, revenue, or funding unless a fetched page states it.
 - For the risks field, report what sources say. Do not soften it and do not
-  invent concerns that no source raised.
+  invent concerns that no source raised. Every risk must include a short
+  verbatim supporting_quote from its source_url; otherwise leave it out.
 - Prefer the company's own site, then reputable news, then review sites.
 
 Return ONLY a JSON object, no prose before or after:
@@ -185,10 +195,15 @@ Return ONLY a JSON object, no prose before or after:
   "mission": "stated mission, or empty string",
   "products": "main products or services",
   "recent_news": [
-    {{"headline": "...", "date": "YYYY-MM or YYYY-MM-DD", "source_url": "..."}}
+    {{"headline": "...", "date": "YYYY-MM or YYYY-MM-DD", "source_url": "...", "supporting_quote": "short verbatim quote from that source"}}
   ],
+  "field_evidence": {{
+    "summary": [{{"source_url": "...", "supporting_quote": "short verbatim quote supporting the summary"}}],
+    "mission": [{{"source_url": "...", "supporting_quote": "short verbatim quote supporting the mission"}}],
+    "products": [{{"source_url": "...", "supporting_quote": "short verbatim quote supporting the products/services"}}]
+  }},
   "risks": [
-    {{"risk": "...", "detail": "one sentence", "source_url": "..."}}
+    {{"risk": "...", "detail": "one sentence", "source_url": "...", "supporting_quote": "short verbatim quote from that source"}}
   ],
   "sources": ["every URL you fetched"],
   "not_found": ["fields you could not source"]
@@ -198,51 +213,121 @@ Return ONLY a JSON object, no prose before or after:
 
 # ---------------------------------------------------------------- validation
 
+def _clean_http_sources(value: Any) -> List[str]:
+    items = value if isinstance(value, list) else []
+    seen: set[str] = set()
+    out: List[str] = []
+    for item in items:
+        url = str(item or "").strip()
+        if not url.startswith(("https://", "http://")) or url in seen:
+            continue
+        seen.add(url)
+        out.append(url)
+    return out
+
+
+def _validated_field_evidence(
+    parsed: Dict[str, Any], source_set: set[str], dropped: List[str],
+) -> Dict[str, List[Dict[str, str]]]:
+    raw = parsed.get("field_evidence")
+    raw = raw if isinstance(raw, dict) else {}
+    out: Dict[str, List[Dict[str, str]]] = {}
+    for field in ("summary", "mission", "products"):
+        entries = raw.get(field)
+        if isinstance(entries, dict):
+            entries = [entries]
+        if not isinstance(entries, list):
+            entries = []
+        kept: List[Dict[str, str]] = []
+        for item in entries:
+            if not isinstance(item, dict):
+                continue
+            url = str(item.get("source_url") or "").strip()
+            quote = " ".join(str(item.get("supporting_quote") or "").split())
+            if url not in source_set or not quote:
+                dropped.append(f"{field} evidence (unsourced/no quote): {str(item)[:80]}")
+                continue
+            kept.append({"source_url": url, "supporting_quote": quote})
+        if kept:
+            out[field] = kept
+    return out
+
+
 def validate(parsed: Dict[str, Any]) -> Dict[str, Any]:
-    """Drop any news item or risk that lacks a source URL, self-sources, or lacks a quote."""
-    sources = [s for s in (parsed.get("sources") or []) if isinstance(s, str) and s.startswith("http")]
+    """Normalize research and require per-claim provenance promised by the prompt.
+
+    Source URLs alone are not evidence for a generated company fact. New
+    summary/mission/products fields therefore survive only when the model also
+    returns a source URL + quote binding. News and risk items use the same
+    contract. Missing evidence degrades to an empty field/item instead of
+    fabricating or failing the whole research run.
+    """
+    parsed = parsed if isinstance(parsed, dict) else {}
+    sources = _clean_http_sources(parsed.get("sources"))
     source_set = set(sources)
+    dropped: List[str] = []
+    field_evidence = _validated_field_evidence(parsed, source_set, dropped)
 
-    kept_news, dropped = [], []
-    for item in parsed.get("recent_news") or []:
-        url = (item or {}).get("source_url", "")
-        if url in source_set:
-            kept_news.append(item)
-        else:
-            dropped.append(f"news: {str(item)[:80]}")
+    company_domain = str(parsed.get("company_domain") or "").strip().lower()
 
-    company_domain = (parsed.get("company_domain") or "").lower()
-    kept_risks = []
-    
-    for item in parsed.get("risks") or []:
-        url = (item or {}).get("source_url", "")
-        
-        # 1. Kiểm tra có nằm trong danh sách nguồn được fetch không
+    fields: Dict[str, str] = {}
+    for field in ("summary", "mission", "products"):
+        value = str(parsed.get(field) or "").strip()
+        if value and not field_evidence.get(field):
+            dropped.append(f"{field}: generated value had no source quote binding")
+            value = ""
+        fields[field] = value
+
+    kept_news: List[Dict[str, Any]] = []
+    for item in parsed.get("recent_news") if isinstance(parsed.get("recent_news"), list) else []:
+        if not isinstance(item, dict):
+            dropped.append(f"news malformed: {str(item)[:80]}")
+            continue
+        url = str(item.get("source_url") or "").strip()
+        quote = " ".join(str(item.get("supporting_quote") or "").split())
+        if url not in source_set or not quote:
+            dropped.append(f"news (unsourced/no quote): {str(item)[:80]}")
+            continue
+        kept_news.append({
+            "headline": str(item.get("headline") or "").strip(),
+            "date": str(item.get("date") or "").strip(),
+            "source_url": url,
+            "supporting_quote": quote,
+        })
+
+    kept_risks: List[Dict[str, Any]] = []
+    for item in parsed.get("risks") if isinstance(parsed.get("risks"), list) else []:
+        if not isinstance(item, dict):
+            dropped.append(f"risk malformed: {str(item)[:80]}")
+            continue
+        url = str(item.get("source_url") or "").strip()
         if url not in source_set:
             dropped.append(f"risk (unsourced): {str(item)[:80]}")
             continue
-            
-        # 2. Chặn self-sourcing (Trang chủ công ty không được làm nguồn tố cáo chính nó)
-        if company_domain and company_domain in url:
+        if company_domain and company_domain in url.lower():
             dropped.append(f"risk (self-sourced to {company_domain}): {item.get('risk','')}")
             continue
-            
-        # 3. Bắt buộc phải có trích dẫn nguyên văn từ nguồn
-        if not (item.get("supporting_quote") or "").strip():
+        quote = " ".join(str(item.get("supporting_quote") or "").split())
+        if not quote:
             dropped.append(f"risk (no quote): {item.get('risk','')}")
             continue
-            
-        kept_risks.append(item)
+        kept_risks.append({
+            "risk": str(item.get("risk") or "").strip(),
+            "detail": str(item.get("detail") or "").strip(),
+            "source_url": url,
+            "supporting_quote": quote,
+        })
 
+    raw_not_found = parsed.get("not_found")
+    not_found = [str(x).strip() for x in raw_not_found if str(x).strip()] if isinstance(raw_not_found, list) else []
     return {
-        "company_domain": (parsed.get("company_domain") or "").strip(),
-        "summary": (parsed.get("summary") or "").strip(),
-        "mission": (parsed.get("mission") or "").strip(),
-        "products": (parsed.get("products") or "").strip(),
+        "company_domain": company_domain,
+        **fields,
         "recent_news": kept_news,
         "risks": kept_risks,
         "sources": sources,
-        "not_found": parsed.get("not_found") or [],
+        "field_evidence": field_evidence,
+        "not_found": not_found,
         "dropped_unsourced": dropped,
         "research_version": RESEARCH_VERSION,
     }
@@ -288,6 +373,7 @@ def upsert_research(cur, company: str, data: Dict[str, Any], ttl_days: int) -> s
             data["mission"], data["products"],
             Jsonb(data["recent_news"]), Jsonb(data["risks"]),
             Jsonb({"urls": data["sources"],
+                   "field_evidence": data.get("field_evidence") or {},
                    "not_found": data["not_found"],
                    "dropped_unsourced": data["dropped_unsourced"],
                    "research_version": RESEARCH_VERSION}),
@@ -387,7 +473,13 @@ def cmd_list_stale(conn) -> int:
         cur.execute(
             """
             SELECT c.company_name, c.last_refreshed_at, c.expires_at,
-                   jsonb_array_length(COALESCE(c.sources->'urls', '[]'::jsonb))
+                   CASE
+                     WHEN jsonb_typeof(c.sources) = 'array' THEN jsonb_array_length(c.sources)
+                     WHEN jsonb_typeof(c.sources) = 'object' AND jsonb_typeof(c.sources->'urls') = 'array'
+                       THEN jsonb_array_length(c.sources->'urls')
+                     WHEN jsonb_typeof(c.sources) = 'object' AND c.sources ? 'url' THEN 1
+                     ELSE 0
+                   END
             FROM company_research_cache c
             WHERE c.expires_at IS NULL OR c.expires_at <= now()
             ORDER BY c.last_refreshed_at NULLS FIRST;

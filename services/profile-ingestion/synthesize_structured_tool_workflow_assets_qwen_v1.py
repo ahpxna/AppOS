@@ -55,7 +55,7 @@ Return JSON only:
     "do_not_overclaim_rules": ["specific boundary"],
     "confidence": 0.80,
     "evidence_links": [
-      {"evidence_unit_index": 1, "evidence_rank": 1, "evidence_role": "primary|supporting|boundary"}
+      {"evidence_unit_index": 1}
     ]
   }
 }
@@ -118,13 +118,18 @@ def parse_json_content(content: str) -> Dict[str, Any]:
     text = re.sub(r"```$", "", text).strip()
 
     try:
-        return json.loads(text)
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
     except json.JSONDecodeError:
-        start = text.find("{")
-        end = text.rfind("}")
-        if start >= 0 and end > start:
-            return json.loads(text[start:end + 1])
-        raise
+        pass
+    start = text.find("{")
+    end = text.rfind("}")
+    if start >= 0 and end > start:
+        parsed = json.loads(text[start:end + 1])
+        if isinstance(parsed, dict):
+            return parsed
+    raise ValueError("Model output JSON must be an object.")
 
 
 def call_ollama_json(prompt: str, model: str, retries: int = 2) -> Dict[str, Any]:
@@ -378,9 +383,16 @@ def normalize_asset(raw: Dict[str, Any], workflow_group: str, units: List[Dict[s
         competency_tags.extend(clean_list(u.get("competency_tags")))
     competency_tags = list(dict.fromkeys(competency_tags))
 
-    tool_tags = clean_list(raw.get("tool_tags"))
+    grounded_tool_tags: list[str] = []
     for u in units:
-        tool_tags.extend(clean_list(u.get("tool_tags")) or [u.get("tool_name")])
+        grounded_tool_tags.extend(clean_list(u.get("tool_tags")) or [u.get("tool_name")])
+    grounded_by_key = {norm(x).casefold(): x for x in grounded_tool_tags if norm(x)}
+    tool_tags = [
+        grounded_by_key[norm(x).casefold()]
+        for x in clean_list(raw.get("tool_tags"))
+        if norm(x).casefold() in grounded_by_key
+    ]
+    tool_tags.extend(grounded_tool_tags)
     tool_tags = [x for x in list(dict.fromkeys(tool_tags)) if x]
 
     project_tags = clean_list(raw.get("project_tags"))
@@ -501,25 +513,29 @@ def insert_asset(cur, workflow_group: str, asset: Dict[str, Any], units: List[Di
 
     links = asset.get("evidence_links") or []
     chosen = []
-
-    for link in links:
+    seen_indexes: set[int] = set()
+    for link in links if isinstance(links, list) else []:
+        if not isinstance(link, dict):
+            continue
         try:
             idx = int(link.get("evidence_unit_index")) - 1
-            if 0 <= idx < len(units):
-                rank = int(link.get("evidence_rank") or len(chosen) + 1)
-                chosen.append((rank, units[idx]))
-        except Exception:
+        except (TypeError, ValueError):
             continue
+        if 0 <= idx < len(units) and idx not in seen_indexes:
+            seen_indexes.add(idx)
+            chosen.append(units[idx])
 
     if not chosen:
-        chosen = [(i + 1, u) for i, u in enumerate(units[:12])]
+        chosen = list(units[:12])
 
     seen_sections = set()
-    for rank, u in sorted(chosen, key=lambda x: x[0])[:12]:
+    rank = 0
+    for u in chosen[:12]:
         sid = u["profile_document_section_id"]
         if sid in seen_sections:
             continue
         seen_sections.add(sid)
+        rank += 1
 
         evidence_text = u["evidence_summary"] or u["claim"] or u["tool_name"]
 
@@ -618,7 +634,11 @@ def main() -> int:
 
                     raw_asset = result.get("asset")
                     if not isinstance(raw_asset, dict):
-                        raise RuntimeError("Model output missing asset object.")
+                        print("SKIP: model output missing usable asset object; evidence remains available for retry.")
+                        cur.execute("ROLLBACK TO SAVEPOINT structured_asset_sp")
+                        cur.execute("RELEASE SAVEPOINT structured_asset_sp")
+                        skipped += 1
+                        continue
 
                     asset = normalize_asset(raw_asset, workflow_group, group_units_list)
                     ok, reason = validate_asset(asset, workflow_group, group_units_list)

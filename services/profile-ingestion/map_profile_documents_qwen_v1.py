@@ -110,7 +110,9 @@ def parse_json_content(content: str) -> Dict[str, Any]:
     text = re.sub(r"```$", "", text).strip()
 
     try:
-        return json.loads(text)
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
     except json.JSONDecodeError:
         pass
 
@@ -118,9 +120,11 @@ def parse_json_content(content: str) -> Dict[str, Any]:
     start = text.find("{")
     end = text.rfind("}")
     if start >= 0 and end > start:
-        return json.loads(text[start:end + 1])
+        parsed = json.loads(text[start:end + 1])
+        if isinstance(parsed, dict):
+            return parsed
 
-    raise ValueError(f"Could not parse JSON from model output: {content[:500]}")
+    raise ValueError(f"Could not parse JSON object from model output: {content[:500]}")
 
 
 def fetch_smoke_docs(cur):
@@ -315,22 +319,79 @@ def build_prompt(doc_row, sections: List[Dict[str, Any]]) -> str:
     )
 
 
-def normalize_result(result: Dict[str, Any]) -> Dict[str, Any]:
-    result.setdefault("document_summary", "")
-    result.setdefault("document_purpose", "")
-    result.setdefault("recommended_processing_strategy", "")
-    result.setdefault("source_risk_level", "medium")
-    result.setdefault("risk_notes", [])
-    result.setdefault("section_map", [])
-    result.setdefault("candidate_asset_directions", [])
-    result.setdefault("do_not_overclaim_rules", [])
-    result.setdefault("role_relevance", [])
+def _clean_string_list(value: Any) -> List[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
 
-    # Ensure arrays are arrays.
-    for k in ["risk_notes", "section_map", "candidate_asset_directions", "do_not_overclaim_rules", "role_relevance"]:
-        if not isinstance(result.get(k), list):
-            result[k] = [str(result.get(k))]
 
+def normalize_result(result: Dict[str, Any], sections: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    """Normalize model output and re-bind section provenance to source rows."""
+    result = dict(result) if isinstance(result, dict) else {}
+    result["document_summary"] = str(result.get("document_summary") or "").strip()
+    result["document_purpose"] = str(result.get("document_purpose") or "").strip()
+    result["recommended_processing_strategy"] = str(result.get("recommended_processing_strategy") or "").strip()
+    risk = str(result.get("source_risk_level") or "medium").strip().lower()
+    result["source_risk_level"] = risk if risk in {"low", "medium", "high"} else "medium"
+    result["risk_notes"] = _clean_string_list(result.get("risk_notes"))
+    result["do_not_overclaim_rules"] = _clean_string_list(result.get("do_not_overclaim_rules"))
+    result["role_relevance"] = _clean_string_list(result.get("role_relevance"))
+
+    allowed_semantics = {
+        "scope", "methodology", "result", "tool_workflow", "career_positioning",
+        "limitation", "academic_record", "reference_background", "guidance", "source_section",
+    }
+    allowed_importance = {"low", "medium", "high"}
+    source_by_index = {
+        int(section["section_index"]): section
+        for section in (sections or [])
+        if isinstance(section, dict) and section.get("section_index") is not None
+    }
+    mapped = []
+    raw_map = result.get("section_map") if isinstance(result.get("section_map"), list) else []
+    seen: set[int] = set()
+    for item in raw_map:
+        if not isinstance(item, dict):
+            continue
+        try:
+            index = int(item.get("section_index"))
+        except (TypeError, ValueError):
+            continue
+        if source_by_index and index not in source_by_index:
+            continue
+        if index in seen:
+            continue
+        seen.add(index)
+        source = source_by_index.get(index, {})
+        semantic = str(item.get("semantic_type") or "source_section").strip()
+        importance = str(item.get("importance") or "medium").strip()
+        mapped.append({
+            "section_index": index,
+            # title/index are authoritative producer data, not LLM provenance.
+            "section_title": str(source.get("section_title") or item.get("section_title") or "").strip(),
+            "semantic_type": semantic if semantic in allowed_semantics else "source_section",
+            "importance": importance if importance in allowed_importance else "medium",
+            "summary": str(item.get("summary") or "").strip(),
+            "supports_profile_assets": item.get("supports_profile_assets") is True,
+            "do_not_use_as_direct_claim": item.get("do_not_use_as_direct_claim") is True,
+        })
+    result["section_map"] = mapped
+
+    directions = []
+    raw_dirs = result.get("candidate_asset_directions") if isinstance(result.get("candidate_asset_directions"), list) else []
+    for item in raw_dirs:
+        if not isinstance(item, dict):
+            continue
+        direction = str(item.get("asset_direction") or "").strip()
+        if not direction:
+            continue
+        directions.append({
+            "asset_direction": direction,
+            "asset_type": str(item.get("asset_type") or "").strip(),
+            "why_it_matters": str(item.get("why_it_matters") or "").strip(),
+            "evidence_boundary": str(item.get("evidence_boundary") or "").strip(),
+        })
+    result["candidate_asset_directions"] = directions
     return result
 
 
@@ -381,7 +442,7 @@ def main() -> int:
                 cur.execute("SAVEPOINT document_map_sp")
                 try:
                     prompt = build_prompt(doc, sections)
-                    result = normalize_result(call_ollama_json(prompt, args.model))
+                    result = normalize_result(call_ollama_json(prompt, args.model), sections)
 
                     structure = {
                         "mapper_version": VERSION,

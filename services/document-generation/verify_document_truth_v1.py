@@ -47,6 +47,9 @@ from psycopg.types.json import Jsonb
 # broken this way before today's fix).
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from services.common.observability import emit_trace, make_trace_id
+from services.common.company_research_sources import (
+    company_research_evidence_text, company_research_source_urls,
+)
 from services.common.llm_gateway import generate_text
 from services.common.model_config import get_model
 from services.common.resume_project_bullet_audit import (
@@ -85,13 +88,18 @@ def extract_json_object(raw: str) -> Dict[str, Any]:
     fence = re.search(r"```(.*?)```", cleaned, flags=re.DOTALL)
     if fence:
         try:
-            return json.loads(fence.group(1).strip())
+            parsed = json.loads(fence.group(1).strip())
+            if isinstance(parsed, dict):
+                return parsed
         except json.JSONDecodeError:
             pass
     first, last = cleaned.find("{"), cleaned.rfind("}")
     if first == -1 or last <= first:
         raise ValueError("No JSON object found in verifier output.")
-    return json.loads(cleaned[first:last + 1])
+    parsed = json.loads(cleaned[first:last + 1])
+    if not isinstance(parsed, dict):
+        raise ValueError("Verifier output JSON must be an object.")
+    return parsed
 
 
 def ollama_generate(
@@ -169,12 +177,10 @@ def fetch_company_source_urls(cur, application_id: str) -> set[str]:
         """,
         (application_id,),
     )
-    return {
-        url.strip()
-        for (sources,) in cur.fetchall()
-        for url in (sources or [])
-        if isinstance(url, str) and url.strip().startswith(("https://", "http://"))
-    }
+    urls: set[str] = set()
+    for (sources,) in cur.fetchall():
+        urls.update(company_research_source_urls(sources))
+    return urls
 
 
 def fetch_application_jd(cur, application_id: str) -> str:
@@ -215,7 +221,7 @@ def fetch_company_research_text(cur, application_id: str) -> str:
     """Return the cached, URL-backed company context for literal-quote audit."""
     cur.execute(
         """
-        SELECT crc.summary, crc.mission, crc.products, crc.recent_news
+        SELECT crc.sources, crc.recent_news
         FROM applications a
         JOIN company_research_cache crc ON lower(crc.company_name) = lower(a.company)
         WHERE a.id = %s
@@ -227,7 +233,13 @@ def fetch_company_research_text(cur, application_id: str) -> str:
     row = cur.fetchone()
     if not row:
         return ""
-    return "\n".join(str(value or "") for value in row)
+    excerpts = [company_research_evidence_text(row[0])]
+    for item in row[1] or []:
+        if isinstance(item, dict):
+            quote = " ".join(str(item.get("supporting_quote") or "").split())
+            if quote:
+                excerpts.append(quote)
+    return "\n".join(value for value in excerpts if value)
 
 
 # ---------------------------------------------------------------- verification

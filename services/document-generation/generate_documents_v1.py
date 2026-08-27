@@ -41,6 +41,9 @@ from psycopg.types.json import Jsonb
 # broken this way before today's fix).
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from services.common.observability import emit_trace, make_trace_id
+from services.common.company_research_sources import (
+    company_research_field_evidence, company_research_source_urls,
+)
 from services.common.llm_gateway import generate_text, resolve_config
 from services.common.model_config import get_model
 from services.common.project_registry import ProjectRegistryError, project_asset_terms_by_slot
@@ -109,14 +112,19 @@ def extract_json_object(raw: str) -> Dict[str, Any]:
     fence = re.search(r"```(.*?)```", cleaned, flags=re.DOTALL)
     if fence:
         try:
-            return json.loads(fence.group(1).strip())
+            parsed = json.loads(fence.group(1).strip())
+            if isinstance(parsed, dict):
+                return parsed
         except json.JSONDecodeError:
             pass
 
     first, last = cleaned.find("{"), cleaned.rfind("}")
     if first == -1 or last <= first:
         raise ValueError("No JSON object found in model output.")
-    return json.loads(cleaned[first:last + 1])
+    parsed = json.loads(cleaned[first:last + 1])
+    if not isinstance(parsed, dict):
+        raise ValueError("Model output JSON must be an object.")
+    return parsed
 
 
 def ollama_generate(
@@ -199,19 +207,28 @@ def fetch_company_context(cur, company: Optional[str]) -> Dict[str, Any]:
     row = cur.fetchone()
     if not row:
         return {}
-    sources = sorted({
-        value.strip() for value in (row[5] or [])
-        if isinstance(value, str) and value.strip().startswith(("https://", "http://"))
-    })
+    sources = sorted(company_research_source_urls(row[5]))
     if not sources:
         return {}
+    field_evidence = company_research_field_evidence(row[5])
+    # New research rows bind generated company facts to source excerpts. Legacy
+    # rows remain readable for URL compatibility, but their free-text fields are
+    # not promoted into a new employer-facing claim until refreshed under the
+    # stronger evidence contract.
+    evidence_aware = isinstance(row[5], dict) and "field_evidence" in row[5]
     return {
         "company_domain": row[0] or "",
-        "summary": row[1] or "",
-        "mission": row[2] or "",
-        "products": row[3] or "",
-        "recent_news": row[4] or [],
+        "summary": (row[1] or "") if evidence_aware and field_evidence.get("summary") else "",
+        "mission": (row[2] or "") if evidence_aware and field_evidence.get("mission") else "",
+        "products": (row[3] or "") if evidence_aware and field_evidence.get("products") else "",
+        "recent_news": [
+            item for item in (row[4] or [])
+            if isinstance(item, dict)
+            and item.get("source_url") in sources
+            and str(item.get("supporting_quote") or "").strip()
+        ],
         "sources": sources,
+        "field_evidence": field_evidence,
     }
 
 
@@ -447,6 +464,7 @@ def validate_and_render(
     resume_coverage_target_percent: int = 0,
     resume_total_material_requirement_count: int = 0,
     cover_alignment_blueprint: Optional[Mapping[str, Any]] = None,
+    expected_questions: Optional[List[str]] = None,
 ) -> Tuple[str, List[str], Dict[str, Any], List[str]]:
     """Drop any claim citing an unknown asset. Returns
     (content, asset_ids_used, evidence_map, dropped)."""
@@ -460,6 +478,16 @@ def validate_and_render(
         set(experience_source_asset_ids) if experience_source_asset_ids is not None else None
     )
     covered_requirement_ids: set[str] = set()
+
+    def mapping_list(value: Any) -> list[Mapping[str, Any]]:
+        if not isinstance(value, list):
+            return []
+        return [item for item in value if isinstance(item, Mapping)]
+
+    def string_list(value: Any) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        return [str(item).strip() for item in value if str(item).strip()]
 
     def requirement_ids(item: Mapping[str, Any]) -> list[str]:
         raw = item.get("matched_requirement_ids") or item.get("alignment_ids") or []
@@ -479,7 +507,7 @@ def validate_and_render(
     if doc_type == "resume":
         experience_bullets, project_bullets, skill_lines, project_subtitles = [], [], [], []
         seen_experience_slots: set[int] = set()
-        for item in parsed.get("experience_updates", []):
+        for item in mapping_list(parsed.get("experience_updates")):
             try:
                 slot = int(item.get("slot"))
             except (TypeError, ValueError):
@@ -531,7 +559,9 @@ def validate_and_render(
             evidence["claims"].append(claim)
             experience_bullets.append({"slot": slot, "text": text, **claim})
 
-        raw_bullets = parsed.get("project_updates", parsed.get("project_bullets", parsed.get("bullets", [])))
+        raw_bullets = mapping_list(
+            parsed.get("project_updates", parsed.get("project_bullets", parsed.get("bullets", [])))
+        )
         seen_project_slots: set[int] = set()
         for position, b in enumerate(raw_bullets[:12], start=1):
             if len(project_bullets) >= max(0, min(max_resume_bullets, 12)):
@@ -589,7 +619,7 @@ def validate_and_render(
             }
             evidence["claims"].append(claim)
             project_bullets.append({"slot": slot, "text": text, **claim})
-        for item in parsed.get("skill_lines_ranked", parsed.get("skill_lines", []))[:5]:
+        for item in mapping_list(parsed.get("skill_lines_ranked", parsed.get("skill_lines", [])))[:5]:
             category, values = (item.get("category") or "").strip(), (item.get("items") or "").strip()
             src = item.get("source_asset_id")
             text = f"{category}: {values}"
@@ -747,9 +777,10 @@ def validate_and_render(
         selected_positioning_ids: set[str] = set()
         covered_positioning_ids: set[str] = set()
         company_specific_count = 0
+        cover_paragraphs = mapping_list(parsed.get("paragraphs"))
         has_sentence_schema = any(
-            isinstance(p, Mapping) and isinstance(p.get("sentences"), list)
-            for p in parsed.get("paragraphs", [])
+            isinstance(p.get("sentences"), list)
+            for p in cover_paragraphs
         )
 
         if has_sentence_schema:
@@ -762,11 +793,11 @@ def validate_and_render(
                 "soft_skill_positioning": "S", "technical_evidence": "T",
                 "company_interest": "I",
             }
-            for paragraph in parsed.get("paragraphs", [])[:4]:
+            for paragraph in cover_paragraphs[:4]:
                 if not isinstance(paragraph, Mapping):
                     continue
                 accepted_sentences: list[str] = []
-                for sentence in paragraph.get("sentences", [])[:4]:
+                for sentence in mapping_list(paragraph.get("sentences"))[:4]:
                     if not isinstance(sentence, Mapping):
                         continue
                     text = " ".join(str(sentence.get("text") or "").split())
@@ -885,7 +916,7 @@ def validate_and_render(
         else:
             # Legacy validation path retained for old stored/test payloads. New
             # generation always uses the sentence-classified schema above.
-            for p in parsed.get("paragraphs", []):
+            for p in cover_paragraphs:
                 text, src = (p.get("text") or "").strip(), p.get("source_asset_id")
                 if not text:
                     continue
@@ -960,26 +991,67 @@ def validate_and_render(
             ]
 
     elif doc_type == "short_answers":
-        for a in parsed.get("answers", []):
-            q = (a.get("question") or "").strip()
-            if not a.get("answerable", False):
-                lines.append(f"### {q}\n\n[NEEDS USER INPUT] {a.get('missing_information', '')}")
+        expected = [" ".join(str(q).split()) for q in (expected_questions or []) if str(q).strip()]
+        expected_by_key = {q.casefold(): q for q in expected}
+        accepted_by_key: Dict[str, Mapping[str, Any]] = {}
+        for answer in mapping_list(parsed.get("answers")):
+            model_q = " ".join(str(answer.get("question") or "").split())
+            if not model_q:
+                continue
+            key = model_q.casefold()
+            if expected_by_key and key not in expected_by_key:
+                dropped.append(f"{model_q[:70]}... (short-answer question is not an exact requested question)")
+                continue
+            if key in accepted_by_key:
+                continue
+            accepted_by_key[key] = answer
+
+        question_order = expected if expected else [
+            " ".join(str(a.get("question") or "").split())
+            for a in mapping_list(parsed.get("answers"))
+            if str(a.get("question") or "").strip()
+        ]
+        seen_q: set[str] = set()
+        for q in question_order:
+            key = q.casefold()
+            if key in seen_q:
+                continue
+            seen_q.add(key)
+            answer = accepted_by_key.get(key)
+            if answer is None:
+                lines.append(f"### {q}\n\n[NEEDS USER INPUT] Not enough reliable information was available to answer safely.")
                 evidence["claims"].append({
                     "claim": q, "source_asset_id": None, "answerable": False,
-                    "missing_information": a.get("missing_information", ""),
+                    "missing_information": "Not enough reliable information was available to answer safely.",
                 })
                 continue
-            text, src = (a.get("text") or "").strip(), a.get("source_asset_id")
+            if not bool(answer.get("answerable", False)):
+                missing = str(answer.get("missing_information") or "").strip() or "Additional user information is required."
+                lines.append(f"### {q}\n\n[NEEDS USER INPUT] {missing}")
+                evidence["claims"].append({
+                    "claim": q, "source_asset_id": None, "answerable": False,
+                    "missing_information": missing,
+                })
+                continue
+            text, src = str(answer.get("text") or "").strip(), answer.get("source_asset_id")
             if not text or not check(src, text):
+                # A model claimed answerable but failed grounding. Preserve the
+                # exact user question and degrade to user input instead of
+                # silently dropping it from the document.
+                lines.append(f"### {q}\n\n[NEEDS USER INPUT] A grounded answer could not be produced from approved data.")
+                evidence["claims"].append({
+                    "claim": q, "source_asset_id": None, "answerable": False,
+                    "missing_information": "A grounded answer could not be produced from approved data.",
+                })
                 continue
             lines.append(f"### {q}\n\n{text}")
             used.append(src)
             evidence["claims"].append({
-                "claim": text, "source_asset_id": src, "answerable": True,
+                "claim": text, "source_asset_id": src, "answerable": True, "question": q,
             })
 
-    evidence["not_supported"] = parsed.get("not_supported", [])
-    evidence["model_self_check"] = parsed.get("self_check", "")
+    evidence["not_supported"] = string_list(parsed.get("not_supported"))
+    evidence["model_self_check"] = str(parsed.get("self_check") or "")
     evidence["dropped_ungrounded_claims"] = dropped
 
     separator = "\n" if doc_type == "resume" else "\n\n"
@@ -1412,6 +1484,7 @@ def main() -> int:
                     resume_coverage["total_material_requirements"] if args.doc_type == "resume" else 0
                 ),
                 cover_alignment_blueprint=cover_alignment_blueprint if args.doc_type == "cover_letter" else None,
+                expected_questions=args.question if args.doc_type == "short_answers" else None,
             )
 
             print("===== GENERATED =====")
