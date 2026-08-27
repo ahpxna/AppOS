@@ -108,6 +108,7 @@ def _record(db, *, approval_status: str = "approved", expires: str = "now() + in
         )
         artifact_id = cur.fetchone()[0]
         page_url, fingerprint, input_hash = "https://jobs.example.test/apply?job=123", "b" * 64, "c" * 64
+        target_id = "fixture-tab"
         # Use the production scope builder so integration fixtures evolve with
         # the exact action-scope contract instead of hard-coding v2/v3 JSON.
         action_scope = build_exact_action_scope([
@@ -119,6 +120,7 @@ def _record(db, *, approval_status: str = "approved", expires: str = "now() + in
             "application_job_url": page_url,
             "application_jd_hash": "fixture-jd",
             "expected_application_step": "awaiting_approval",
+            "expected_target_id": target_id,
             "expected_upload_capabilities": [],
         }
         cur.execute(
@@ -153,6 +155,7 @@ def _record(db, *, approval_status: str = "approved", expires: str = "now() + in
         "generated_document_id": str(document_id), "document_sha256": content_hash,
         "bound_artifact_id": str(artifact_id), "artifact_sha256": artifact_hash,
         "artifact_filename": "fixture-resume.docx", "expected_origin": "https://jobs.example.test",
+        "expected_target_id": target_id,
         "expected_initial_url": page_url, "expected_page_fingerprint": fingerprint,
         "autofill_input_hash": input_hash, "autofill_action_scope": action_scope,
         "input_json": {}, "timeout_seconds": 30,
@@ -166,6 +169,10 @@ class FakeTransport:
         self.value, self.write_count = "", 0
 
     def resolve_target(self): return BrowserTarget("fixture-tab", self.url)
+    def focus(self, target_id):
+        if target_id != "fixture-tab":
+            raise TransportError("synthetic target mismatch")
+        return BrowserTarget("fixture-tab", self.url)
     def current_url(self, _target): return self.url
     def snapshot(self, _target): return {}
     def execute(self, _target, command):
@@ -185,6 +192,10 @@ class MultiFieldFakeTransport:
         self.write_refs: list[str] = []
 
     def resolve_target(self): return BrowserTarget("fixture-tab", self.url)
+    def focus(self, target_id):
+        if target_id != "fixture-tab":
+            raise TransportError("synthetic target mismatch")
+        return BrowserTarget("fixture-tab", self.url)
     def current_url(self, _target): return self.url
     def snapshot(self, _target): return {}
     def execute(self, _target, command):
@@ -210,7 +221,8 @@ def test_happy_path_calls_production_durable_functions(db):
     binding, transport = _binding(worker, db, task), FakeTransport(url=task["expected_initial_url"], fingerprint=task["expected_page_fingerprint"])
     action = PlannedAction("fill", "name-ref", "Ada", "personal.first_name", "fixture", "First name")
     session = AutofillSession(
-        transport=transport, expected_origin=task["expected_origin"], expected_initial_url=task["expected_initial_url"],
+        transport=transport, expected_origin=task["expected_origin"], expected_target_id=task["expected_target_id"],
+        expected_initial_url=task["expected_initial_url"],
         expected_page_fingerprint=task["expected_page_fingerprint"], snapshot_state=lambda _id: transport.state(),
         origin_allowed=lambda _url: None, begin_execution=lambda target: worker.durable_begin_execution(task, binding, target),
         before_action=lambda item, target: worker.durable_journal_start(task, binding, item, target),
@@ -232,7 +244,8 @@ def test_wrong_job_or_fingerprint_writes_zero(db):
                              (task["expected_initial_url"], "different")):
         transport = FakeTransport(url=url, fingerprint=fingerprint)
         session = AutofillSession(
-            transport=transport, expected_origin=task["expected_origin"], expected_initial_url=task["expected_initial_url"],
+            transport=transport, expected_origin=task["expected_origin"], expected_target_id=task["expected_target_id"],
+            expected_initial_url=task["expected_initial_url"],
             expected_page_fingerprint=task["expected_page_fingerprint"], snapshot_state=lambda _id: transport.state(),
             origin_allowed=lambda _url: None, begin_execution=lambda _id: pytest.fail("must not begin"),
             before_action=lambda *_args: pytest.fail("must not journal"), after_verified=lambda *_args: None,
@@ -583,12 +596,12 @@ def test_post_io_lifecycle_race_becomes_reconciliation_not_completed(db):
 
 
 def test_denied_parent_restores_form_ready_and_closes_delegated_children(db):
-    approval = _load_module("approval_service_lifecycle", ROOT / "services" / "approval" / "approval_service_v1.py")
+    from services.approval import approval_service_v1 as approval
     task = _record(db, approval_status="pending")
     with db.connect(TEST_DSN) as conn, conn.cursor() as cur:
         cur.execute("UPDATE applications SET current_step='awaiting_approval' WHERE id=%s", (task["application_id"],))
         plan_key = "plan-fixture"
-        cur.execute("UPDATE approval_requests SET payload_json = jsonb_build_object('application_job_url','https://jobs.example.test/apply?job=123','application_jd_hash','fixture-jd','expected_application_step','awaiting_approval','autofill_plan_key',%s) WHERE id=%s", (plan_key, task["approval_request_id"]))
+        cur.execute("UPDATE approval_requests SET payload_json = payload_json || jsonb_build_object('autofill_plan_key',%s) WHERE id=%s", (plan_key, task["approval_request_id"]))
         cur.execute("""INSERT INTO approval_requests(type,application_id,payload_json,status,approval_token_hash,token_expires_at)
                        VALUES ('privileged_upload_document',%s,%s,'approved','child-token',now()+interval '5 minutes') RETURNING id""",
                     (task["application_id"], json.dumps({"delegated_to_autofill": True, "autofill_plan_key": plan_key, "parent_approval_request_id": task["approval_request_id"]})))
@@ -621,14 +634,17 @@ def test_missing_delegated_child_is_repaired_and_bound_to_exact_parent(db):
             "target_id": "tab", "expected_url": "https://jobs.example.test/apply",
             "expected_origin": "https://jobs.example.test", "expected_page_fingerprint": "b" * 64,
         }
+        parent_scope = build_exact_action_scope([])
         parent_payload = {
             "autofill_plan_key": "repair-plan",
+            "expected_target_id": "tab",
             "expected_upload_capabilities": [{"field_ref": "resume", "document_type": "resume", "artifact_id": package["artifact_id"], "sha256": "a" * 64}],
             "delegated_upload_packages": [package],
         }
-        cur.execute("""INSERT INTO approval_requests(type,application_id,payload_json,status,approval_token_hash,token_expires_at)
-                       VALUES ('autofill_form',%s,%s,'pending','parent-token',now()+interval '5 minutes') RETURNING id::text""",
-                    (app_id, json.dumps(parent_payload)))
+        cur.execute("""INSERT INTO approval_requests(
+                           type,application_id,payload_json,status,approval_token_hash,token_expires_at,bound_autofill_action_scope)
+                       VALUES ('autofill_form',%s,%s,'pending','parent-token',now()+interval '5 minutes',%s::jsonb) RETURNING id::text""",
+                    (app_id, json.dumps(parent_payload), json.dumps(parent_scope)))
         parent_id = cur.fetchone()[0]
         assert approval.queue_ready_autofill_for_plan(cur, application_id=str(app_id), plan_key="repair-plan", actor="test") is False
         cur.execute("""SELECT payload_json->>'parent_approval_request_id' FROM approval_requests
@@ -647,13 +663,18 @@ def test_same_plan_new_parent_gets_distinct_upload_child(db):
             "field_ref": "resume", "document_type": "resume", "artifact_id": "art",
             "sha256": "a" * 64, "autofill_plan_key": "same-plan", "filename": "resume.pdf",
         }
-        payload = {"delegated_upload_packages": [base_package], "expected_upload_capabilities": []}
-        cur.execute("""INSERT INTO approval_requests(type,application_id,payload_json,status,approval_token_hash,token_expires_at,created_at)
-                       VALUES ('autofill_form',%s,%s,'denied','p1',now()+interval '5 minutes',now()-interval '1 minute') RETURNING id::text""", (app_id, json.dumps({**payload, "autofill_plan_key": "same-plan"})))
+        parent_scope = build_exact_action_scope([])
+        payload = {"delegated_upload_packages": [base_package], "expected_upload_capabilities": [], "expected_target_id": "tab"}
+        cur.execute("""INSERT INTO approval_requests(
+                           type,application_id,payload_json,status,approval_token_hash,token_expires_at,created_at,bound_autofill_action_scope)
+                       VALUES ('autofill_form',%s,%s,'denied','p1',now()+interval '5 minutes',now()-interval '1 minute',%s::jsonb) RETURNING id::text""",
+                    (app_id, json.dumps({**payload, "autofill_plan_key": "same-plan"}), json.dumps(parent_scope)))
         parent_a = cur.fetchone()[0]
         approval._repair_delegated_children_for_parent(cur, application_id=str(app_id), parent_request_id=parent_a, payload=payload)
-        cur.execute("""INSERT INTO approval_requests(type,application_id,payload_json,status,approval_token_hash,token_expires_at)
-                       VALUES ('autofill_form',%s,%s,'pending','p2',now()+interval '5 minutes') RETURNING id::text""", (app_id, json.dumps({**payload, "autofill_plan_key": "same-plan"})))
+        cur.execute("""INSERT INTO approval_requests(
+                           type,application_id,payload_json,status,approval_token_hash,token_expires_at,bound_autofill_action_scope)
+                       VALUES ('autofill_form',%s,%s,'pending','p2',now()+interval '5 minutes',%s::jsonb) RETURNING id::text""",
+                    (app_id, json.dumps({**payload, "autofill_plan_key": "same-plan"}), json.dumps(parent_scope)))
         parent_b = cur.fetchone()[0]
         approval._repair_delegated_children_for_parent(cur, application_id=str(app_id), parent_request_id=parent_b, payload=payload)
         cur.execute("""SELECT payload_json->>'parent_approval_request_id', count(*) FROM approval_requests
@@ -681,6 +702,7 @@ def _configure_delegated_gate(db, *, child_status: str):
         "application_job_url": task["expected_initial_url"],
         "application_jd_hash": "fixture-jd",
         "expected_application_step": "awaiting_approval",
+        "expected_target_id": task["expected_target_id"],
         "document_id": task["generated_document_id"],
         "document_sha256": task["document_sha256"],
         "artifact_id": task["bound_artifact_id"],
