@@ -29,6 +29,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(THIS_DIR))
 
 from services.common.project_registry import configured_github_projects, load_registry
+from services.common.value_coercion import coerce_bool
 from repository_claims_v1 import ANALYZER_VERSION, classify_changed_files, extract_claims, persist_claims
 
 SNAPSHOT_ROOT = ROOT / "data/repository_snapshots"
@@ -67,15 +68,19 @@ def github_json(url: str, token: str | None) -> Any:
 def github_repository_state(repo_full_name: str, branch: str, token: str | None) -> dict[str, Any]:
     encoded_repo = "/".join(urllib.parse.quote(part, safe="") for part in repo_full_name.split("/", 1))
     repo = github_json(f"https://api.github.com/repos/{encoded_repo}", token)
-    actual_branch = branch or repo.get("default_branch") or "main"
+    if not isinstance(repo, dict):
+        raise RefreshError(f"GitHub repository metadata for {repo_full_name} was not a JSON object.")
+    actual_branch = branch or str(repo.get("default_branch") or "main").strip() or "main"
     commit = github_json(
         f"https://api.github.com/repos/{encoded_repo}/commits/{urllib.parse.quote(actual_branch, safe='')}", token
     )
+    if not isinstance(commit, dict):
+        raise RefreshError(f"GitHub commit metadata for {repo_full_name}@{actual_branch} was not a JSON object.")
     sha = str(commit.get("sha") or "")
     if not re.fullmatch(r"[0-9a-fA-F]{40}", sha):
         raise RefreshError(f"GitHub did not return a full commit SHA for {repo_full_name}@{actual_branch}.")
-    commit_obj = commit.get("commit") or {}
-    tree = commit_obj.get("tree") or {}
+    commit_obj = commit.get("commit") if isinstance(commit.get("commit"), dict) else {}
+    tree = commit_obj.get("tree") if isinstance(commit_obj.get("tree"), dict) else {}
     pushed = repo.get("pushed_at")
     return {
         "repo_full_name": repo_full_name,
@@ -85,12 +90,13 @@ def github_repository_state(repo_full_name: str, branch: str, token: str | None)
         "head_sha": sha.lower(),
         "tree_sha": str(tree.get("sha") or "") or None,
         "pushed_at": pushed,
-        "private": bool(repo.get("private")),
-        "fork": bool(repo.get("fork")),
-        "archived": bool(repo.get("archived")),
+        "private": coerce_bool(repo.get("private")),
+        "fork": coerce_bool(repo.get("fork")),
+        "archived": coerce_bool(repo.get("archived")),
         "description": repo.get("description"),
         "language": repo.get("language"),
-        "topics": repo.get("topics") or [],
+        "topics": [item.strip() for item in repo.get("topics") if isinstance(item, str) and item.strip()]
+                  if isinstance(repo.get("topics"), list) else [],
         "homepage": repo.get("homepage"),
         "metadata": {"repo": repo, "commit": {"sha": sha, "commit": commit_obj}},
     }
@@ -101,7 +107,11 @@ def github_compare(repo_full_name: str, base_sha: str, head_sha: str, token: str
         return []
     encoded_repo = "/".join(urllib.parse.quote(part, safe="") for part in repo_full_name.split("/", 1))
     data = github_json(f"https://api.github.com/repos/{encoded_repo}/compare/{base_sha}...{head_sha}", token)
-    files = data.get("files") or []
+    if not isinstance(data, dict):
+        raise RefreshError("GitHub compare response was not a JSON object.")
+    files = data.get("files")
+    if not isinstance(files, list):
+        return []
     result: list[dict[str, Any]] = []
     for item in files:
         if not isinstance(item, dict):

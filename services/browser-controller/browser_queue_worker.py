@@ -57,6 +57,7 @@ from psycopg.types.json import Jsonb
 from services.autofill.parallel_bypass import execute_parallel_bypass, _fake_mouse_routine
 import threading
 import requests
+from services.common.value_coercion import coerce_bool
 from services.common.observability import emit_trace, make_trace_id
 from services.common.config import database_dsn, load_repo_env
 from services.discovery.linkedin_discovery_v1 import (
@@ -1430,7 +1431,7 @@ def snapshot_state(transport: OpenClawTransport, target_id: str) -> SnapshotStat
     nodes = parse_snapshot(payload)
     return SnapshotState(
         tuple(inspect_nodes(nodes)), tuple(inspect_question_groups(nodes)),
-        page_fingerprint(payload, page_url=transport.current_url(target_id)), bool(payload.get("truncated")),
+        page_fingerprint(payload, page_url=transport.current_url(target_id)), coerce_bool(payload.get("truncated")),
     )
 
 

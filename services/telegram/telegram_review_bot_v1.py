@@ -25,6 +25,7 @@ import requests
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 from services.common.config import database_dsn, load_repo_env
+from services.common.value_coercion import coerce_bool
 from services.review.review_service_v1 import (
     ReviewError, answer_question, decide_item, review_artifacts, sync_inbox,
     safe_batch_review_items, snooze_review_item, question_quick_choices,
@@ -66,21 +67,47 @@ def api(token: str, method: str, *, data: dict[str, Any] | None = None,
         response = requests.post(f"https://api.telegram.org/bot{token}/{method}",
                                  data=data, files=files, timeout=timeout)
         payload = response.json()
+        if not isinstance(payload, dict):
+            raise TelegramError(
+                f"Telegram {method} returned {type(payload).__name__}; expected a JSON object."
+            )
     except (requests.RequestException, ValueError) as exc:
         raise TelegramError(f"Telegram {method} request failed: {exc}") from exc
-    if not response.ok or not payload.get("ok"):
+    if not response.ok or not coerce_bool(payload.get("ok")):
         raise TelegramError(f"Telegram {method} failed: {payload.get('description') or response.text[:300]}")
     return payload
 
+
+
+def _safe_int(value: Any) -> int:
+    try:
+        if isinstance(value, bool):
+            return 0
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _result_dict(payload: dict[str, Any]) -> dict[str, Any]:
+    result = payload.get("result")
+    return result if isinstance(result, dict) else {}
+
+
+def _result_list(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    result = payload.get("result")
+    if not isinstance(result, list):
+        return []
+    return [item for item in result if isinstance(item, dict)]
 
 def discover_ids(token: str) -> list[dict[str, int | str]]:
     payload = api(token, "getUpdates", data={"timeout": "0", "allowed_updates": json.dumps(["message"])}, timeout=15)
     seen: set[tuple[int, int]] = set()
     result: list[dict[str, int | str]] = []
-    for update in payload.get("result") or []:
-        message = update.get("message") or {}
-        sender, chat = message.get("from") or {}, message.get("chat") or {}
-        user_id, chat_id = int(sender.get("id") or 0), int(chat.get("id") or 0)
+    for update in _result_list(payload):
+        message = update.get("message") if isinstance(update.get("message"), dict) else {}
+        sender = message.get("from") if isinstance(message.get("from"), dict) else {}
+        chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
+        user_id, chat_id = _safe_int(sender.get("id")), _safe_int(chat.get("id"))
         if not user_id or not chat_id or (user_id, chat_id) in seen:
             continue
         seen.add((user_id, chat_id))
@@ -1337,13 +1364,15 @@ def poll_once(conn, token: str, allowed_user_id: int, *, timeout_seconds: int = 
                   "allowed_updates": json.dumps(["callback_query", "message"])},
                   timeout=timeout_seconds + 15)
     next_offset = offset
-    updates = payload.get("result") or []
+    updates = _result_list(payload)
     for update in updates:
-        update_id = int(update.get("update_id") or 0)
-        if update.get("callback_query"):
-            handle_callback(conn, token, allowed_user_id, update["callback_query"])
-        if update.get("message"):
-            handle_message(conn, token, allowed_user_id, update["message"])
+        update_id = _safe_int(update.get("update_id"))
+        callback = update.get("callback_query")
+        message = update.get("message")
+        if isinstance(callback, dict):
+            handle_callback(conn, token, allowed_user_id, callback)
+        if isinstance(message, dict):
+            handle_message(conn, token, allowed_user_id, message)
         next_offset = max(next_offset, update_id + 1)
     if next_offset != offset:
         with conn.cursor() as cur:
@@ -1364,7 +1393,7 @@ def main() -> int:
     if args.discover_id:
         token = _bot_token()
         me = api(token, "getMe", data={})
-        print(f"Telegram bot: @{me['result'].get('username', 'unknown')}")
+        print(f"Telegram bot: @{_result_dict(me).get('username', 'unknown')}")
         rows = discover_ids(token)
         print(json.dumps(rows, indent=2))
         if not rows:
@@ -1372,7 +1401,7 @@ def main() -> int:
         return 0
     token, allowed_user_id, chat_id = _required_env()
     me = api(token, "getMe", data={})
-    print(f"Telegram bot: @{me['result'].get('username', 'unknown')} | chat={chat_id} | allowed_user={allowed_user_id}")
+    print(f"Telegram bot: @{_result_dict(me).get('username', 'unknown')} | chat={chat_id} | allowed_user={allowed_user_id}")
     with psycopg.connect(database_dsn(), autocommit=False) as conn:
         while True:
             dashboard = dispatch_dashboard(conn, token, allowed_user_id, chat_id)

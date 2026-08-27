@@ -11,6 +11,8 @@ import hashlib
 import json
 from psycopg.types.json import Jsonb
 
+from services.common.value_coercion import coerce_bool
+
 
 class ReviewMaterializationError(RuntimeError):
     pass
@@ -54,7 +56,7 @@ def ensure_approval_review_item(cur, approval_request_id: str) -> str | None:
     review_payload = {
         "approval_type": approval_type,
         "expires_at": expires.isoformat() if expires else None,
-        "delegated_to_autofill": bool((approval_payload or {}).get("delegated_to_autofill")),
+        "delegated_to_autofill": coerce_bool((approval_payload or {}).get("delegated_to_autofill")),
         "parent_approval_request_id": (approval_payload or {}).get("parent_approval_request_id"),
     }
     source_sha = _sha256_text(json.dumps({

@@ -46,7 +46,7 @@ def is_batch_safe_item(*, item_type: str, payload: dict[str, Any] | None) -> boo
     if approval_type not in BATCH_SAFE_APPROVAL_TYPES:
         return False
     if approval_type == "privileged_upload_document":
-        return bool(payload.get("delegated_to_autofill"))
+        return payload.get("delegated_to_autofill") is True
     return True
 
 

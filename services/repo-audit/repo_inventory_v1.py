@@ -5,10 +5,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 import urllib.parse
 import urllib.request
 from typing import Any
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from services.common.value_coercion import coerce_bool
 
 
 def get_json(url: str, token: str | None) -> Any:
@@ -48,18 +52,31 @@ def inventory(*, github_user: str | None, token: str | None) -> list[dict]:
     else:
         raise ValueError("Provide --github-user for public repos or set GH_TOKEN for your accessible repos.")
     repos = get_json(endpoint, token)
+    if not isinstance(repos, list):
+        raise ValueError("GitHub repository inventory response must be a JSON list.")
     result = []
     for repo in repos:
-        branch = repo.get("default_branch") or "main"
+        if not isinstance(repo, dict):
+            continue
+        full_name = str(repo.get("full_name") or "").strip()
+        clone_url = str(repo.get("clone_url") or "").strip()
+        html_url = str(repo.get("html_url") or "").strip()
+        if (not full_name or full_name.count("/") != 1
+                or not clone_url.startswith(("https://", "http://"))
+                or not html_url.startswith(("https://", "http://"))):
+            continue
+        branch = str(repo.get("default_branch") or "main").strip() or "main"
+        topics_raw = repo.get("topics")
+        topics = [item.strip() for item in topics_raw if isinstance(item, str) and item.strip()] if isinstance(topics_raw, list) else []
         result.append({
-        "full_name": repo["full_name"], "clone_url": repo["clone_url"],
-        "default_branch": branch, "revision_sha": head_sha(repo["full_name"], branch, token),
-        "private": bool(repo.get("private")),
-        "fork": bool(repo.get("fork")), "archived": bool(repo.get("archived")),
+        "full_name": full_name, "clone_url": clone_url,
+        "default_branch": branch, "revision_sha": head_sha(full_name, branch, token),
+        "private": coerce_bool(repo.get("private")),
+        "fork": coerce_bool(repo.get("fork")), "archived": coerce_bool(repo.get("archived")),
         "updated_at": repo.get("updated_at"), "pushed_at": repo.get("pushed_at"),
-        "language": repo.get("language"), "topics": repo.get("topics") or [],
+        "language": repo.get("language"), "topics": topics,
         "description": repo.get("description"), "homepage": repo.get("homepage"),
-        "html_url": repo.get("html_url"),
+        "html_url": html_url,
         })
     return result
 

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import math
 import os
 import urllib.error
 import urllib.request
@@ -153,13 +154,29 @@ def _post_json(url: str, payload: dict[str, Any], *, timeout: int,
     )
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
-            return json.loads(response.read().decode("utf-8", errors="replace"))
+            parsed = json.loads(response.read().decode("utf-8", errors="replace"))
+            if not isinstance(parsed, dict):
+                raise LLMGatewayError(
+                    f"LLM endpoint {url} returned {type(parsed).__name__}; expected a JSON object."
+                )
+            return parsed
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")[:500]
         raise LLMGatewayError(f"LLM HTTP {exc.code} from {url}: {body}") from exc
     except urllib.error.URLError as exc:
         raise LLMGatewayError(f"LLM request failed for {url}: {exc}") from exc
 
+
+def _chat_content(response: dict[str, Any], *, ollama: bool) -> str | None:
+    """Extract chat text without trusting provider nested response shapes."""
+    if ollama:
+        message = response.get("message")
+        return message.get("content") if isinstance(message, dict) else None
+    choices = response.get("choices")
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+        return None
+    message = choices[0].get("message")
+    return message.get("content") if isinstance(message, dict) else None
 
 def _estimate_tokens(text: str) -> int:
     # Conservative portable fallback when provider usage is unavailable.
@@ -214,8 +231,7 @@ def generate_result(*, role: str, prompt: str, model: str | None = None,
             }
             response = _post_json(_api_endpoint(config.base_url, "chat/completions", style=config.api_style), payload,
                                   timeout=timeout, api_key=config.api_key)
-            choices = response.get("choices") or []
-            text = ((choices[0].get("message") or {}).get("content") if choices else None)
+            text = _chat_content(response, ollama=False)
     except Exception as exc:
         if reservation is not None:
             from .llm_cost_accounting_v1 import mark_paid_call_uncertain
@@ -277,7 +293,7 @@ def chat_result(*, role: str, messages: Sequence[dict[str, str]], model: str | N
             elif json_mode:
                 payload["format"] = "json"
             response = _post_json(config.base_url + "/api/chat", payload, timeout=timeout)
-            text = (response.get("message") or {}).get("content")
+            text = _chat_content(response, ollama=True)
         else:
             payload = {"model": config.model, "messages": list(messages), "temperature": temperature,
                        "max_tokens": _max_output_tokens()}
@@ -285,8 +301,7 @@ def chat_result(*, role: str, messages: Sequence[dict[str, str]], model: str | N
                 payload["response_format"] = {"type": "json_object"}
             response = _post_json(_api_endpoint(config.base_url, "chat/completions", style=config.api_style), payload,
                                   timeout=timeout, api_key=config.api_key)
-            choices = response.get("choices") or []
-            text = ((choices[0].get("message") or {}).get("content") if choices else None)
+            text = _chat_content(response, ollama=False)
     except Exception as exc:
         if reservation is not None:
             from .llm_cost_accounting_v1 import mark_paid_call_uncertain
@@ -325,6 +340,19 @@ def chat_text(*, role: str, messages: Sequence[dict[str, str]], model: str | Non
                        temperature=temperature, num_ctx=num_ctx, json_mode=json_mode, json_schema=json_schema).text
 
 
+def _embedding_vector(value: Any) -> list[float] | None:
+    if not isinstance(value, list) or not value:
+        return None
+    result: list[float] = []
+    for item in value:
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            return None
+        number = float(item)
+        if not math.isfinite(number):
+            return None
+        result.append(number)
+    return result
+
 def embed_texts(*, texts: Sequence[str], model: str | None = None,
                 local_url: str | None = None, timeout: int = 180) -> list[list[float]]:
     """Embed a batch with the same paid-budget/per-call accounting boundary."""
@@ -350,22 +378,28 @@ def embed_texts(*, texts: Sequence[str], model: str | None = None,
                 embeddings = []
                 for text in texts:
                     legacy = _post_json(config.base_url + "/api/embeddings", {"model": config.model, "prompt": text}, timeout=timeout)
-                    vector = legacy.get("embedding")
-                    if not isinstance(vector, list):
-                        raise LLMGatewayError("Ollama embedding backend returned no vector.")
+                    vector = _embedding_vector(legacy.get("embedding"))
+                    if vector is None:
+                        raise LLMGatewayError("Ollama embedding backend returned no valid vector.")
                     embeddings.append(vector)
         else:
             response = _post_json(_api_endpoint(config.base_url, "embeddings", style=config.api_style),
                                   {"model": config.model, "input": list(texts)}, timeout=timeout, api_key=config.api_key)
-            data = response.get("data") or []
-            embeddings = [row.get("embedding") for row in data if isinstance(row, dict)]
+            data = response.get("data")
+            if not isinstance(data, list):
+                data = []
+            embeddings = []
+            for row in data:
+                vector = _embedding_vector(row.get("embedding")) if isinstance(row, dict) else None
+                if vector is not None:
+                    embeddings.append(vector)
     except Exception as exc:
         if reservation is not None:
             from .llm_cost_accounting_v1 import mark_paid_call_uncertain
             mark_paid_call_uncertain(reservation, role="embed", configured_model=config.model,
                                      estimated_input_tokens=input_est, error=str(exc))
         raise
-    if len(embeddings) != len(texts) or any(not isinstance(v, list) for v in embeddings):
+    if len(embeddings) != len(texts) or any(_embedding_vector(v) is None for v in embeddings):
         if reservation is not None:
             from .llm_cost_accounting_v1 import mark_paid_call_uncertain
             mark_paid_call_uncertain(reservation, role="embed", configured_model=config.model,

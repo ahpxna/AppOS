@@ -29,6 +29,7 @@ from services.application_actions.action_request_v1 import PRIVILEGED_TYPES, cre
 from services.auth.gmail_verification_v1 import refetch_secret
 from services.autofill.autofill_agent_v1 import INPUT_ROLES, parse_snapshot
 from services.autofill.autofill_executor_v1 import OpenClawTransport, TransportError
+from services.common.value_coercion import coerce_bool
 from services.common.autofill_identity import canonical_page_url, page_fingerprint
 from services.common.config import database_dsn, load_repo_env
 from services.common.openclaw_runtime import resolve_openclaw_binary
@@ -85,7 +86,7 @@ def _require_trusted_target(cur, url: str, *, application_id: str | None = None,
 def _snapshot(transport: OpenClawTransport, target_id: str) -> tuple[str, dict[str, Any], list[dict[str, Any]], str]:
     url = transport.current_url(target_id)
     payload = transport.snapshot(target_id)
-    if payload.get("truncated"):
+    if coerce_bool(payload.get("truncated")):
         raise PrivilegedActionError("browser snapshot is truncated; privileged action requires a complete snapshot")
     return url, payload, parse_snapshot(payload), page_fingerprint(payload, page_url=url)
 

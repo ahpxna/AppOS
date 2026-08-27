@@ -59,6 +59,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import psycopg
 
+from services.common.value_coercion import coerce_bool
 from services.common.immigration_semantics import legal_question_pause_reason
 from services.autofill.field_matcher_v1 import FieldClass, match_field as deterministic_match
 from services.autofill.form_inspector_v1 import FormField
@@ -257,7 +258,7 @@ def take_snapshot(url: Optional[str]) -> Tuple[List[Dict[str, Any]], bool]:
     if url:
         run_browser(["open", url], timeout=90)
     payload = browser_json(["snapshot", "--efficient"], timeout=150)    
-    truncated = bool(payload.get("truncated"))
+    truncated = coerce_bool(payload.get("truncated"))
     return parse_snapshot(payload), truncated
 
 

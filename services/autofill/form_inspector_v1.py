@@ -5,6 +5,8 @@ import re
 from dataclasses import dataclass
 from typing import Any, Iterable
 
+from services.common.value_coercion import coerce_bool
+
 
 @dataclass(frozen=True)
 class FormField:
@@ -49,15 +51,18 @@ def inspect_nodes(nodes: Iterable[dict[str, Any]]) -> list[FormField]:
     """Build fields from the existing OpenClaw snapshot parser's node format."""
     fields: list[FormField] = []
     for node in nodes:
+        if not isinstance(node, dict):
+            continue
         ref, label = str(node.get("ref") or ""), str(node.get("label") or "").strip()
         if not ref or not label:
             continue
         role = str(node.get("role") or "").casefold()
         fields.append(FormField(
             ref=ref, label=label, role=role, value=str(node.get("value") or ""),
-            required=bool(node.get("required")),
+            required=coerce_bool(node.get("required")),
             selected=node.get("selected") if isinstance(node.get("selected"), bool) else None,
-            options=tuple(str(item) for item in (node.get("options") or ())),
+            options=tuple(str(item) for item in node.get("options"))
+                    if isinstance(node.get("options"), (list, tuple)) else (),
             document_hint=document_hint(label, role),
             input_type=str(node.get("type") or "").casefold(),
         ))
@@ -88,5 +93,5 @@ def inspect_question_groups(nodes: list[dict[str, Any]]) -> list[QuestionGroup]:
         key = (label.casefold(), tuple(option.ref for option in options))
         if len(options) >= 2 and key not in seen:
             seen.add(key)
-            groups.append(QuestionGroup(label, role, options, bool(node.get("required"))))
+            groups.append(QuestionGroup(label, role, options, coerce_bool(node.get("required"))))
     return groups

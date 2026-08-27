@@ -21,6 +21,7 @@ from psycopg.types.json import Jsonb
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from services.common.config import database_dsn
+from services.common.value_coercion import coerce_bool
 
 IMPORT_VERSION = "repository_evidence_v1_2026_08_20"
 ASSET_COMPILER_VERSION = "repository_evidence_asset_compiler_v1_2026_08_20"
@@ -32,10 +33,14 @@ def norm(value: Any) -> str:
 
 
 def unique_terms(values: Iterable[Any]) -> list[str]:
-    """Keep ordered, case-insensitive unique labels from imported metadata."""
+    """Keep ordered unique labels; malformed scalar values are not character-split."""
+    if isinstance(values, (str, bytes, dict)) or not isinstance(values, Iterable):
+        return []
     result: list[str] = []
     seen: set[str] = set()
     for value in values:
+        if not isinstance(value, str):
+            continue
         term = norm(value)
         key = term.casefold()
         if term and key not in seen:
@@ -63,9 +68,9 @@ def inventory_records(payload: Any) -> list[dict[str, Any]]:
             "clone_url": norm(raw.get("clone_url")) or None,
             "default_branch": norm(raw.get("default_branch")) or None,
             "revision_sha": norm(raw.get("revision_sha")) or None,
-            "is_private": bool(raw.get("private", False)),
-            "is_fork": bool(raw.get("fork", False)),
-            "archived": bool(raw.get("archived", False)),
+            "is_private": coerce_bool(raw.get("private", False)),
+            "is_fork": coerce_bool(raw.get("fork", False)),
+            "archived": coerce_bool(raw.get("archived", False)),
             "description": norm(raw.get("description")) or None,
             "homepage": norm(raw.get("homepage")) or None,
             "primary_language": norm(raw.get("language")) or None,

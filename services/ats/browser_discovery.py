@@ -17,6 +17,7 @@ from urllib.parse import urljoin
 from services.ats.contracts import JDQuality, WorkMode, assess_jd_quality, canonical_job_url, infer_work_mode
 from services.ats.public_page import is_candidate_job_link
 from services.ats.registry import detect_ats_platform
+from services.common.value_coercion import coerce_bool
 
 
 class BrowserDiscoveryError(RuntimeError):
@@ -120,7 +121,7 @@ def _snapshot_title(payload: dict[str, Any]) -> str:
 
 def _normalized_snapshot_job(payload: dict[str, Any], *, page_url: str,
                              company_hint: str) -> dict[str, Any] | None:
-    if bool(payload.get("truncated")):
+    if coerce_bool(payload.get("truncated")):
         return None
     text = _visible_snapshot_text(payload)
     if assess_jd_quality(text) != JDQuality.COMPLETE:
@@ -179,7 +180,7 @@ def discover_public_jobs_with_browser(*, career_url: str, platform: str, company
         opened_target_ids.append(board_target_id)
         rendered_board_url = transport.current_url(board_target_id)
         board_snapshot = transport.snapshot(board_target_id)
-        if bool(board_snapshot.get("truncated")):
+        if coerce_bool(board_snapshot.get("truncated")):
             raise BrowserDiscoveryError(
                 "rendered ATS board snapshot is truncated; refusing incomplete discovery",
                 kind="truncated_snapshot",

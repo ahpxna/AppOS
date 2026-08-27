@@ -39,6 +39,7 @@ from typing import Any, Dict, Optional
 import psycopg
 from psycopg.types.json import Jsonb
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from services.common.value_coercion import coerce_bool
 from services.common.config import database_dsn, load_repo_env
 from services.common.autofill_identity import canonical_page_url
 from services.common.autofill_action_scope import autofill_plan_key
@@ -1122,7 +1123,7 @@ def decide_request_by_id(conn, request_id: str, *, decision: str, note: str,
     return {"ok": True, "request_id": rid, "status": new_status,
             "type": atype, "application_id": application_id,
             "autofill_queued": bool(autofill_queued),
-            "delegated_to_autofill": bool((request.get("payload_json") or {}).get("delegated_to_autofill"))}
+            "delegated_to_autofill": coerce_bool((request.get("payload_json") or {}).get("delegated_to_autofill"))}
 
 
 # ---------------------------------------------------------------- list / expire

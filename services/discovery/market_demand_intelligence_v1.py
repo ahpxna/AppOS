@@ -47,17 +47,31 @@ def clean_json_object(raw: str) -> dict[str, Any]:
     fenced = re.search(
         re.escape(fence_token) + r"\s*(.*?)\s*" + re.escape(fence_token), cleaned, flags=re.S
     )
-    candidates = [fenced.group(1)] if fenced else []
+    if fenced:
+        try:
+            parsed = json.loads(fenced.group(1))
+        except json.JSONDecodeError:
+            parsed = None
+        else:
+            if not isinstance(parsed, dict):
+                raise ValueError("Model response JSON must be an object.")
+            return parsed
+    try:
+        parsed = json.loads(cleaned)
+    except json.JSONDecodeError:
+        parsed = None
+    else:
+        if not isinstance(parsed, dict):
+            raise ValueError("Model response JSON must be an object.")
+        return parsed
     first, last = cleaned.find("{"), cleaned.rfind("}")
     if first >= 0 and last > first:
-        candidates.append(cleaned[first:last + 1])
-    for candidate in candidates:
         try:
-            parsed = json.loads(candidate)
-            if isinstance(parsed, dict):
-                return parsed
+            parsed = json.loads(cleaned[first:last + 1])
         except json.JSONDecodeError:
-            pass
+            parsed = None
+        if isinstance(parsed, dict):
+            return parsed
     raise ValueError("Model response did not contain a JSON object.")
 
 
