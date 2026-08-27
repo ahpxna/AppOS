@@ -7,6 +7,7 @@ representations and otherwise return the caller's conservative default.
 from __future__ import annotations
 
 from typing import Any
+import re
 
 _TRUE_STRINGS = {"1", "true", "yes", "y", "on"}
 _FALSE_STRINGS = {"0", "false", "no", "n", "off", "", "none", "null"}
@@ -30,4 +31,27 @@ def coerce_bool(value: Any, *, default: bool = False) -> bool:
             return True
         if normalized in _FALSE_STRINGS:
             return False
+    return default
+
+
+def coerce_int(value: Any, *, default: int = 0) -> int:
+    """Return an integer only for explicit integral scalar representations.
+
+    Booleans, containers, non-integral floats, and arbitrary strings are not
+    integer data.  Treat them as the conservative caller-supplied default so a
+    malformed JSON field cannot turn a safe fallback into an exception.
+    """
+    if isinstance(value, bool) or value is None:
+        return default
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value) if value.is_integer() else default
+    if isinstance(value, str):
+        text = value.strip()
+        if re.fullmatch(r"[+-]?\d+", text):
+            try:
+                return int(text)
+            except ValueError:
+                return default
     return default

@@ -488,7 +488,21 @@ def validate_and_render(
     def string_list(value: Any) -> list[str]:
         if not isinstance(value, list):
             return []
-        return [str(item).strip() for item in value if str(item).strip()]
+        return [str(item).strip() for item in value if isinstance(item, (str, int, float)) and not isinstance(item, bool) and str(item).strip()]
+
+    def text_scalar(value: Any) -> str:
+        # Generated prose fields are strings by contract.  Containers/booleans
+        # are schema drift, not text to stringify into a resume or letter.
+        return value.strip() if isinstance(value, str) else ""
+
+    def asset_id(value: Any) -> Optional[str]:
+        # Asset IDs are authorization/provenance identifiers.  Never stringify
+        # a model-produced container into an ID or let an unhashable value crash
+        # set membership checks.
+        if not isinstance(value, str):
+            return None
+        value = value.strip()
+        return value or None
 
     def requirement_ids(item: Mapping[str, Any]) -> list[str]:
         raw = item.get("matched_requirement_ids") or item.get("alignment_ids") or []
@@ -515,7 +529,7 @@ def validate_and_render(
                 continue
             if slot in seen_experience_slots or slot not in (experience_baselines or {}):
                 continue
-            text, src = (item.get("text") or "").strip(), item.get("source_asset_id")
+            text, src = text_scalar(item.get("text")), asset_id(item.get("source_asset_id"))
             if not text:
                 continue
             if src in (None, "", "none"):
@@ -575,7 +589,7 @@ def validate_and_render(
                 continue
             if slot % 2 == 0 and slot - 1 not in seen_project_slots:
                 continue
-            text, src = (b.get("text") or "").strip(), b.get("source_asset_id")
+            text, src = text_scalar(b.get("text")), asset_id(b.get("source_asset_id"))
             block_slot = slot if slot % 2 else slot - 1
             if fixed_project_assets is not None and src not in fixed_project_assets.get(block_slot, set()):
                 dropped.append(
@@ -621,8 +635,8 @@ def validate_and_render(
             evidence["claims"].append(claim)
             project_bullets.append({"slot": slot, "text": text, **claim})
         for item in mapping_list(parsed.get("skill_lines_ranked", parsed.get("skill_lines", [])))[:5]:
-            category, values = (item.get("category") or "").strip(), (item.get("items") or "").strip()
-            src = item.get("source_asset_id")
+            category, values = text_scalar(item.get("category")), text_scalar(item.get("items"))
+            src = asset_id(item.get("source_asset_id"))
             text = f"{category}: {values}"
             if not category or not values or not check(src, text):
                 continue
@@ -654,12 +668,12 @@ def validate_and_render(
                 "skill_evidence_quote": evidence_quote,
             })
         seen_subtitle_slots: set[int] = set()
-        for item in parsed.get("project_subtitle_updates", [])[:6]:
+        for item in mapping_list(parsed.get("project_subtitle_updates"))[:6]:
             try:
                 slot = int(item.get("slot"))
             except (TypeError, ValueError):
                 continue
-            text, src = (item.get("text") or "").strip(), item.get("source_asset_id")
+            text, src = text_scalar(item.get("text")), asset_id(item.get("source_asset_id"))
             block_slot = slot
             if slot not in {1, 3, 5, 7, 9, 11} or slot in seen_subtitle_slots:
                 continue
@@ -821,7 +835,7 @@ def validate_and_render(
                         if len(jd_quote) < 4 or jd_quote.casefold() not in jd_text.casefold():
                             dropped.append(f"{text[:70]}... (positioning/evidence sentence lacks exact JD quote)")
                             continue
-                    src = sentence.get("source_asset_id")
+                    src = asset_id(sentence.get("source_asset_id"))
                     candidate_quote = " ".join(str(sentence.get("candidate_evidence_quote") or "").split())
                     requested_urls = sentence.get("company_source_urls") or []
                     company_urls = [url for url in requested_urls if isinstance(url, str)] if isinstance(requested_urls, list) else []
@@ -918,7 +932,7 @@ def validate_and_render(
             # Legacy validation path retained for old stored/test payloads. New
             # generation always uses the sentence-classified schema above.
             for p in cover_paragraphs:
-                text, src = (p.get("text") or "").strip(), p.get("source_asset_id")
+                text, src = text_scalar(p.get("text")), asset_id(p.get("source_asset_id"))
                 if not text:
                     continue
                 requested_urls = p.get("company_source_urls") or []
@@ -938,17 +952,17 @@ def validate_and_render(
                 if uses_company_context and src not in valid_asset_ids:
                     dropped.append(f"{text[:70]}... (company-specific paragraph must cite a candidate asset)")
                     continue
-                jd_quote = (p.get("jd_requirement_quote") or "").strip()
-                evidence_quote = (p.get("candidate_evidence_quote") or "").strip()
+                jd_quote = text_scalar(p.get("jd_requirement_quote"))
+                evidence_quote = text_scalar(p.get("candidate_evidence_quote"))
                 if src in valid_asset_ids and (len(jd_quote) < 8 or jd_quote.casefold() not in jd_text.casefold()):
                     dropped.append(f"{text[:70]}... (candidate paragraph lacks an exact JD requirement quote)")
                     continue
                 if src in valid_asset_ids and len(evidence_quote) < 8:
                     dropped.append(f"{text[:70]}... (candidate paragraph lacks an exact asset evidence quote)")
                     continue
-                company_insight = (p.get("company_insight") or "").strip()
-                company_evidence_quote = (p.get("company_evidence_quote") or "").strip()
-                why_company_fit = (p.get("why_company_fit") or "").strip()
+                company_insight = text_scalar(p.get("company_insight"))
+                company_evidence_quote = text_scalar(p.get("company_evidence_quote"))
+                why_company_fit = text_scalar(p.get("why_company_fit"))
                 if uses_company_context and (len(company_insight) < 12 or len(company_evidence_quote) < 8 or len(why_company_fit) < 24):
                     dropped.append(f"{text[:70]}... (company-specific paragraph needs source quote, insight and fit reason)")
                     continue
@@ -1027,14 +1041,14 @@ def validate_and_render(
                 })
                 continue
             if not coerce_bool(answer.get("answerable", False)):
-                missing = str(answer.get("missing_information") or "").strip() or "Additional user information is required."
+                missing = text_scalar(answer.get("missing_information")) or "Additional user information is required."
                 lines.append(f"### {q}\n\n[NEEDS USER INPUT] {missing}")
                 evidence["claims"].append({
                     "claim": q, "source_asset_id": None, "answerable": False,
                     "missing_information": missing,
                 })
                 continue
-            text, src = str(answer.get("text") or "").strip(), answer.get("source_asset_id")
+            text, src = text_scalar(answer.get("text")), asset_id(answer.get("source_asset_id"))
             if not text or not check(src, text):
                 # A model claimed answerable but failed grounding. Preserve the
                 # exact user question and degrade to user input instead of

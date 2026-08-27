@@ -1394,7 +1394,8 @@ def check_domain(cur, url: str, *, application_id: str | None = None,
 
 def require_url(cur, input_json: Dict[str, Any]) -> str:
     """Require an HTTP(S) URL and enforce the central allowed-domain gate."""
-    url = (input_json.get("url") or "").strip()
+    raw_url = input_json.get("url")
+    url = raw_url.strip() if isinstance(raw_url, str) else ""
     if not url:
         raise PermanentTaskError("input_json.url is required.")
     if not url.startswith(("http://", "https://")):

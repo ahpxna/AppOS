@@ -13,6 +13,7 @@ import hashlib
 from typing import Any, Iterable
 
 from services.common.question_memory import normalize_question
+from services.common.value_coercion import coerce_int
 
 
 def _value_sha256(value: Any) -> str:
@@ -69,7 +70,7 @@ def action_is_exactly_approved(action: Any, scope: dict[str, Any]) -> bool:
     # An upload identity in this scope is necessary but never sufficient: the
     # browser worker additionally requires a separately approved delegated
     # ``privileged_upload_document`` child capability.
-    if int(scope.get("version") or 0) != 3 or not isinstance(scope.get("actions"), list):
+    if coerce_int(scope.get("version"), default=0) != 3 or not isinstance(scope.get("actions"), list):
         return False
     wanted = exact_action_identity(action)
     return any(isinstance(item, dict) and {

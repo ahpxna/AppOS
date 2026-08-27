@@ -37,8 +37,13 @@ Grounding rules (hard constraints):
 
 
 def requirement_catalog(matched_requirements: Sequence[Any]) -> list[dict[str, Any]]:
+    # This field is persisted JSON from the fit-analysis boundary.  A string is
+    # a malformed scalar, not a one-item sequence: iterating it would turn
+    # "Python" into six fake requirements and corrupt the coverage denominator.
+    if not isinstance(matched_requirements, (list, tuple)):
+        return []
     catalog: list[dict[str, Any]] = []
-    for index, item in enumerate(matched_requirements or [], start=1):
+    for index, item in enumerate(matched_requirements, start=1):
         if isinstance(item, Mapping):
             requirement = str(item.get("requirement") or "").strip()
             support = str(item.get("profile_support") or "").strip()
@@ -65,7 +70,10 @@ def material_requirement_summary(app: Mapping[str, Any]) -> dict[str, Any]:
     supportable = requirement_catalog(app.get("matched_requirements") or [])
     seen = {item["requirement"].casefold() for item in supportable}
     unsupported = []
-    for item in app.get("missing_or_weak_requirements") or []:
+    raw_unsupported = app.get("missing_or_weak_requirements")
+    if not isinstance(raw_unsupported, (list, tuple)):
+        raw_unsupported = []
+    for item in raw_unsupported:
         if isinstance(item, Mapping):
             requirement = str(item.get("requirement") or item.get("name") or "").strip()
             severity = str(item.get("severity") or "").strip()

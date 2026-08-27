@@ -9,6 +9,7 @@ from services.autofill.form_inspector_v1 import FormField, QuestionGroup
 from services.common.immigration_semantics import classify_immigration_question
 from services.common.question_memory import normalize_question
 from services.autofill.value_normalization import equivalent_value, resolve_select_option
+from services.common.value_coercion import coerce_int
 
 
 @dataclass(frozen=True)
@@ -35,7 +36,7 @@ def _answer_for_question(question: str, answers: Mapping[str, Any]) -> str | Non
     if kind is None:
         return None
     record = answers.get(kind.value)
-    if not isinstance(record, Mapping) or not record.get("confirmed_at") or int(record.get("confirmation_version") or 0) < 1:
+    if not isinstance(record, Mapping) or not record.get("confirmed_at") or coerce_int(record.get("confirmation_version"), default=0) < 1:
         return None
     value = str(record.get("value") or "").strip()
     return value if value.casefold() in {"yes", "no"} else None

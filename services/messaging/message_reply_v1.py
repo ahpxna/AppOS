@@ -326,7 +326,7 @@ def cmd_classify(conn, args) -> int:
             meta = labels[label]
 
             print(f"\n  {subject or '(no subject)'}")
-            print(f"    -> {label}  ({conf:.2f})  {parsed.get('reason','')[:80]}")
+            print(f"    -> {label}  ({conf:.2f})  {str(parsed.get('reason') or '')[:80]}")
             contains_ai_instructions = coerce_bool(parsed.get("contains_instructions_to_ai"))
             if contains_ai_instructions:
                 print("    NOTE: message appears to contain instructions aimed "
@@ -472,7 +472,14 @@ Return ONLY valid JSON:
 def _string_list(value: Any) -> List[str]:
     if not isinstance(value, list):
         return []
-    return [str(item).strip() for item in value if str(item).strip()]
+    return [str(item).strip() for item in value if isinstance(item, (str, int, float)) and not isinstance(item, bool) and str(item).strip()]
+
+
+def _asset_id(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value or None
 
 
 def validate_reply(parsed, valid_ids) -> Tuple[str, List[str], Dict[str, Any]]:
@@ -487,7 +494,7 @@ def validate_reply(parsed, valid_ids) -> Tuple[str, List[str], Dict[str, Any]]:
         if not isinstance(item, dict):
             continue
         text = str(item.get("text") or "").strip()
-        src = item.get("source_asset_id")
+        src = _asset_id(item.get("source_asset_id"))
         kind = str(item.get("kind") or "").strip()
         if not text:
             continue

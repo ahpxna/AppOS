@@ -322,7 +322,7 @@ def build_prompt(doc_row, sections: List[Dict[str, Any]]) -> str:
 def _clean_string_list(value: Any) -> List[str]:
     if not isinstance(value, list):
         return []
-    return [str(item).strip() for item in value if str(item).strip()]
+    return [item.strip() for item in value if isinstance(item, str) and item.strip()]
 
 
 def normalize_result(result: Dict[str, Any], sections: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:

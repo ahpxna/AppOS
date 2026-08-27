@@ -236,8 +236,7 @@ Required JSON schema:
       "why": ""
     }}
   ],
-  "recommended_profile_brief_types": [],
-  "next_step": ""
+  "recommended_profile_brief_types": []
 }}
 
 APPLICATION METADATA:
@@ -318,13 +317,13 @@ def normalize_analysis(parsed: Dict[str, Any]) -> Dict[str, Any]:
 
     if decision == "approve_research":
         priority = "high" if score >= 85 else "medium_high"
-        next_step = parsed.get("next_step") or "approve_research"
+        next_step = "approve_research"
     elif decision == "ask_user":
         priority = "review"
-        next_step = parsed.get("next_step") or "ask_user_to_review_fit"
+        next_step = "ask_user_to_review_fit"
     else:
         priority = "low"
-        next_step = parsed.get("next_step") or "save_only_reject_by_fit"
+        next_step = "save_only_reject_by_fit"
 
     return {
         "fit_score": score,

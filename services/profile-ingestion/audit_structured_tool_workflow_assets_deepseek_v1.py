@@ -81,7 +81,7 @@ def clean_list(value: Any) -> List[str]:
     if value is None:
         return []
     if isinstance(value, list):
-        return [norm(x) for x in value if norm(x)]
+        return [norm(x) for x in value if isinstance(x, str) and norm(x)]
     if isinstance(value, str) and norm(value):
         return [norm(value)]
     return []

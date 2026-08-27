@@ -167,7 +167,30 @@ def fetch_queue(cur, interview_id: Optional[str]) -> List[Dict[str, Any]]:
 def _string_list(value: Any) -> List[str]:
     if not isinstance(value, list):
         return []
-    return [str(item).strip() for item in value if str(item).strip()]
+    return [item.strip() for item in value if isinstance(item, str) and item.strip()]
+
+
+def normalize_prep_result(parsed: Any) -> Dict[str, Any]:
+    """Normalize nested model fields without turning schema drift into prose.
+
+    Interview prep is advisory.  Missing/malformed text should produce a
+    conservative review note, not abort the whole prep batch or stringify a
+    model-produced container into user-facing content.
+    """
+    parsed = parsed if isinstance(parsed, dict) else {}
+    text = lambda value: value.strip() if isinstance(value, str) else ""
+    prep_notes = text(parsed.get("prep_notes")) or (
+        "No grounded interview-prep notes were produced from the available information; review the role and approved profile context manually."
+    )
+    return {
+        "prep_notes": prep_notes,
+        "opening_line": text(parsed.get("opening_line")),
+        "questions_to_ask": _string_list(parsed.get("questions_to_ask")),
+        "stories_to_practice": _string_list(parsed.get("stories_to_practice")),
+        "watch_outs": _string_list(parsed.get("watch_outs")),
+        "self_check": text(parsed.get("self_check")),
+        "prep_version": PREP_VERSION,
+    }
 
 
 def build_prompt(interview: Dict[str, Any], context_pack: str, research: Dict[str, Any]) -> str:
@@ -243,17 +266,8 @@ def cmd_prep(conn, args) -> int:
                 application_id=interview["application_id"],
             )
             parsed = extract_json_object(raw)
-            prep_notes = (parsed.get("prep_notes") or "").strip()
-            if not prep_notes:
-                raise RuntimeError("Prep package did not include prep_notes.")
-            prep_json = {
-                "opening_line": str(parsed.get("opening_line") or "").strip(),
-                "questions_to_ask": _string_list(parsed.get("questions_to_ask")),
-                "stories_to_practice": _string_list(parsed.get("stories_to_practice")),
-                "watch_outs": _string_list(parsed.get("watch_outs")),
-                "self_check": str(parsed.get("self_check") or "").strip(),
-                "prep_version": PREP_VERSION,
-            }
+            prep_json = normalize_prep_result(parsed)
+            prep_notes = prep_json["prep_notes"]
 
             print(f"\n  {interview['company']} / {interview['job_title']}")
             print(f"    prep notes: {prep_notes[:120]}")

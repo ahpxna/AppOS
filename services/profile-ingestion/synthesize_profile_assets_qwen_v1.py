@@ -120,7 +120,7 @@ def clean_list(value: Any) -> List[str]:
     if value is None:
         return []
     if isinstance(value, list):
-        return [str(x).strip() for x in value if str(x).strip()]
+        return [x.strip() for x in value if isinstance(x, str) and x.strip()]
     if isinstance(value, str) and value.strip():
         return [value.strip()]
     return []

@@ -39,7 +39,7 @@ from typing import Any, Dict, Optional
 import psycopg
 from psycopg.types.json import Jsonb
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from services.common.value_coercion import coerce_bool
+from services.common.value_coercion import coerce_bool, coerce_int
 from services.common.config import database_dsn, load_repo_env
 from services.common.autofill_identity import canonical_page_url
 from services.common.autofill_action_scope import autofill_plan_key
@@ -615,7 +615,7 @@ def cmd_create(conn, args) -> int:
                 artifact = (fetch_artifact_binding(cur, args.application_id, args.document_id, args.artifact_id)
                             if args.artifact_id else None)
                 action_scope = json.loads(args.autofill_action_scope_json or "{}")
-                if (not isinstance(action_scope, dict) or int(action_scope.get("version") or 0) != 3
+                if (not isinstance(action_scope, dict) or coerce_int(action_scope.get("version"), default=0) != 3
                         or not isinstance(action_scope.get("actions"), list)):
                     raise RuntimeError("--autofill-action-scope-json must contain exact version=3 actions from jobos autofill prepare.")
                 for item in action_scope["actions"]:
