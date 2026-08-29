@@ -778,6 +778,13 @@ def finish_after_review() -> dict[str, Any]:
         ROOT / "services/profile-ingestion/rebuild_profile_capabilities_v2.sql",
         label="rebuild_profile_capabilities",
     )
+    # Vector retrieval is an active profile-pipeline authority, not an optional
+    # manual maintenance script. Materialize every currently eligible verified
+    # chunk before building the context packs that downstream stages consume.
+    run_checked([
+        sys.executable, "services/profile-ingestion/embed_profile_chunks.py",
+        "--apply", "--limit", "100000",
+    ], label="embed_profile_chunks")
     run_checked([
         sys.executable, "services/profile-ingestion/prepare_profile_for_pipeline_v1.py",
         "build", "--apply",

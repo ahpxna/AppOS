@@ -91,4 +91,6 @@ def test_save_retrieval_records_actual_provider_but_filters_by_configured_model(
     assert component_params[-4:] == ("gemini", "embed-resolved", 13, 0.5)
     retrieval_params = cur.calls[1][1]
     assert retrieval_params[4] == "embed-alias"
-    assert retrieval_params[5] == MODULE.EMBED_DIM
+    assert retrieval_params[5] == "gemini"
+    assert retrieval_params[6] == "embed-resolved"
+    assert retrieval_params[7] == MODULE.EMBED_DIM

@@ -59,7 +59,7 @@ from services.ats.browser_discovery import BrowserDiscoveryError, discover_publi
 from services.ats.registry import (
     DiscoveryStrategy, detect_ats_platform, discovery_platform_keys, get_definition, normalize_ats_key,
 )
-from services.intake.posting_identity import build_posting_identity
+from services.intake.posting_identity import build_posting_identity, find_existing_application
 from services.intake.source_observation import find_and_observe_existing, observe_existing_posting
 
 DISCOVERY_VERSION = "ats_discovery_v1_2026_07_31"
@@ -630,31 +630,39 @@ def cmd_test(conn, args) -> int:
 
 
 def poll_company(conn, cid, name, platform, slug, source_url, *, apply: bool, with_details: bool):
-    with conn.cursor() as cur:
-        cur.execute(
-            "INSERT INTO ats_discovery_runs (ats_company_id, started_at) "
-            "VALUES (%s, now()) RETURNING id::text;",
-            (cid,),
-        )
-        run_id = cur.fetchone()[0]
-    conn.commit()
+    """Poll one company without letting dry-run mutate discovery state.
+
+    Apply mode persists an explicit discovery-run ledger before external I/O.
+    Every exit path terminalizes that ledger; unexpected exceptions are
+    re-raised after the durable failure record is committed.
+    """
+    run_id = None
+    if apply:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO ats_discovery_runs (ats_company_id, started_at) "
+                "VALUES (%s, now()) RETURNING id::text;",
+                (cid,),
+            )
+            run_id = cur.fetchone()[0]
+        conn.commit()
 
     seen = new = dup = 0
     ok = True
     err = None
     error_kind: str | None = None
     transient_failure = False
+    unexpected: Exception | None = None
     try:
         jobs = fetch_jobs(platform, slug, with_details=with_details, source_url=source_url, company=name)
         seen = len(jobs)
         for j in jobs:
             if not j["title"] or not jd_is_complete(j.get("jd_text")):
                 continue
-            with conn.cursor() as cur:
-                app_id = None
-                if apply:
-                    detected = detect_ats_platform(j.get("url"))
-                    job_ats_type = detected if detected != "custom" else platform
+            detected = detect_ats_platform(j.get("url"))
+            job_ats_type = detected if detected != "custom" else platform
+            if apply:
+                with conn.cursor() as cur:
                     app_id = intake_job(
                         cur, jd_text=j["jd_text"], company=name, job_title=j["title"],
                         job_url=j["url"], location=j["location"],
@@ -662,6 +670,20 @@ def poll_company(conn, cid, name, platform, slug, source_url, *, apply: bool, wi
                         ats_type=job_ats_type, ats_company_id=cid,
                         ats_external_id=j["external_id"],
                     )
+                exists = app_id is None
+            else:
+                # Read-only duplicate classification: use the exact same stable
+                # identity authority as intake without calling the observation
+                # writer. This makes dry-run counts meaningful and mutation-free.
+                identity = build_posting_identity(
+                    company=name, job_title=j["title"], jd_text=j["jd_text"],
+                    job_url=j["url"], ats_hint=job_ats_type,
+                )
+                with conn.cursor() as cur:
+                    exists = find_existing_application(
+                        cur, identity, ats_company_id=cid, source_job_id=j["external_id"]
+                    ) is not None
+                app_id = None if exists else "dry-run-new"
             if app_id:
                 new += 1
                 print(f"    NEW  [{platform}] {name} -- {j['title']}")
@@ -677,18 +699,25 @@ def poll_company(conn, cid, name, platform, slug, source_url, *, apply: bool, wi
         error_kind = e.kind
         transient_failure = e.transient
         conn.rollback()
+    except Exception as e:
+        ok = False
+        err = f"{type(e).__name__}: {e}"
+        error_kind = "unexpected_exception"
+        transient_failure = False
+        unexpected = e
+        conn.rollback()
 
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            UPDATE ats_discovery_runs
-            SET finished_at = now(), ok = %s, jobs_seen = %s,
-                jobs_new = %s, jobs_duplicate = %s, error = %s
-            WHERE id = %s;
-            """,
-            (ok, seen, new, dup, err, run_id),
-        )
-        if apply:
+    if apply:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE ats_discovery_runs
+                SET finished_at = now(), ok = %s, jobs_seen = %s,
+                    jobs_new = %s, jobs_duplicate = %s, error = %s
+                WHERE id = %s;
+                """,
+                (ok, seen, new, dup, err, run_id),
+            )
             cur.execute(
                 """
                 UPDATE ats_companies
@@ -719,9 +748,6 @@ def poll_company(conn, cid, name, platform, slug, source_url, *, apply: bool, wi
                        AND last_seen_at < (SELECT started_at FROM ats_discovery_runs WHERE id = %s);""",
                     (cid, platform, run_id),
                 )
-                # A posting that remains absent after the configurable grace
-                # window is closed for discovery/ranking, while retained for
-                # audit and demand-analysis history.
                 cur.execute(
                     """UPDATE applications
                            SET closed_at = now(), status = 'closed', updated_at = now()
@@ -730,7 +756,14 @@ def poll_company(conn, cid, name, platform, slug, source_url, *, apply: bool, wi
                            AND status = 'stale' AND stale_at < now() - make_interval(days => %s);""",
                     (cid, platform, STALE_CLOSE_DAYS),
                 )
-    conn.commit()
+        conn.commit()
+    else:
+        # SELECTs may have opened a transaction; explicitly discard it so the
+        # dry-run contract is true at the PostgreSQL boundary.
+        conn.rollback()
+
+    if unexpected is not None:
+        raise unexpected
     return ok, seen, new, dup, err
 
 

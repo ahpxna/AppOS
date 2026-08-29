@@ -1092,26 +1092,22 @@ def reconcile_materialized_review_state(cur) -> None:
                                   'sensitive_question_required','application_ready','action_required');"""
     )
 
-    # Expire stale parent autofill capabilities first, then restore the
-    # recoverable application state and close delegated children. Otherwise a
-    # timed-out approval leaves the application stranded at awaiting_approval.
+    # Expire every human gate whose TTL can strand the pipeline, then use the
+    # approval service's single recovery authority. Autofill returns to
+    # application_form_ready; fit review returns to screened for a fresh gate.
     cur.execute(
         """UPDATE approval_requests
               SET status='expired', executing_task_id=NULL
-            WHERE type='autofill_form' AND status IN ('pending','approved')
+            WHERE type IN ('autofill_form','fit_review')
+              AND status IN ('pending','approved')
               AND token_expires_at <= now()
-            RETURNING id::text, application_id::text, payload_json;"""
+            RETURNING id::text,type,application_id::text,payload_json;"""
     )
-    expired_autofill = [(str(row[0]), str(row[1]), dict(row[2] or {})) for row in cur.fetchall()]
-    if expired_autofill:
-        from services.approval.approval_service_v1 import _restore_autofill_ready_after_terminal_parent
-        for parent_request_id, application_id, payload in expired_autofill:
-            _restore_autofill_ready_after_terminal_parent(
-                cur, application_id=application_id,
-                plan_key=str(payload.get("autofill_plan_key") or ""),
-                reason="Autofill approval expired before browser I/O.",
-                parent_request_id=parent_request_id,
-            )
+    expired_gates = [(str(row[0]), str(row[1] or ''), str(row[2] or ''), dict(row[3] or {}))
+                     for row in cur.fetchall()]
+    if expired_gates:
+        from services.approval.approval_service_v1 import _recover_expired_requests
+        _recover_expired_requests(cur, expired_gates, actor="review_materializer_expirer")
     cur.execute(
         """UPDATE human_review_items h
               SET status = CASE WHEN ar.status IN ('approved','executing','consumed') THEN 'approved'

@@ -17,6 +17,11 @@ from pathlib import Path
 import psycopg
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from services.common.config import _parse_dotenv_value, database_dsn, load_repo_env
+from services.ats.registry import sync_registry
+
 MIGRATIONS = ROOT / "db" / "migrations"
 MIGRATION_RE = re.compile(r"^(\d+)")
 
@@ -29,21 +34,17 @@ def load_dotenv(path: Path) -> None:
         line = raw.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
-        key, value = line.split("=", 1)
-        key, value = key.strip(), value.strip().strip('"').strip("'")
-        os.environ.setdefault(key, value)
+        key, raw_value = line.split("=", 1)
+        key = key.strip()
+        if key:
+            os.environ.setdefault(key, _parse_dotenv_value(raw_value))
 
 
 def connection_string() -> str:
-    load_dotenv(ROOT / ".env")
-    host = os.getenv("JOBOS_DB_HOST", "127.0.0.1")
-    port = os.getenv("JOBOS_DB_PORT", os.getenv("POSTGRES_HOST_PORT", "5433"))
-    name = os.getenv("JOBOS_DB_NAME", "job_apply_os")
-    user = os.getenv("JOBOS_DB_USER", os.getenv("POSTGRES_USER", "jobos"))
-    password = os.getenv("JOBOS_DB_PASSWORD", os.getenv("POSTGRES_PASSWORD", ""))
-    if not password or password.startswith("CHANGE_ME"):
-        raise RuntimeError("Set a real POSTGRES_PASSWORD/JOBOS_DB_PASSWORD in .env first.")
-    return f"host={host} port={port} dbname={name} user={user} password={password}"
+    load_repo_env()
+    # ``database_dsn`` is the canonical fail-closed/escaped authority; do not
+    # try to re-parse its quoted output here.
+    return database_dsn()
 
 
 def migration_files() -> list[Path]:
@@ -326,6 +327,16 @@ def apply(args: argparse.Namespace) -> int:
                     """,
                     (path.name, current),
                 )
+        if not args.dry_run:
+            # Keep the DB projection wired to the live registry on every schema
+            # application. This is additive/upsert-only: operator/custom rows
+            # are preserved, while newly supported registry entries cannot be
+            # forgotten in a hand-maintained SQL seed.
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    counts = sync_registry(cur)
+            print(f"ATS registry projection synced: {counts['capabilities']} capabilities, "
+                  f"{counts['candidate_domains']} candidate domains.")
     print("Migrations are current.")
     return 0
 

@@ -8,6 +8,8 @@ claims are invalidated only when their evidence path changed.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
 import hashlib
 import json
 import os
@@ -174,6 +176,20 @@ def _git_env(token: str | None) -> dict[str, str]:
     return env
 
 
+@contextlib.contextmanager
+def _snapshot_checkout_lock(repo_full_name: str, head_sha: str):
+    """Serialize materialization of one immutable repo/SHA cache entry."""
+    lock_root = SNAPSHOT_ROOT / ".locks"
+    lock_root.mkdir(parents=True, exist_ok=True)
+    lock_path = lock_root / f"{_safe_repo_name(repo_full_name)}--{head_sha}.lock"
+    with lock_path.open("a+") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 def _cached_checkout_matches(destination: Path, marker: Path, head_sha: str) -> bool:
     """Reuse only an exact, clean cached checkout for the requested immutable HEAD."""
     if not destination.is_dir() or not marker.is_file():
@@ -199,34 +215,37 @@ def _cached_checkout_matches(destination: Path, marker: Path, head_sha: str) -> 
 def ensure_immutable_checkout(*, repo_full_name: str, clone_url: str, head_sha: str, token: str | None) -> Path:
     destination = snapshot_checkout_path(repo_full_name, head_sha)
     marker = destination.parent / "snapshot.json"
-    if _cached_checkout_matches(destination, marker, head_sha):
-        return destination
     if shutil.which("git") is None:
         raise RefreshError("git is required to materialize an immutable repository snapshot.")
-    if destination.parent.exists():
-        shutil.rmtree(destination.parent)
-    destination.mkdir(parents=True, exist_ok=True)
-    env = _git_env(token)
-    commands = [
-        ["git", "init", "-q"],
-        ["git", "remote", "add", "origin", clone_url],
-        ["git", "fetch", "-q", "--depth", "1", "origin", head_sha],
-        ["git", "checkout", "-q", "--detach", "FETCH_HEAD"],
-    ]
-    for command in commands:
-        proc = subprocess.run(command, cwd=destination, env=env, capture_output=True, text=True, timeout=180)
-        if proc.returncode != 0:
+    with _snapshot_checkout_lock(repo_full_name, head_sha):
+        # Check only after acquiring the lock: another refresher may have
+        # completed the exact snapshot while we waited.
+        if _cached_checkout_matches(destination, marker, head_sha):
+            return destination
+        if destination.parent.exists():
+            shutil.rmtree(destination.parent)
+        destination.mkdir(parents=True, exist_ok=True)
+        env = _git_env(token)
+        commands = [
+            ["git", "init", "-q"],
+            ["git", "remote", "add", "origin", clone_url],
+            ["git", "fetch", "-q", "--depth", "1", "origin", head_sha],
+            ["git", "checkout", "-q", "--detach", "FETCH_HEAD"],
+        ]
+        for command in commands:
+            proc = subprocess.run(command, cwd=destination, env=env, capture_output=True, text=True, timeout=180)
+            if proc.returncode != 0:
+                shutil.rmtree(destination.parent, ignore_errors=True)
+                raise RefreshError(f"git snapshot fetch failed: {(proc.stderr or proc.stdout)[-800:]}")
+        actual = subprocess.run(["git", "rev-parse", "HEAD"], cwd=destination, capture_output=True, text=True, timeout=15)
+        if actual.returncode != 0 or actual.stdout.strip().lower() != head_sha.lower():
             shutil.rmtree(destination.parent, ignore_errors=True)
-            raise RefreshError(f"git snapshot fetch failed: {(proc.stderr or proc.stdout)[-800:]}")
-    actual = subprocess.run(["git", "rev-parse", "HEAD"], cwd=destination, capture_output=True, text=True, timeout=15)
-    if actual.returncode != 0 or actual.stdout.strip().lower() != head_sha.lower():
-        shutil.rmtree(destination.parent, ignore_errors=True)
-        raise RefreshError("Immutable checkout HEAD did not match the GitHub-observed SHA.")
-    marker.write_text(json.dumps({
-        "repo_full_name": repo_full_name, "head_sha": head_sha,
-        "fetched_at": datetime.now(timezone.utc).isoformat(), "fetcher_version": REFRESH_VERSION,
-    }, indent=2) + "\n", encoding="utf-8")
-    return destination
+            raise RefreshError("Immutable checkout HEAD did not match the GitHub-observed SHA.")
+        marker.write_text(json.dumps({
+            "repo_full_name": repo_full_name, "head_sha": head_sha,
+            "fetched_at": datetime.now(timezone.utc).isoformat(), "fetcher_version": REFRESH_VERSION,
+        }, indent=2) + "\n", encoding="utf-8")
+        return destination
 
 
 def _load_db():

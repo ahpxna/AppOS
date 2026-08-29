@@ -630,7 +630,7 @@ def main() -> int:
             if not args.apply:
                 conn.rollback()
                 print("")
-                print("DRY RUN ONLY. No database changes committed.")
+                print("DRY RUN ONLY. No job-analysis/domain rows committed. LLM transport/accounting may already be durable, and paid providers may incur cost.")
                 return 0
 
             input_json = {

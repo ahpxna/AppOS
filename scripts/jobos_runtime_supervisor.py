@@ -175,6 +175,7 @@ def _write_state(children: dict[str, subprocess.Popen[Any]], restarts: dict[str,
         "supervisor_pid": os.getpid(),
         "runtime_instance_id": runtime_instance_id,
         "updated_at_unix": int(time.time()),
+        "expected_required_services": sorted(name for name, spec in specs.items() if spec.required),
         "services": {
             name: {
                 "pid": children[name].pid if name in children else None,
@@ -260,7 +261,13 @@ def daemon() -> int:
                     history = [at for at in restart_times.get(name, []) if now - at <= spec.restart.window_seconds]
                     restart_times[name] = history
                     if name in degraded:
-                        continue
+                        # Circuit breakers are time-windowed, not permanent. Once
+                        # enough restart timestamps age out of the configured
+                        # window, automatically close the circuit and try again.
+                        if len(history) < spec.restart.max_restarts:
+                            degraded.pop(name, None)
+                        else:
+                            continue
                     if proc is not None:
                         delay = min(
                             spec.restart.max_backoff_seconds,
@@ -354,12 +361,21 @@ def status() -> int:
     state["running"] = running
     state["supervisor_pid"] = pid
     services = state.get("services") if isinstance(state.get("services"), dict) else {}
-    required_failures = [
-        name for name, service in services.items()
-        if isinstance(service, dict) and service.get("required") and not service.get("running")
-    ]
+    expected_required = {name for name, spec in _specs().items() if spec.required}
+    now = int(time.time())
+    try:
+        state_age = max(0, now - int(state.get("updated_at_unix") or 0))
+    except Exception:
+        state_age = 10**9
+    state["state_age_seconds"] = state_age
+    state["state_fresh"] = bool(state.get("updated_at_unix")) and state_age <= 15
+    required_failures = sorted(
+        name for name in expected_required
+        if not isinstance(services.get(name), dict) or not services[name].get("running")
+    )
+    state["expected_required_services"] = sorted(expected_required)
     state["required_failures"] = required_failures
-    state["ready"] = running and not required_failures
+    state["ready"] = running and state["state_fresh"] and not required_failures
     try:
         import psycopg
         with psycopg.connect(database_dsn(), autocommit=True) as conn, conn.cursor() as cur:

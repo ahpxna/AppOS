@@ -58,7 +58,10 @@ class _Cursor:
         return []
 
 
-def test_legacy_embedder_fetches_by_resolved_configuration_identity():
+def test_canonical_embedder_scans_eligible_chunks_before_exact_content_identity_filter():
     cur = _Cursor()
     assert OLD.fetch_chunks(cur, 12, "configured-embed") == []
-    assert cur.params == ("configured-embed", 12)
+    # Exact currentness includes provider + configured model + content hash and
+    # is evaluated after canonical embedding text is hashed. Pre-filtering by
+    # model alone would strand stale vectors when chunk content changes.
+    assert cur.params == ()

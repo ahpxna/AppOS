@@ -556,7 +556,7 @@ def _reap_stale_transport(cur) -> None:
     )
 
 
-def _finish_delivery(cur, delivery_id: str, message_id: int) -> None:
+def _finish_delivery(cur, delivery_id: str, message_id: int, *, commit: bool = True) -> None:
     cur.execute(
         """UPDATE telegram_review_deliveries
               SET status='sent',message_id=%s,delivered_at=now(),updated_at=now(),lease_expires_at=NULL
@@ -567,7 +567,8 @@ def _finish_delivery(cur, delivery_id: str, message_id: int) -> None:
               SET status='sent',telegram_message_id=%s,finished_at=now()
             WHERE delivery_id=%s AND attempt_no=1 AND status='started';""", (message_id, delivery_id),
     )
-    cur.connection.commit()
+    if commit:
+        cur.connection.commit()
 
 
 def _uncertain_delivery(cur, delivery_id: str, exc: BaseException) -> None:
@@ -582,6 +583,99 @@ def _uncertain_delivery(cur, delivery_id: str, exc: BaseException) -> None:
             WHERE delivery_id=%s AND attempt_no=1 AND status='started';""", (error, delivery_id),
     )
     cur.connection.commit()
+
+
+def _send_bound_force_reply_prompt(
+    conn, token: str, *, item_id: str, chat_id: int, source_sha256: str,
+    callback_token_id: str, prompt_kind: str, text: str, placeholder: str,
+) -> int:
+    """Persist exact reply binding + transport intent before Telegram I/O."""
+    if prompt_kind not in {"document_feedback", "question"}:
+        raise ReviewError(f"Unsupported ForceReply prompt kind: {prompt_kind}")
+    payload = {
+        "chat_id": str(chat_id),
+        "text": text,
+        "reply_markup": json.dumps({"force_reply": True, "input_field_placeholder": placeholder}),
+    }
+    with conn.cursor() as cur:
+        if prompt_kind == "document_feedback":
+            cur.execute(
+                """INSERT INTO telegram_control_surface_state(
+                       chat_id,pending_document_review_item_id,pending_document_source_sha256,
+                       pending_document_feedback_expires_at,pending_document_prompt_message_id,updated_at)
+                   VALUES (%s,%s,%s,now()+interval '15 minutes',NULL,now())
+                   ON CONFLICT (chat_id) DO UPDATE SET
+                     pending_document_review_item_id=EXCLUDED.pending_document_review_item_id,
+                     pending_document_source_sha256=EXCLUDED.pending_document_source_sha256,
+                     pending_document_feedback_expires_at=EXCLUDED.pending_document_feedback_expires_at,
+                     pending_document_prompt_message_id=NULL,updated_at=now();""",
+                (chat_id, item_id, source_sha256),
+            )
+            delivery_kind = "document_feedback_prompt"
+        else:
+            cur.execute(
+                """INSERT INTO telegram_control_surface_state(
+                       chat_id,pending_question_review_item_id,pending_question_source_sha256,
+                       pending_question_expires_at,pending_question_prompt_message_id,updated_at)
+                   VALUES (%s,%s,%s,now()+interval '15 minutes',NULL,now())
+                   ON CONFLICT (chat_id) DO UPDATE SET
+                     pending_question_review_item_id=EXCLUDED.pending_question_review_item_id,
+                     pending_question_source_sha256=EXCLUDED.pending_question_source_sha256,
+                     pending_question_expires_at=EXCLUDED.pending_question_expires_at,
+                     pending_question_prompt_message_id=NULL,updated_at=now();""",
+                (chat_id, item_id, source_sha256),
+            )
+            delivery_kind = "question_reply_prompt"
+        # Consume the callback in the same durable pre-network transaction.
+        cur.execute("UPDATE telegram_callback_tokens SET used_at=now() WHERE id=%s AND used_at IS NULL;", (callback_token_id,))
+        delivery_id = _prepare_delivery(
+            cur, item_id=item_id, chat_id=chat_id, kind=delivery_kind,
+            method="sendMessage", payload=payload, context_sha256=source_sha256,
+            force_nonce=callback_token_id,
+        )
+        if not delivery_id:
+            dedupe = _delivery_dedupe(
+                item_id=item_id, chat_id=chat_id, kind=delivery_kind, method="sendMessage",
+                context_sha256=source_sha256, force_nonce=callback_token_id,
+            )
+            cur.execute(
+                """SELECT status,message_id FROM telegram_review_deliveries
+                    WHERE dedupe_key=%s;""", (dedupe,),
+            )
+            prior = cur.fetchone()
+            if prior and str(prior[0]) == "sent" and prior[1]:
+                message_id = int(prior[1])
+                if prompt_kind == "document_feedback":
+                    cur.execute("UPDATE telegram_control_surface_state SET pending_document_prompt_message_id=%s,updated_at=now() WHERE chat_id=%s;", (message_id, chat_id))
+                else:
+                    cur.execute("UPDATE telegram_control_surface_state SET pending_question_prompt_message_id=%s,updated_at=now() WHERE chat_id=%s;", (message_id, chat_id))
+                conn.commit()
+                return message_id
+            conn.commit()
+            raise ReviewError("That Telegram prompt delivery is already in-flight/uncertain; refresh instead of resending it.")
+
+    # _prepare_delivery committed the pending state, callback consumption and
+    # send intent, releasing DB locks before the external Telegram call.
+    try:
+        sent = api(token, "sendMessage", data=payload)
+        message_id = int(sent["result"]["message_id"])
+        with conn.cursor() as cur:
+            # Acknowledgement and reply-binding become durable atomically after
+            # the external send. If that commit fails, the pre-send outbox row
+            # remains ambiguous and is reconciled as ``uncertain``; a reply is
+            # never accepted against an unbound prompt id.
+            _finish_delivery(cur, delivery_id, message_id, commit=False)
+            if prompt_kind == "document_feedback":
+                cur.execute("UPDATE telegram_control_surface_state SET pending_document_prompt_message_id=%s,updated_at=now() WHERE chat_id=%s;", (message_id, chat_id))
+            else:
+                cur.execute("UPDATE telegram_control_surface_state SET pending_question_prompt_message_id=%s,updated_at=now() WHERE chat_id=%s;", (message_id, chat_id))
+        conn.commit()
+        return message_id
+    except Exception as exc:
+        conn.rollback()
+        with conn.cursor() as cur:
+            _uncertain_delivery(cur, delivery_id, exc)
+        raise
 
 
 def _deliver_artifact(cur, token: str, *, item_id: str, chat_id: int,
@@ -1151,58 +1245,32 @@ def handle_callback(conn, token: str, allowed_user_id: int, callback: dict[str, 
             api(token, "answerCallbackQuery", data={"callback_query_id": callback_id, "text": str(exc)[:180], "show_alert": "true"})
         return
     if action == "document_feedback":
-        api(token, "answerCallbackQuery", data={"callback_query_id": callback_id, "text": "Reply with what to change"})
-        prompt = api(token, "sendMessage", data={
-            "chat_id": str(chat_id),
-            "text": ("✏️ Tell the document agent exactly what is wrong or what to improve. "
-                     "Your feedback is editing direction, never evidence; JobOS will not invent unsupported facts. "
-                     "Reply directly to this message within 15 minutes."),
-            "reply_markup": json.dumps({"force_reply": True, "input_field_placeholder": "What should the resume/cover letter agent fix?"}),
-        })
-        prompt_id = int(prompt["result"]["message_id"])
-        with conn.cursor() as cur:
-            cur.execute(
-                """INSERT INTO telegram_control_surface_state(
-                       chat_id,pending_document_review_item_id,pending_document_source_sha256,
-                       pending_document_feedback_expires_at,pending_document_prompt_message_id,updated_at)
-                   VALUES (%s,%s,%s,now() + interval '15 minutes',%s,now())
-                   ON CONFLICT (chat_id) DO UPDATE
-                   SET pending_document_review_item_id=EXCLUDED.pending_document_review_item_id,
-                       pending_document_source_sha256=EXCLUDED.pending_document_source_sha256,
-                       pending_document_feedback_expires_at=EXCLUDED.pending_document_feedback_expires_at,
-                       pending_document_prompt_message_id=EXCLUDED.pending_document_prompt_message_id,
-                       updated_at=now();""",
-                (chat_id, item_id, token_source, prompt_id),
+        try:
+            _send_bound_force_reply_prompt(
+                conn, token, item_id=item_id, chat_id=chat_id, source_sha256=token_source,
+                callback_token_id=str(row[0]), prompt_kind="document_feedback",
+                text=("✏️ Tell the document agent exactly what is wrong or what to improve. "
+                      "Your feedback is editing direction, never evidence; JobOS will not invent unsupported facts. "
+                      "Reply directly to this message within 15 minutes."),
+                placeholder="What should the resume/cover letter agent fix?",
             )
-            cur.execute("UPDATE telegram_callback_tokens SET used_at=now() WHERE id=%s;", (row[0],))
-        conn.commit()
+            api(token, "answerCallbackQuery", data={"callback_query_id": callback_id, "text": "Reply with what to change"})
+        except Exception as exc:
+            conn.rollback()
+            api(token, "answerCallbackQuery", data={"callback_query_id": callback_id, "text": str(exc)[:180], "show_alert": "true"})
         return
     if action == "other":
-        # Bind free text to a short-lived ForceReply prompt, not to arbitrary
-        # future chat text.  The DB binding is saved only after Telegram gives
-        # us the exact prompt message id.
-        api(token, "answerCallbackQuery", data={"callback_query_id": callback_id, "text": "Reply to this prompt"})
-        prompt = api(token, "sendMessage", data={
-            "chat_id": str(chat_id),
-            "text": "✏️ Reply directly to this message with your answer. This prompt expires in 15 minutes.",
-            "reply_markup": json.dumps({"force_reply": True, "input_field_placeholder": "Type your answer"}),
-        })
-        prompt_id = int(prompt["result"]["message_id"])
-        with conn.cursor() as cur:
-            cur.execute(
-                """INSERT INTO telegram_control_surface_state(
-                       chat_id,pending_question_review_item_id,pending_question_source_sha256,
-                       pending_question_expires_at,pending_question_prompt_message_id,updated_at)
-                   VALUES (%s,%s,%s,now() + interval '15 minutes',%s,now())
-                   ON CONFLICT (chat_id) DO UPDATE
-                   SET pending_question_review_item_id=EXCLUDED.pending_question_review_item_id,
-                       pending_question_source_sha256=EXCLUDED.pending_question_source_sha256,
-                       pending_question_expires_at=EXCLUDED.pending_question_expires_at,
-                       pending_question_prompt_message_id=EXCLUDED.pending_question_prompt_message_id,
-                       updated_at=now();""", (chat_id, item_id, token_source, prompt_id)
+        try:
+            _send_bound_force_reply_prompt(
+                conn, token, item_id=item_id, chat_id=chat_id, source_sha256=token_source,
+                callback_token_id=str(row[0]), prompt_kind="question",
+                text="✏️ Reply directly to this message with your answer. This prompt expires in 15 minutes.",
+                placeholder="Type your answer",
             )
-            cur.execute("UPDATE telegram_callback_tokens SET used_at=now() WHERE id=%s;", (row[0],))
-        conn.commit()
+            api(token, "answerCallbackQuery", data={"callback_query_id": callback_id, "text": "Reply to this prompt"})
+        except Exception as exc:
+            conn.rollback()
+            api(token, "answerCallbackQuery", data={"callback_query_id": callback_id, "text": str(exc)[:180], "show_alert": "true"})
         return
     if action == "answer":
         answer = str(callback_payload.get("answer") or "").strip()

@@ -642,6 +642,35 @@ def advance_one(cur, application_id: str, *, apply: bool) -> None:
 
 def claim_application(cur, application_id: str) -> tuple[str, str, str] | None:
     run_id = str(uuid.uuid4())
+    # Reaping an expired application lease must also terminalize the workflow
+    # ledger owned by that lease; otherwise durable observability accumulates
+    # zombie `running` runs while the application itself moves on.
+    cur.execute(
+        """SELECT processing_run_id::text,processing_lease_expires_at
+             FROM applications WHERE id=%s FOR UPDATE;""",
+        (application_id,),
+    )
+    prior = cur.fetchone()
+    if prior and prior[0] and prior[1] is not None:
+        cur.execute("SELECT %s <= now();", (prior[1],))
+        expired = bool((cur.fetchone() or [False])[0])
+        if expired:
+            old_run_id = str(prior[0])
+            message = "Orchestrator application lease expired and was reclaimed by a later run."
+            cur.execute(
+                """UPDATE workflow_step_runs
+                      SET status='failed',finished_at=coalesce(finished_at,now()),lease_expires_at=NULL,
+                          error_message=coalesce(error_message,%s)
+                    WHERE workflow_run_id=%s::uuid AND status IN ('pending','claimed','running');""",
+                (message, old_run_id),
+            )
+            cur.execute(
+                """UPDATE workflow_runs
+                      SET status='failed',finished_at=coalesce(finished_at,now()),
+                          error_message=coalesce(error_message,%s)
+                    WHERE id=%s::uuid AND status='running';""",
+                (message, old_run_id),
+            )
     cur.execute(
         """UPDATE applications a
               SET processing_run_id=%s::uuid, processing_step=a.current_step,
@@ -786,6 +815,7 @@ def cmd_advance(conn, args) -> int:
             print("Nothing to advance.")
             return 0
 
+        failures = 0
         for app_id in ids:
             run_id: str | None = None
             try:
@@ -811,6 +841,7 @@ def cmd_advance(conn, args) -> int:
                         conn.commit()
                     except Exception:
                         conn.rollback()
+                failures += 1
                 print(f"    error: {type(e).__name__}: {e}")
             finally:
                 _ACTIVE_PROCESSING_RUN_ID = None
@@ -819,7 +850,7 @@ def cmd_advance(conn, args) -> int:
         if not args.apply:
             conn.rollback()
             print("\nDRY RUN. Nothing committed.")
-    return 0
+    return 1 if failures else 0
 
 
 def cmd_board(conn, args) -> int:

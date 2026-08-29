@@ -817,6 +817,15 @@ def insert_revision(
             for r in results if r["verdict"] != "supported"
         ],
     }
+    # Serialize revision allocation on the same logical document lane used by
+    # the canonical generator.  MAX(version)+1 is not safe under concurrent
+    # verifier/regenerator workers without this transaction-scoped lock.
+    app_id = str(doc.get("application_id") or "")
+    doc_type = str(doc.get("doc_type") or "")
+    cur.execute(
+        "SELECT pg_advisory_xact_lock(hashtext(%s));",
+        (f"jobos-document:{app_id}:{doc_type}",),
+    )
     cur.execute(
         """
         INSERT INTO generated_documents (
@@ -967,7 +976,7 @@ def main() -> int:
 
             if not args.apply:
                 conn.rollback()
-                print("\nDRY RUN ONLY. No database changes committed.")
+                print("\nDRY RUN ONLY. No document/domain rows committed. LLM transport/accounting may already be durable, and paid providers may incur cost.")
                 return 0
 
             conn.commit()

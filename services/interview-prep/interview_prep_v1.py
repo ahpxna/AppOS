@@ -287,7 +287,7 @@ def cmd_prep(conn, args) -> int:
 
         if not args.apply:
             conn.rollback()
-            print("\nDRY RUN. Nothing committed.")
+            print("\nDRY RUN. No interview/domain rows committed. LLM transport/accounting may already be durable, and paid providers may incur cost.")
             return 0
         conn.commit()
     return 0

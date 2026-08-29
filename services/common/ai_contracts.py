@@ -63,8 +63,21 @@ def parse_json_object(
     text = preprocess(raw) if preprocess is not None else raw
     if not isinstance(text, str):
         raise ValueError(error_message)
-    text = strip_model_thinking(text).strip()
+    text = text.strip()
 
+    # Exact valid JSON is data, not presentation.  Parse it before touching
+    # model-specific ``<think>`` wrappers so literal strings containing those
+    # markers are never deleted or truncated.
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        parsed = None
+    if isinstance(parsed, dict):
+        return parsed
+    if parsed is not None:
+        raise ValueError(error_message)
+
+    text = strip_model_thinking(text).strip()
     try:
         parsed = json.loads(text)
     except json.JSONDecodeError:

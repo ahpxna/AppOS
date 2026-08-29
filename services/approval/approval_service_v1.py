@@ -568,8 +568,10 @@ def cmd_create(conn, args) -> int:
             """UPDATE approval_requests
                   SET status = 'expired', executing_task_id = NULL
                 WHERE status IN ('pending', 'approved')
-                  AND token_expires_at <= now();"""
+                  AND token_expires_at <= now()
+                RETURNING id::text,type,application_id::text,payload_json;"""
         )
+        _recover_expired_requests(cur, cur.fetchall(), actor="approval_create_expirer")
         if args.application_id:
             cur.execute(
                 "SELECT company, job_title, current_step, coalesce(job_url,''), coalesce(jd_hash,''), pipeline_version FROM applications WHERE id = %s;",
@@ -962,6 +964,59 @@ def _stop_application_for_denied_privileged(cur, *, application_id: str | None,
     return True
 
 
+def _recover_expired_requests(cur, expired_rows, *, actor: str) -> None:
+    """Apply state recovery for every approval TTL expiration boundary."""
+    for row in expired_rows:
+        rid = str(row[0])
+        atype = str(row[1] or "")
+        application_id = str(row[2] or "")
+        payload = dict(row[3] or {})
+        log_event(cur, rid, "expired", actor, {})
+        if atype == "autofill_form" and application_id:
+            _restore_autofill_ready_after_terminal_parent(
+                cur, application_id=application_id,
+                plan_key=str(payload.get("autofill_plan_key") or ""),
+                reason="Autofill approval expired before browser I/O.",
+                parent_request_id=rid,
+            )
+        elif atype == "fit_review" and application_id:
+            try:
+                DEFAULT_PIPELINE_STATE_STORE.transition(
+                    cur, application_id=application_id, expected_from="awaiting_fit_review",
+                    to="screened", actor=actor,
+                    reason="Fit-review approval expired before a human decision; return to a claimable state.",
+                    detail={"expired_approval_request_id": rid}, required_kind="recovery",
+                )
+            except PipelineStateError:
+                pass
+
+
+def _record_binding_mismatch(
+    cur, *, request_id: str, atype: str, application_id: str | None,
+    payload: dict[str, Any], actor: str, error: str,
+) -> tuple[int, bool]:
+    """Count a failed binding attempt and terminalize the capability at its limit."""
+    cur.execute(
+        """UPDATE approval_requests
+              SET attempt_count=attempt_count+1,
+                  status=CASE WHEN attempt_count+1 >= max_attempts THEN 'expired' ELSE status END,
+                  executing_task_id=CASE WHEN attempt_count+1 >= max_attempts THEN NULL ELSE executing_task_id END
+            WHERE id=%s AND status='pending'
+        RETURNING attempt_count,status;""",
+        (request_id,),
+    )
+    row = cur.fetchone()
+    attempts = int(row[0]) if row else 0
+    expired = bool(row and row[1] == "expired")
+    log_event(cur, request_id, "binding_mismatch", actor, {"error": error, "attempt_count": attempts})
+    if expired:
+        _recover_expired_requests(
+            cur, [(request_id, atype, application_id, payload)],
+            actor="approval_binding_attempt_limit",
+        )
+    return attempts, expired
+
+
 # ---------------------------------------------------------------- redeem
 
 def redeem(conn, token: str, *, decision: str, note: str, actor: str) -> int:
@@ -973,10 +1028,12 @@ def redeem(conn, token: str, *, decision: str, note: str, actor: str) -> int:
         cur.execute(
             """
             UPDATE approval_requests
-            SET status = 'expired'
-            WHERE status IN ('pending', 'approved') AND token_expires_at <= now();
+            SET status = 'expired', executing_task_id=NULL
+            WHERE status IN ('pending', 'approved') AND token_expires_at <= now()
+            RETURNING id::text,type,application_id::text,payload_json;
             """
         )
+        _recover_expired_requests(cur, cur.fetchall(), actor="approval_redeem_expirer")
 
         cur.execute(
             """
@@ -1040,7 +1097,10 @@ def redeem(conn, token: str, *, decision: str, note: str, actor: str) -> int:
             try:
                 assert_binding_matches(cur, payload_request)
             except RuntimeError as e:
-                log_event(cur, request_id, "binding_mismatch", actor, {"error": str(e)})
+                _record_binding_mismatch(
+                    cur, request_id=request_id, atype=atype, application_id=application_id,
+                    payload=payload_request["payload_json"], actor=actor, error=str(e),
+                )
                 conn.commit()
                 print(f"  {e}")
                 return 1
@@ -1136,10 +1196,12 @@ def decide_request_by_id(conn, request_id: str, *, decision: str, note: str,
     normalized = "approve" if decision == "approve" else "deny"
     with conn.cursor() as cur:
         cur.execute(
-            """UPDATE approval_requests SET status = 'expired'
-                WHERE id = %s AND status = 'pending' AND token_expires_at <= now();""",
+            """UPDATE approval_requests SET status = 'expired',executing_task_id=NULL
+                WHERE id = %s AND status = 'pending' AND token_expires_at <= now()
+                RETURNING id::text,type,application_id::text,payload_json;""",
             (request_id,),
         )
+        _recover_expired_requests(cur, cur.fetchall(), actor="approval_review_expirer")
         cur.execute(
             """SELECT id::text, type, application_id::text, status, attempt_count,
                       max_attempts, payload_json, summary_text
@@ -1161,7 +1223,10 @@ def decide_request_by_id(conn, request_id: str, *, decision: str, note: str,
             try:
                 assert_binding_matches(cur, request)
             except RuntimeError as exc:
-                log_event(cur, rid, "binding_mismatch", actor, {"error": str(exc)})
+                _record_binding_mismatch(
+                    cur, request_id=rid, atype=atype, application_id=application_id,
+                    payload=request["payload_json"], actor=actor, error=str(exc),
+                )
                 if commit:
                     conn.commit()
                 return {"ok": False, "error": str(exc)}
@@ -1274,15 +1339,7 @@ def cmd_expire_stale(conn, args) -> int:
         )
         expired = [(str(r[0]), str(r[1] or ""), str(r[2] or ""), dict(r[3] or {})) for r in cur.fetchall()]
         ids = [row[0] for row in expired]
-        for rid, atype, application_id, payload in expired:
-            log_event(cur, rid, "expired", "system", {})
-            if atype == "autofill_form" and application_id:
-                _restore_autofill_ready_after_terminal_parent(
-                    cur, application_id=application_id,
-                    plan_key=str(payload.get("autofill_plan_key") or ""),
-                    reason="Autofill approval expired before browser I/O.",
-                    parent_request_id=rid,
-                )
+        _recover_expired_requests(cur, expired, actor="approval_expirer")
         if not args.apply:
             conn.rollback()
             print(f"DRY RUN: {len(ids)} request(s) would be expired.")

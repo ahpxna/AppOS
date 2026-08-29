@@ -13,8 +13,8 @@ def _sql(version: int) -> str:
     return matches[0].read_text(encoding="utf-8")
 
 
-def test_db_authority_migrations_087_through_096_exist_once_and_are_transaction_wrapped():
-    for version in range(87, 97):
+def test_db_authority_migrations_087_through_097_exist_once_and_are_transaction_wrapped():
+    for version in range(87, 98):
         text = _sql(version)
         assert re.search(r"\bBEGIN\s*;", text, re.I)
         assert re.search(r"\bCOMMIT\s*;\s*$", text, re.I)

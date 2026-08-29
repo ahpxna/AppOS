@@ -347,7 +347,7 @@ def cmd_classify(conn, args) -> int:
 
         if not args.apply:
             conn.rollback()
-            print("\nDRY RUN. Nothing committed.")
+            print("\nDRY RUN. No reply/domain rows committed. LLM transport/accounting may already be durable, and paid providers may incur cost.")
             return 0
         conn.commit()
     return 0
@@ -952,9 +952,16 @@ def cmd_draft(conn, args) -> int:
 
         if not args.apply:
             conn.rollback()
-            print("\nDRY RUN. Nothing committed.")
+            print("\nDRY RUN. No messaging/domain rows committed. LLM transport/accounting may already be durable, and paid providers may incur cost.")
             return 0
 
+        # Serialize version allocation per message thread.  The companion DB
+        # unique index is a backstop; the advisory lock keeps concurrent writers
+        # from racing on MAX(version)+1 in normal operation.
+        cur.execute(
+            "SELECT pg_advisory_xact_lock(hashtext(%s));",
+            (f"jobos-reply:{args.thread_id}",),
+        )
         cur.execute(
             "SELECT COALESCE(MAX(version), 0) + 1 FROM drafted_replies WHERE thread_id = %s;",
             (args.thread_id,),
@@ -1037,7 +1044,7 @@ def cmd_verify(conn, args) -> int:
 
         if not args.apply:
             conn.rollback()
-            print("\nDRY RUN. Nothing committed.")
+            print("\nDRY RUN. No messaging/domain rows committed. LLM transport/accounting may already be durable, and paid providers may incur cost.")
             return 0
         conn.commit()
     return 0

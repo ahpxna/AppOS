@@ -351,3 +351,41 @@ def capability_rows() -> tuple[tuple[str, bool, bool, bool, bool, bool, bool, st
             "writes remain page-bound, approval-bound, primitive-control checked, and safe-pause on unknown controls.",
         ))
     return tuple(rows)
+
+def sync_registry(cur) -> dict[str, int]:
+    """Upsert the Python ATS registry into its PostgreSQL projection tables.
+
+    The Python registry remains classification/capability source-of-truth; this
+    projection never grants browser trust. Existing rows not owned by the
+    registry are preserved so custom/operator capabilities are not deleted.
+    """
+    capability_count = 0
+    for row in capability_rows():
+        cur.execute(
+            """INSERT INTO ats_capabilities(
+                   ats_type,supports_discovery,supports_static_text,supports_radio,
+                   supports_select,supports_upload,supports_multi_page,autofill_mode,notes,updated_at)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,now())
+               ON CONFLICT (ats_type) DO UPDATE SET
+                 supports_discovery=EXCLUDED.supports_discovery,
+                 supports_static_text=EXCLUDED.supports_static_text,
+                 supports_radio=EXCLUDED.supports_radio,
+                 supports_select=EXCLUDED.supports_select,
+                 supports_upload=EXCLUDED.supports_upload,
+                 supports_multi_page=EXCLUDED.supports_multi_page,
+                 autofill_mode=EXCLUDED.autofill_mode,
+                 notes=EXCLUDED.notes,updated_at=now();""",
+            row,
+        )
+        capability_count += 1
+    domain_count = 0
+    for domain, category, notes in candidate_domain_rows():
+        cur.execute(
+            """INSERT INTO ats_candidate_domains(domain,category,notes,enabled,updated_at)
+               VALUES (%s,%s,%s,true,now())
+               ON CONFLICT (domain) DO UPDATE SET
+                 category=EXCLUDED.category,notes=EXCLUDED.notes,enabled=true,updated_at=now();""",
+            (domain, category, notes),
+        )
+        domain_count += 1
+    return {"capabilities": capability_count, "candidate_domains": domain_count}

@@ -80,13 +80,26 @@ def retrieve_chunks(
     include_buckets: Optional[List[str]],
     exclude_buckets: Optional[List[str]],
     embedding_model: str = EMBED_MODEL,
+    embedding_provider: str = "ollama",
+    resolved_embedding_model: str | None = None,
 ) -> List[Dict[str, Any]]:
+    resolved_embedding_model = resolved_embedding_model or embedding_model
     where = [
         "e.status = 'completed'",
+        "e.embedding_provider = %s",
         "e.embedding_model = %s",
+        "e.resolved_embedding_model = %s",
+        # Retrieval is downstream of the human profile-evidence gate. A raw
+        # chunk is eligible only when at least one approved profile asset cites
+        # that exact chunk as evidence.
+        "EXISTS (SELECT 1 FROM profile_asset_evidence_items pai "
+        "JOIN profile_assets pa ON pa.id=pai.profile_asset_id "
+        "WHERE pai.chunk_id=e.chunk_id AND pa.status='approved')",
     ]
 
-    params: List[Any] = [vector_literal(query_embedding), embedding_model]
+    params: List[Any] = [
+        vector_literal(query_embedding), embedding_provider, embedding_model, resolved_embedding_model
+    ]
 
     if include_roles:
         where.append("s.file_role = ANY(%s)")
@@ -432,6 +445,8 @@ def save_retrieval(
           role_family,
           retrieval_mode,
           embedding_model,
+          embedding_provider,
+          resolved_embedding_model,
           embedding_dim,
           query_embedding,
           max_chunks,
@@ -447,6 +462,8 @@ def save_retrieval(
           %s,
           %s,
           'vector_signal_rerank',
+          %s,
+          %s,
           %s,
           %s,
           %s::vector,
@@ -465,6 +482,8 @@ def save_retrieval(
             query_text,
             args.role_family,
             configured_embedding_model,
+            embedding_provider,
+            resolved_embedding_model,
             len(query_embedding),
             vector_literal(query_embedding),
             args.max_chunks,
@@ -589,6 +608,8 @@ def main() -> int:
                 include_buckets=args.include_bucket,
                 exclude_buckets=args.exclude_bucket,
                 embedding_model=embedding_result.configured_model,
+                embedding_provider=embedding_result.provider,
+                resolved_embedding_model=embedding_result.model,
             )
 
             results = rerank_results(

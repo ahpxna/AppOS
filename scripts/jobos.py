@@ -547,11 +547,26 @@ def status() -> int:
             runtime["supervisor_pid"] = pid
             runtime["running"] = pid_alive(pid)
             services = runtime.get("services") if isinstance(runtime.get("services"), dict) else {}
-            runtime["required_failures"] = [
+            fallback_required = {"orchestrator", "privileged-actions", "browser-worker",
+                                 "browser-state-watcher", "document-revision"}
+            declared_required = {
                 name for name, service in services.items()
-                if isinstance(service, dict) and service.get("required") and not service.get("running")
-            ]
-            runtime["ready"] = runtime["running"] and not runtime["required_failures"]
+                if isinstance(service, dict) and service.get("required")
+            }
+            advertised_required = runtime.get("expected_required_services")
+            expected_required = (set(advertised_required) if isinstance(advertised_required, list)
+                                 else set(fallback_required)) | declared_required
+            try:
+                runtime_age = max(0, int(time.time()) - int(runtime.get("updated_at_unix") or 0))
+            except Exception:
+                runtime_age = 10**9
+            runtime["state_age_seconds"] = runtime_age
+            runtime["state_fresh"] = bool(runtime.get("updated_at_unix")) and runtime_age <= 15
+            runtime["required_failures"] = sorted(
+                name for name in expected_required
+                if not isinstance(services.get(name), dict) or not services[name].get("running")
+            )
+            runtime["ready"] = runtime["running"] and runtime["state_fresh"] and not runtime["required_failures"]
             if not runtime["running"]:
                 runtime["status"] = "stale_runtime_state"
     except Exception:

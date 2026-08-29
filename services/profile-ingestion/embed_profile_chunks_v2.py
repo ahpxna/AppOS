@@ -1,4 +1,6 @@
 import argparse
+import hashlib
+import importlib.util
 import os
 import sys
 import time
@@ -92,168 +94,94 @@ def fetch_chunks(cur, limit: int):
 
 
 def insert_embedding_log_if_possible(cur, chunk_id, embedding_literal: str, model: str, dims: int):
+    """Backward-compatible direct helper against the current canonical schema."""
     cols = table_columns(cur, "profile_chunk_embeddings")
-    if not cols:
+    if not cols or "embedding" not in cols:
+        return
+    id_col = "chunk_id" if "chunk_id" in cols else ("profile_chunk_id" if "profile_chunk_id" in cols else None)
+    if not id_col:
         return
 
-    values = {}
-
-    if "chunk_id" in cols:
-        values["chunk_id"] = chunk_id
-    elif "profile_chunk_id" in cols:
-        values["profile_chunk_id"] = chunk_id
-    else:
-        return
-
-    if "embedding" not in cols:
-        return
-
-    values["embedding"] = embedding_literal
-
-    if "embedding_model" in cols:
-        values["embedding_model"] = model
-    if "model" in cols:
-        values["model"] = model
-    if "embedding_dim" in cols:
-        values["embedding_dim"] = dims
-    if "dimensions" in cols:
-        values["dimensions"] = dims
-    if "status" in cols:
-        values["status"] = "completed"
-    if "embedder_version" in cols:
-        values["embedder_version"] = VERSION
-
-    keys = list(values.keys())
-    placeholders = []
-    params = []
-
-    for k in keys:
-        if k == "embedding":
-            placeholders.append("%s::vector")
-        else:
-            placeholders.append("%s")
-        params.append(values[k])
-
-    id_col = "chunk_id" if "chunk_id" in values else "profile_chunk_id"
-    model_col = "embedding_model" if "embedding_model" in values else ("model" if "model" in values else None)
-
-    if model_col:
-        cur.execute(
-            f"DELETE FROM profile_chunk_embeddings WHERE {id_col} = %s AND {model_col} = %s",
-            (chunk_id, model),
-        )
-    else:
-        cur.execute(
-            f"DELETE FROM profile_chunk_embeddings WHERE {id_col} = %s",
-            (chunk_id,),
-        )
-
-    q = (
-        f"INSERT INTO profile_chunk_embeddings ({', '.join(keys)}) "
-        f"VALUES ({', '.join(placeholders)})"
+    # Recover canonical chunk metadata so NOT NULL content/provider identity is
+    # satisfied even for external callers of this historical helper.
+    cur.execute(
+        """SELECT pc.file_id,rf.file_name,coalesce(rf.file_role,''),pc.chunk_index,
+                  coalesce(pc.section,''),coalesce(pc.category,''),pc.text_content
+             FROM profile_chunks pc JOIN raw_files rf ON rf.id=pc.file_id
+            WHERE pc.id=%s;""", (chunk_id,),
     )
-    cur.execute(q, params)
+    row = cur.fetchone()
+    if not row:
+        raise RuntimeError(f"profile chunk not found: {chunk_id}")
+    file_id, file_name, file_role, chunk_index, section, category, text_content = row
+    canonical_text = "\n".join([
+        f"FILE: {file_name}", f"FILE_ROLE: {file_role}", f"CHUNK_INDEX: {chunk_index}",
+        f"SECTION: {section}", f"CATEGORY: {category}", "", str(text_content or ""),
+    ]).strip()
+    digest = hashlib.sha256(canonical_text.encode("utf-8", errors="ignore")).hexdigest()
+    config = resolve_config(role="embed", model=model, local_url=OLLAMA_URL)
+
+    values = {id_col: chunk_id, "embedding": embedding_literal}
+    optional = {
+        "file_id": file_id,
+        "embedding_model": config.model,
+        "model": config.model,
+        "embedding_provider": config.provider,
+        "resolved_embedding_model": config.model,
+        "embedding_dim": dims,
+        "dimensions": dims,
+        "content_hash": digest,
+        "status": "completed",
+        "embedder_version": VERSION,
+    }
+    for key, value in optional.items():
+        if key in cols:
+            values[key] = value
+    keys = list(values)
+    placeholders = ["%s::vector" if key == "embedding" else "%s" for key in keys]
+    params = [values[key] for key in keys]
+
+    if {"embedding_provider", "embedding_model", "resolved_embedding_model", "content_hash"} <= set(values):
+        cur.execute(
+            f"DELETE FROM profile_chunk_embeddings WHERE {id_col}=%s AND embedding_provider=%s "
+            "AND embedding_model=%s AND resolved_embedding_model=%s AND content_hash=%s",
+            (chunk_id, values["embedding_provider"], values["embedding_model"],
+             values["resolved_embedding_model"], values["content_hash"]),
+        )
+    elif "embedding_model" in values:
+        cur.execute(f"DELETE FROM profile_chunk_embeddings WHERE {id_col}=%s AND embedding_model=%s", (chunk_id, values["embedding_model"]))
+    else:
+        cur.execute(f"DELETE FROM profile_chunk_embeddings WHERE {id_col}=%s", (chunk_id,))
+    cur.execute(
+        f"INSERT INTO profile_chunk_embeddings ({', '.join(keys)}) VALUES ({', '.join(placeholders)})",
+        params,
+    )
+
+
+def _canonical_embedder():
+    path = Path(__file__).with_name("embed_profile_chunks.py")
+    spec = importlib.util.spec_from_file_location("jobos_profile_chunk_embedder_canonical", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Cannot load canonical embedder from {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--apply", action="store_true")
-    parser.add_argument("--limit", type=int, default=100)
-    parser.add_argument("--model", default=MODEL)
-    parser.add_argument("--write-log-table", action="store_true", help="Also write profile_chunk_embeddings log table.")
-    args = parser.parse_args()
+    """Compatibility CLI: V2 now routes to the canonical merged embedder.
 
-    print("===== PROFILE CHUNK EMBEDDER V2 =====")
-    print(f"Version: {VERSION}")
-    print(f"Mode:    {'APPLY' if args.apply else 'DRY-RUN'}")
-    config = resolve_config(role="embed", model=args.model, local_url=OLLAMA_URL)
-    configured_model = config.model
-    expected_dim = int(os.getenv("PROFILE_EMBED_DIM", "768"))
-    print(f"Configured model: {configured_model}")
-    print(f"Provider: {config.provider}")
-    print(f"Expected dim: {expected_dim}")
-    print(f"Limit:   {args.limit}")
-    print("")
-
-    with psycopg.connect(database_dsn()) as conn:
-        with conn.cursor() as cur:
-            rows = fetch_chunks(cur, args.limit)
-
-            print(f"Chunks selected: {len(rows)}")
-
-            if not rows:
-                print("Nothing to embed.")
-                return 0
-
-            embedded = 0
-            failed = 0
-
-            for i, row in enumerate(rows, start=1):
-                chunk_id, file_name, chunk_index, section, category, token_count, text_content = row
-
-                print("")
-                print(f"--- Chunk {i}/{len(rows)} ---")
-                print(f"File:     {file_name}")
-                print(f"Index:    {chunk_index}")
-                print(f"Section:  {section}")
-                print(f"Category: {category}")
-                print(f"Tokens:   {token_count}")
-
-                if not args.apply:
-                    continue
-
-                cur.execute("SAVEPOINT chunk_embed_sp")
-                try:
-                    embedding_result = embed_text_result(text_content, model=args.model)
-                    emb = list(embedding_result.vectors[0])
-                    if len(emb) != expected_dim:
-                        raise RuntimeError(
-                            f"Embedding dim mismatch. Expected {expected_dim}, got {len(emb)}. "
-                            "Change PROFILE_EMBED_DIM and vector schema before using another dimension."
-                        )
-                    lit = vector_literal(emb)
-
-                    cur.execute(
-                        """
-                        UPDATE profile_chunks
-                        SET embedding = %s::vector
-                        WHERE id = %s
-                        """,
-                        (lit, chunk_id),
-                    )
-
-                    if args.write_log_table:
-                        insert_embedding_log_if_possible(cur, chunk_id, lit, embedding_result.configured_model, len(emb))
-
-                    cur.execute("RELEASE SAVEPOINT chunk_embed_sp")
-
-                    embedded += 1
-                    print(f"Embedded dim: {len(emb)}")
-
-                    if embedded % 25 == 0:
-                        conn.commit()
-                        print("Committed batch.")
-
-                except Exception as e:
-                    cur.execute("ROLLBACK TO SAVEPOINT chunk_embed_sp")
-                    cur.execute("RELEASE SAVEPOINT chunk_embed_sp")
-                    failed += 1
-                    print(f"FAILED: {e}")
-
-            if args.apply:
-                conn.commit()
-
-    print("")
-    print("===== SUMMARY =====")
-    print(f"Selected: {len(rows)}")
-    print(f"Embedded: {embedded}")
-    print(f"Failed:   {failed}")
-
-    if not args.apply:
-        print("Dry-run only. Re-run with --apply to write DB.")
-
-    print("Done.")
-    return 0
+    All historical flags remain accepted by the canonical parser, including
+    --write-log-table (now a no-op because canonical log-table persistence is
+    unconditional on --apply).
+    """
+    canonical = _canonical_embedder()
+    argv = list(sys.argv[1:])
+    # Preserve V2's historical default dry-run while sharing the canonical
+    # implementation. Explicit --apply/--dry-run always wins.
+    if "--apply" not in argv and "--dry-run" not in argv:
+        argv.insert(0, "--dry-run")
+    return int(canonical.main(argv))
 
 
 if __name__ == "__main__":

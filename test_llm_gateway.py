@@ -181,3 +181,55 @@ def test_embedding_inputs_reject_scalar_string(monkeypatch):
     monkeypatch.setenv("JOBOS_LLM_BACKEND", "ollama")
     with pytest.raises(llm_gateway.LLMGatewayError, match="sequence of strings"):
         llm_gateway.embed_result(texts="not-a-batch")
+
+
+def test_embeddings_reorder_indexed_api_rows_to_input_identity(monkeypatch, no_cost_db):
+    monkeypatch.setenv("JOBOS_LLM_BACKEND", "api")
+    monkeypatch.setenv("JOBOS_LLM_API_BASE", "https://embed.example.test/v1")
+    monkeypatch.setenv("JOBOS_LLM_API_KEY", "unit-test-token")
+    monkeypatch.setenv("JOBOS_LLM_API_MODEL", "unit-embed-model")
+
+    monkeypatch.setattr(
+        llm_gateway,
+        "_post_json",
+        lambda *_args, **_kwargs: {
+            "data": [
+                {"index": 1, "embedding": [20, 21]},
+                {"index": 0, "embedding": [10, 11]},
+            ]
+        },
+    )
+
+    assert llm_gateway.embed_texts(texts=["first", "second"]) == [
+        [10.0, 11.0],
+        [20.0, 21.0],
+    ]
+
+
+def test_embeddings_fail_closed_on_partial_or_duplicate_indexes(monkeypatch, no_cost_db):
+    monkeypatch.setenv("JOBOS_LLM_BACKEND", "api")
+    monkeypatch.setenv("JOBOS_LLM_API_BASE", "https://embed.example.test/v1")
+    monkeypatch.setenv("JOBOS_LLM_API_KEY", "unit-test-token")
+    monkeypatch.setenv("JOBOS_LLM_API_MODEL", "unit-embed-model")
+
+    for payload, message in (
+        ({"data": [{"index": 0, "embedding": [1]}, {"embedding": [2]}]}, "mixed indexed"),
+        ({"data": [{"index": 0, "embedding": [1]}, {"index": 0, "embedding": [2]}]}, "duplicate"),
+    ):
+        monkeypatch.setattr(llm_gateway, "_post_json", lambda *_args, _payload=payload, **_kwargs: _payload)
+        with pytest.raises(llm_gateway.LLMGatewayError, match=message):
+            llm_gateway.embed_texts(texts=["first", "second"])
+
+
+def test_post_json_normalizes_malformed_http_200_json(monkeypatch):
+    class FakeResponse:
+        def __enter__(self):
+            return self
+        def __exit__(self, *_args):
+            return False
+        def read(self):
+            return b"not-json"
+
+    monkeypatch.setattr(llm_gateway.urllib.request, "urlopen", lambda *_args, **_kwargs: FakeResponse())
+    with pytest.raises(llm_gateway.LLMGatewayError, match="malformed JSON"):
+        llm_gateway._post_json("https://api.example.test/v1/test", {}, timeout=1)

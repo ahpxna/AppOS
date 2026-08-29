@@ -1507,7 +1507,7 @@ def main() -> int:
 
             if not args.apply:
                 conn.rollback()
-                print("\nDRY RUN ONLY. No database changes committed.")
+                print("\nDRY RUN ONLY. No generated-document/domain rows committed. LLM transport/accounting may already be durable, and paid providers may incur cost.")
                 return 0
 
             version = next_version(cur, app["id"], args.doc_type)

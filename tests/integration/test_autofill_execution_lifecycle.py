@@ -12,6 +12,7 @@ import importlib.util
 import json
 import os
 import sys
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1061,4 +1062,111 @@ def test_document_generation_attempt_reuses_completed_and_recovers_after_bounded
                                 input_manifest={**manifest, "doc_type": "cover_letter"})
         assert recovered_again.id == recovered.id
         assert recovered_again.attempt_count == 3
+        conn.rollback()
+
+
+def test_097_model_pricing_identity_allows_same_model_name_per_provider(db):
+    model = f"shared-model-{uuid.uuid4()}"
+    with db.connect(TEST_DSN) as conn, conn.cursor() as cur:
+        cur.execute(
+            """INSERT INTO model_pricing(model_name,provider,input_usd_per_1k,output_usd_per_1k,is_local,notes)
+               VALUES (%s,'provider-a',1,2,false,'fixture'),
+                      (%s,'provider-b',3,4,false,'fixture')""",
+            (model, model),
+        )
+        cur.execute("SELECT provider,input_usd_per_1k FROM model_pricing WHERE model_name=%s ORDER BY provider", (model,))
+        assert cur.fetchall() == [('provider-a', 1), ('provider-b', 3)]
+        conn.rollback()
+
+
+def test_097_profile_vectors_are_unique_per_provider_and_resolved_space(db):
+    with db.connect(TEST_DSN) as conn, conn.cursor() as cur:
+        cur.execute("INSERT INTO raw_files(file_name,source) VALUES ('vector-fixture.txt','test') RETURNING id")
+        file_id = cur.fetchone()[0]
+        cur.execute("INSERT INTO profile_chunks(file_id,chunk_index,text_content) VALUES (%s,0,'fixture') RETURNING id", (file_id,))
+        chunk_id = cur.fetchone()[0]
+        digest = 'a' * 64
+        for provider, resolved in [('provider-a', 'resolved-a'), ('provider-b', 'resolved-b')]:
+            cur.execute(
+                """INSERT INTO profile_chunk_embeddings(
+                       chunk_id,file_id,embedding_provider,embedding_model,resolved_embedding_model,
+                       embedding_dim,content_hash,status)
+                   VALUES (%s,%s,%s,'shared-alias',%s,768,%s,'completed')""",
+                (chunk_id, file_id, provider, resolved, digest),
+            )
+        cur.execute("SELECT count(*) FROM profile_chunk_embeddings WHERE chunk_id=%s AND content_hash=%s", (chunk_id, digest))
+        assert cur.fetchone() == (2,)
+        conn.rollback()
+
+
+def test_097_pipeline_event_prefilled_metadata_cannot_forge_state_transition(db):
+    with db.connect(TEST_DSN) as conn, conn.cursor() as cur:
+        cur.execute("INSERT INTO applications(company,job_title,current_step) VALUES ('Event Guard Co','Role','intake') RETURNING id,pipeline_version")
+        app_id, version = cur.fetchone()
+        with pytest.raises(db.Error, match="state-changing pipeline events"):
+            cur.execute(
+                """INSERT INTO pipeline_events(
+                       application_id,from_step,to_step,actor,reason,detail_json,
+                       sequence_no,pipeline_version,transition_kind)
+                   VALUES (%s,'intake','jd_stored','forger','fixture','{}'::jsonb,1,%s,'automated')""",
+                (app_id, version),
+            )
+        conn.rollback()
+
+
+def test_097_telegram_force_reply_delivery_kinds_are_in_db_domain(db):
+    with db.connect(TEST_DSN) as conn, conn.cursor() as cur:
+        cur.execute(
+            """SELECT pg_get_constraintdef(oid)
+                 FROM pg_constraint
+                WHERE conrelid='telegram_review_deliveries'::regclass
+                  AND conname='telegram_review_deliveries_delivery_kind_check'"""
+        )
+        row = cur.fetchone()
+        assert row is not None
+        definition = row[0]
+        assert 'document_feedback_prompt' in definition
+        assert 'question_reply_prompt' in definition
+
+
+def test_097_fit_review_expiry_recovers_application_to_screened(db):
+    from services.approval import approval_service_v1 as approval
+    with db.connect(TEST_DSN) as conn, conn.cursor() as cur:
+        cur.execute(
+            """INSERT INTO applications(company,job_title,current_step,status)
+                 VALUES ('Expired Fit Co','Role','awaiting_fit_review','active') RETURNING id::text"""
+        )
+        app_id = cur.fetchone()[0]
+        cur.execute(
+            """INSERT INTO approval_requests(type,application_id,payload_json,status,approval_token_hash,token_expires_at)
+                 VALUES ('fit_review',%s,'{}'::jsonb,'pending',%s,now()-interval '1 second')""",
+            (app_id, f"expired-{uuid.uuid4()}"),
+        )
+        conn.commit()
+    with db.connect(TEST_DSN) as conn:
+        assert approval.cmd_expire_stale(conn, SimpleNamespace(apply=True)) == 0
+    with db.connect(TEST_DSN) as conn, conn.cursor() as cur:
+        cur.execute("SELECT current_step FROM applications WHERE id=%s", (app_id,))
+        assert cur.fetchone() == ('screened',)
+
+
+def test_097_document_and_reply_version_lanes_have_unique_db_backstops(db):
+    with db.connect(TEST_DSN) as conn, conn.cursor() as cur:
+        cur.execute("INSERT INTO applications(company,job_title,current_step) VALUES ('Version Lane Co','Role','intake') RETURNING id")
+        app_id = cur.fetchone()[0]
+        cur.execute("INSERT INTO generated_documents(application_id,doc_type,version,content) VALUES (%s,'resume',77,'v1')", (app_id,))
+        cur.execute("SAVEPOINT duplicate_doc_version")
+        with pytest.raises(db.errors.UniqueViolation):
+            cur.execute("INSERT INTO generated_documents(application_id,doc_type,version,content) VALUES (%s,'resume',77,'v2')", (app_id,))
+        cur.execute("ROLLBACK TO SAVEPOINT duplicate_doc_version")
+        cur.execute("RELEASE SAVEPOINT duplicate_doc_version")
+
+        cur.execute("INSERT INTO message_threads(source,external_thread_id,status) VALUES ('test',%s,'open') RETURNING id", (f"thread-{uuid.uuid4()}",))
+        thread_id = cur.fetchone()[0]
+        cur.execute("INSERT INTO drafted_replies(thread_id,body_text,version) VALUES (%s,'v1',77)", (thread_id,))
+        cur.execute("SAVEPOINT duplicate_reply_version")
+        with pytest.raises(db.errors.UniqueViolation):
+            cur.execute("INSERT INTO drafted_replies(thread_id,body_text,version) VALUES (%s,'v2',77)", (thread_id,))
+        cur.execute("ROLLBACK TO SAVEPOINT duplicate_reply_version")
+        cur.execute("RELEASE SAVEPOINT duplicate_reply_version")
         conn.rollback()

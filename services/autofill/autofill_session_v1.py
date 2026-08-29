@@ -7,6 +7,7 @@ from urllib.parse import urlsplit
 
 from services.autofill.autofill_executor_v1 import AutofillTransport, BrowserTarget
 from services.autofill.autofill_planner_v1 import PlannedAction
+from services.autofill.autofill_verifier_v1 import verify_actions
 from services.autofill.form_inspector_v1 import FormField, QuestionGroup
 from services.common.autofill_identity import canonical_page_url
 from services.autofill.value_normalization import equivalent_value, normal_text
@@ -102,13 +103,21 @@ class AutofillSession:
         if action.action == "check":
             # The option ref may change on an ATS rerender: recover by the
             # question and desired option label, never by a stale old ref.
-            return any(
-                option.selected is True and (
+            selected = next((
+                option for group in state.groups for option in group.options
+                if option.selected is True and (
                     option.ref == action.ref or
                     _normal_text(option.label) == _normal_text(action.value or "")
                 ) and (not action.question_label or _normal_text(group.label) == _normal_text(action.question_label))
-                for group in state.groups for option in group.options
-            )
+            ), None)
+            if selected is None:
+                return False
+            # The semantic selection check above is authoritative: a stable
+            # option ref remains valid even when the rendered label changes.
+            # Feed the canonical verifier the approved value so wiring the
+            # shared state machine cannot make this path stricter than before.
+            result = verify_actions([action], {action.ref: str(action.value or "")})
+            return result.status == "completed"
         field = next((item for item in state.fields if item.ref == action.ref), None)
         if field is None:
             # React/Workday often replaces every accessibility ref. Recover
@@ -117,7 +126,11 @@ class AutofillSession:
                           if action.question_label and _normal_text(item.label) == _normal_text(action.question_label)), None)
         if field is None:
             return False
-        return _equivalent_value(action, field.value, field.role)
+        result = verify_actions(
+            [action], {action.ref: field.value},
+            value_matches=lambda item, observed: _equivalent_value(item, observed, field.role),
+        )
+        return result.status == "completed"
 
     def execute(self, plan: Callable[[SnapshotState], list[PlannedAction]]) -> SessionResult:
         try:

@@ -83,7 +83,8 @@ def validate_saved_request(max_results: int) -> dict[str, Any]:
 
 def validate_job_url(url: str) -> str:
     parsed = urlparse((url or "").strip())
-    if (parsed.scheme != "https" or not (parsed.hostname or "").lower().endswith("linkedin.com")
+    host = (parsed.hostname or "").lower()
+    if (parsed.scheme != "https" or not (host == "linkedin.com" or host.endswith(".linkedin.com"))
             or not re.fullmatch(r"/jobs/view/\d+/?", parsed.path)):
         raise LinkedInDiscoveryError("result URL must be an https canonical LinkedIn /jobs/view/<id>/ page.")
     # Tracking parameters are neither evidence nor a stable identity.  Intake
@@ -135,21 +136,43 @@ def _contains_structured_jobs(value: Any) -> bool:
     return False
 
 
+def _structured_blocker_metadata(value: Any) -> dict[str, Any]:
+    """Collect blocker fields from wrappers without scanning job-description prose."""
+    found: dict[str, Any] = {}
+    blocker_keys = ("blocked", "blocker", "error", "status", "warning")
+
+    def walk(node: Any, path: str = "") -> None:
+        if isinstance(node, dict):
+            # Do not descend into the jobs array: JD text is evidence data and
+            # can legitimately contain words such as verification/security.
+            for key in blocker_keys:
+                if key in node and key not in found:
+                    found[key] = node[key]
+            for key, nested in node.items():
+                if key == "jobs":
+                    continue
+                if isinstance(nested, (dict, list)):
+                    walk(nested, f"{path}.{key}" if path else key)
+        elif isinstance(node, list):
+            for nested in node:
+                if isinstance(nested, (dict, list)):
+                    walk(nested, path)
+
+    walk(value)
+    return found
+
+
 def blocker_safe_agent_response(value: Any) -> Any:
     """Wrap successful LinkedIn job output so JD prose cannot trigger blockers.
 
-    If no structured jobs payload exists we keep the original response visible
-    to the frozen blocker scan, because a raw agent error/report is exactly
-    where CAPTCHA/login/checkpoint evidence is expected.
+    Blocker metadata is commonly nested beneath the OpenClaw ``parsed`` wrapper.
+    Preserve those fields in the safe string/JSON view while excluding the jobs
+    array itself, so partial results plus a CAPTCHA cannot be misclassified as a
+    clean extraction and ordinary JD prose cannot false-positive.
     """
     if not isinstance(value, dict) or not _contains_structured_jobs(value):
         return value
-    blocker_view: dict[str, Any] = {}
-    for key in ("blocked", "blocker", "error", "status", "warning"):
-        if key in value:
-            blocker_view[key] = value[key]
-    # A successful structured jobs payload with no explicit blocker should look
-    # clean to the legacy scan even when JD prose contains blocker-like words.
+    blocker_view = _structured_blocker_metadata(value)
     blocker_view.setdefault("status", "jobs_extracted")
     return BlockerSafeAgentResponse(value, blocker_view)
 

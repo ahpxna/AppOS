@@ -122,7 +122,21 @@ def process_pending(conn, *, max_results: int = 10) -> int:
                     or str(live[1]) != "needs_email_verification"
                     or str(live[2] or "").casefold() != str(recipient or "").casefold()
                     or str(live[3] or "") != str(origin or "")):
+                # The discovery intent was committed before Gmail I/O. If the
+                # authority changes while that I/O is in flight, terminalize
+                # the durable run instead of leaving a permanent `running`
+                # zombie that no worker will ever resume.
                 conn.rollback()
+                if discovery_run_id:
+                    with conn.cursor() as terminal_cur:
+                        terminal_cur.execute(
+                            """UPDATE gmail_discovery_runs
+                                  SET status='completed',finished_at=now(),
+                                      error_message='authoritative verification state changed before candidate persistence'
+                                WHERE id=%s AND status='running';""",
+                            (discovery_run_id,),
+                        )
+                    conn.commit()
                 continue
             candidate_id = persist_candidate(cur, application_id=app_id, candidate=candidate)
             if discovery_run_id:

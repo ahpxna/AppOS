@@ -52,21 +52,40 @@ def _workflow_step_run_id() -> str | None:
         return None
 
 
-def _price(cur, model: str, *, require_priced: bool) -> tuple[Decimal, Decimal, bool]:
+def _price(cur, provider: str, model: str, *, require_priced: bool) -> tuple[Decimal, Decimal, bool]:
     cur.execute(
         """SELECT input_usd_per_1k, output_usd_per_1k, is_local, notes
-             FROM model_pricing WHERE model_name=%s;""", (model,)
+             FROM model_pricing WHERE provider=%s AND model_name=%s;""", (provider, model)
     )
     row = cur.fetchone()
     if not row:
         if require_priced:
-            raise LLMBudgetError(f"Paid LLM model {model!r} has no model_pricing row; set a real price before API use.")
+            raise LLMBudgetError(f"Paid LLM model {provider}/{model!r} has no model_pricing row; set a real price before API use.")
         return Decimal(0), Decimal(0), True
     inp, out, is_local, notes = row
     unpriced = (not is_local and str(notes or "").upper().startswith("PRICING NOT SET"))
     if require_priced and unpriced:
-        raise LLMBudgetError(f"Paid LLM model {model!r} is marked PRICING NOT SET; hard USD budget cannot authorize it.")
+        raise LLMBudgetError(f"Paid LLM model {provider}/{model!r} is marked PRICING NOT SET; hard USD budget cannot authorize it.")
     return Decimal(inp or 0), Decimal(out or 0), bool(is_local)
+
+
+def _provider_price_ceiling(cur, provider: str, *, input_price: Decimal, output_price: Decimal) -> tuple[Decimal, Decimal]:
+    """Return a conservative pre-call ceiling for provider-side model routing.
+
+    Some compatible endpoints return a resolved model different from the configured
+    alias.  Reserving only the alias price makes a so-called hard daily budget
+    impossible to enforce.  Use the greatest maintained non-local price for the
+    provider as the reservation ceiling; unpriced sentinel rows do not count.
+    """
+    cur.execute(
+        """SELECT COALESCE(MAX(input_usd_per_1k),0), COALESCE(MAX(output_usd_per_1k),0)
+             FROM model_pricing
+            WHERE provider=%s AND is_local=false
+              AND NOT upper(coalesce(notes,'')) LIKE 'PRICING NOT SET%%';""",
+        (provider,),
+    )
+    row = cur.fetchone() or (0, 0)
+    return max(input_price, Decimal(row[0] or 0)), max(output_price, Decimal(row[1] or 0))
 
 
 def reserve_paid_call(*, role: str, provider: str, model: str,
@@ -91,11 +110,14 @@ def reserve_paid_call(*, role: str, provider: str, model: str,
             (budget_date,),
         )
         max_usd, current = cur.fetchone()
-        in_price, out_price, is_local = _price(cur, model, require_priced=True)
+        in_price, out_price, is_local = _price(cur, provider, model, require_priced=True)
         if is_local:
             raise LLMBudgetError(f"API backend model {model!r} is marked local in model_pricing; fix pricing metadata.")
-        reserve = (Decimal(max(0, estimated_input_tokens)) / Decimal(1000) * in_price
-                   + Decimal(max(0, max_output_tokens)) / Decimal(1000) * out_price)
+        ceiling_in, ceiling_out = _provider_price_ceiling(
+            cur, provider, input_price=in_price, output_price=out_price
+        )
+        reserve = (Decimal(max(0, estimated_input_tokens)) / Decimal(1000) * ceiling_in
+                   + Decimal(max(0, max_output_tokens)) / Decimal(1000) * ceiling_out)
         cur.execute("SELECT COALESCE(SUM(estimated_cost_usd),0) FROM cost_ledger WHERE budget_date=%s;", (budget_date,))
         ledger_spent = Decimal(cur.fetchone()[0] or 0)
         authoritative = max(Decimal(current or 0), ledger_spent)
@@ -163,7 +185,7 @@ def settle_paid_call(reservation: Reservation, *, role: str, configured_model: s
             raise LLMBudgetError("LLM cost reservation is missing or no longer open.")
         reserved, budget_date = Decimal(row[0] or 0), row[2]
         try:
-            in_price, out_price, _ = _price(cur, resolved_model, require_priced=True)
+            in_price, out_price, _ = _price(cur, reservation.provider, resolved_model, require_priced=True)
             actual = (Decimal(max(0, input_tokens)) / Decimal(1000) * in_price
                       + Decimal(max(0, output_tokens)) / Decimal(1000) * out_price)
             pricing_note = "resolved_model_priced"
@@ -192,12 +214,24 @@ def settle_paid_call(reservation: Reservation, *, role: str, configured_model: s
                 """UPDATE llm_call_attempts SET status='completed',provider_request_id=%s,finished_at=now()
                     WHERE llm_call_id=%s AND attempt_no=1;""", (request_id, reservation.llm_call_id),
             )
-        cur.execute("SELECT current_cost_usd FROM daily_budgets WHERE date=%s FOR UPDATE;", (budget_date,))
-        current = Decimal((cur.fetchone() or [0])[0] or 0)
+        cur.execute("SELECT max_cost_usd,current_cost_usd FROM daily_budgets WHERE date=%s FOR UPDATE;", (budget_date,))
+        budget_row = cur.fetchone() or (None, 0)
+        max_usd, current = budget_row[0], Decimal(budget_row[1] or 0)
+        settled_total = max(Decimal(0), current - reserved + actual)
         cur.execute(
             "UPDATE daily_budgets SET current_cost_usd=%s WHERE date=%s;",
-            (max(Decimal(0), current - reserved + actual), budget_date),
+            (settled_total, budget_date),
         )
+        if max_usd is not None and settled_total > Decimal(max_usd):
+            # The call is already externally irreversible. Persist the truthful
+            # charge, then surface a hard-budget breach instead of pretending
+            # the invariant held.  Conservative provider-ceiling reservation
+            # above should make this reachable only after mid-call price drift.
+            conn.commit()
+            raise LLMBudgetError(
+                f"Paid LLM settlement exceeded daily budget after provider/model price drift: "
+                f"${settled_total:.4f} > ${Decimal(max_usd):.2f}."
+            )
         conn.commit()
         return actual
 

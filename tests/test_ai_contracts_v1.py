@@ -28,3 +28,14 @@ def test_parse_json_object_handles_braces_inside_json_strings():
     assert parse_json_object('prefix {"text": "literal } and { braces"} suffix') == {
         "text": "literal } and { braces"
     }
+
+
+def test_parse_json_object_preserves_literal_think_markers_inside_valid_json():
+    assert parse_json_object('{"text":"literal <think>not reasoning</think> marker","ok":true}') == {
+        "text": "literal <think>not reasoning</think> marker",
+        "ok": True,
+    }
+    assert parse_json_object('{"text":"literal </think> marker","ok":true}') == {
+        "text": "literal </think> marker",
+        "ok": True,
+    }

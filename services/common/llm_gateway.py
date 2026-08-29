@@ -203,7 +203,14 @@ def _post_json(url: str, payload: dict[str, Any], *, timeout: int,
     )
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
-            parsed = json.loads(response.read().decode("utf-8", errors="replace"))
+            body = response.read().decode("utf-8", errors="replace")
+            try:
+                parsed = json.loads(body)
+            except json.JSONDecodeError as exc:
+                preview = body[:500].replace("\n", " ")
+                raise LLMGatewayError(
+                    f"LLM endpoint {url} returned malformed JSON: {preview}"
+                ) from exc
             if not isinstance(parsed, dict):
                 raise LLMGatewayError(
                     f"LLM endpoint {url} returned {type(parsed).__name__}; expected a JSON object."
@@ -480,11 +487,42 @@ def embed_result(*, texts: Sequence[str], model: str | None = None,
             data = response.get("data")
             if not isinstance(data, list):
                 data = []
-            embeddings = []
-            for row in data:
-                vector = _embedding_vector(row.get("embedding")) if isinstance(row, dict) else None
-                if vector is not None:
-                    embeddings.append(vector)
+            # OpenAI-compatible embedding responses carry an explicit ``index``
+            # binding each vector to its input.  Providers/proxies are not
+            # required to serialize rows in input order, so response order is
+            # not an identity.  Preserve legacy compatible providers that omit
+            # index entirely, but fail closed on partial/duplicate/bogus index
+            # metadata rather than silently attaching a vector to the wrong
+            # profile chunk.
+            rows_with_index = [
+                row for row in data
+                if isinstance(row, dict) and row.get("index") is not None
+            ]
+            if rows_with_index:
+                if len(rows_with_index) != len(data):
+                    raise LLMGatewayError("Embedding response mixed indexed and unindexed rows.")
+                indexed: list[list[float] | None] = [None] * len(text_list)
+                for row in data:
+                    if not isinstance(row, dict):
+                        raise LLMGatewayError("Embedding response row was not an object.")
+                    index = row.get("index")
+                    if isinstance(index, bool) or not isinstance(index, int) or not 0 <= index < len(text_list):
+                        raise LLMGatewayError("Embedding response contained an invalid input index.")
+                    if indexed[index] is not None:
+                        raise LLMGatewayError("Embedding response contained a duplicate input index.")
+                    vector = _embedding_vector(row.get("embedding"))
+                    if vector is None:
+                        raise LLMGatewayError("Embedding response contained an invalid vector.")
+                    indexed[index] = vector
+                if any(vector is None for vector in indexed):
+                    raise LLMGatewayError("Embedding response omitted one or more input indexes.")
+                embeddings = [vector for vector in indexed if vector is not None]
+            else:
+                embeddings = []
+                for row in data:
+                    vector = _embedding_vector(row.get("embedding")) if isinstance(row, dict) else None
+                    if vector is not None:
+                        embeddings.append(vector)
     except Exception as exc:
         if reservation is not None:
             from .llm_cost_accounting_v1 import mark_paid_call_uncertain

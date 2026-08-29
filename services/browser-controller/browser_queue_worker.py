@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -54,7 +55,7 @@ if str(REPO_ROOT) not in sys.path:
 import psycopg
 from psycopg.types.json import Jsonb
 # Sửa lại đoạn import ở đầu file browser_queue_worker.py
-from services.autofill.parallel_bypass import execute_parallel_bypass, _fake_mouse_routine
+from services.autofill.parallel_bypass import execute_parallel_bypass
 import threading
 import requests
 from services.common.value_coercion import coerce_bool
@@ -127,6 +128,78 @@ def feature_enabled(name: str, default: bool = True) -> bool:
     if value is None:
         return default
     return value.strip().casefold() in {"1", "true", "yes", "on"}
+
+
+def _load_fake_mouse_start():
+    """Load the public FakeMouse adapter from the historical hyphenated directory."""
+    path = REPO_ROOT / "services" / "browser-controller" / "fake_mouse.py"
+    spec = importlib.util.spec_from_file_location("jobos_browser_fake_mouse_public", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Cannot load FakeMouse public entrypoint: {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.start_fake_mouse_thread
+
+
+def _start_linkedin_fake_mouse(stop_event: threading.Event):
+    start_fake_mouse_thread = _load_fake_mouse_start()
+    return start_fake_mouse_thread(
+        "data/pointer-regimes.json",
+        duration_seconds=None,
+        stop_event=stop_event,
+        cdp_url=BROWSER_CDP_URL.rstrip("/") + "/json",
+    )
+
+
+def _cdp_port_from_url() -> int:
+    parsed = urlsplit(BROWSER_CDP_URL)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise PermanentTaskError(f"Invalid JOBOS browser CDP URL: {BROWSER_CDP_URL!r}")
+    if parsed.port is not None:
+        return int(parsed.port)
+    return 443 if parsed.scheme == "https" else 80
+
+
+def _current_linkedin_page_url(expected_url: str) -> str:
+    """Return the live exact LinkedIn page URL for CAPTCHA binding.
+
+    OpenClaw may add filters and therefore mutate the search query.  CapSolver
+    must bind to that live URL, not the seed URL constructed before navigation.
+    """
+    response = requests.get(BROWSER_CDP_URL.rstrip("/") + "/json", timeout=3)
+    response.raise_for_status()
+    tabs = response.json()
+    if not isinstance(tabs, list):
+        raise TransientTaskError("CDP /json did not return a page list while binding LinkedIn CAPTCHA")
+    wanted = urlsplit(expected_url)
+    wanted_host = (wanted.hostname or "").casefold()
+    wanted_path = (wanted.path or "/").rstrip("/") or "/"
+    same_page: list[str] = []
+    challenge_pages: list[str] = []
+    linkedin_pages: list[str] = []
+    challenge_markers = ("/checkpoint", "/challenge", "/authwall", "/uas/login", "/login", "/security")
+    for tab in tabs:
+        if not isinstance(tab, dict) or tab.get("type") != "page":
+            continue
+        current = str(tab.get("url") or "")
+        parsed = urlsplit(current)
+        host = (parsed.hostname or "").casefold()
+        if host == "linkedin.com" or host.endswith(".linkedin.com"):
+            linkedin_pages.append(current)
+            path = (parsed.path or "/").rstrip("/") or "/"
+            if any(marker in path.casefold() for marker in challenge_markers):
+                challenge_pages.append(current)
+            if host == wanted_host and path == wanted_path:
+                same_page.append(current)
+    # A challenge redirect intentionally changes the path away from /jobs/search.
+    # Prefer one explicit challenge/auth page even when another ordinary LinkedIn
+    # tab is open; otherwise keep exact same-path affinity before singleton fallback.
+    candidates = challenge_pages if len(challenge_pages) == 1 else (same_page or linkedin_pages)
+    if len(candidates) != 1:
+        raise TransientTaskError(
+            f"Cannot bind one live LinkedIn CAPTCHA page for {expected_url!r}; found {len(candidates)} candidates"
+        )
+    return candidates[0]
 
 
 class PermanentTaskError(Exception):
@@ -1566,40 +1639,27 @@ def handle_discover_linkedin_jobs(cur, task) -> Dict[str, Any]:
     )
 
     # =====================================================================
-    # 1. BẬT FAKE MOUSE (PHÒNG BỆNH)
+    # 1. BẬT FAKE MOUSE (PHÒNG BỆNH) THROUGH ITS PUBLIC ENTRYPOINT
     # =====================================================================
-    import threading
-    import requests
-    from services.autofill.parallel_bypass import _fake_mouse_routine, execute_parallel_bypass
-    
     mouse_stop_event = threading.Event()
     mouse_thread = None
     try:
-        # BROWSER_CDP_URL đã được định nghĩa ở đầu file (thường là http://127.0.0.1:9222)
-        res = requests.get(f"{BROWSER_CDP_URL}/json", timeout=2)
-        tabs = res.json()
-        ws_url = next(t["webSocketDebuggerUrl"] for t in tabs if t["type"] == "page")
-        
-        mouse_thread = threading.Thread(
-            target=_fake_mouse_routine,
-            args=(ws_url, "data/pointer-regimes.json", mouse_stop_event)
-        )
-        mouse_thread.start()
+        mouse_thread = _start_linkedin_fake_mouse(mouse_stop_event)
         print("  [FakeMouse] Đã bật khiên bảo vệ Brownian Motion...")
     except Exception as e:
         print(f"  [FakeMouse] Bỏ qua Fake Mouse vì không thể kết nối CDP: {e}")
 
     try:
-        # Cào lần 1
         agent_response = openclaw_agent(
             agent=OPENCLAW_AGENT_LINKEDIN_DISCOVERY, message=msg, timeout=task["timeout_seconds"],
             session_id=f"jobos-task-{task['id']}",
         )
     finally:
-        # Luôn tắt chuột phòng bệnh
         mouse_stop_event.set()
         if mouse_thread and mouse_thread.is_alive():
-            mouse_thread.join()
+            mouse_thread.join(timeout=5)
+            if mouse_thread.is_alive():
+                print("  [FakeMouse] warning: helper still stopping in daemon thread")
 
     # =====================================================================
     # 2. CHECK CAPTCHA & PARALLEL BYPASS (CHỮA BỆNH VÀ PERMANENT FAILURE)
@@ -1608,13 +1668,13 @@ def handle_discover_linkedin_jobs(cur, task) -> Dict[str, Any]:
     if any(marker in agent_raw_output for marker in ("captcha", "verification", "security check", "checkpoint", "sign in", "login required")):
         print("  [Bypass] Đụng độ CAPTCHA/Login LinkedIn! Kích hoạt CapSolver + Fake Mouse...")
         try:
-            # Lấy port linh hoạt từ BROWSER_CDP_URL (Mặc định 9222)
-            cdp_port = int(BROWSER_CDP_URL.split(":")[-1].replace("/", ""))
-            
-            # Gọi API CapSolver và múa chuột song song để vượt rào
+            cdp_port = _cdp_port_from_url()
+            live_captcha_url = _current_linkedin_page_url(search_url)
+
+            # Bind CapSolver to the exact live page after LinkedIn applied filters.
             execute_parallel_bypass(
                 cdp_port=cdp_port,
-                website_url=search_url,
+                website_url=live_captcha_url,
                 website_key="2CB16598-CB82-458A-898B-53544380C934", # FunCaptcha public key mặc định của LinkedIn
                 regimes_path="data/pointer-regimes.json",
                 captcha_type="FunCaptchaTaskProxyless"
@@ -1631,8 +1691,12 @@ def handle_discover_linkedin_jobs(cur, task) -> Dict[str, Any]:
             agent_raw_retry = str(agent_response).lower()
             if any(marker in agent_raw_retry for marker in ("captcha", "verification", "security check", "checkpoint", "sign in", "login required")):
                 raise PermanentTaskError("CapSolver đã giải nhưng vẫn bị chặn. Đánh dấu lỗi vĩnh viễn (Permanent Failure)!")
+        except PermanentTaskError:
+            raise
         except Exception as e:
-            raise PermanentTaskError(f"Bypass thất bại hoặc không thể vượt qua: {e}")
+            # Network/CDP/OpenClaw/CapSolver availability is transient. Only a
+            # second grounded blocker after a successful bypass is permanent.
+            raise TransientTaskError(f"Bypass tạm thời thất bại hoặc không thể kết nối: {e}") from e
 
     # =====================================================================
     # 3. LƯU VÀO DB
@@ -1686,24 +1750,12 @@ def handle_discover_linkedin_saved_jobs(cur, task) -> Dict[str, Any]:
     )
 
     # =====================================================================
-    # [THÊM MỚI] BẬT FAKE MOUSE CHO SAVED JOBS
+    # BẬT FAKE MOUSE CHO SAVED JOBS THROUGH ITS PUBLIC ENTRYPOINT
     # =====================================================================
-    import threading
-    import requests
-    from services.autofill.parallel_bypass import _fake_mouse_routine
-    
     mouse_stop_event = threading.Event()
     mouse_thread = None
     try:
-        res = requests.get(f"{BROWSER_CDP_URL}/json", timeout=2)
-        tabs = res.json()
-        ws_url = next(t["webSocketDebuggerUrl"] for t in tabs if t["type"] == "page")
-        
-        mouse_thread = threading.Thread(
-            target=_fake_mouse_routine,
-            args=(ws_url, "data/pointer-regimes.json", mouse_stop_event)
-        )
-        mouse_thread.start()
+        mouse_thread = _start_linkedin_fake_mouse(mouse_stop_event)
         print("  [FakeMouse] Đã bật khiên bảo vệ Brownian Motion cho Saved Jobs...")
     except Exception as e:
         print(f"  [FakeMouse] Bỏ qua Fake Mouse vì không thể kết nối CDP: {e}")
@@ -1719,7 +1771,9 @@ def handle_discover_linkedin_saved_jobs(cur, task) -> Dict[str, Any]:
         # [THÊM MỚI] TẮT CHUỘT MA NGAY CẢ KHI LỖI
         mouse_stop_event.set()
         if mouse_thread and mouse_thread.is_alive():
-            mouse_thread.join(timeout=2)
+            mouse_thread.join(timeout=5)
+            if mouse_thread.is_alive():
+                print("  [FakeMouse] warning: Saved Jobs helper still stopping in daemon thread")
 
     blocker_text = json.dumps(agent_response, ensure_ascii=False).casefold()
     if any(word in blocker_text for word in ("captcha", "checkpoint", "sign in", "login required")):

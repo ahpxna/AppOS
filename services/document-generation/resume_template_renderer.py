@@ -314,8 +314,13 @@ def _arial_font() -> Path:
 
 
 def export_pdf_from_reference(*, reference_pdf: Path, output_pdf: Path,
-                              project_bullets: list[str], skill_lines: list[dict[str, str]]) -> Path:
-    """Overlay only editable slots on the known-good one-page PDF reference."""
+                              project_bullets: list[Any], skill_lines: list[dict[str, str]]) -> Path:
+    """Overlay sparse editable slots on the known-good one-page PDF reference.
+
+    Project updates accept the canonical ``{"slot": N, "text": ...}`` form.
+    Legacy string lists remain supported and map sequentially to slots 1..N.
+    Untouched PDF slots are never blanked.
+    """
     if not reference_pdf.is_file():
         raise ResumeTemplateError(f"Reference PDF not found: {reference_pdf}")
     if len(project_bullets) > MAX_PROJECT_BULLETS or len(skill_lines) > MAX_SKILL_LINES:
@@ -327,39 +332,71 @@ def export_pdf_from_reference(*, reference_pdf: Path, output_pdf: Path,
         from reportlab.pdfgen import canvas
     except ImportError as exc:
         raise ResumeTemplateError("Install document-generation requirements for PDF overlay export.") from exc
+
+    normalized_projects: list[tuple[int, str]] = []
+    seen: set[int] = set()
+    requested: set[int] = set()
+    for index, item in enumerate(project_bullets, start=1):
+        if isinstance(item, dict):
+            try:
+                slot = int(item.get("slot"))
+            except (TypeError, ValueError) as exc:
+                raise ResumeTemplateError("Every PDF project update needs an integer fixed slot 1..12.") from exc
+            text = " ".join(str(item.get("text") or "").split())
+        else:
+            slot = index
+            text = " ".join(str(item or "").split())
+        if not 1 <= slot <= MAX_PROJECT_BULLETS or slot in seen or not text:
+            raise ResumeTemplateError("PDF project updates must use unique non-empty fixed slots 1..12.")
+        seen.add(slot); requested.add(slot)
+        normalized_projects.append((slot, text))
+    for slot in requested:
+        if slot % 2 == 0 and slot - 1 not in requested:
+            raise ResumeTemplateError(f"Secondary PDF slot {slot} requires primary slot {slot - 1}.")
+
     font = _arial_font()
     output_pdf.parent.mkdir(parents=True, exist_ok=True)
     overlay = output_pdf.with_suffix(".overlay.pdf")
     pdfmetrics.registerFont(TTFont("JobOSArial", str(font)))
-    page_height, right = 792, 568
+    page_height = 792
     canvas_out = canvas.Canvas(str(overlay), pagesize=(612, page_height))
     canvas_out.setFillColorRGB(1, 1, 1)
-    for top, lines in PROJECT_BULLET_SLOTS:
+    for slot, _text in normalized_projects:
+        top, lines = PROJECT_BULLET_SLOTS[slot - 1]
         canvas_out.rect(54, page_height - top - (lines * 11.2), 520, lines * 11.2, fill=1, stroke=0)
-    for top, lines in SKILL_SLOTS:
+    for top, lines in SKILL_SLOTS[:len(skill_lines)]:
         canvas_out.rect(40, page_height - top - (lines * 11.2), 535, lines * 11.2, fill=1, stroke=0)
     canvas_out.setFillColorRGB(0, 0, 0)
     canvas_out.setFont("JobOSArial", 9.5)
-    for (top, capacity), text in zip(PROJECT_BULLET_SLOTS, project_bullets):
+    for slot, text in normalized_projects:
+        top, capacity = PROJECT_BULLET_SLOTS[slot - 1]
         words, lines, current = text.split(), [], ""
         for word in words:
             proposed = (current + " " + word).strip()
             if pdfmetrics.stringWidth(proposed, "JobOSArial", 9.5) > 492 and current:
                 lines.append(current); current = word
-            else: current = proposed
-        if current: lines.append(current)
+            else:
+                current = proposed
+        if current:
+            lines.append(current)
         if len(lines) > capacity:
-            raise ResumeTemplateError("A tailored project bullet exceeds its original PDF line capacity.")
+            raise ResumeTemplateError(f"Tailored project bullet slot {slot} exceeds its PDF line capacity.")
         canvas_out.drawString(58, page_height - top - 8, u"•")
-        for index, line in enumerate(lines): canvas_out.drawString(72, page_height - top - 8 - index * 11.2, line)
+        for line_index, line in enumerate(lines):
+            canvas_out.drawString(72, page_height - top - 8 - line_index * 11.2, line)
     for (top, capacity), item in zip(SKILL_SLOTS, skill_lines):
         text = f"{item['category']}: {item['items']}"
         if pdfmetrics.stringWidth(text, "JobOSArial", 9.5) > 525 * capacity:
             raise ResumeTemplateError("A tailored skill row exceeds its original PDF line capacity.")
         canvas_out.drawString(43.6, page_height - top - 8, text)
     canvas_out.save()
-    writer = PdfWriter(); base = PdfReader(str(reference_pdf)); layer = PdfReader(str(overlay))
-    base.pages[0].merge_page(layer.pages[0]); writer.add_page(base.pages[0])
-    with output_pdf.open("wb") as stream: writer.write(stream)
-    overlay.unlink(missing_ok=True)
+    try:
+        writer = PdfWriter(); base = PdfReader(str(reference_pdf)); layer = PdfReader(str(overlay))
+        if len(base.pages) != 1 or len(layer.pages) != 1:
+            raise ResumeTemplateError("Reference PDF overlay requires exactly one base page.")
+        base.pages[0].merge_page(layer.pages[0]); writer.add_page(base.pages[0])
+        with output_pdf.open("wb") as stream:
+            writer.write(stream)
+    finally:
+        overlay.unlink(missing_ok=True)
     return output_pdf

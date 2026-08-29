@@ -66,33 +66,57 @@ def ensure_today_budget(cur) -> None:
     )
 
 
-def price_for(cur, model_name: Optional[str]) -> Tuple[Decimal, Decimal, bool, bool]:
-    """Returns (input_per_1k, output_per_1k, is_local, is_priced)."""
+def price_for(cur, model_name: Optional[str], provider: Optional[str] = None) -> Tuple[Decimal, Decimal, bool, bool]:
+    """Returns (input_per_1k, output_per_1k, is_local, is_priced).
+
+    New runs are provider-bound. Historical component runs may predate provider
+    provenance; those rows may use a model-only fallback *only* when exactly one
+    provider owns that model name. Ambiguous multi-provider names never guess.
+    """
     name = model_name or "unknown"
-    cur.execute(
-        """
-        SELECT input_usd_per_1k, output_usd_per_1k, is_local, notes
-        FROM model_pricing WHERE model_name = %s;
-        """,
-        (name,),
-    )
-    row = cur.fetchone()
+    provider_name = (provider or "").strip().casefold()
+    row = None
+    if provider_name:
+        cur.execute(
+            """
+            SELECT input_usd_per_1k, output_usd_per_1k, is_local, notes
+            FROM model_pricing WHERE provider = %s AND model_name = %s;
+            """,
+            (provider_name, name),
+        )
+        row = cur.fetchone()
+    else:
+        cur.execute(
+            """SELECT input_usd_per_1k, output_usd_per_1k, is_local, notes, provider
+                 FROM model_pricing WHERE model_name=%s ORDER BY provider;""",
+            (name,),
+        )
+        candidates = cur.fetchall()
+        if len(candidates) == 1:
+            row = candidates[0][:4]
+            provider_name = str(candidates[0][4])
+        elif len(candidates) > 1:
+            # A pre-provider historical row cannot be priced safely once the
+            # same alias exists in multiple provider namespaces.
+            return Decimal(0), Decimal(0), False, False
+
     if not row:
-        # Unknown model: record it so it shows up as unpriced rather than
-        # vanishing from the ledger.
+        provider_name = provider_name or "unknown"
+        # Unknown model/provider. Record it so the operator sees it, but zero
+        # dollars is not considered a trustworthy price.
         cur.execute(
             """
             INSERT INTO model_pricing (model_name, provider, is_local, notes)
-            VALUES (%s, 'unknown', false, 'Auto-added. PRICING NOT SET.')
-            ON CONFLICT (model_name) DO NOTHING;
+            VALUES (%s, %s, false, 'Auto-added. PRICING NOT SET.')
+            ON CONFLICT (provider, model_name) DO NOTHING;
             """,
-            (name,),
+            (name, provider_name),
         )
         return Decimal(0), Decimal(0), False, False
 
-    in_p, out_p, is_local, notes = row
-    is_priced = is_local or not (notes or "").upper().startswith("PRICING NOT SET")
-    return Decimal(in_p or 0), Decimal(out_p or 0), bool(is_local), is_priced
+    inp, out, is_local, notes = row
+    is_priced = bool(is_local) or not str(notes or "").upper().startswith("PRICING NOT SET")
+    return Decimal(inp or 0), Decimal(out or 0), bool(is_local), is_priced
 
 
 def cmd_backfill(conn, args) -> int:
@@ -102,7 +126,7 @@ def cmd_backfill(conn, args) -> int:
         cur.execute(
             """
             SELECT cr.id::text, cr.application_id::text, cr.component_name,
-                   cr.model_name, cr.input_tokens, cr.output_tokens, cr.task_type
+                   cr.model_name, cr.model_provider, cr.input_tokens, cr.output_tokens, cr.task_type
             FROM component_runs cr
             LEFT JOIN cost_ledger cl ON cl.component_run_id = cr.id
             WHERE cl.id IS NULL
@@ -120,9 +144,9 @@ def cmd_backfill(conn, args) -> int:
 
         total = Decimal(0)
         unpriced = 0
-        for (run_id, app_id, component, model,
+        for (run_id, app_id, component, model, provider,
              in_tok, out_tok, task_type) in runs:
-            in_p, out_p, is_local, is_priced = price_for(cur, model)
+            in_p, out_p, is_local, is_priced = price_for(cur, model, provider)
             if not is_priced:
                 unpriced += 1
 
@@ -336,7 +360,7 @@ def cmd_price(conn, args) -> int:
               (model_name, provider, input_usd_per_1k, output_usd_per_1k,
                is_local, notes, updated_at)
             VALUES (%s, %s, %s, %s, %s, %s, now())
-            ON CONFLICT (model_name) DO UPDATE
+            ON CONFLICT (provider, model_name) DO UPDATE
             SET provider = EXCLUDED.provider,
                 input_usd_per_1k = EXCLUDED.input_usd_per_1k,
                 output_usd_per_1k = EXCLUDED.output_usd_per_1k,
@@ -344,7 +368,7 @@ def cmd_price(conn, args) -> int:
                 notes = EXCLUDED.notes,
                 updated_at = now();
             """,
-            (args.model, args.provider, args.input, args.output,
+            (args.model, (args.provider or "unknown").strip().casefold() or "unknown", args.input, args.output,
              args.local, args.note or "Set manually."),
         )
         conn.commit()

@@ -9,6 +9,7 @@ exact bytes.
 from __future__ import annotations
 
 import importlib.util
+import os
 from pathlib import Path
 from typing import Any
 
@@ -40,5 +41,19 @@ def render_canonical_resume(*, template: Path, output_dir: Path,
         skill_lines=list(tailoring.get("skill_lines") or []),
         project_subtitles=list(tailoring.get("project_subtitles") or []),
     )
-    pdf = renderer.export_pdf(docx, output_dir)
+    overlay_enabled = os.getenv("JOBOS_RESUME_TEMPLATE_OVERLAY_ENABLED", "false").strip().casefold() in {"1", "true", "yes", "on"}
+    reference_raw = os.getenv("JOBOS_RESUME_REFERENCE_PDF_PATH", "").strip()
+    reference_pdf = Path(reference_raw).expanduser() if reference_raw else template.expanduser().with_suffix(".pdf")
+    # The reference-PDF overlay currently owns project-bullet + skill slots.
+    # Experience/subtitle edits still require the full DOCX->PDF renderer; do
+    # not silently drop those edits merely because overlay mode is enabled.
+    overlay_compatible = not list(tailoring.get("experience_bullets") or []) and not list(tailoring.get("project_subtitles") or [])
+    if overlay_enabled and overlay_compatible:
+        pdf = renderer.export_pdf_from_reference(
+            reference_pdf=reference_pdf, output_pdf=output_dir / "resume.pdf",
+            project_bullets=list(tailoring.get("project_bullets") or []),
+            skill_lines=list(tailoring.get("skill_lines") or []),
+        )
+    else:
+        pdf = renderer.export_pdf(docx, output_dir)
     return docx, pdf
