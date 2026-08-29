@@ -6,14 +6,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import psycopg
-import requests
 from psycopg.types.json import Jsonb
 
 # Make `services.*` importable regardless of cwd/PYTHONPATH when this file
 # is run directly (`python services/profile-ingestion/<this file>.py`).
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from services.common.model_config import get_model  # noqa: E402
-from services.common.llm_gateway import embed_texts  # noqa: E402
+from services.common.llm_gateway import LLMEmbeddingResult, embed_result  # noqa: E402
 from services.common.config import database_dsn  # noqa: E402
 
 
@@ -28,15 +27,21 @@ def vector_literal(vec: List[float]) -> str:
     return "[" + ",".join(str(float(x)) for x in vec) + "]"
 
 
-def embed_query(query_text: str) -> List[float]:
-    embedding = embed_texts(
+def embed_query_result(query_text: str) -> LLMEmbeddingResult:
+    result = embed_result(
         texts=[query_text], model=EMBED_MODEL, local_url=OLLAMA_BASE_URL, timeout=120
-    )[0]
-
+    )
+    if len(result.vectors) != 1:
+        raise RuntimeError(f"Embedding backend returned {len(result.vectors)} vectors for one query.")
+    embedding = result.vectors[0]
     if len(embedding) != EMBED_DIM:
         raise RuntimeError(f"Embedding dimension mismatch: expected {EMBED_DIM}, got {len(embedding)}")
+    return result
 
-    return [float(value) for value in embedding]
+
+def embed_query(query_text: str) -> List[float]:
+    """Backward-compatible vector-only query embedding helper."""
+    return list(embed_query_result(query_text).vectors[0])
 
 
 def build_query_text(args: argparse.Namespace) -> str:
@@ -74,13 +79,14 @@ def retrieve_chunks(
     exclude_roles: Optional[List[str]],
     include_buckets: Optional[List[str]],
     exclude_buckets: Optional[List[str]],
+    embedding_model: str = EMBED_MODEL,
 ) -> List[Dict[str, Any]]:
     where = [
         "e.status = 'completed'",
         "e.embedding_model = %s",
     ]
 
-    params: List[Any] = [vector_literal(query_embedding), EMBED_MODEL]
+    params: List[Any] = [vector_literal(query_embedding), embedding_model]
 
     if include_roles:
         where.append("s.file_role = ANY(%s)")
@@ -171,6 +177,8 @@ def tokenize_query(text: str) -> List[str]:
 
 
 def compute_query_relevance(result: Dict[str, Any], query_terms: List[str]) -> float:
+    if not query_terms:
+        return 0.0
     blob = " ".join(
         [
             str(result.get("file_name") or ""),
@@ -178,23 +186,14 @@ def compute_query_relevance(result: Dict[str, Any], query_terms: List[str]) -> f
             str(result.get("category") or ""),
             str(result.get("text_content") or ""),
         ]
-    ).lower()
-
-    if not query_terms:
-        return 0.0
-
-    hits = sum(1 for term in query_terms if term in blob)
-    hit_ratio = hits / max(len(query_terms), 1)
-
-    # Extra boosts for high-value cybersecurity evidence terms.
-    high_value_terms = [
-        "linux", "forensics", "firewall", "gns3", "radius", "syslog", "nmap",
-        "tcpdump", "wireshark", "burp", "incident", "pki", "ocsp", "mitm",
-        "lockbit", "malware", "cve", "vulnerability", "network", "security"
-    ]
-    hv_hits = sum(1 for term in high_value_terms if term in blob)
-
-    return min(0.35, hit_ratio * 0.22 + hv_hits * 0.015)
+    )
+    # Use the same tokenizer on query and evidence so lexical relevance is
+    # domain-neutral and token-exact (for example ``aws`` must not match
+    # ``draws``). Provider- or role-specific keywords do not belong here.
+    blob_terms = set(tokenize_query(blob))
+    hits = sum(1 for term in query_terms if term in blob_terms)
+    hit_ratio = hits / len(query_terms)
+    return min(0.25, hit_ratio * 0.25)
 
 
 def rerank_results(
@@ -326,7 +325,14 @@ def save_retrieval(
     query_embedding: List[float],
     results: List[Dict[str, Any]],
     filters: Dict[str, Any],
+    embedding_result: LLMEmbeddingResult | None = None,
 ):
+    configured_embedding_model = embedding_result.configured_model if embedding_result else EMBED_MODEL
+    resolved_embedding_model = embedding_result.model if embedding_result else configured_embedding_model
+    embedding_provider = embedding_result.provider if embedding_result else "unknown"
+    embedding_input_tokens = embedding_result.tokens_input if embedding_result else 0
+    embedding_cost_usd = embedding_result.estimated_cost_usd if embedding_result else 0.0
+
     input_json = {
         "purpose": args.purpose,
         "role_family": args.role_family,
@@ -342,6 +348,12 @@ def save_retrieval(
     output_json = {
         "selected_chunk_ids": [r["chunk_id"] for r in results],
         "result_count": len(results),
+        "embedding": {
+            "provider": embedding_provider,
+            "configured_model": configured_embedding_model,
+            "resolved_model": resolved_embedding_model,
+            "dimension": len(query_embedding),
+        },
         "results": [
             {
                 "rank": r["rank"],
@@ -388,11 +400,11 @@ def save_retrieval(
           %s,
           %s,
           'completed',
-          'local_ollama',
+          %s,
+          %s,
           %s,
           0,
-          0,
-          0,
+          %s,
           now()
         )
         RETURNING id;
@@ -403,7 +415,10 @@ def save_retrieval(
             Jsonb(input_json),
             Jsonb(output_json),
             json.dumps(output_json, ensure_ascii=False),
-            EMBED_MODEL,
+            embedding_provider,
+            resolved_embedding_model,
+            embedding_input_tokens,
+            embedding_cost_usd,
         ),
     )
     component_run_id = cur.fetchone()[0]
@@ -449,8 +464,8 @@ def save_retrieval(
             args.purpose,
             query_text,
             args.role_family,
-            EMBED_MODEL,
-            EMBED_DIM,
+            configured_embedding_model,
+            len(query_embedding),
             vector_literal(query_embedding),
             args.max_chunks,
             args.min_similarity,
@@ -550,13 +565,17 @@ def main() -> int:
     print(f"Purpose:          {args.purpose}")
     print(f"Role family:      {args.role_family}")
     print(f"Retrieval intent: {args.retrieval_intent}")
-    print(f"Model:            {EMBED_MODEL}")
+    print(f"Default embed model: {EMBED_MODEL}")
     print(f"Max chunks:       {args.max_chunks}")
     print(f"Excluded buckets: {args.exclude_bucket}")
     print(f"Query:            {args.query}")
     print("")
 
-    query_embedding = embed_query(query_text)
+    embedding_result = embed_query_result(query_text)
+    query_embedding = list(embedding_result.vectors[0])
+    print(f"Provider:         {embedding_result.provider}")
+    print(f"Configured model: {embedding_result.configured_model}")
+    print(f"Resolved model:   {embedding_result.model}")
 
     with psycopg.connect(database_dsn()) as conn:
         with conn.cursor() as cur:
@@ -569,6 +588,7 @@ def main() -> int:
                 exclude_roles=args.exclude_role,
                 include_buckets=args.include_bucket,
                 exclude_buckets=args.exclude_bucket,
+                embedding_model=embedding_result.configured_model,
             )
 
             results = rerank_results(
@@ -586,6 +606,7 @@ def main() -> int:
                 query_embedding=query_embedding,
                 results=results,
                 filters=filters,
+                embedding_result=embedding_result,
             )
 
         conn.commit()

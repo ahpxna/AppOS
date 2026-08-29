@@ -154,10 +154,16 @@ nền) ở `http://127.0.0.1:11434` trước khi chạy service sinh nội dung.
 `services/common/llm_gateway.py` dùng OpenAI-compatible chat/completions và
 embeddings; từng role có thể override, ví dụ `JOBOS_DOCGEN_LLM_BACKEND=api`.
 Xem danh sách tên role và ví dụ đầy đủ trong `.env.example`. Dùng
-`JOBOS_*_LLM_API_STYLE=deepseek` với DeepSeek (base URL không thêm `/v1`), và
-để role `embed` dùng provider có embeddings, ví dụ OpenAI. Vì vậy có thể dùng
-DeepSeek cho analysis/coordinator và một provider khác cho CV, verification,
-và embeddings mà không sửa code.
+`JOBOS_*_LLM_API_STYLE=deepseek` với DeepSeek (base URL không thêm `/v1`). Với
+OpenAI-compatible provider, gateway giữ nguyên API root đã hoàn chỉnh như
+`.../v1`, Groq `.../openai/v1`, hoặc Gemini `.../v1beta/openai`; token API phải
+dùng HTTPS trừ loopback local và URL không được nhúng credential/query secret.
+Role `embed` phải dùng provider/model có embeddings và vẫn phải khớp
+`PROFILE_EMBED_DIM`/vector schema hiện tại. Vì vậy có thể dùng provider khác
+nhau cho analysis, document generation, verification và embedding mà không đổi
+workflow/control-plane code. Native `api.anthropic.com` is intentionally not
+pretended to be OpenAI-compatible; configure Claude through a tested compatible
+gateway/provider until a native Messages-API adapter has its own contract tests.
 
 ### Ubuntu NVIDIA/Ollama GPU doctor
 

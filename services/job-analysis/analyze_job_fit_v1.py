@@ -5,8 +5,6 @@ import os
 import re
 import sys
 import time
-import urllib.error
-import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -25,6 +23,7 @@ from services.common.observability import emit_trace, make_trace_id
 from services.common.llm_gateway import generate_text
 from services.common.model_config import get_model
 from services.common.config import database_dsn
+from services.common.ai_contracts import parse_json_object as _parse_contract_json_object
 from services.intake.posting_identity import build_posting_identity
 from services.intake.source_observation import find_and_observe_existing, observe_existing_posting
 
@@ -56,34 +55,8 @@ def read_jd_file(path: Path) -> str:
 
 
 def extract_json_object(raw: str) -> Dict[str, Any]:
-    cleaned = raw.strip()
+    return _parse_contract_json_object(raw, error_message="Job-fit output JSON must be an object.")
 
-    cleaned = re.sub(r"<think>.*?</think>", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
-    cleaned = cleaned.replace("```json", "```").replace("```JSON", "```")
-
-    fence = re.search(r"```(.*?)```", cleaned, flags=re.DOTALL)
-    if fence:
-        candidate = fence.group(1).strip()
-        try:
-            parsed = json.loads(candidate)
-            if isinstance(parsed, dict):
-                return parsed
-        except json.JSONDecodeError:
-            pass
-
-    first = cleaned.find("{")
-    last = cleaned.rfind("}")
-    if first == -1 or last == -1 or last <= first:
-        raise ValueError("Could not find JSON object in model output.")
-
-    candidate = cleaned[first:last + 1]
-    try:
-        parsed = json.loads(candidate)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"Could not parse JSON object from model output: {e}") from e
-    if not isinstance(parsed, dict):
-        raise ValueError("Job-fit model output JSON must be an object.")
-    return parsed
 
 
 def ollama_generate(

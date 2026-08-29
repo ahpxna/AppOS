@@ -4,7 +4,6 @@ import os
 import re
 import sys
 import time
-import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -14,6 +13,7 @@ import psycopg
 # is run directly (`python services/profile-ingestion/<this file>.py`).
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from services.common.model_config import get_model  # noqa: E402
+from services.common.ai_contracts import parse_json_object as _parse_contract_json_object  # noqa: E402
 from services.common.llm_gateway import chat_text  # noqa: E402
 from services.common.config import database_dsn  # noqa: E402
 
@@ -95,60 +95,13 @@ def clamp_score(value: Any, default: float) -> float:
         return default
 
 
-def strip_thinking(text: str) -> str:
-    # Handles normal <think>...</think> and incomplete thinking blocks.
-    text = re.sub(r"<think>.*?</think>", "", text, flags=re.S | re.I)
-    text = re.sub(r"^.*?</think>", "", text, flags=re.S | re.I)
-    return text.strip()
+def extract_json_object(raw: str) -> Dict[str, Any]:
+    return _parse_contract_json_object(
+        raw,
+        error_message="Structured asset audit output JSON must be an object.",
+        prefer_last=True,
+    )
 
-
-def extract_json_object(text: str) -> Dict[str, Any]:
-    text = strip_thinking(text)
-    text = re.sub(r"^```(?:json)?", "", text).strip()
-    text = re.sub(r"```$", "", text).strip()
-
-    try:
-        parsed = json.loads(text)
-        if isinstance(parsed, dict):
-            return parsed
-    except Exception:
-        pass
-
-    # Robust balanced-brace extraction: try every JSON-looking object.
-    starts = [i for i, ch in enumerate(text) if ch == "{"]
-    for start in reversed(starts):
-        depth = 0
-        in_str = False
-        esc = False
-
-        for end in range(start, len(text)):
-            ch = text[end]
-
-            if in_str:
-                if esc:
-                    esc = False
-                elif ch == "\\":
-                    esc = True
-                elif ch == '"':
-                    in_str = False
-                continue
-
-            if ch == '"':
-                in_str = True
-            elif ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    candidate = text[start:end + 1]
-                    try:
-                        parsed = json.loads(candidate)
-                        if isinstance(parsed, dict):
-                            return parsed
-                    except Exception:
-                        break
-
-    raise ValueError("Could not extract JSON object from model output.")
 
 
 def call_ollama_json(prompt: str, model: str, retries: int = 2) -> Dict[str, Any]:

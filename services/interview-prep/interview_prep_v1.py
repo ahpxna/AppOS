@@ -12,11 +12,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import sys
 import time
-import urllib.error
-import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -34,6 +31,7 @@ from services.common.observability import emit_trace, make_trace_id
 from services.common.llm_gateway import generate_text
 from services.common.model_config import get_model
 from services.common.config import database_dsn
+from services.common.ai_contracts import parse_json_object as _parse_contract_json_object
 from services.common.company_research_sources import (
     company_research_field_evidence, company_research_source_urls,
 )
@@ -48,23 +46,8 @@ def estimate_tokens(text: str) -> int:
 
 
 def extract_json_object(raw: str) -> Dict[str, Any]:
-    cleaned = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL | re.IGNORECASE)
-    cleaned = cleaned.replace("```json", "```").replace("```JSON", "```").strip()
-    fence = re.search(r"```(.*?)```", cleaned, flags=re.DOTALL)
-    if fence:
-        try:
-            parsed = json.loads(fence.group(1).strip())
-            if isinstance(parsed, dict):
-                return parsed
-        except json.JSONDecodeError:
-            pass
-    first, last = cleaned.find("{"), cleaned.rfind("}")
-    if first == -1 or last <= first:
-        raise ValueError("No JSON object found in prep output.")
-    parsed = json.loads(cleaned[first:last + 1])
-    if not isinstance(parsed, dict):
-        raise ValueError("Interview-prep output JSON must be an object.")
-    return parsed
+    return _parse_contract_json_object(raw, error_message="Interview-prep output JSON must be an object.")
+
 
 
 def ollama_generate(*, model: str, prompt: str, ollama_url: str,

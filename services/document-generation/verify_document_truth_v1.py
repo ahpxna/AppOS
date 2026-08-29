@@ -29,11 +29,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import sys
 import time
-import urllib.error
-import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
 
@@ -69,6 +66,7 @@ from services.common.document_prompt_templates_v1 import (
     requirement_catalog,
 )
 from services.common.config import database_dsn
+from services.common.ai_contracts import parse_json_object as _parse_contract_json_object
 from services.common.value_coercion import coerce_bool
 
 VERIFIER_VERSION = "truth_quality_checker_v5_selected_fit_soft_degrade_2026_08_25"
@@ -84,23 +82,8 @@ def estimate_tokens(text: str) -> int:
 
 
 def extract_json_object(raw: str) -> Dict[str, Any]:
-    cleaned = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL | re.IGNORECASE)
-    cleaned = cleaned.replace("```json", "```").replace("```JSON", "```").strip()
-    fence = re.search(r"```(.*?)```", cleaned, flags=re.DOTALL)
-    if fence:
-        try:
-            parsed = json.loads(fence.group(1).strip())
-            if isinstance(parsed, dict):
-                return parsed
-        except json.JSONDecodeError:
-            pass
-    first, last = cleaned.find("{"), cleaned.rfind("}")
-    if first == -1 or last <= first:
-        raise ValueError("No JSON object found in verifier output.")
-    parsed = json.loads(cleaned[first:last + 1])
-    if not isinstance(parsed, dict):
-        raise ValueError("Verifier output JSON must be an object.")
-    return parsed
+    return _parse_contract_json_object(raw, error_message="Verifier output JSON must be an object.")
+
 
 
 def ollama_generate(

@@ -109,3 +109,75 @@ def test_deepseek_style_is_rejected_for_embeddings(monkeypatch):
 
     with pytest.raises(llm_gateway.LLMGatewayError, match="embedding-capable"):
         llm_gateway.embed_texts(texts=["unit"])
+
+
+def test_openai_compatible_endpoint_preserves_known_complete_api_roots():
+    assert llm_gateway._api_endpoint(
+        "https://api.groq.com/openai/v1", "chat/completions"
+    ) == "https://api.groq.com/openai/v1/chat/completions"
+    assert llm_gateway._api_endpoint(
+        "https://generativelanguage.googleapis.com/v1beta/openai", "chat/completions"
+    ) == "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+    # Preserve historical behavior for custom proxy subpaths that are not an
+    # explicitly complete OpenAI-compatible root.
+    assert llm_gateway._api_endpoint(
+        "https://proxy.example.test/api", "chat/completions"
+    ) == "https://proxy.example.test/api/v1/chat/completions"
+
+
+def test_api_backend_rejects_insecure_or_secret_bearing_base_urls(monkeypatch):
+    monkeypatch.setenv("JOBOS_LLM_BACKEND", "api")
+    monkeypatch.setenv("JOBOS_LLM_API_KEY", "unit-test-token")
+
+    monkeypatch.setenv("JOBOS_LLM_API_BASE", "http://api.example.test/v1")
+    with pytest.raises(llm_gateway.LLMGatewayError, match="requires HTTPS"):
+        llm_gateway.resolve_config(role="docgen", model="unit")
+
+    monkeypatch.setenv("JOBOS_LLM_API_BASE", "https://user:secret@api.example.test/v1")
+    with pytest.raises(llm_gateway.LLMGatewayError, match="must not contain credentials"):
+        llm_gateway.resolve_config(role="docgen", model="unit")
+
+    monkeypatch.setenv("JOBOS_LLM_API_BASE", "https://api.example.test/v1?token=secret")
+    with pytest.raises(llm_gateway.LLMGatewayError, match="must not contain credentials"):
+        llm_gateway.resolve_config(role="docgen", model="unit")
+
+    monkeypatch.setenv("JOBOS_LLM_API_BASE", "https://api.anthropic.com")
+    with pytest.raises(llm_gateway.LLMGatewayError, match="Native Anthropic Messages API is not implemented"):
+        llm_gateway.resolve_config(role="docgen", model="unit")
+
+    monkeypatch.setenv("JOBOS_LLM_API_BASE", "http://127.0.0.1:9000/v1")
+    assert llm_gateway.resolve_config(role="docgen", model="unit").base_url == "http://127.0.0.1:9000/v1"
+
+
+def test_embedding_result_records_configured_and_resolved_provider_identity(monkeypatch, no_cost_db):
+    monkeypatch.setenv("JOBOS_LLM_BACKEND", "api")
+    monkeypatch.setenv("JOBOS_LLM_API_BASE", "https://generativelanguage.googleapis.com/v1beta/openai")
+    monkeypatch.setenv("JOBOS_LLM_API_KEY", "unit-test-token")
+    monkeypatch.setenv("JOBOS_LLM_API_MODEL", "configured-embed-model")
+    calls = []
+
+    def fake_post(url, payload, *, timeout, api_key=None):
+        calls.append((url, payload, timeout, api_key))
+        return {
+            "id": "embed-request-1",
+            "model": "resolved-embed-model",
+            "usage": {"prompt_tokens": 7},
+            "data": [{"embedding": [0.25, 0.75]}],
+        }
+
+    monkeypatch.setattr(llm_gateway, "_post_json", fake_post)
+    result = llm_gateway.embed_result(texts=["hello"], timeout=4)
+
+    assert result.vectors == [[0.25, 0.75]]
+    assert result.provider == "gemini"
+    assert result.configured_model == "configured-embed-model"
+    assert result.model == "resolved-embed-model"
+    assert result.tokens_input == 7
+    assert result.request_id == "embed-request-1"
+    assert calls[0][0] == "https://generativelanguage.googleapis.com/v1beta/openai/embeddings"
+
+
+def test_embedding_inputs_reject_scalar_string(monkeypatch):
+    monkeypatch.setenv("JOBOS_LLM_BACKEND", "ollama")
+    with pytest.raises(llm_gateway.LLMGatewayError, match="sequence of strings"):
+        llm_gateway.embed_result(texts="not-a-batch")

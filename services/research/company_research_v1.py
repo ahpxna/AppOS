@@ -55,6 +55,7 @@ from psycopg.types.json import Jsonb
 
 from services.common.observability import emit_trace, make_trace_id
 from services.common.config import database_dsn
+from services.common.ai_contracts import parse_json_object as _parse_contract_json_object
 from services.ats.registry import detect_ats_platform
 
 from services.common.openclaw_runtime import resolve_openclaw_binary
@@ -136,28 +137,8 @@ def unwrap_agent_payload(raw: str) -> str:
 
 
 def extract_json_object(raw: str) -> Dict[str, Any]:
-    inner = unwrap_agent_payload(raw)
+    return _parse_contract_json_object(raw, preprocess=unwrap_agent_payload, error_message="Research output JSON must be an object.")
 
-    inner = inner.replace("```json", "```").replace("```JSON", "```").strip()
-    fence = re.search(r"```(.*?)```", inner, flags=re.DOTALL)
-    if fence:
-        try:
-            parsed = json.loads(fence.group(1).strip())
-            if isinstance(parsed, dict):
-                return parsed
-        except json.JSONDecodeError:
-            pass
-
-    first, last = inner.find("{"), inner.rfind("}")
-    if first == -1 or last <= first:
-        raise ValueError(
-            "Agent replied without a JSON object. Reply began: "
-            + inner.strip()[:200]
-        )
-    parsed = json.loads(inner[first:last + 1])
-    if not isinstance(parsed, dict):
-        raise ValueError("Research output JSON must be an object.")
-    return parsed
 
 
 # ---------------------------------------------------------------- prompt

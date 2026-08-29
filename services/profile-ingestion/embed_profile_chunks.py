@@ -1,19 +1,17 @@
 import hashlib
-import json
 import os
 import sys
 from pathlib import Path
 from typing import List
 
 import psycopg
-import requests
 from psycopg.types.json import Jsonb
 
 # Make `services.*` importable regardless of cwd/PYTHONPATH when this file
 # is run directly (`python services/profile-ingestion/<this file>.py`).
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from services.common.model_config import get_model  # noqa: E402
-from services.common.llm_gateway import embed_texts  # noqa: E402
+from services.common.llm_gateway import LLMEmbeddingResult, embed_result, resolve_config  # noqa: E402
 from services.common.config import database_dsn  # noqa: E402
 
 
@@ -57,21 +55,27 @@ def build_embedding_text(row) -> str:
     ).strip()
 
 
-def embed_text(text: str) -> List[float]:
-    emb = embed_texts(
+def embed_text_result(text: str) -> LLMEmbeddingResult:
+    result = embed_result(
         texts=[text], model=EMBED_MODEL, local_url=OLLAMA_BASE_URL, timeout=120
-    )[0]
-
+    )
+    if len(result.vectors) != 1:
+        raise RuntimeError(f"Embedding backend returned {len(result.vectors)} vectors for one chunk.")
+    emb = result.vectors[0]
     if len(emb) != EMBED_DIM:
         raise RuntimeError(
             f"Embedding dim mismatch. Expected {EMBED_DIM}, got {len(emb)}. "
             f"Change PROFILE_EMBED_DIM and migration/table if using another model."
         )
+    return result
 
-    return [float(value) for value in emb]
+
+def embed_text(text: str) -> List[float]:
+    """Backward-compatible vector-only helper."""
+    return list(embed_text_result(text).vectors[0])
 
 
-def fetch_chunks(cur, limit: int):
+def fetch_chunks(cur, limit: int, embedding_model: str = EMBED_MODEL):
     cur.execute(
         """
         SELECT
@@ -101,7 +105,7 @@ def fetch_chunks(cur, limit: int):
         ORDER BY rf.file_name, pc.chunk_index
         LIMIT %s;
         """,
-        (EMBED_MODEL, limit),
+        (embedding_model, limit),
     )
     return cur.fetchall()
 
@@ -110,7 +114,10 @@ def main() -> int:
     limit = int(sys.argv[1]) if len(sys.argv) >= 2 else 100
 
     print("===== PROFILE CHUNK EMBEDDER =====")
-    print(f"Model: {EMBED_MODEL}")
+    config = resolve_config(role="embed", model=EMBED_MODEL, local_url=OLLAMA_BASE_URL)
+    configured_model = config.model
+    print(f"Configured model: {configured_model}")
+    print(f"Provider: {config.provider}")
     print(f"Dim:   {EMBED_DIM}")
     print(f"Limit: {limit}")
     print("")
@@ -120,7 +127,7 @@ def main() -> int:
 
     with psycopg.connect(database_dsn()) as conn:
         with conn.cursor() as cur:
-            rows = fetch_chunks(cur, limit)
+            rows = fetch_chunks(cur, limit, configured_model)
             print(f"Chunks selected: {len(rows)}")
 
             for row in rows:
@@ -135,7 +142,8 @@ def main() -> int:
                 print(f"- {file_name} chunk {chunk_index}")
 
                 try:
-                    emb = embed_text(emb_text)
+                    embedding_result = embed_text_result(emb_text)
+                    emb = list(embedding_result.vectors[0])
 
                     cur.execute(
                         """
@@ -160,7 +168,7 @@ def main() -> int:
                         (
                             chunk_id,
                             file_id,
-                            EMBED_MODEL,
+                            embedding_result.configured_model,
                             EMBED_DIM,
                             h,
                             vector_literal(emb),
@@ -193,11 +201,11 @@ def main() -> int:
                           %s,
                           %s,
                           'completed',
-                          'local_ollama',
+                          %s,
+                          %s,
                           %s,
                           0,
-                          0,
-                          0,
+                          %s,
                           now()
                         );
                         """,
@@ -208,7 +216,9 @@ def main() -> int:
                             chunk_id,
                             Jsonb(
                                 {
-                                    "embedding_model": EMBED_MODEL,
+                                    "embedding_model": embedding_result.configured_model,
+                                    "resolved_model": embedding_result.model,
+                                    "provider": embedding_result.provider,
                                     "embedding_dim": EMBED_DIM,
                                     "content_hash": h,
                                 }
@@ -219,7 +229,10 @@ def main() -> int:
                                     "status": "completed",
                                 }
                             ),
-                            EMBED_MODEL,
+                            embedding_result.provider,
+                            embedding_result.model,
+                            embedding_result.tokens_input,
+                            embedding_result.estimated_cost_usd,
                         ),
                     )
 
@@ -250,7 +263,7 @@ def main() -> int:
                             (
                                 chunk_id,
                                 file_id,
-                                EMBED_MODEL,
+                                configured_model,
                                 EMBED_DIM,
                                 h,
                                 str(e),
@@ -284,7 +297,7 @@ def main() -> int:
                               %s,
                               'failed',
                               %s,
-                              'local_ollama',
+                              %s,
                               %s,
                               0,
                               0,
@@ -297,10 +310,11 @@ def main() -> int:
                                 TASK_TYPE,
                                 file_id,
                                 chunk_id,
-                                Jsonb({"embedding_model": EMBED_MODEL, "content_hash": h}),
+                                Jsonb({"embedding_model": configured_model, "content_hash": h}),
                                 Jsonb({}),
                                 str(e),
-                                EMBED_MODEL,
+                                config.provider,
+                                configured_model,
                             ),
                         )
                     conn.commit()

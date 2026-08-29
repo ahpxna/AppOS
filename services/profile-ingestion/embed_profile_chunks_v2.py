@@ -1,10 +1,7 @@
 import argparse
-import json
 import os
 import sys
 import time
-import urllib.request
-import urllib.error
 from pathlib import Path
 from typing import List, Optional
 
@@ -14,7 +11,7 @@ import psycopg
 # is run directly (`python services/profile-ingestion/<this file>.py`).
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from services.common.model_config import get_model  # noqa: E402
-from services.common.llm_gateway import embed_texts  # noqa: E402
+from services.common.llm_gateway import LLMEmbeddingResult, embed_result, resolve_config  # noqa: E402
 from services.common.config import database_dsn  # noqa: E402
 
 
@@ -23,22 +20,24 @@ MODEL = get_model("embed")
 VERSION = "profile_chunk_embedder_v2_sources_2026_04_27"
 
 
-def embed_text(text: str, model: str = MODEL, retries: int = 3) -> List[float]:
+def embed_text_result(text: str, model: str = MODEL, retries: int = 3) -> LLMEmbeddingResult:
     last_error: Optional[Exception] = None
     for attempt in range(1, retries + 1):
         try:
-            embedding = embed_texts(
-                texts=[text], model=model, local_url=OLLAMA_URL, timeout=180
-            )[0]
-            if not embedding:
-                raise RuntimeError("Embedding backend returned an empty vector.")
-            return [float(value) for value in embedding]
+            result = embed_result(texts=[text], model=model, local_url=OLLAMA_URL, timeout=180)
+            if len(result.vectors) != 1 or not result.vectors[0]:
+                raise RuntimeError("Embedding backend returned an invalid vector batch.")
+            return result
         except Exception as e:
             last_error = e
             if attempt < retries:
                 time.sleep(2 * attempt)
-
     raise RuntimeError(f"LLM embedding failed after {retries} retries: {last_error}")
+
+
+def embed_text(text: str, model: str = MODEL, retries: int = 3) -> List[float]:
+    """Backward-compatible vector-only helper."""
+    return list(embed_text_result(text, model=model, retries=retries).vectors[0])
 
 
 def vector_literal(values: List[float]) -> str:
@@ -167,7 +166,12 @@ def main() -> int:
     print("===== PROFILE CHUNK EMBEDDER V2 =====")
     print(f"Version: {VERSION}")
     print(f"Mode:    {'APPLY' if args.apply else 'DRY-RUN'}")
-    print(f"Model:   {args.model}")
+    config = resolve_config(role="embed", model=args.model, local_url=OLLAMA_URL)
+    configured_model = config.model
+    expected_dim = int(os.getenv("PROFILE_EMBED_DIM", "768"))
+    print(f"Configured model: {configured_model}")
+    print(f"Provider: {config.provider}")
+    print(f"Expected dim: {expected_dim}")
     print(f"Limit:   {args.limit}")
     print("")
 
@@ -200,7 +204,13 @@ def main() -> int:
 
                 cur.execute("SAVEPOINT chunk_embed_sp")
                 try:
-                    emb = embed_text(text_content, model=args.model)
+                    embedding_result = embed_text_result(text_content, model=args.model)
+                    emb = list(embedding_result.vectors[0])
+                    if len(emb) != expected_dim:
+                        raise RuntimeError(
+                            f"Embedding dim mismatch. Expected {expected_dim}, got {len(emb)}. "
+                            "Change PROFILE_EMBED_DIM and vector schema before using another dimension."
+                        )
                     lit = vector_literal(emb)
 
                     cur.execute(
@@ -213,7 +223,7 @@ def main() -> int:
                     )
 
                     if args.write_log_table:
-                        insert_embedding_log_if_possible(cur, chunk_id, lit, args.model, len(emb))
+                        insert_embedding_log_if_possible(cur, chunk_id, lit, embedding_result.configured_model, len(emb))
 
                     cur.execute("RELEASE SAVEPOINT chunk_embed_sp")
 

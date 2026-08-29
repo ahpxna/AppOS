@@ -4,7 +4,6 @@ import os
 import re
 import sys
 import time
-import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -14,6 +13,7 @@ import psycopg
 # is run directly (`python services/profile-ingestion/<this file>.py`).
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from services.common.model_config import get_model  # noqa: E402
+from services.common.ai_contracts import parse_json_object as _parse_contract_json_object  # noqa: E402
 from services.common.llm_gateway import chat_text  # noqa: E402
 from services.common.config import database_dsn  # noqa: E402
 
@@ -69,23 +69,8 @@ Return at most 8 evidence units per document. Prefer fewer, richer, high-signal 
 
 
 def parse_json_content(content: str) -> Dict[str, Any]:
-    text = content.strip()
-    text = re.sub(r"^```(?:json)?", "", text).strip()
-    text = re.sub(r"```$", "", text).strip()
+    return _parse_contract_json_object(content, error_message="Model output JSON must be an object.")
 
-    try:
-        parsed = json.loads(text)
-        if isinstance(parsed, dict):
-            return parsed
-    except json.JSONDecodeError:
-        pass
-    start = text.find("{")
-    end = text.rfind("}")
-    if start >= 0 and end > start:
-        parsed = json.loads(text[start:end + 1])
-        if isinstance(parsed, dict):
-            return parsed
-    raise ValueError("Model output JSON must be an object.")
 
 
 def call_ollama_json(prompt: str, model: str, retries: int = 2) -> Dict[str, Any]:

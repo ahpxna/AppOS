@@ -23,11 +23,8 @@ import argparse
 import json
 import math
 import os
-import re
 import sys
 import time
-import urllib.error
-import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
@@ -63,9 +60,10 @@ from services.common.document_prompt_templates_v1 import (
     RESUME_TARGET_COVERAGE_PERCENT, COVER_POSITIONING_TARGET_PERCENT,
     build_resume_tailoring_prompt, build_cover_alignment_blueprint_prompt,
     build_cover_alignment_audit_prompt, build_cover_letter_tailoring_prompt,
-    material_requirement_summary, requirement_catalog,
+    material_requirement_summary,
 )
 from services.common.config import database_dsn
+from services.common.ai_contracts import parse_json_object as _parse_contract_json_object
 from services.common.value_coercion import coerce_bool
 from services.control_plane.document_attempts import (
     DocumentAttemptError, claim as claim_document_attempt,
@@ -107,25 +105,8 @@ def estimate_tokens(text: str) -> int:
 
 
 def extract_json_object(raw: str) -> Dict[str, Any]:
-    cleaned = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL | re.IGNORECASE)
-    cleaned = cleaned.replace("```json", "```").replace("```JSON", "```").strip()
+    return _parse_contract_json_object(raw, error_message="Model output JSON must be an object.")
 
-    fence = re.search(r"```(.*?)```", cleaned, flags=re.DOTALL)
-    if fence:
-        try:
-            parsed = json.loads(fence.group(1).strip())
-            if isinstance(parsed, dict):
-                return parsed
-        except json.JSONDecodeError:
-            pass
-
-    first, last = cleaned.find("{"), cleaned.rfind("}")
-    if first == -1 or last <= first:
-        raise ValueError("No JSON object found in model output.")
-    parsed = json.loads(cleaned[first:last + 1])
-    if not isinstance(parsed, dict):
-        raise ValueError("Model output JSON must be an object.")
-    return parsed
 
 
 def ollama_generate(

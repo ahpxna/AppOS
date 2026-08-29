@@ -3,7 +3,6 @@ import json
 import os
 import re
 import time
-import urllib.request
 from collections import defaultdict
 from typing import Any, Dict, List, Optional
 
@@ -20,6 +19,7 @@ from common import jobos_safety as _safety  # noqa: E402
 from common.llm_gateway import chat_text as _chat_text  # noqa: E402
 from common import model_config as _model_config  # noqa: E402
 from common.config import database_dsn  # noqa: E402
+from common.ai_contracts import parse_json_object as _parse_contract_json_object  # noqa: E402
 
 
 
@@ -113,23 +113,8 @@ def clamp_float(value: Any, default: float = 0.80) -> float:
 
 
 def parse_json_content(content: str) -> Dict[str, Any]:
-    text = content.strip()
-    text = re.sub(r"^```(?:json)?", "", text).strip()
-    text = re.sub(r"```$", "", text).strip()
+    return _parse_contract_json_object(content, error_message="Model output JSON must be an object.")
 
-    try:
-        parsed = json.loads(text)
-        if isinstance(parsed, dict):
-            return parsed
-    except json.JSONDecodeError:
-        pass
-    start = text.find("{")
-    end = text.rfind("}")
-    if start >= 0 and end > start:
-        parsed = json.loads(text[start:end + 1])
-        if isinstance(parsed, dict):
-            return parsed
-    raise ValueError("Model output JSON must be an object.")
 
 
 def call_ollama_json(prompt: str, model: str, retries: int = 2) -> Dict[str, Any]:

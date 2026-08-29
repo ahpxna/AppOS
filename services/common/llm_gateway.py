@@ -14,10 +14,12 @@ Configuration:
   JOBOS_LLM_API_STYLE=openai|deepseek           (default: openai)
   JOBOS_<ROLE>_API_MODEL=...                    (optional API model override)
 
-``api`` uses the OpenAI-compatible chat/completions and embeddings interfaces.
-The ``deepseek`` style preserves DeepSeek's documented base URL shape, which
-does not append ``/v1``.  Use an embedding-capable provider (for example
-OpenAI) for the ``embed`` role when the chat provider lacks embeddings.
+``api`` uses OpenAI-compatible chat/completions and embeddings interfaces.
+The ``deepseek`` style preserves DeepSeek's root-base URL convention. Other
+compatible providers may publish an explicit API root (for example ``/openai/v1``
+or Gemini's ``/v1beta/openai``); the gateway appends resources without inserting
+a second ``/v1``. Use an embedding-capable provider for the ``embed`` role when
+the chat provider lacks embeddings.
 """
 from __future__ import annotations
 
@@ -60,6 +62,17 @@ class LLMResult:
     request_id: str | None = None
 
 
+@dataclass(frozen=True)
+class LLMEmbeddingResult:
+    vectors: list[list[float]]
+    provider: str
+    configured_model: str
+    model: str
+    tokens_input: int
+    estimated_cost_usd: float
+    request_id: str | None = None
+
+
 def _role_prefix(role: str) -> str:
     return role.upper().replace("-", "_")
 
@@ -77,7 +90,36 @@ def _provider_name(base_url: str, api_style: str, explicit: str | None = None) -
         return "deepseek"
     if "anthropic" in host:
         return "anthropic"
+    if "generativelanguage.googleapis.com" in host:
+        return "gemini"
+    if "groq.com" in host:
+        return "groq"
+    if "together" in host:
+        return "together"
+    if "huggingface" in host:
+        return "huggingface"
     return api_style
+
+
+def _validate_api_base(base_url: str) -> None:
+    parsed = urlsplit(base_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise LLMGatewayError("JOBOS_LLM_API_BASE must be an absolute http(s) URL.")
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise LLMGatewayError(
+            "JOBOS_LLM_API_BASE must not contain credentials, query parameters, or fragments."
+        )
+    host = parsed.hostname.casefold()
+    if parsed.scheme == "http" and host not in {"127.0.0.1", "localhost", "::1"}:
+        raise LLMGatewayError(
+            "Paid/token API traffic requires HTTPS unless the API endpoint is loopback-local."
+        )
+    if host == "api.anthropic.com" or host.endswith(".api.anthropic.com"):
+        raise LLMGatewayError(
+            "Native Anthropic Messages API is not implemented by this OpenAI-compatible gateway; "
+            "use a tested compatible gateway/provider instead of silently sending the wrong schema."
+        )
+
 
 def resolve_config(*, role: str, model: str | None = None,
                    local_url: str | None = None) -> LLMConfig:
@@ -122,6 +164,7 @@ def resolve_config(*, role: str, model: str | None = None,
             "API backend selected but JOBOS_LLM_API_KEY is not set. "
             "Put the token in your untracked .env or shell, never in git."
         )
+    _validate_api_base(base_url)
     provider = _provider_name(
         base_url, api_style,
         os.getenv(f"JOBOS_{prefix}_LLM_API_PROVIDER") or os.getenv("JOBOS_LLM_API_PROVIDER"),
@@ -131,18 +174,23 @@ def resolve_config(*, role: str, model: str | None = None,
 
 
 def _api_endpoint(base_url: str, resource: str, *, style: str = "openai") -> str:
-    """Build a provider endpoint without forcing DeepSeek through ``/v1``.
+    """Append a resource to the configured provider API root exactly once.
 
-    OpenAI-compatible gateways conventionally expose ``.../v1``. DeepSeek's
-    documented OpenAI-compatible base URL is the host root instead, so style
-    is explicit rather than guessed from a hostname or a secret-bearing URL.
+    OpenAI-compatible bases ending in ``/v1`` are already complete. Gemini's
+    compatibility root ends in ``/v1beta/openai`` and is also complete. Other
+    bases keep the historical behavior of receiving ``/v1`` so existing custom
+    proxy configurations are not silently reinterpreted. DeepSeek keeps its
+    root-base convention.
     """
     root = base_url.rstrip("/")
     if style == "deepseek":
         if root.endswith("/v1"):
             root = root[:-3]
         return root + "/" + resource
-    return root + "/" + resource if root.endswith("/v1") else root + "/v1/" + resource
+    path = urlsplit(root).path.rstrip("/")
+    if path.endswith("/v1") or path.endswith("/v1beta/openai"):
+        return root + "/" + resource
+    return root + "/v1/" + resource
 
 
 def _post_json(url: str, payload: dict[str, Any], *, timeout: int,
@@ -375,41 +423,60 @@ def _embedding_vector(value: Any) -> list[float] | None:
         result.append(number)
     return result
 
-def embed_texts(*, texts: Sequence[str], model: str | None = None,
-                local_url: str | None = None, timeout: int = 180) -> list[list[float]]:
-    """Embed a batch with the same paid-budget/per-call accounting boundary."""
+def embed_result(*, texts: Sequence[str], model: str | None = None,
+                 local_url: str | None = None, timeout: int = 180) -> LLMEmbeddingResult:
+    """Embed a batch and return canonical provider/model/accounting metadata."""
     config = resolve_config(role="embed", model=model, local_url=local_url)
-    if not texts:
-        return []
+    if isinstance(texts, (str, bytes)):
+        raise LLMGatewayError("Embedding inputs must be a sequence of strings, not one scalar string.")
+    text_list = list(texts)
+    if not text_list:
+        return LLMEmbeddingResult(
+            vectors=[], provider=config.provider, configured_model=config.model, model=config.model,
+            tokens_input=0, estimated_cost_usd=0.0, request_id=None,
+        )
+    if any(not isinstance(text, str) for text in text_list):
+        raise LLMGatewayError("Embedding inputs must be strings.")
     if config.backend == "api" and config.api_style == "deepseek":
         raise LLMGatewayError(
             "DeepSeek API style is not an embedding-capable endpoint; configure an embedding-capable provider for role='embed'."
         )
     request_sha256 = _sha_payload({"kind": "embed", "provider": config.provider,
-                                   "model": config.model, "texts": list(texts)})
-    input_est = sum(_estimate_tokens(text) for text in texts)
+                                   "model": config.model, "texts": text_list})
+    input_est = sum(_estimate_tokens(text) for text in text_list)
     reservation = None
     if config.backend == "api":
         from .llm_cost_accounting_v1 import reserve_paid_call
-        # Embeddings have no completion tokens.
         reservation = reserve_paid_call(role="embed", provider=config.provider, model=config.model,
                                         estimated_input_tokens=input_est, max_output_tokens=0,
                                         request_sha256=request_sha256, request_kind='embed')
     try:
         if config.backend == "ollama":
-            response = _post_json(config.base_url + "/api/embed", {"model": config.model, "input": list(texts)}, timeout=timeout)
+            response = _post_json(
+                config.base_url + "/api/embed",
+                {"model": config.model, "input": text_list},
+                timeout=timeout,
+            )
             embeddings = response.get("embeddings")
             if embeddings is None:
                 embeddings = []
-                for text in texts:
-                    legacy = _post_json(config.base_url + "/api/embeddings", {"model": config.model, "prompt": text}, timeout=timeout)
+                for text in text_list:
+                    legacy = _post_json(
+                        config.base_url + "/api/embeddings",
+                        {"model": config.model, "prompt": text},
+                        timeout=timeout,
+                    )
                     vector = _embedding_vector(legacy.get("embedding"))
                     if vector is None:
                         raise LLMGatewayError("Ollama embedding backend returned no valid vector.")
                     embeddings.append(vector)
         else:
-            response = _post_json(_api_endpoint(config.base_url, "embeddings", style=config.api_style),
-                                  {"model": config.model, "input": list(texts)}, timeout=timeout, api_key=config.api_key)
+            response = _post_json(
+                _api_endpoint(config.base_url, "embeddings", style=config.api_style),
+                {"model": config.model, "input": text_list},
+                timeout=timeout,
+                api_key=config.api_key,
+            )
             data = response.get("data")
             if not isinstance(data, list):
                 data = []
@@ -421,27 +488,47 @@ def embed_texts(*, texts: Sequence[str], model: str | None = None,
     except Exception as exc:
         if reservation is not None:
             from .llm_cost_accounting_v1 import mark_paid_call_uncertain
-            mark_paid_call_uncertain(reservation, role="embed", configured_model=config.model,
-                                     estimated_input_tokens=input_est, error=str(exc))
+            mark_paid_call_uncertain(
+                reservation, role="embed", configured_model=config.model,
+                estimated_input_tokens=input_est, error=str(exc),
+            )
         raise
-    if len(embeddings) != len(texts) or any(_embedding_vector(v) is None for v in embeddings):
+    normalized = [_embedding_vector(value) for value in embeddings] if isinstance(embeddings, list) else []
+    if len(normalized) != len(text_list) or any(vector is None for vector in normalized):
         if reservation is not None:
             from .llm_cost_accounting_v1 import mark_paid_call_uncertain
-            mark_paid_call_uncertain(reservation, role="embed", configured_model=config.model,
-                                     estimated_input_tokens=input_est, error="provider returned invalid embedding batch")
+            mark_paid_call_uncertain(
+                reservation, role="embed", configured_model=config.model,
+                estimated_input_tokens=input_est, error="provider returned invalid embedding batch",
+            )
         raise LLMGatewayError(f"{config.backend} embedding backend returned an invalid batch.")
+    vectors = [vector for vector in normalized if vector is not None]
     input_tokens, _ = _usage(response, fallback_input=input_est, fallback_output_text="")
     resolved_model = str(response.get("model") or config.model)
     request_id = str(response.get("id")) if response.get("id") else None
+    cost = 0.0
     if reservation is not None:
         from .llm_cost_accounting_v1 import settle_paid_call
-        settle_paid_call(reservation, role="embed", configured_model=config.model, resolved_model=resolved_model,
-                         input_tokens=input_tokens, output_tokens=0, request_id=request_id,
-                         response_sha256=_sha_payload({"embeddings": embeddings}))
+        cost = float(settle_paid_call(
+            reservation, role="embed", configured_model=config.model, resolved_model=resolved_model,
+            input_tokens=input_tokens, output_tokens=0, request_id=request_id,
+            response_sha256=_sha_payload({"embeddings": vectors}),
+        ))
     else:
         from .llm_cost_accounting_v1 import record_local_call
-        record_local_call(role="embed", provider="ollama", model=resolved_model,
-                          input_tokens=input_tokens, output_tokens=0, request_id=request_id,
-                          request_sha256=request_sha256, response_sha256=_sha_payload({"embeddings": embeddings}),
-                          request_kind='embed')
-    return embeddings
+        record_local_call(
+            role="embed", provider="ollama", model=resolved_model,
+            input_tokens=input_tokens, output_tokens=0, request_id=request_id,
+            request_sha256=request_sha256, response_sha256=_sha_payload({"embeddings": vectors}),
+            request_kind='embed',
+        )
+    return LLMEmbeddingResult(
+        vectors=vectors, provider=config.provider, configured_model=config.model, model=resolved_model,
+        tokens_input=input_tokens, estimated_cost_usd=cost, request_id=request_id,
+    )
+
+
+def embed_texts(*, texts: Sequence[str], model: str | None = None,
+                local_url: str | None = None, timeout: int = 180) -> list[list[float]]:
+    """Backward-compatible vector-only embedding API."""
+    return embed_result(texts=texts, model=model, local_url=local_url, timeout=timeout).vectors
