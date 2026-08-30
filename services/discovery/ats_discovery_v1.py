@@ -52,7 +52,7 @@ import logging
 import psycopg
 from psycopg.types.json import Jsonb
 from services.discovery.immigration_intelligence import record_jd_immigration_assessment
-from services.common.config import database_dsn
+from services.common.config import database_dsn, env_int
 from services.common.value_coercion import coerce_bool
 from services.common.search_preferences import preference_reason
 from services.ats.contracts import canonical_job_url, infer_work_mode, jd_is_complete, normalize_work_mode
@@ -70,31 +70,22 @@ USER_AGENT = "jobos-ats-discovery/1 (personal job search tool, contact via GitHu
 REQUEST_TIMEOUT = 30
 
 
-def _env_int(name: str, default: int, low: int, high: int) -> int:
-    """Bound numeric environment input without making a typo an import crash."""
-    try:
-        value = int(os.getenv(name, str(default)))
-    except (TypeError, ValueError):
-        value = default
-    return max(low, min(value, high))
-
-
-STALE_CLOSE_DAYS = _env_int("JOBOS_STALE_CLOSE_DAYS", 14, 1, 3650)
+STALE_CLOSE_DAYS = env_int("JOBOS_STALE_CLOSE_DAYS", 14, minimum=1, maximum=3650)
 ATS_FINALIZATION_GRACE_SECONDS = 45
-ATS_PERIODIC_TIMEOUT_SECONDS = _env_int("JOBOS_ATS_PERIODIC_TIMEOUT_SECONDS", 1320, 180, 7200)
+ATS_PERIODIC_TIMEOUT_SECONDS = env_int("JOBOS_ATS_PERIODIC_TIMEOUT_SECONDS", 1320, minimum=180, maximum=7200)
 ATS_PROCESS_DEADLINE_SECONDS = max(120, min(
-    _env_int("JOBOS_ATS_PROCESS_DEADLINE_SECONDS", 1200, 120, 3600),
+    env_int("JOBOS_ATS_PROCESS_DEADLINE_SECONDS", 1200, minimum=120, maximum=3600),
     3600,
     ATS_PERIODIC_TIMEOUT_SECONDS - ATS_FINALIZATION_GRACE_SECONDS,
 ))
 ATS_RUN_DEADLINE_SECONDS = max(60, min(
-    _env_int("JOBOS_ATS_RUN_DEADLINE_SECONDS", 1200, 60, 3600),
+    env_int("JOBOS_ATS_RUN_DEADLINE_SECONDS", 1200, minimum=60, maximum=3600),
     ATS_PROCESS_DEADLINE_SECONDS,
 ))
 # Detail fetches are bounded to leave finalization time before the periodic
 # process timeout; no source may create an unbounded `running` ledger row.
 DETAIL_REQUEST_BUDGET = min(
-    _env_int("JOBOS_ATS_DETAIL_REQUEST_BUDGET", 100, 1, 1000),
+    env_int("JOBOS_ATS_DETAIL_REQUEST_BUDGET", 100, minimum=1, maximum=1000),
     max(1, (ATS_RUN_DEADLINE_SECONDS - 60) // REQUEST_TIMEOUT),
 )
 

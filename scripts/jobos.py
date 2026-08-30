@@ -528,12 +528,7 @@ def status() -> int:
     load_repo_env()
     runtime = {"running": False}
 
-    def pid_alive(value: object) -> bool:
-        try:
-            os.kill(int(value), 0)
-            return True
-        except (TypeError, ValueError, OSError):
-            return False
+    from scripts.jobos_runtime_supervisor import _is_supervisor_process
     try:
         runtime_path = ROOT / ".jobos" / "run" / "runtime.json"
         if runtime_path.is_file():
@@ -545,7 +540,7 @@ def status() -> int:
             except Exception:
                 pid = runtime.get("supervisor_pid")
             runtime["supervisor_pid"] = pid
-            runtime["running"] = pid_alive(pid)
+            runtime["running"] = _is_supervisor_process(pid)
             services = runtime.get("services") if isinstance(runtime.get("services"), dict) else {}
             fallback_required = {"orchestrator", "privileged-actions", "browser-worker",
                                  "browser-state-watcher", "document-revision"}

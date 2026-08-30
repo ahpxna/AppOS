@@ -110,6 +110,21 @@ def test_profile_bootstrap_uses_the_v1_constraint_set():
     assert '"-c", str(CONSTRAINTS)' in profile_ready
 
 
+def test_first_run_bootstrap_supports_root_and_installs_daily_tk_ui():
+    bootstrap = (ROOT / "scripts" / "bootstrap_ubuntu_24.sh").read_text(encoding="utf-8")
+    assert "${EUID}" in bootstrap
+    assert "python3-tk" in bootstrap
+    assert "unknown option" in bootstrap
+    assert "scripts/migration_lint.py" in bootstrap
+    assert "scripts/jobos.py doctor --profile core --strict" in bootstrap
+
+
+def test_all_release_python_install_paths_use_constraints():
+    dockerfile = (ROOT / "Dockerfile.market-intelligence").read_text(encoding="utf-8")
+    assert "COPY constraints-v1.txt" in dockerfile
+    assert "-c /tmp/jobos-constraints-v1.txt" in dockerfile
+
+
 def test_v1_constraints_cover_direct_python_runtime_dependencies():
     constraints = (ROOT / "constraints-v1.txt").read_text(encoding="utf-8").lower()
     required = {
@@ -123,6 +138,7 @@ def test_v1_constraints_cover_direct_python_runtime_dependencies():
         "requests",
         "websocket-client",
         "reportlab",
+        "regex",
     }
     missing = sorted(name for name in required if name not in constraints)
     assert missing == [], f"missing V1 release constraints: {missing}"

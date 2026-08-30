@@ -24,6 +24,10 @@ It does not start Ollama, OpenClaw, or any token-charging worker.
 EOF
   exit 0
 fi
+if [[ $# -gt 1 || ($# -eq 1 && "${1:-}" != "--with-n8n") ]]; then
+  echo "ERROR: unknown option. Usage: bash scripts/bootstrap_ubuntu_24.sh [--with-n8n]" >&2
+  exit 2
+fi
 
 need_command python3 "Install Python 3.11+ and retry."
 python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' || {
@@ -38,8 +42,14 @@ docker compose version >/dev/null 2>&1 || {
 
 if command -v apt-get >/dev/null 2>&1; then
   echo "Installing Ubuntu packages (Python venv/pip and optional OCR binaries)..."
-  sudo apt-get update
-  sudo apt-get install -y python3-venv python3-pip poppler-utils tesseract-ocr libreoffice-writer
+  apt_prefix=()
+  if [[ ${EUID} -ne 0 ]]; then
+    need_command sudo "Run as root or install sudo, then retry."
+    apt_prefix=(sudo)
+  fi
+  "${apt_prefix[@]}" apt-get update
+  "${apt_prefix[@]}" apt-get install -y \
+    python3-venv python3-pip python3-tk poppler-utils tesseract-ocr libreoffice-writer
 fi
 
 if [[ ! -f .env ]]; then
@@ -82,7 +92,9 @@ for _ in $(seq 1 30); do
 done
 docker exec jobos-postgres pg_isready -U jobos -d job_apply_os >/dev/null
 
+.venv/bin/python scripts/migration_lint.py
 .venv/bin/python scripts/apply_migrations.py
+.venv/bin/python scripts/jobos.py doctor --profile core --strict
 echo
 echo "Bootstrap complete. Next: source .venv/bin/activate"
 echo "Optional LLM/OpenClaw setup is separate; see docs/ubuntu_bootstrap.md."

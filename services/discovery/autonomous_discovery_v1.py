@@ -25,7 +25,7 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from services.common.config import database_dsn
+from services.common.config import database_dsn, env_int
 from services.common.profile_job_matching import unique_terms
 from services.discovery.linkedin_discovery_v1 import validate_search_request
 from services.discovery.linkedin_intake_v1 import queue_discovery_task, queue_saved_sync_task, safe_discovery_reissue
@@ -44,14 +44,6 @@ def _truthy(name: str, default: bool = False) -> bool:
     if raw is None:
         return default
     return raw.strip().casefold() in {"1", "true", "yes", "on"}
-
-
-def _bounded_int(name: str, default: int, low: int, high: int) -> int:
-    try:
-        value = int(os.getenv(name, str(default)))
-    except ValueError:
-        value = default
-    return max(low, min(value, high))
 
 
 def _preferences(cur) -> dict[str, Any]:
@@ -129,7 +121,9 @@ def _fingerprint(request: dict[str, Any]) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
 
 
-def build_linkedin_plan(cur, *, now: float | None = None) -> list[dict[str, Any]]:
+def build_linkedin_plan(
+    cur, *, now: float | None = None, scan_all: bool = False,
+) -> list[dict[str, Any]]:
     """Build a rotating bounded search plan from approved profile + preferences."""
     prefs = _preferences(cur)
     terms = _prioritized_terms(cur)
@@ -138,7 +132,7 @@ def build_linkedin_plan(cur, *, now: float | None = None) -> list[dict[str, Any]
     locations = _literal_locations(prefs.get("location_allow_patterns")) or [""]
     work_modes = [str(x).strip() for x in (prefs.get("allowed_work_modes") or []) if str(x).strip()][:8]
     employment = [str(x).strip() for x in (prefs.get("allowed_employment_types") or []) if str(x).strip()][:8]
-    max_results = _bounded_int("JOBOS_LINKEDIN_DISCOVERY_MAX_RESULTS", 3, 1, 5)
+    max_results = env_int("JOBOS_LINKEDIN_DISCOVERY_MAX_RESULTS", 3, minimum=1, maximum=5)
 
     candidates: list[dict[str, Any]] = []
     for term in terms:
@@ -158,17 +152,17 @@ def build_linkedin_plan(cur, *, now: float | None = None) -> list[dict[str, Any]
     # of hard-coding three searches per six hours.  The per-query rolling
     # cooldown below still prevents repeated searches; this only controls how
     # quickly the durable cursor reaches every distinct candidate.
-    interval_seconds = _bounded_int("JOBOS_PROFILE_DISCOVERY_INTERVAL_SECONDS", 900, 60, 86400)
-    target_hours = _bounded_int("JOBOS_LINKEDIN_TARGET_COVERAGE_HOURS", 24, 1, 168)
+    interval_seconds = env_int("JOBOS_PROFILE_DISCOVERY_INTERVAL_SECONDS", 900, minimum=60, maximum=86400)
+    target_hours = env_int("JOBOS_LINKEDIN_TARGET_COVERAGE_HOURS", 24, minimum=1, maximum=168)
     cycles_in_target = max(1, int((target_hours * 3600) / interval_seconds))
     adaptive = max(1, math.ceil(len(candidates) / cycles_in_target))
-    configured_floor = _bounded_int("JOBOS_LINKEDIN_SEARCHES_PER_CYCLE", 3, 1, 20)
+    configured_floor = env_int("JOBOS_LINKEDIN_SEARCHES_PER_CYCLE", 3, minimum=1, maximum=20)
     per_cycle = min(20, max(configured_floor, adaptive))
     if locations == [""] and prefs.get("location_allow_patterns"):
         # Regex-only locations cannot be faithfully translated to LinkedIn's
         # location input. Widen the autonomous read pool, then enforce the exact
         # regex after intake. Manual discovery retains its smaller cap.
-        max_results = _bounded_int("JOBOS_LINKEDIN_REGEX_LOCATION_MAX_RESULTS", 20, 3, 20)
+        max_results = env_int("JOBOS_LINKEDIN_REGEX_LOCATION_MAX_RESULTS", 20, minimum=3, maximum=20)
         candidates = [{**item, "max_results": max_results} for item in candidates]
     if hasattr(cur, "execute"):
         cur.execute("SELECT cursor FROM discovery_scheduler_state WHERE scheduler_key=%s;", (PLANNER_KEY,))
@@ -177,7 +171,10 @@ def build_linkedin_plan(cur, *, now: float | None = None) -> list[dict[str, Any]
         row = None
     start = int(row[0] or 0) % len(candidates) if row else 0
     ordered = candidates[start:] + candidates[:start]
-    return ordered[: min(per_cycle, len(candidates))]
+    # Scheduling needs the whole ordered matrix so it can scan beyond entries
+    # that are cooling down or durably blocked.  Public/dry planner consumers
+    # retain the bounded per-cycle projection by default.
+    return ordered if scan_all else ordered[: min(per_cycle, len(candidates))]
 
 
 def _coverage_requirements(cur) -> dict[str, int]:
@@ -186,11 +183,11 @@ def _coverage_requirements(cur) -> dict[str, int]:
     terms = _prioritized_terms(cur)
     locations = _literal_locations(prefs.get("location_allow_patterns")) or ([""] if terms else [])
     matrix_size = len(terms) * len(locations)
-    interval_seconds = _bounded_int("JOBOS_PROFILE_DISCOVERY_INTERVAL_SECONDS", 900, 60, 86400)
-    target_hours = _bounded_int("JOBOS_LINKEDIN_TARGET_COVERAGE_HOURS", 24, 1, 168)
+    interval_seconds = env_int("JOBOS_PROFILE_DISCOVERY_INTERVAL_SECONDS", 900, minimum=60, maximum=86400)
+    target_hours = env_int("JOBOS_LINKEDIN_TARGET_COVERAGE_HOURS", 24, minimum=1, maximum=168)
     cycles_in_target = max(1, int((target_hours * 3600) / interval_seconds))
     required = math.ceil(matrix_size / cycles_in_target) if matrix_size else 0
-    configured_floor = _bounded_int("JOBOS_LINKEDIN_SEARCHES_PER_CYCLE", 3, 1, 20)
+    configured_floor = env_int("JOBOS_LINKEDIN_SEARCHES_PER_CYCLE", 3, minimum=1, maximum=20)
     return {
         "matrix_size": matrix_size,
         "target_hours": target_hours,
@@ -314,7 +311,7 @@ def _failed_task_action(
             if cur.fetchone():
                 return None, None
         return None, "non_retryable_failure"
-    retry_delay = _bounded_int("JOBOS_LINKEDIN_FAILED_RETRY_COOLDOWN_SECONDS", 300, 60, 3600)
+    retry_delay = env_int("JOBOS_LINKEDIN_FAILED_RETRY_COOLDOWN_SECONDS", 300, minimum=60, maximum=3600)
     finished_at = latest[3]
     if finished_at is not None and now_value - finished_at.timestamp() < retry_delay:
         return None, "retry_backoff"
@@ -331,8 +328,8 @@ def _retryable_failed_key(cur, *, base_key: str, task_type: str, now_value: floa
 
 def run_once(cur, *, apply: bool, now: float | None = None) -> dict[str, Any]:
     now_value = time.time() if now is None else float(now)
-    cooldown = _bounded_int("JOBOS_LINKEDIN_DISCOVERY_COOLDOWN_SECONDS", 21600, 3600, 604800)
-    max_queued = _bounded_int("JOBOS_DISCOVERY_MAX_QUEUED_TASKS", 6, 1, 50)
+    cooldown = env_int("JOBOS_LINKEDIN_DISCOVERY_COOLDOWN_SECONDS", 21600, minimum=3600, maximum=604800)
+    max_queued = env_int("JOBOS_DISCOVERY_MAX_QUEUED_TASKS", 6, minimum=1, maximum=50)
     if apply:
         # One planner transaction owns cursor/cooldown decisions at a time.
         cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s));", (PLANNER_KEY,))
@@ -356,7 +353,7 @@ def run_once(cur, *, apply: bool, now: float | None = None) -> dict[str, Any]:
     # before ordinary matrix searches so a large search matrix cannot starve it.
     saved_result: dict[str, Any] | None = None
     if saved_enabled and autonomous_enabled:
-        saved_cooldown = _bounded_int("JOBOS_LINKEDIN_SAVED_SYNC_COOLDOWN_SECONDS", 21600, 3600, 604800)
+        saved_cooldown = env_int("JOBOS_LINKEDIN_SAVED_SYNC_COOLDOWN_SECONDS", 21600, minimum=3600, maximum=604800)
         saved_base_key = "jobos:auto-linkedin-saved"
         if slots <= 0:
             saved_result = {"created": False, "reason": "backpressure", "idempotency_key": saved_base_key}
@@ -377,8 +374,8 @@ def run_once(cur, *, apply: bool, now: float | None = None) -> dict[str, Any]:
                 saved_key = _occurrence_key(saved_base_key, now_value)
             if saved_key:
                 sync_id, task_id, created = queue_saved_sync_task(
-                    cur, max_results=_bounded_int("JOBOS_LINKEDIN_SAVED_MAX_RESULTS", 10, 1, 20),
-                    timeout=_bounded_int("JOBOS_LINKEDIN_SAVED_TIMEOUT_SECONDS", 600, 60, 1800),
+                    cur, max_results=env_int("JOBOS_LINKEDIN_SAVED_MAX_RESULTS", 10, minimum=1, maximum=20),
+                    timeout=env_int("JOBOS_LINKEDIN_SAVED_TIMEOUT_SECONDS", 600, minimum=60, maximum=1800),
                     requested_by=PLANNER_KEY, autonomous=True, idempotency_key=saved_key,
                 )
                 if created:
@@ -413,11 +410,13 @@ def run_once(cur, *, apply: bool, now: float | None = None) -> dict[str, Any]:
     # matrix entries are due.  Coverage feasibility is reported from physical
     # queue capacity above rather than pretending every planned candidate can be
     # admitted.
-    planned = build_linkedin_plan(cur, now=now_value)
+    planned = build_linkedin_plan(cur, now=now_value, scan_all=True)
+    admission_budget = min(slots, coverage["required_searches_per_cycle"])
+    admitted = 0
     considered = 0
     if linkedin_capable and autonomous_enabled:
         for request in planned:
-            if slots <= 0:
+            if slots <= 0 or admitted >= admission_budget:
                 break
             considered += 1
             fingerprint = _fingerprint(request)
@@ -440,7 +439,7 @@ def run_once(cur, *, apply: bool, now: float | None = None) -> dict[str, Any]:
                     key = _occurrence_key(base_key, now_value)
                 task_id, created = queue_discovery_task(
                     cur, request=request,
-                    timeout=_bounded_int("JOBOS_LINKEDIN_DISCOVERY_TIMEOUT_SECONDS", 300, 60, 1800),
+                    timeout=env_int("JOBOS_LINKEDIN_DISCOVERY_TIMEOUT_SECONDS", 300, minimum=60, maximum=1800),
                     requested_by=PLANNER_KEY, autonomous=True, idempotency_key=key,
                 )
                 if created:
@@ -454,6 +453,7 @@ def run_once(cur, *, apply: bool, now: float | None = None) -> dict[str, Any]:
                            "idempotency_key": key, "search": request})
             if created:
                 slots -= 1
+                admitted += 1
         if apply and considered:
             cur.execute(
                 "UPDATE discovery_scheduler_state SET cursor=%s,updated_at=now() WHERE scheduler_key=%s;",

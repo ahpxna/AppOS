@@ -15,6 +15,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from psycopg.types.json import Jsonb
+from services.ats.contracts import WorkMode, normalize_work_mode
 from services.discovery.immigration_intelligence import record_jd_immigration_assessment
 from services.intake.posting_identity import build_posting_identity
 from services.intake.source_observation import find_and_observe_existing, observe_existing_posting
@@ -22,7 +23,6 @@ from services.intake.source_observation import find_and_observe_existing, observ
 
 MIN_JD_CHARS = 200
 SOURCE_OPTIONS = {"manual_paste", "linkedin_copy", "company_career_page", "recruiter", "job_board", "referral"}
-WORK_MODES = {"", "remote", "hybrid", "on_site", "unknown"}
 
 
 class ManualIntakeError(ValueError):
@@ -54,7 +54,12 @@ def normalize_draft(draft: JobDraft) -> JobDraft:
     job_title = _clean(draft.job_title, limit=300)
     jd_text = (draft.jd_text or "").strip()
     source = _clean(draft.source, limit=80).lower().replace(" ", "_") or "manual_paste"
-    work_mode = _clean(draft.work_mode, limit=40).lower().replace("-", "_") or "unknown"
+    raw_work_mode = _clean(draft.work_mode, limit=40)
+    normalized_work_mode = normalize_work_mode(raw_work_mode)
+    normalized_raw = raw_work_mode.casefold().replace("-", "_").replace(" ", "_")
+    if raw_work_mode and normalized_work_mode is WorkMode.UNKNOWN and normalized_raw != "unknown":
+        raise ManualIntakeError("Choose a work mode from the form options.")
+    work_mode = normalized_work_mode.value
     job_url = (draft.job_url or "").strip()
     if not company:
         raise ManualIntakeError("Company name is required.")
@@ -64,8 +69,6 @@ def normalize_draft(draft: JobDraft) -> JobDraft:
         raise ManualIntakeError(f"Paste at least {MIN_JD_CHARS} characters of the job description.")
     if source not in SOURCE_OPTIONS:
         raise ManualIntakeError("Choose a source from the form options.")
-    if work_mode not in WORK_MODES:
-        raise ManualIntakeError("Choose a work mode from the form options.")
     if job_url:
         parsed = urlparse(job_url)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:

@@ -68,7 +68,7 @@ services:
       - >-
         while true; do
           python services/discovery/market_demand_intelligence_v1.py process --apply || true;
-          sleep "$$JOBOS_MARKET_WORKER_POLL_SECONDS";
+          sleep "$${JOBOS_MARKET_WORKER_POLL_SECONDS:-45}";
         done
 
 volumes:

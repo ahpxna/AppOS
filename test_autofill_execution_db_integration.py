@@ -7,6 +7,7 @@ The test never falls back to the developer's JobOS database.
 from __future__ import annotations
 
 import hashlib
+import argparse
 import json
 import os
 
@@ -24,7 +25,28 @@ def test_migrations_054_058_support_one_durable_autofill_lifecycle():
         pytest.fail("JOBOS_TEST_DSN must explicitly name a disposable test database")
 
     psycopg = pytest.importorskip("psycopg")
+    # This module is also collected before tests/integration on a plain
+    # ``pytest`` run. Make the gate self-contained instead of relying on a
+    # different test module's session fixture to initialize the disposable DB.
+    from scripts import apply_migrations
+    original = apply_migrations.connection_string
+    apply_migrations.connection_string = lambda: TEST_DSN
+    try:
+        assert apply_migrations.apply(
+            argparse.Namespace(dry_run=False, adopt_existing=False, through=None)
+        ) == 0
+    finally:
+        apply_migrations.connection_string = original
     with psycopg.connect(TEST_DSN) as conn, conn.cursor() as cur:
+        cur.execute(
+            """SELECT
+                 (SELECT count(*) FROM applications WHERE source='mock'),
+                 (SELECT count(*) FROM browser_tasks WHERE task_type='test_open_url' AND requested_by='manual_seed'),
+                 (SELECT count(*) FROM raw_files WHERE source='mock_seed'),
+                 (SELECT count(*) FROM profile_facts WHERE evidence_source='mock_profile_summary.md'),
+                 (SELECT count(*) FROM allowed_domains WHERE domain='example.com' AND category='test')"""
+        )
+        assert cur.fetchone() == (0, 0, 0, 0, 0), "production migrations must not leave test fixtures"
         cur.execute("SELECT 1 FROM schema_migrations WHERE migration_id = '058_autofill_exact_action_scope.sql'")
         assert cur.fetchone(), "apply all migrations through 058 before this test"
         cur.execute("SELECT 1 FROM schema_migrations WHERE migration_id = '096_db_authority_final_invariants.sql'")

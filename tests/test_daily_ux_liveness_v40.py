@@ -99,7 +99,8 @@ def test_paid_call_budget_ownership_is_immutable_across_midnight():
 def test_status_rejects_stale_runtime_file_and_infra_flags_are_independent():
     jobos = _source("scripts/jobos.py")
     supervisor = _source("scripts/jobos_runtime_supervisor.py")
-    assert 'runtime["running"] = pid_alive(pid)' in jobos
+    assert 'runtime["running"] = _is_supervisor_process(pid)' in jobos
+    assert "def _is_supervisor_process" in supervisor
     start = supervisor[supervisor.index("def _start_infra"):supervisor.index("def start")]
     assert 'if not _truthy("JOBOS_RUNTIME_START_POSTGRES", True):\n        return' not in start
     assert 'JOBOS_RUNTIME_START_POSTGRES' in start

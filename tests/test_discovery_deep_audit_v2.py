@@ -10,6 +10,7 @@ import pytest
 from services.ats.contracts import WorkMode, infer_work_mode
 from services.common.config import env_float, env_int
 from services.common.search_preferences import preference_reason
+from services.intake.manual_job_intake import JobDraft, ManualIntakeError, normalize_draft
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -40,6 +41,14 @@ def test_work_mode_authority_normalizes_on_site_and_does_not_reject_unknown():
         preferences={"allowed_work_modes": ["remote"]},
     ) == "work_mode_not_preferred"
     assert infer_work_mode("", "NY", "This position is on-site in our office.") == WorkMode.ON_SITE
+
+
+def test_manual_intake_uses_canonical_work_mode_authority():
+    base = dict(company="Acme", job_title="Engineer", jd_text="x" * 250)
+    assert normalize_draft(JobDraft(**base, work_mode="On-site")).work_mode == "on_site"
+    assert normalize_draft(JobDraft(**base, work_mode="on_site")).work_mode == "on_site"
+    with pytest.raises(ManualIntakeError):
+        normalize_draft(JobDraft(**base, work_mode="sometimes_remote"))
 
 
 def test_location_regex_cli_preserves_commas_and_supports_json_array():
@@ -184,7 +193,7 @@ def test_saved_sync_reserves_first_available_queue_slot(monkeypatch):
     })
     monkeypatch.setattr(mod, "approved_terms", lambda cur: ["Engineer"])
 
-    def plan(cur, *, now=None):
+    def plan(cur, *, now=None, scan_all=False):
         return [{"keywords": "Engineer", "location": "", "max_results": 3}]
 
     monkeypatch.setattr(mod, "build_linkedin_plan", plan)
@@ -221,16 +230,17 @@ def test_queue_admission_scans_past_cooldown_candidates(monkeypatch):
     monkeypatch.setenv("JOBOS_DISCOVERY_MAX_QUEUED_TASKS", "1")
     monkeypatch.setattr(mod, "_enroll_observed_ats_sources", lambda cur: 0)
     monkeypatch.setattr(mod, "_active_planner_tasks", lambda cur: 0)
-    monkeypatch.setattr(mod, "approved_terms", lambda cur: ["A", "B"] )
+    monkeypatch.setattr(mod, "approved_terms", lambda cur: ["cooldown", "due"])
+    monkeypatch.setattr(mod, "_preferences", lambda cur: {
+        "location_allow_patterns": [], "allowed_work_modes": [],
+        "allowed_employment_types": [], "freshness_days": 30,
+    })
+    monkeypatch.setattr(mod, "_prioritized_terms", lambda cur: ["cooldown", "due"])
+    monkeypatch.setenv("JOBOS_LINKEDIN_SEARCHES_PER_CYCLE", "1")
     monkeypatch.setattr(mod, "_coverage_requirements", lambda cur: {
         "matrix_size": 2, "target_hours": 24, "cycles_in_target": 96,
         "required_searches_per_cycle": 1,
     })
-    planned = [
-        {"keywords": "cooldown", "location": "", "max_results": 3},
-        {"keywords": "due", "location": "", "max_results": 3},
-    ]
-    monkeypatch.setattr(mod, "build_linkedin_plan", lambda cur, **kwargs: planned)
     monkeypatch.setattr(mod, "_failed_task_action", lambda *a, **k: (None, None))
 
     queued: list[str] = []
@@ -315,9 +325,6 @@ def test_status_surfaces_ats_source_health_not_only_wrapper_health():
 def test_no_unbounded_raw_numeric_env_parsers_remain_outside_safe_helpers():
     offenders: list[str] = []
     allowed_helpers = {
-        "services/discovery/ats_discovery_v1.py",
-        "services/discovery/autonomous_discovery_v1.py",
-        "services/runtime/periodic_tasks_v1.py",
         # Embedding dimension is a persisted/vector-shape authority.  A typo
         # must fail fast rather than silently substituting another dimension.
         "services/profile-ingestion/embed_profile_chunks.py",
@@ -330,3 +337,151 @@ def test_no_unbounded_raw_numeric_env_parsers_remain_outside_safe_helpers():
             if rel not in allowed_helpers:
                 offenders.append(rel)
     assert offenders == []
+
+
+def test_supervisor_state_never_reports_ready_when_db_heartbeat_failed(monkeypatch, tmp_path):
+    mod = _load("scripts/jobos_runtime_supervisor.py", "supervisor_db_ready_test")
+    monkeypatch.setattr(mod, "STATE_FILE", tmp_path / "runtime.json")
+
+    class Process:
+        pid = 123
+        def poll(self): return None
+
+    spec = mod.WorkerSpec("required", ("python",), required=True)
+    children = {"required": Process()}
+    specs = {"required": spec}
+    mod._write_state(
+        children, {}, specs, {}, "00000000-0000-0000-0000-000000000001",
+        database_ok=False, database_error="connection refused",
+    )
+    state = json.loads(mod.STATE_FILE.read_text())
+    assert state["ready"] is False
+    assert state["database_health"]["available"] is False
+
+    mod._write_state(
+        children, {}, specs, {}, "00000000-0000-0000-0000-000000000001",
+        database_ok=True,
+    )
+    assert json.loads(mod.STATE_FILE.read_text())["ready"] is True
+
+
+def test_supervisor_operational_intervals_are_bounded_and_typo_safe(monkeypatch):
+    mod = _load("scripts/jobos_runtime_supervisor.py", "supervisor_safe_intervals_test")
+    monkeypatch.setenv("JOBOS_ATS_POLL_INTERVAL_SECONDS", "not-a-number")
+    monkeypatch.setenv("JOBOS_PROFILE_DISCOVERY_INTERVAL_SECONDS", "0")
+    monkeypatch.setenv("JOBOS_AUTONOMOUS_DISCOVERY_ENABLED", "true")
+    specs = mod._specs()
+    assert specs["ats-discovery"].argv[-1] == "900"
+    assert specs["profile-discovery"].argv[-1] == "60"
+
+
+def test_supervisor_heartbeat_recovers_missing_parent_and_surfaces_degraded_health(monkeypatch):
+    mod = _load("scripts/jobos_runtime_supervisor.py", "supervisor_heartbeat_recovery_test")
+    import psycopg
+    statements: list[str] = []
+
+    class Cursor:
+        rows = []
+        one = None
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def execute(self, sql, params=()):
+            normalized = " ".join(sql.lower().split())
+            statements.append(normalized)
+            if "from schema_migrations" in normalized:
+                from scripts.apply_migrations import checksum, migration_files
+                self.one = (checksum(migration_files()[-1]),)
+                self.rows = []
+            elif "from periodic_task_health" in normalized:
+                self.rows = [("ats-discovery",)]
+                self.one = None
+            elif "from ats_companies" in normalized:
+                self.rows = [("source-1",)]
+                self.one = None
+            else:
+                self.rows = []
+                self.one = None
+        def fetchone(self): return self.one
+        def fetchall(self): return list(self.rows)
+
+    class Connection:
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def cursor(self): return Cursor()
+        def commit(self): pass
+
+    monkeypatch.setattr(psycopg, "connect", lambda *args, **kwargs: Connection())
+
+    class Process:
+        pid = 123
+        def poll(self): return None
+
+    spec = mod.WorkerSpec("required", ("python",), required=True)
+    available, health_error = mod._db_runtime_heartbeat(
+        "00000000-0000-0000-0000-000000000001",
+        {"required": Process()}, {}, {"required": spec}, {},
+    )
+    assert available is True
+    assert health_error == "periodic=ats-discovery; ats_sources=source-1"
+    assert any("insert into runtime_instances" in sql and "on conflict (id) do update" in sql
+               for sql in statements)
+
+
+def test_supervisor_readiness_fails_closed_on_missing_latest_migration(monkeypatch):
+    mod = _load("scripts/jobos_runtime_supervisor.py", "supervisor_migration_ready_test")
+    import psycopg
+
+    class Cursor:
+        rows = []
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def execute(self, sql, params=()): self.rows = []
+        def fetchone(self): return None
+        def fetchall(self): return list(self.rows)
+
+    class Connection:
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def cursor(self): return Cursor()
+        def commit(self): pass
+
+    monkeypatch.setattr(psycopg, "connect", lambda *args, **kwargs: Connection())
+    available, health_error = mod._db_runtime_heartbeat(
+        "00000000-0000-0000-0000-000000000001", {}, {}, {}, {},
+    )
+    assert available is True
+    assert health_error and "migration_not_current=100_remove_legacy_production_mock_seeds.sql" in health_error
+
+
+def test_supervisor_pid_identity_rejects_reused_unrelated_pid(monkeypatch):
+    mod = _load("scripts/jobos_runtime_supervisor.py", "supervisor_pid_identity_test")
+    from types import SimpleNamespace
+    monkeypatch.setattr(mod, "_alive", lambda pid: True)
+    monkeypatch.setattr(
+        mod.subprocess, "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout="/usr/bin/python unrelated_worker.py"),
+    )
+    assert mod._is_supervisor_process(123) is False
+    monkeypatch.setattr(
+        mod.subprocess, "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0, stdout="/venv/bin/python /repo/scripts/jobos_runtime_supervisor.py daemon"
+        ),
+    )
+    assert mod._is_supervisor_process(123) is True
+
+
+def test_supervisor_stop_never_signals_unproven_stale_pid(monkeypatch, tmp_path):
+    mod = _load("scripts/jobos_runtime_supervisor.py", "supervisor_safe_stop_test")
+    pid_file = tmp_path / "supervisor.pid"
+    state_file = tmp_path / "runtime.json"
+    pid_file.write_text("999")
+    state_file.write_text("{}")
+    monkeypatch.setattr(mod, "SUPERVISOR_PID", pid_file)
+    monkeypatch.setattr(mod, "STATE_FILE", state_file)
+    monkeypatch.setattr(mod, "_is_supervisor_process", lambda pid: False)
+    signals: list[tuple[int, int]] = []
+    monkeypatch.setattr(mod.os, "kill", lambda pid, sig: signals.append((pid, sig)))
+    assert mod.stop() == 0
+    assert signals == []
+    assert not pid_file.exists() and not state_file.exists()

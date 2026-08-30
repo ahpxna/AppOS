@@ -115,3 +115,4 @@ def test_doctor_uses_dynamic_latest_migration_and_configured_template():
 def test_verify_pipeline_defaults_to_core_profile():
     source = (ROOT / "scripts/verify_pipeline.sh").read_text()
     assert 'JOBOS_VERIFY_PROFILE:-core' in source
+    assert 'JOBOS_PYTHON:-.venv/bin/python' in source

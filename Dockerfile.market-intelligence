@@ -4,6 +4,7 @@ WORKDIR /app
 
 # This worker only needs PostgreSQL transport; source code is mounted
 # read-only by Compose so it cannot silently rewrite the project.
-RUN pip install --no-cache-dir "psycopg[binary]"
+COPY constraints-v1.txt /tmp/jobos-constraints-v1.txt
+RUN pip install --no-cache-dir -c /tmp/jobos-constraints-v1.txt "psycopg[binary]>=3.2.3,<4"
 
 CMD ["python", "services/discovery/market_demand_intelligence_v1.py", "process", "--apply"]

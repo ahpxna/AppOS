@@ -17,6 +17,7 @@
     "python -m compileall -q scripts services",
     "python scripts/migration_lint.py",
     "python -m pytest -q --ignore=tests/integration",
+    "python scripts/apply_migrations.py (against the disposable test database)",
     "JOBOS_RUN_DB_INTEGRATION=1 JOBOS_TEST_DSN=<disposable-test-dsn> python -m pytest -q tests/integration test_autofill_execution_db_integration.py",
     "python scripts/build_release.py --output dist/jobos-v0.1.0-source.zip"
   ],

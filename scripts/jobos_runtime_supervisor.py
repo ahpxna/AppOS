@@ -24,7 +24,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from services.common.config import database_dsn, load_repo_env
+from services.common.config import database_dsn, env_int, load_repo_env
 from services.runtime.process_runner import DEFAULT_PROCESS_RUNNER
 
 RUN_DIR = ROOT / ".jobos" / "run"
@@ -68,6 +68,25 @@ def _alive(pid: int | None) -> bool:
         return False
 
 
+def _is_supervisor_process(pid: int | None) -> bool:
+    """Prove a persisted PID still belongs to this supervisor before trust/kill.
+
+    PID reuse is normal after a crash or reboot. A stale file must never make
+    ``status`` report an unrelated process as JobOS or let ``stop`` signal it.
+    """
+    if not _alive(pid):
+        return False
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(int(pid)), "-o", "command="],
+            text=True, capture_output=True, check=False, timeout=3,
+        )
+    except (OSError, subprocess.TimeoutExpired, TypeError, ValueError):
+        return False
+    command = result.stdout.strip()
+    return result.returncode == 0 and "jobos_runtime_supervisor.py" in command and "daemon" in command
+
+
 def _read_pid() -> int | None:
     try:
         return int(SUPERVISOR_PID.read_text().strip())
@@ -88,7 +107,9 @@ def _specs() -> dict[str, WorkerSpec]:
         "ats-discovery": WorkerSpec(
             "ats-discovery",
             (sys.executable, "-m", "services.runtime.periodic_tasks_v1", "ats-discovery",
-             "--interval-seconds", os.getenv("JOBOS_ATS_POLL_INTERVAL_SECONDS", "900")),
+             "--interval-seconds", str(env_int(
+                 "JOBOS_ATS_POLL_INTERVAL_SECONDS", 900, minimum=60, maximum=86400
+             ))),
             required=False,
         ),
     }
@@ -98,7 +119,9 @@ def _specs() -> dict[str, WorkerSpec]:
         specs["profile-discovery"] = WorkerSpec(
             "profile-discovery",
             (sys.executable, "-m", "services.runtime.periodic_tasks_v1", "profile-discovery",
-             "--interval-seconds", os.getenv("JOBOS_PROFILE_DISCOVERY_INTERVAL_SECONDS", "900")),
+             "--interval-seconds", str(env_int(
+                 "JOBOS_PROFILE_DISCOVERY_INTERVAL_SECONDS", 900, minimum=60, maximum=86400
+             ))),
             required=False,
         )
     if (os.getenv("JOBOS_TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")) and (
@@ -111,7 +134,9 @@ def _specs() -> dict[str, WorkerSpec]:
         specs["repo-freshness"] = WorkerSpec(
             "repo-freshness",
             (sys.executable, "-m", "services.runtime.periodic_tasks_v1", "repo-freshness",
-             "--interval-seconds", os.getenv("JOBOS_REPO_FRESHNESS_INTERVAL_SECONDS", "3600")),
+             "--interval-seconds", str(env_int(
+                 "JOBOS_REPO_FRESHNESS_INTERVAL_SECONDS", 3600, minimum=60, maximum=86400
+             ))),
             required=False,
         )
     return specs
@@ -135,13 +160,52 @@ def _db_runtime_start(runtime_instance_id: str) -> None:
 
 
 def _db_runtime_heartbeat(runtime_instance_id: str, children: dict[str, subprocess.Popen[Any]],
-                          restarts: dict[str, int], specs: dict[str, WorkerSpec], degraded: dict[str, str]) -> None:
+                          restarts: dict[str, int], specs: dict[str, WorkerSpec],
+                          degraded: dict[str, str]) -> tuple[bool, str | None]:
     try:
         import psycopg
         with psycopg.connect(database_dsn(), autocommit=False) as conn, conn.cursor() as cur:
+            from scripts.apply_migrations import checksum, migration_files
+            latest_path = migration_files()[-1]
             cur.execute(
-                """UPDATE runtime_instances SET status=%s,heartbeat_at=now() WHERE id=%s::uuid;""",
-                ("degraded" if degraded else "running", runtime_instance_id),
+                "SELECT checksum_sha256 FROM schema_migrations WHERE migration_id=%s;",
+                (latest_path.name,),
+            )
+            migration_row = cur.fetchone()
+            migration_current = bool(migration_row and str(migration_row[0]) == checksum(latest_path))
+            cur.execute(
+                """SELECT task_key FROM periodic_task_health
+                    WHERE consecutive_failures>0 ORDER BY task_key LIMIT 20;"""
+            )
+            periodic_failures = [str(row[0]) for row in cur.fetchall()]
+            cur.execute(
+                """SELECT id::text FROM ats_companies
+                    WHERE enabled=true AND consecutive_failures>0 ORDER BY id LIMIT 20;"""
+            )
+            ats_failures = [str(row[0]) for row in cur.fetchall()]
+            health_failures: list[str] = []
+            if not migration_current:
+                health_failures.append("migration_not_current=" + latest_path.name)
+            if periodic_failures:
+                health_failures.append("periodic=" + ",".join(periodic_failures))
+            if ats_failures:
+                health_failures.append("ats_sources=" + ",".join(ats_failures))
+            health_error = "; ".join(health_failures) or None
+            runtime_status = "degraded" if degraded or health_error else "running"
+            # This is deliberately an UPSERT rather than UPDATE. If PostgreSQL
+            # was unavailable during daemon startup, the first successful
+            # heartbeat recreates the parent row before runtime_services' FK
+            # writes and lets readiness recover without a manual restart.
+            cur.execute(
+                """INSERT INTO runtime_instances
+                     (id,hostname,pid,release_version,git_commit,status,started_at,heartbeat_at)
+                   VALUES (%s::uuid,%s,%s,%s,%s,%s,now(),now())
+                   ON CONFLICT (id) DO UPDATE SET
+                     hostname=EXCLUDED.hostname,pid=EXCLUDED.pid,
+                     release_version=EXCLUDED.release_version,git_commit=EXCLUDED.git_commit,
+                     status=EXCLUDED.status,heartbeat_at=now(),stopped_at=NULL;""",
+                (runtime_instance_id, socket.gethostname(), os.getpid(),
+                 os.getenv("JOBOS_RELEASE_VERSION"), os.getenv("JOBOS_GIT_COMMIT"), runtime_status),
             )
             for name,spec in specs.items():
                 proc=children.get(name)
@@ -157,8 +221,9 @@ def _db_runtime_heartbeat(runtime_instance_id: str, children: dict[str, subproce
                      restarts.get(name,0),degraded.get(name)),
                 )
             conn.commit()
-    except Exception:
-        pass
+        return True, health_error
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"[:300]
 
 
 def _db_runtime_stop(runtime_instance_id: str) -> None:
@@ -179,12 +244,19 @@ def _db_runtime_stop(runtime_instance_id: str) -> None:
 
 def _write_state(children: dict[str, subprocess.Popen[Any]], restarts: dict[str, int],
                  specs: dict[str, WorkerSpec], degraded: dict[str, str],
-                 runtime_instance_id: str | None = None) -> None:
+                 runtime_instance_id: str | None = None, *, database_ok: bool = False,
+                 database_error: str | None = None) -> None:
+    required_running = all(
+        name in children and children[name].poll() is None
+        for name, spec in specs.items() if spec.required
+    )
     data = {
         "supervisor_pid": os.getpid(),
         "runtime_instance_id": runtime_instance_id,
         "updated_at_unix": int(time.time()),
         "expected_required_services": sorted(name for name, spec in specs.items() if spec.required),
+        "ready": bool(required_running and database_ok and not database_error),
+        "database_health": {"available": bool(database_ok), "error": database_error},
         "services": {
             name: {
                 "pid": children[name].pid if name in children else None,
@@ -294,8 +366,13 @@ def daemon() -> int:
                         restarts[name] = restarts.get(name, 0) + 1
                     children[name] = _spawn(spec)
                     last_start[name] = now
-            _write_state(children, restarts, specs, degraded, runtime_instance_id)
-            _db_runtime_heartbeat(runtime_instance_id, children, restarts, specs, degraded)
+            database_ok, database_error = _db_runtime_heartbeat(
+                runtime_instance_id, children, restarts, specs, degraded
+            )
+            _write_state(
+                children, restarts, specs, degraded, runtime_instance_id,
+                database_ok=database_ok, database_error=database_error,
+            )
             time.sleep(2)
     finally:
         _shutdown(children)
@@ -324,9 +401,21 @@ def start() -> int:
     RUN_DIR.mkdir(parents=True, exist_ok=True)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     pid = _read_pid()
-    if _alive(pid):
-        print(f"JobOS is already running (supervisor pid {pid}).")
-        return 0
+    if _is_supervisor_process(pid):
+        try:
+            state = json.loads(STATE_FILE.read_text())
+            age = max(0, int(time.time()) - int(state.get("updated_at_unix") or 0))
+        except Exception:
+            state, age = {}, 10**9
+        if state.get("ready") is True and age <= 15:
+            print(f"JobOS is already running and ready (supervisor pid {pid}).")
+            return 0
+        print(
+            f"JobOS supervisor pid {pid} is running but not ready. "
+            "Run `python scripts/jobos.py status` and inspect .jobos/logs.",
+            file=sys.stderr,
+        )
+        return 1
     SUPERVISOR_PID.unlink(missing_ok=True)
     STATE_FILE.unlink(missing_ok=True)
     _start_infra()
@@ -337,18 +426,15 @@ def start() -> int:
     finally:
         log.close()
     expected = {name for name, spec in _specs().items() if spec.required}
-    deadline = time.time() + 8
+    deadline = time.time() + env_int(
+        "JOBOS_RUNTIME_STARTUP_TIMEOUT_SECONDS", 30, minimum=5, maximum=120
+    )
     while time.time() < deadline:
         try:
             state = json.loads(STATE_FILE.read_text())
         except Exception:
             state = {}
-        services = state.get("services") if isinstance(state.get("services"), dict) else {}
-        children_ready = bool(expected) and all(
-            bool(isinstance(services.get(name), dict) and services[name].get("running"))
-            for name in expected
-        )
-        if _alive(proc.pid) and SUPERVISOR_PID.exists() and children_ready:
+        if _alive(proc.pid) and SUPERVISOR_PID.exists() and state.get("ready") is True:
             if "telegram" in expected:
                 print("JobOS workers are running. Daily control surface: Telegram /start")
             else:
@@ -361,7 +447,7 @@ def start() -> int:
 
 def status() -> int:
     pid = _read_pid()
-    running = _alive(pid)
+    running = _is_supervisor_process(pid)
     state: dict[str, Any] = {}
     try:
         state = json.loads(STATE_FILE.read_text())
@@ -440,16 +526,16 @@ def status() -> int:
 
 def stop() -> int:
     pid = _read_pid()
-    if not _alive(pid):
+    if not _is_supervisor_process(pid):
         SUPERVISOR_PID.unlink(missing_ok=True)
         STATE_FILE.unlink(missing_ok=True)
-        print("JobOS is not running.")
+        print("JobOS is not running; stale runtime state was cleared without signaling another process.")
         return 0
     os.kill(int(pid), signal.SIGTERM)
     deadline = time.time() + 10
-    while time.time() < deadline and _alive(pid):
+    while time.time() < deadline and _is_supervisor_process(pid):
         time.sleep(0.2)
-    if _alive(pid):
+    if _is_supervisor_process(pid):
         os.kill(int(pid), signal.SIGKILL)
     print("JobOS stopped.")
     return 0

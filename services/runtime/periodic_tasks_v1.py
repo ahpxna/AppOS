@@ -12,7 +12,6 @@ import argparse
 import signal
 import sys
 import time
-import os
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -20,20 +19,13 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from services.runtime.process_runner import DEFAULT_PROCESS_RUNNER
+from services.common.config import env_int
 
 STOP = False
 
 
-def _bounded_timeout(name: str, default: int, low: int, high: int) -> int:
-    try:
-        value = int(os.getenv(name, str(default)))
-    except (TypeError, ValueError):
-        value = default
-    return max(low, min(value, high))
-
-
-ATS_PERIODIC_TIMEOUT_SECONDS = _bounded_timeout(
-    "JOBOS_ATS_PERIODIC_TIMEOUT_SECONDS", 1320, 180, 7200
+ATS_PERIODIC_TIMEOUT_SECONDS = env_int(
+    "JOBOS_ATS_PERIODIC_TIMEOUT_SECONDS", 1320, minimum=180, maximum=7200
 )
 
 TASKS: dict[str, tuple[list[str], int]] = {
@@ -102,7 +94,7 @@ def run_loop(task: str, *, interval_seconds: int, once: bool = False) -> int:
     signal.signal(signal.SIGTERM, lambda *_: globals().__setitem__("STOP", True))
     signal.signal(signal.SIGINT, lambda *_: globals().__setitem__("STOP", True))
     consecutive_failures = 0
-    exit_threshold = _bounded_timeout("JOBOS_PERIODIC_FAILURE_EXIT_THRESHOLD", 3, 1, 20)
+    exit_threshold = env_int("JOBOS_PERIODIC_FAILURE_EXIT_THRESHOLD", 3, minimum=1, maximum=20)
     while not STOP:
         result = DEFAULT_PROCESS_RUNNER.run(argv, cwd=ROOT, timeout_s=timeout_s)
         if not result.ok:
