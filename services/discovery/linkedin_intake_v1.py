@@ -153,6 +153,19 @@ def _lock_idempotency(cur, key: str | None) -> None:
         cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s));", (key,))
 
 
+def _safe_discovery_reissue(error_message: object) -> bool:
+    """Autonomous retries are limited to auth/transient recovery states.
+
+    A manual command may deliberately retry a terminal read-only capture, but
+    the periodic planner must not continuously requeue a CAPTCHA/policy block.
+    """
+    text = str(error_message or "").casefold()
+    return any(marker in text for marker in (
+        "manual re-authentication", "login", "auth", "timeout", "temporar",
+        "connection", "rate limit", "transient",
+    ))
+
+
 def queue_discovery_task(
     cur, *, request: dict[str, Any], timeout: int = 300,
     requested_by: str = "linkedin_intake_v1", autonomous: bool = False,
@@ -176,9 +189,20 @@ def queue_discovery_task(
     key = str(idempotency_key or "").strip() or None
     _lock_idempotency(cur, key)
     if key:
-        cur.execute("SELECT id::text FROM browser_tasks WHERE idempotency_key=%s;", (key,))
+        cur.execute("SELECT id::text,status,error_message FROM browser_tasks WHERE idempotency_key=%s FOR UPDATE;", (key,))
         row = cur.fetchone()
         if row:
+            # Discovery is read-only. A terminal transient/auth failure can be
+            # safely reissued under the same durable request identity after the
+            # user restores login, rather than waiting for a bucket boundary.
+            if row[1] == "failed" and (not autonomous or _safe_discovery_reissue(row[2])):
+                cur.execute(
+                    """UPDATE browser_tasks SET status='queued',error_message=NULL,
+                              locked_by=NULL,lease_expires_at=NULL,finished_at=NULL,
+                              retry_count=0,updated_at=now() WHERE id=%s;""",
+                    (row[0],),
+                )
+                return str(row[0]), True
             return str(row[0]), False
     payload = {
         **request,
@@ -211,12 +235,21 @@ def queue_saved_sync_task(
     _lock_idempotency(cur, key)
     if key:
         cur.execute(
-            """SELECT bt.id::text, coalesce(bt.input_json->>'saved_sync_id','')
+            """SELECT bt.id::text, coalesce(bt.input_json->>'saved_sync_id',''), bt.status,bt.error_message
                  FROM browser_tasks bt WHERE bt.idempotency_key=%s;""",
             (key,),
         )
         row = cur.fetchone()
         if row:
+            if row[2] == "failed" and (not autonomous or _safe_discovery_reissue(row[3])):
+                cur.execute(
+                    """UPDATE browser_tasks SET status='queued',error_message=NULL,
+                              locked_by=NULL,lease_expires_at=NULL,finished_at=NULL,
+                              retry_count=0,updated_at=now() WHERE id=%s;""",
+                    (row[0],),
+                )
+                cur.execute("UPDATE linkedin_saved_syncs SET status='queued',error_message=NULL,completed_at=NULL WHERE id=%s;", (row[1],))
+                return str(row[1]), str(row[0]), True
             return str(row[1]), str(row[0]), False
     cur.execute(
         """INSERT INTO linkedin_saved_syncs(requested_limit, status)

@@ -12,6 +12,7 @@ import argparse
 import signal
 import sys
 import time
+import os
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -23,10 +24,34 @@ from services.runtime.process_runner import DEFAULT_PROCESS_RUNNER
 STOP = False
 
 TASKS: dict[str, tuple[list[str], int]] = {
-    "ats-discovery": ([sys.executable, "-m", "services.discovery.ats_discovery_v1", "poll", "--apply"], 900),
+    "ats-discovery": ([sys.executable, "-m", "services.discovery.ats_discovery_v1", "poll", "--apply"], int(os.getenv("JOBOS_ATS_PERIODIC_TIMEOUT_SECONDS", "1320"))),
     "profile-discovery": ([sys.executable, "-m", "services.discovery.autonomous_discovery_v1", "run", "--apply"], 120),
     "repo-freshness": ([sys.executable, "services/repo-audit/repository_freshness_v1.py", "refresh"], 900),
 }
+
+
+def _record_health(task: str, *, ok: bool, detail: str = "") -> None:
+    """Best-effort durable health: wrapper liveness never masks failures."""
+    try:
+        from services.common.config import database_dsn
+        import psycopg
+        with psycopg.connect(database_dsn(), autocommit=True) as conn, conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO periodic_task_health(task_key,consecutive_failures,last_success_at,last_failure_at,last_error,updated_at)
+                   VALUES (%s,CASE WHEN %s THEN 0 ELSE 1 END,
+                           CASE WHEN %s THEN now() ELSE NULL END,
+                           CASE WHEN %s THEN NULL ELSE now() END,
+                           CASE WHEN %s THEN NULL ELSE %s END,now())
+                   ON CONFLICT (task_key) DO UPDATE SET
+                     consecutive_failures=CASE WHEN EXCLUDED.last_success_at IS NOT NULL THEN 0 ELSE periodic_task_health.consecutive_failures+1 END,
+                     last_success_at=coalesce(EXCLUDED.last_success_at,periodic_task_health.last_success_at),
+                     last_failure_at=coalesce(EXCLUDED.last_failure_at,periodic_task_health.last_failure_at),
+                     last_error=coalesce(EXCLUDED.last_error,periodic_task_health.last_error),updated_at=now();""",
+                (task, ok, ok, ok, ok, detail[:2000]),
+            )
+    except Exception:
+        # The process output still carries the error when DB itself is down.
+        pass
 
 
 def run_loop(task: str, *, interval_seconds: int, once: bool = False) -> int:
@@ -41,7 +66,10 @@ def run_loop(task: str, *, interval_seconds: int, once: bool = False) -> int:
         result = DEFAULT_PROCESS_RUNNER.run(argv, cwd=ROOT, timeout_s=timeout_s)
         if not result.ok:
             detail = (result.output or result.start_error or "unknown periodic task failure").strip()[-2000:]
+            _record_health(task, ok=False, detail=detail)
             print(f"[{task}] iteration failed (transient={result.transient}): {detail}", file=sys.stderr, flush=True)
+        else:
+            _record_health(task, ok=True)
         if once:
             return 0 if result.ok else 1
         deadline = time.monotonic() + interval

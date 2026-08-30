@@ -107,5 +107,5 @@ def test_linkedin_intake_has_bucket_idempotency_and_preference_aware_autonomous_
 def test_saved_jobs_periodic_path_is_planner_wired_not_manual_only():
     planner = (ROOT / "services/discovery/autonomous_discovery_v1.py").read_text()
     assert 'JOBOS_LINKEDIN_SAVED_DISCOVERY_ENABLED' in planner
-    assert 'jobos:auto-linkedin-saved:' in planner
+    assert 'jobos:auto-linkedin-saved' in planner
     assert 'queue_saved_sync_task(' in planner

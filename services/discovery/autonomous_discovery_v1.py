@@ -84,10 +84,6 @@ def _date_posted(freshness_days: Any) -> str:
     return "month"
 
 
-def _bucket(now: float, cooldown_seconds: int) -> int:
-    return int(now // max(3600, cooldown_seconds))
-
-
 def _fingerprint(request: dict[str, Any]) -> str:
     raw = json.dumps(request, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
@@ -99,8 +95,6 @@ def build_linkedin_plan(cur, *, now: float | None = None) -> list[dict[str, Any]
     terms = unique_terms(approved_terms(cur))
     if not terms:
         return []
-    cooldown = _bounded_int("JOBOS_LINKEDIN_DISCOVERY_COOLDOWN_SECONDS", 21600, 3600, 604800)
-    cycle = _bucket(time.time() if now is None else now, cooldown)
     locations = _literal_locations(prefs.get("location_allow_patterns")) or [""]
     work_modes = [str(x).strip() for x in (prefs.get("allowed_work_modes") or []) if str(x).strip()][:8]
     employment = [str(x).strip() for x in (prefs.get("allowed_employment_types") or []) if str(x).strip()][:8]
@@ -116,37 +110,42 @@ def build_linkedin_plan(cur, *, now: float | None = None) -> list[dict[str, Any]
             ))
     if not candidates:
         return []
-    # Rotate the search window by cooldown bucket so large profiles eventually
-    # receive coverage without creating dozens of browser tasks in one cycle.
+    # Durable state (not epoch buckets) selects the next high-priority coverage
+    # window. Regex-only locations intentionally widen the result pool, then
+    # remain a strict post-intake filter instead of silently searching only a
+    # few global rows.
     per_cycle = _bounded_int("JOBOS_LINKEDIN_SEARCHES_PER_CYCLE", 3, 1, 10)
-    start = (cycle * per_cycle) % len(candidates)
+    if locations == [""] and prefs.get("location_allow_patterns"):
+        max_results = _bounded_int("JOBOS_LINKEDIN_REGEX_LOCATION_MAX_RESULTS", 10, 3, 20)
+        candidates = [{**item, "max_results": max_results} for item in candidates]
+    if hasattr(cur, "execute"):
+        cur.execute("SELECT cursor FROM discovery_scheduler_state WHERE scheduler_key=%s;", (PLANNER_KEY,))
+        row = cur.fetchone()
+    else:  # pure planner tests / dry plan consumers without a DB cursor
+        row = None
+    start = int(row[0] or 0) % len(candidates) if row else 0
     ordered = candidates[start:] + candidates[:start]
     return ordered[: min(per_cycle, len(candidates))]
 
 
 def _enroll_observed_ats_sources(cur, *, limit: int = 200) -> int:
-    """Project already-grounded application/source URLs into ATS polling sources."""
-    candidates: list[tuple[str, str]] = []
+    """Project only DOM-href-evidenced external URLs into ATS sources."""
+    candidates: list[tuple[str, str, str]] = []
     cur.execute(
-        """SELECT coalesce(company,''),coalesce(job_url,'')
-             FROM applications
-            WHERE nullif(trim(coalesce(job_url,'')),'') IS NOT NULL
-            ORDER BY updated_at DESC LIMIT %s;""",
-        (max(1, min(int(limit), 1000)),),
-    )
-    candidates.extend((str(company or ""), str(url or "")) for company, url in cur.fetchall())
-    cur.execute(
-        """SELECT coalesce(company,''),coalesce(metadata_json->>'external_apply_url','')
+        """SELECT coalesce(company,''),coalesce(metadata_json->>'external_apply_url',''),
+                  coalesce(metadata_json->>'external_apply_href_evidence','')
              FROM job_posting_source_revisions
             WHERE nullif(trim(coalesce(metadata_json->>'external_apply_url','')),'') IS NOT NULL
+              AND nullif(trim(coalesce(metadata_json->>'external_apply_href_evidence','')),'') IS NOT NULL
             ORDER BY observed_at DESC LIMIT %s;""",
         (max(1, min(int(limit), 1000)),),
     )
-    candidates.extend((str(company or ""), str(url or "")) for company, url in cur.fetchall())
+    candidates.extend((str(company or ""), str(url or ""), str(witness or "")) for company, url, witness in cur.fetchall())
     enrolled: set[str] = set()
-    for company, url in candidates:
+    for company, url, witness in candidates:
         source_id = enroll_ats_source(
-            cur, company=company, apply_url=url, evidence_source="observed_job_source",
+            cur, company=company, apply_url=url, href_evidence=witness,
+            evidence_source="observed_job_source",
         )
         if source_id:
             enrolled.add(source_id)
@@ -165,23 +164,34 @@ def _active_planner_tasks(cur) -> int:
 def run_once(cur, *, apply: bool, now: float | None = None) -> dict[str, Any]:
     now_value = time.time() if now is None else float(now)
     cooldown = _bounded_int("JOBOS_LINKEDIN_DISCOVERY_COOLDOWN_SECONDS", 21600, 3600, 604800)
-    cycle = _bucket(now_value, cooldown)
     max_queued = _bounded_int("JOBOS_DISCOVERY_MAX_QUEUED_TASKS", 6, 1, 50)
     ats_sources_enrolled = _enroll_observed_ats_sources(cur) if apply else 0
     active = _active_planner_tasks(cur)
     slots = max(0, max_queued - active)
+    cur.execute("SELECT cursor FROM discovery_scheduler_state WHERE scheduler_key=%s;", (PLANNER_KEY,))
+    cursor_row = cur.fetchone()
+    current_cursor = int(cursor_row[0] or 0) if cursor_row else 0
     planned = build_linkedin_plan(cur, now=now_value)
     queued: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
 
-    linkedin_enabled = _truthy("JOBOS_LINKEDIN_AGENT_DISCOVERY_ENABLED", False)
-    if linkedin_enabled:
+    linkedin_capable = _truthy("JOBOS_LINKEDIN_AGENT_DISCOVERY_ENABLED", False)
+    autonomous_enabled = _truthy("JOBOS_AUTONOMOUS_DISCOVERY_ENABLED", False)
+    if linkedin_capable and autonomous_enabled:
         for request in planned:
             if slots <= 0:
                 skipped.append({"reason": "backpressure", "search": request})
                 continue
-            key = f"jobos:auto-linkedin:{cycle}:{_fingerprint(request)}"
+            key = f"jobos:auto-linkedin:{_fingerprint(request)}"
             if apply:
+                cur.execute(
+                    """SELECT last_queued_at FROM discovery_scheduler_state
+                         WHERE scheduler_key=%s FOR UPDATE;""", (PLANNER_KEY,)
+                )
+                state = cur.fetchone()
+                if state and state[0] and (now_value - state[0].timestamp()) < cooldown:
+                    skipped.append({"reason": "rolling_cooldown", "search": request})
+                    break
                 task_id, created = queue_discovery_task(
                     cur, request=request,
                     timeout=_bounded_int("JOBOS_LINKEDIN_DISCOVERY_TIMEOUT_SECONDS", 300, 60, 1800),
@@ -193,14 +203,23 @@ def run_once(cur, *, apply: bool, now: float | None = None) -> dict[str, Any]:
                            "idempotency_key": key, "search": request})
             if created:
                 slots -= 1
+        created_count = sum(1 for item in queued if item["created"])
+        if apply and created_count:
+            cur.execute(
+                """INSERT INTO discovery_scheduler_state(scheduler_key,cursor,last_queued_at,updated_at)
+                   VALUES (%s,%s,now(),now())
+                   ON CONFLICT (scheduler_key) DO UPDATE
+                     SET cursor=EXCLUDED.cursor,last_queued_at=EXCLUDED.last_queued_at,updated_at=now();""",
+                (PLANNER_KEY, current_cursor + created_count),
+            )
     elif planned:
-        skipped.append({"reason": "linkedin_discovery_disabled", "planned_searches": len(planned)})
+        skipped.append({"reason": "autonomous_discovery_disabled" if linkedin_capable else "linkedin_capability_disabled",
+                        "planned_searches": len(planned)})
 
     saved_result: dict[str, Any] | None = None
-    if _truthy("JOBOS_LINKEDIN_SAVED_DISCOVERY_ENABLED", False):
+    if _truthy("JOBOS_LINKEDIN_SAVED_DISCOVERY_ENABLED", False) and autonomous_enabled:
         saved_cooldown = _bounded_int("JOBOS_LINKEDIN_SAVED_SYNC_COOLDOWN_SECONDS", 21600, 3600, 604800)
-        saved_bucket = _bucket(now_value, saved_cooldown)
-        saved_key = f"jobos:auto-linkedin-saved:{saved_bucket}"
+        saved_key = "jobos:auto-linkedin-saved"
         if slots <= 0:
             saved_result = {"created": False, "reason": "backpressure", "idempotency_key": saved_key}
         elif apply:
@@ -219,8 +238,8 @@ def run_once(cur, *, apply: bool, now: float | None = None) -> dict[str, Any]:
     cur.execute("SELECT count(*) FROM ats_companies WHERE enabled=true;")
     ats_companies = int(cur.fetchone()[0])
     return {
-        "apply": bool(apply), "cycle": cycle, "approved_term_count": len(approved_terms(cur)),
-        "linkedin_enabled": linkedin_enabled, "active_planner_tasks_before": active,
+        "apply": bool(apply), "approved_term_count": len(approved_terms(cur)),
+        "linkedin_enabled": linkedin_capable, "autonomous_enabled": autonomous_enabled, "active_planner_tasks_before": active,
         "queued_searches": queued, "skipped": skipped, "saved_sync": saved_result,
         "ats_companies_enabled": ats_companies, "ats_sources_enrolled": ats_sources_enrolled,
         "ats_note": ("ATS periodic polling has configured sources." if ats_companies else
@@ -240,6 +259,7 @@ def status(cur) -> dict[str, Any]:
     return {
         "planner": PLANNER_KEY,
         "linkedin_enabled": _truthy("JOBOS_LINKEDIN_AGENT_DISCOVERY_ENABLED", False),
+        "autonomous_enabled": _truthy("JOBOS_AUTONOMOUS_DISCOVERY_ENABLED", False),
         "saved_enabled": _truthy("JOBOS_LINKEDIN_SAVED_DISCOVERY_ENABLED", False),
         "approved_profile_terms": approved_terms(cur),
         "planner_browser_tasks": tasks,

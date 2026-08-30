@@ -42,6 +42,8 @@ import json
 import os
 import re
 import sys
+import time
+from datetime import datetime, timezone, timedelta
 from html.parser import HTMLParser
 from typing import Any, Dict, List, Optional
 from services.discovery.captcha_detector import analyze_captcha_risk
@@ -67,7 +69,13 @@ DISCOVERY_VERSION = "ats_discovery_v1_2026_07_31"
 USER_AGENT = "jobos-ats-discovery/1 (personal job search tool, contact via GitHub repo)"
 REQUEST_TIMEOUT = 30
 STALE_CLOSE_DAYS = max(1, int(os.getenv("JOBOS_STALE_CLOSE_DAYS", "14")))
-DETAIL_REQUEST_BUDGET = max(1, int(os.getenv("JOBOS_ATS_DETAIL_REQUEST_BUDGET", "100")))
+ATS_RUN_DEADLINE_SECONDS = max(60, min(int(os.getenv("JOBOS_ATS_RUN_DEADLINE_SECONDS", "1200")), 3600))
+# Detail fetches are bounded to leave finalization time before the periodic
+# process timeout; no source may create an unbounded `running` ledger row.
+DETAIL_REQUEST_BUDGET = min(
+    max(1, int(os.getenv("JOBOS_ATS_DETAIL_REQUEST_BUDGET", "100"))),
+    max(1, (ATS_RUN_DEADLINE_SECONDS - 60) // REQUEST_TIMEOUT),
+)
 
 PLATFORMS = discovery_platform_keys()
 
@@ -630,6 +638,18 @@ def cmd_test(conn, args) -> int:
     return 0
 
 
+def _parse_posted_at(value: Any) -> datetime | None:
+    """Parse adapter-provided ISO timestamps; unknown dates remain eligible."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
+
+
 def poll_company(conn, cid, name, platform, slug, source_url, *, apply: bool, with_details: bool):
     """Poll one company without letting dry-run mutate discovery state.
 
@@ -654,6 +674,7 @@ def poll_company(conn, cid, name, platform, slug, source_url, *, apply: bool, wi
     error_kind: str | None = None
     transient_failure = False
     unexpected: Exception | None = None
+    deadline = time.monotonic() + ATS_RUN_DEADLINE_SECONDS
     try:
         jobs = fetch_jobs(platform, slug, with_details=with_details, source_url=source_url, company=name)
         seen = len(jobs)
@@ -667,8 +688,18 @@ def poll_company(conn, cid, name, platform, slug, source_url, *, apply: bool, wi
             )
             active_for_employer = int(cur.fetchone()[0])
         employer_cap = max(1, int(preferences.get("max_active_applications_per_employer") or 1))
+        try:
+            freshness_days = max(1, int(preferences.get("freshness_days") or 30))
+        except (TypeError, ValueError):
+            freshness_days = 30
         for j in jobs:
+            if time.monotonic() >= deadline:
+                raise DiscoveryError("ATS poll run deadline reached before all postings were processed.",
+                                     kind="run_deadline", transient=True)
             if not j["title"] or not jd_is_complete(j.get("jd_text")):
+                continue
+            posted_at = _parse_posted_at(j.get("posted_at") or j.get("created_at") or j.get("updated_at"))
+            if posted_at and posted_at < datetime.now(timezone.utc) - timedelta(days=freshness_days):
                 continue
             detected = detect_ats_platform(j.get("url"))
             job_ats_type = detected if detected != "custom" else platform
@@ -802,6 +833,19 @@ def poll_company(conn, cid, name, platform, slug, source_url, *, apply: bool, wi
 
 def cmd_poll(conn, args) -> int:
     with conn.cursor() as cur:
+        # A periodic supervisor can be killed outside Python. Repair only old
+        # open ledger rows before a new poll so they cannot remain zombies.
+        if args.apply:
+            cur.execute(
+                """UPDATE ats_discovery_runs SET finished_at=now(),ok=false,
+                          error=coalesce(error,'ATS run exceeded durable deadline or worker was interrupted.')
+                     WHERE finished_at IS NULL
+                       AND started_at < now() - make_interval(secs => %s);""",
+                (ATS_RUN_DEADLINE_SECONDS,),
+            )
+            # Persist the reaper before any next source can begin external
+            # I/O.  A no-company early return must not roll zombie repair back.
+            conn.commit()
         if args.company_id:
             cur.execute(
                 "SELECT id::text, company_name, ats_platform, slug, source_url "

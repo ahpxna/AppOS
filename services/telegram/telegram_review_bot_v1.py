@@ -1438,6 +1438,67 @@ def handle_message(conn, token: str, allowed_user_id: int, message: dict[str, An
         dispatch_dashboard(conn, token, allowed_user_id, chat_id, force=True)
         return
 
+    if text.startswith("/search_now"):
+        # Keep Telegram control explicit without inventing a location parser:
+        # multi-word keywords/location use ``keywords | location``.  The
+        # no-pipe form remains backwards compatible for one-word keywords.
+        raw_search = text[len("/search_now"):].strip()
+        if not raw_search:
+            api(token, "sendMessage", data={"chat_id": str(chat_id),
+                                              "text": "Usage: /search_now <keywords> [| location]"})
+            return
+        if "|" in raw_search:
+            keywords, location = (part.strip() for part in raw_search.split("|", 1))
+        else:
+            keywords, location = raw_search, ""
+        if not keywords:
+            api(token, "sendMessage", data={"chat_id": str(chat_id),
+                                              "text": "Usage: /search_now <keywords> [| location]"})
+            return
+        try:
+            from services.discovery.linkedin_discovery_v1 import validate_search_request
+            from services.discovery.linkedin_intake_v1 import queue_discovery_task
+            request = validate_search_request(keywords, location, 5, sort_by="recent")
+            with conn.cursor() as cur:
+                task_id, created = queue_discovery_task(
+                    cur, request=request, requested_by="telegram_control", autonomous=False,
+                )
+            conn.commit()
+            api(token, "sendMessage", data={"chat_id": str(chat_id),
+                                              "text": f"LinkedIn search {'queued' if created else 'already queued'}: {task_id}"})
+        except Exception as exc:
+            conn.rollback()
+            api(token, "sendMessage", data={"chat_id": str(chat_id), "text": f"⚠️ Search not queued: {exc}"})
+        return
+
+    if text in {"/saved_sync", "/saved"}:
+        try:
+            from services.discovery.linkedin_intake_v1 import queue_saved_sync_task
+            with conn.cursor() as cur:
+                sync_id, task_id, created = queue_saved_sync_task(
+                    max_results=10, requested_by="telegram_control", autonomous=False,
+                )
+            conn.commit()
+            api(token, "sendMessage", data={"chat_id": str(chat_id),
+                                              "text": f"Saved Jobs sync {'queued' if created else 'already queued'}: {task_id} (sync {sync_id})"})
+        except Exception as exc:
+            conn.rollback()
+            api(token, "sendMessage", data={"chat_id": str(chat_id), "text": f"⚠️ Saved sync not queued: {exc}"})
+        return
+
+    if text == "/discovery_status":
+        try:
+            from services.discovery.autonomous_discovery_v1 import status as discovery_status
+            with conn.cursor() as cur:
+                summary = discovery_status(cur)
+            conn.rollback()
+            api(token, "sendMessage", data={"chat_id": str(chat_id),
+                                              "text": "Discovery status:\n" + json.dumps(summary, default=str, indent=2)[:3500]})
+        except Exception as exc:
+            conn.rollback()
+            api(token, "sendMessage", data={"chat_id": str(chat_id), "text": f"⚠️ Status unavailable: {exc}"})
+        return
+
     # Document-agent feedback is accepted only as a direct reply to the exact
     # short-lived prompt created from a version-bound document review card.
     with conn.cursor() as cur:

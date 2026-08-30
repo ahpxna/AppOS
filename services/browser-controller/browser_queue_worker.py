@@ -110,7 +110,10 @@ BROWSER_CDP_URL = (
 
 WORKER_VERSION = "browser_queue_worker_v4_deterministic_form_session_2026_08_23"
 WORKER_ID = f"{socket.gethostname()}:{os.getpid()}"
-LEASE_SECONDS = int(os.getenv("JOBOS_BROWSER_LEASE_SECONDS", "600"))
+# A claimed task is never reclaimable while its bounded OpenClaw/CDP I/O is
+# still permitted to run. The SQL claim also takes max(task timeout + grace).
+LEASE_SECONDS = max(60, int(os.getenv("JOBOS_BROWSER_LEASE_SECONDS", "600")))
+LEASE_GRACE_SECONDS = max(30, int(os.getenv("JOBOS_BROWSER_LEASE_GRACE_SECONDS", "120")))
 
 SUPPORTED_TASKS = {
     "fetch_job_description",
@@ -149,6 +152,28 @@ def _start_linkedin_fake_mouse(stop_event: threading.Event):
         stop_event=stop_event,
         cdp_url=BROWSER_CDP_URL.rstrip("/") + "/json",
     )
+
+
+def _run_linkedin_agent_with_fake_mouse(*, message: str, timeout: int, session_id: str) -> Dict[str, Any]:
+    """Run each LinkedIn scrape attempt with the existing mouse lifecycle.
+
+    The helper intentionally does not modify FakeMouse itself; it guarantees a
+    fresh public entrypoint/cleanup around both the initial scrape and a
+    post-CAPTCHA retry.
+    """
+    stop_event = threading.Event()
+    thread = None
+    try:
+        thread = _start_linkedin_fake_mouse(stop_event)
+    except Exception as exc:
+        print(f"  [FakeMouse] unavailable for this bounded attempt: {exc}")
+    try:
+        return openclaw_agent(agent=OPENCLAW_AGENT_LINKEDIN_DISCOVERY,
+                               message=message, timeout=timeout, session_id=session_id)
+    finally:
+        stop_event.set()
+        if thread and thread.is_alive():
+            thread.join(timeout=5)
 
 
 def _cdp_port_from_url() -> int:
@@ -595,7 +620,7 @@ def claim_next_task(cur) -> Optional[Dict[str, Any]]:
         """
         UPDATE browser_tasks
         SET status = 'running', locked_by = %s,
-            lease_expires_at = now() + make_interval(secs => %s),
+            lease_expires_at = now() + make_interval(secs => GREATEST(%s, timeout_seconds + %s)),
             started_at = COALESCE(started_at, now())
         WHERE id = (
           SELECT id FROM browser_tasks
@@ -615,7 +640,7 @@ def claim_next_task(cur) -> Optional[Dict[str, Any]]:
                   expected_initial_url, expected_page_fingerprint, autofill_input_hash,
                   autofill_action_scope, requested_by;
         """,
-        (WORKER_ID, LEASE_SECONDS),
+        (WORKER_ID, LEASE_SECONDS, LEASE_GRACE_SECONDS),
     )
     row = cur.fetchone()
     if not row:
@@ -1642,41 +1667,30 @@ def handle_discover_linkedin_jobs(cur, task) -> Dict[str, Any]:
         "{\"jobs\":[{\"company\":\"...\",\"title\":\"...\",\"location\":\"...\","
         "\"work_mode\":\"remote|hybrid|on-site|unknown\",\"url\":\"https://www.linkedin.com/jobs/...\","
         "\"apply_url\":\"exact external employer/ATS apply URL if visibly grounded, otherwise empty\","
+        "\"apply_url_evidence\":\"the exact snapshot/DOM href evidence containing apply_url, otherwise empty\","
+        "\"salary_range\":\"published compensation text if visible, otherwise empty\","
         "\"jd_text\":\"full visible job description text\"}]}\n"
         "Include only pages with a full visible JD of at least 200 characters. Do not "
         "summarise, infer, invent a URL, or include jobs beyond the cap. If extraction "
         "cannot be grounded in the snapshot, return {\"jobs\":[]} rather than guessing."
     )
 
-    # =====================================================================
-    # 1. BẬT FAKE MOUSE (PHÒNG BỆNH) THROUGH ITS PUBLIC ENTRYPOINT
-    # =====================================================================
-    mouse_stop_event = threading.Event()
-    mouse_thread = None
-    try:
-        mouse_thread = _start_linkedin_fake_mouse(mouse_stop_event)
-        print("  [FakeMouse] Đã bật khiên bảo vệ Brownian Motion...")
-    except Exception as e:
-        print(f"  [FakeMouse] Bỏ qua Fake Mouse vì không thể kết nối CDP: {e}")
-
-    try:
-        agent_response = openclaw_agent(
-            agent=OPENCLAW_AGENT_LINKEDIN_DISCOVERY, message=msg, timeout=task["timeout_seconds"],
-            session_id=f"jobos-task-{task['id']}",
-        )
-    finally:
-        mouse_stop_event.set()
-        if mouse_thread and mouse_thread.is_alive():
-            mouse_thread.join(timeout=5)
-            if mouse_thread.is_alive():
-                print("  [FakeMouse] warning: helper still stopping in daemon thread")
+    agent_response = _run_linkedin_agent_with_fake_mouse(
+        message=msg, timeout=task["timeout_seconds"], session_id=f"jobos-task-{task['id']}"
+    )
 
     # =====================================================================
     # 2. CHECK CAPTCHA & PARALLEL BYPASS (CHỮA BỆNH VÀ PERMANENT FAILURE)
     # =====================================================================
-    agent_raw_output = str(agent_response).lower()
-    if any(marker in agent_raw_output for marker in ("captcha", "verification", "security check", "checkpoint", "sign in", "login required")):
-        print("  [Bypass] Đụng độ CAPTCHA/Login LinkedIn! Kích hoạt CapSolver + Fake Mouse...")
+    agent_raw_output = str(agent_response).casefold()
+    # Expired sessions/authwalls require the human to re-authenticate. Do not
+    # send an auth problem to CapSolver or mark it permanently impossible.
+    if any(marker in agent_raw_output for marker in ("sign in", "login required", "authwall", "not signed in")):
+        raise TransientTaskError(
+            "LinkedIn session requires manual re-authentication; task is retryable after login."
+        )
+    if any(marker in agent_raw_output for marker in ("captcha", "verification", "security check", "checkpoint", "challenge")):
+        print("  [Bypass] Đụng độ CAPTCHA/challenge LinkedIn! Kích hoạt CapSolver...")
         try:
             cdp_port = _cdp_port_from_url()
             live_captcha_url = _current_linkedin_page_url(search_url)
@@ -1691,15 +1705,18 @@ def handle_discover_linkedin_jobs(cur, task) -> Dict[str, Any]:
             )
             print("  [Bypass] Vượt rào thành công! Thử cào lại lần 2...")
             
-            # Cào lại lần 2 sau khi đã giải CAPTCHA
-            agent_response = openclaw_agent(
-                agent=OPENCLAW_AGENT_LINKEDIN_DISCOVERY, message=msg, timeout=task["timeout_seconds"],
-                session_id=f"jobos-task-{task['id']}",
+            # Every retry gets a new FakeMouse lifecycle rather than reusing a
+            # stopped thread from the first browser attempt.
+            agent_response = _run_linkedin_agent_with_fake_mouse(
+                message=msg, timeout=task["timeout_seconds"],
+                session_id=f"jobos-task-{task['id']}-after-captcha",
             )
             
             # Nếu lần 2 vẫn dính -> Buông súng, đánh dấu Permanent Failure
             agent_raw_retry = str(agent_response).lower()
-            if any(marker in agent_raw_retry for marker in ("captcha", "verification", "security check", "checkpoint", "sign in", "login required")):
+            if any(marker in agent_raw_retry for marker in ("sign in", "login required", "authwall", "not signed in")):
+                raise TransientTaskError("LinkedIn session expired after CAPTCHA solve; re-authenticate and retry.")
+            if any(marker in agent_raw_retry for marker in ("captcha", "verification", "security check", "checkpoint", "challenge")):
                 raise PermanentTaskError("CapSolver đã giải nhưng vẫn bị chặn. Đánh dấu lỗi vĩnh viễn (Permanent Failure)!")
         except PermanentTaskError:
             raise

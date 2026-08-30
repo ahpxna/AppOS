@@ -393,6 +393,22 @@ def status() -> int:
             if row:
                 state["database_runtime"]={"id":row[0],"hostname":row[1],"pid":row[2],"status":row[3],
                                            "started_at":row[4],"heartbeat_at":row[5],"stopped_at":row[6]}
+            cur.execute(
+                """SELECT task_key,consecutive_failures,last_success_at,last_failure_at,last_error
+                     FROM periodic_task_health
+                    WHERE consecutive_failures > 0
+                    ORDER BY consecutive_failures DESC, last_failure_at DESC;"""
+            )
+            unhealthy = [
+                {"task": row[0], "consecutive_failures": int(row[1] or 0),
+                 "last_success_at": row[2], "last_failure_at": row[3],
+                 "last_error": str(row[4] or "")[:300]}
+                for row in cur.fetchall()
+            ]
+            state["periodic_task_health"] = unhealthy
+            if unhealthy:
+                state["ready"] = False
+                state["periodic_failures"] = [entry["task"] for entry in unhealthy]
     except Exception as exc:
         state["database_runtime"]={"available":False,"error":str(exc)[:300]}
     print(json.dumps(state, indent=2, default=str))

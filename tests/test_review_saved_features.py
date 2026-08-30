@@ -47,7 +47,7 @@ def test_linkedin_search_discovery_preserves_frozen_helpers_with_bounded_safety_
     assert "execute_parallel_bypass" in handler
     # LinkedIn discovery must enter FakeMouse through its public adapter so
     # the feature is wired rather than importing a private implementation.
-    assert "_start_linkedin_fake_mouse" in handler
+    assert "_run_linkedin_agent_with_fake_mouse" in handler
     assert "_fake_mouse_routine" not in handler
     bypass = (root / "services" / "autofill" / "parallel_bypass.py").read_text(encoding="utf-8")
     capsolver = (root / "services" / "autofill" / "capsolver_api.py").read_text(encoding="utf-8")

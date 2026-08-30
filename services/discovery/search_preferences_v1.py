@@ -11,6 +11,7 @@ import psycopg
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from services.common.config import database_dsn
+from services.common.search_preferences import validate_location_pattern
 
 
 FIELDS = ("company_blacklist", "title_blacklist", "location_blacklist", "location_allow_patterns",
@@ -45,6 +46,8 @@ def main() -> int:
         for field in FIELDS[:6]:
             value = csv_list(getattr(args, field))
             if value is not None:
+                if field == "location_allow_patterns":
+                    value = [validate_location_pattern(pattern) for pattern in value]
                 changes[field] = value
         for field in FIELDS[6:]:
             value = getattr(args, field)

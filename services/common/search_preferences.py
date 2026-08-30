@@ -4,6 +4,31 @@ from __future__ import annotations
 import re
 from typing import Mapping
 
+MAX_LOCATION_REGEX_LENGTH = 160
+_UNSAFE_REGEX = re.compile(r"(?:\([^)]*[+*][^)]*\)[+*])|(?:\.\*[+*])|(?:\{\d{3,}(?:,\d*)?\})")
+
+
+def validate_location_pattern(value: object) -> str:
+    pattern = str(value or "").strip()
+    if not pattern or len(pattern) > MAX_LOCATION_REGEX_LENGTH:
+        raise ValueError("location regex must be 1..160 characters")
+    if _UNSAFE_REGEX.search(pattern):
+        raise ValueError("location regex contains unsupported pathological repetition")
+    try:
+        re.compile(pattern, flags=re.I)
+    except re.error as exc:
+        raise ValueError(f"invalid location regex: {exc}") from exc
+    return pattern
+
+
+def _safe_location_match(pattern: str, value: str) -> bool:
+    try:
+        return bool(re.search(validate_location_pattern(pattern), value, flags=re.I))
+    except (ValueError, re.error):
+        # Old/corrupt preference rows must fail closed for that pattern, not
+        # abort an otherwise valid discovery run.
+        return False
+
 
 def normalized_terms(values: object) -> list[str]:
     return [str(item).casefold().strip() for item in (values or []) if str(item).strip()]
@@ -40,7 +65,7 @@ def preference_reason(*, company: str, title: str, location: str, work_mode: str
     if values["work_mode"] and allowed_modes and values["work_mode"] not in allowed_modes:
         return "work_mode_not_preferred"
     patterns = normalized_terms(preferences.get("location_allow_patterns"))
-    if patterns and not any(re.search(pattern, values["location"], flags=re.I) for pattern in patterns):
+    if patterns and not any(_safe_location_match(pattern, values["location"]) for pattern in patterns):
         return "location_not_allowed"
     allowed_types = normalized_terms(preferences.get("allowed_employment_types"))
     employment_type = _employment_type(f"{title}\n{jd_text}")

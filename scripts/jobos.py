@@ -628,9 +628,26 @@ def status() -> int:
         workflow_runs = {str(k):int(v) for k,v in cur.fetchall()}
         cur.execute("SELECT status,count(*) FROM control_commands GROUP BY status ORDER BY status;")
         control_commands = {str(k):int(v) for k,v in cur.fetchall()}
+        cur.execute(
+            """SELECT task_key,consecutive_failures,last_success_at,last_failure_at,last_error
+                 FROM periodic_task_health
+                WHERE consecutive_failures > 0
+                ORDER BY consecutive_failures DESC,last_failure_at DESC;"""
+        )
+        periodic_failures = [
+            {"task": row[0], "consecutive_failures": int(row[1] or 0),
+             "last_success_at": str(row[2]) if row[2] else None,
+             "last_failure_at": str(row[3]) if row[3] else None,
+             "last_error": str(row[4] or "")[:300]}
+            for row in cur.fetchall()
+        ]
+        if periodic_failures:
+            runtime["ready"] = False
+            runtime["periodic_failures"] = [entry["task"] for entry in periodic_failures]
     print(json.dumps({
         "runtime": runtime, "database_runtime": database_runtime,
         "workflow_runs": workflow_runs, "control_commands": control_commands,
+        "periodic_task_failures": periodic_failures,
         "applications_by_status": applications, "applications_by_step": steps, "applications_by_source": sources,
         "browser_tasks": browser_tasks, "attempts": attempts, "pending_human_reviews": pending_reviews,
         "needs_reconciliation": reconciliation,
