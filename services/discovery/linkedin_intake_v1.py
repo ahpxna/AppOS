@@ -23,6 +23,7 @@ from psycopg.types.json import Jsonb
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from services.discovery.linkedin_discovery_v1 import (
     LinkedInDiscoveryError,
+    MAX_AUTONOMOUS_DISCOVERY_RESULTS, MAX_DISCOVERY_RESULTS,
     linkedin_job_id,
     validate_job_url,
     validate_search_request,
@@ -153,7 +154,7 @@ def _lock_idempotency(cur, key: str | None) -> None:
         cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s));", (key,))
 
 
-def _safe_discovery_reissue(error_message: object) -> bool:
+def safe_discovery_reissue(error_message: object) -> bool:
     """Autonomous retries are limited to auth/transient recovery states.
 
     A manual command may deliberately retry a terminal read-only capture, but
@@ -175,14 +176,16 @@ def queue_discovery_task(
 
     ``autonomous`` is permitted only for the profile discovery planner and is
     represented explicitly in the task payload; manual callers retain
-    ``user_initiated=true``.  A bucketed idempotency key lets the periodic
-    planner rerun the same search after its cooldown without queue storms.
+    ``user_initiated=true``.  A per-occurrence idempotency key plus durable rolling cooldown lets the
+    periodic planner rerun the same search later without queue storms.
     """
     if not feature_enabled("JOBOS_LINKEDIN_AGENT_DISCOVERY_ENABLED"):
         raise IntakeError("LinkedIn autonomous discovery is disabled by configuration.")
     request = validate_search_request(
         str(request.get("keywords") or ""), str(request.get("location") or ""),
-        int(request.get("max_results") or 0), date_posted=request.get("date_posted"),
+        int(request.get("max_results") or 0),
+        max_allowed=(MAX_AUTONOMOUS_DISCOVERY_RESULTS if autonomous else MAX_DISCOVERY_RESULTS),
+        date_posted=request.get("date_posted"),
         experience_levels=request.get("experience_levels"), employment_types=request.get("employment_types"),
         work_modes=request.get("work_modes"), companies=request.get("companies"), sort_by=request.get("sort_by"),
     )
@@ -195,7 +198,7 @@ def queue_discovery_task(
             # Discovery is read-only. A terminal transient/auth failure can be
             # safely reissued under the same durable request identity after the
             # user restores login, rather than waiting for a bucket boundary.
-            if row[1] == "failed" and (not autonomous or _safe_discovery_reissue(row[2])):
+            if row[1] == "failed" and (not autonomous or safe_discovery_reissue(row[2])):
                 cur.execute(
                     """UPDATE browser_tasks SET status='queued',error_message=NULL,
                               locked_by=NULL,lease_expires_at=NULL,finished_at=NULL,
@@ -241,7 +244,7 @@ def queue_saved_sync_task(
         )
         row = cur.fetchone()
         if row:
-            if row[2] == "failed" and (not autonomous or _safe_discovery_reissue(row[3])):
+            if row[2] == "failed" and (not autonomous or safe_discovery_reissue(row[3])):
                 cur.execute(
                     """UPDATE browser_tasks SET status='queued',error_message=NULL,
                               locked_by=NULL,lease_expires_at=NULL,finished_at=NULL,

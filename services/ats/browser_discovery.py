@@ -208,7 +208,7 @@ def discover_public_jobs_with_browser(*, career_url: str, platform: str, company
             if item:
                 jobs.append(item)
 
-        for detail_url in detail_urls[:max(1, min(int(max_details), 50))]:
+        for detail_url in detail_urls[:max(0, min(int(max_details), 50))]:
             detail_target = transport.open(detail_url)
             detail_target_id = str(detail_target.target_id)
             opened_target_ids.append(detail_target_id)

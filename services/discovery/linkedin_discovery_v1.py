@@ -10,7 +10,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 from urllib.parse import urlparse
 
 from psycopg.types.json import Jsonb
@@ -21,6 +21,7 @@ from services.ats.contracts import canonical_job_url
 from services.intake.source_observation import observe_existing_posting
 
 MAX_DISCOVERY_RESULTS = 5
+MAX_AUTONOMOUS_DISCOVERY_RESULTS = 20
 MAX_SAVED_RESULTS = 20
 MIN_JD_CHARS = 200
 LINKEDIN_JOB_ID_RE = re.compile(r"/jobs/view/(?P<id>\d+)/?$")
@@ -51,15 +52,16 @@ def _terms(value: Any, *, limit: int = 8) -> tuple[str, ...]:
     return cleaned
 
 
-def validate_search_request(keywords: str, location: str, max_results: int, **raw: Any) -> dict[str, Any]:
+def validate_search_request(keywords: str, location: str, max_results: int, *, max_allowed: int = MAX_DISCOVERY_RESULTS, **raw: Any) -> dict[str, Any]:
     keywords = re.sub(r"\s+", " ", (keywords or "").strip())
     location = re.sub(r"\s+", " ", (location or "").strip())
     if not keywords:
         raise LinkedInDiscoveryError("keywords are required.")
     if len(keywords) > 160 or len(location) > 160:
         raise LinkedInDiscoveryError("keywords/location are too long.")
-    if not isinstance(max_results, int) or not 1 <= max_results <= MAX_DISCOVERY_RESULTS:
-        raise LinkedInDiscoveryError(f"max_results must be 1..{MAX_DISCOVERY_RESULTS}.")
+    allowed = max(1, min(int(max_allowed), MAX_AUTONOMOUS_DISCOVERY_RESULTS))
+    if not isinstance(max_results, int) or not 1 <= max_results <= allowed:
+        raise LinkedInDiscoveryError(f"max_results must be 1..{allowed}.")
     date_posted = str(raw.get("date_posted") or "").casefold() or None
     if date_posted not in {None, "24h", "week", "month"}:
         raise LinkedInDiscoveryError("date_posted must be one of 24h, week, month.")
@@ -211,10 +213,33 @@ def extract_jobs(agent_response: Any) -> list[dict[str, Any]]:
     raise LinkedInDiscoveryError("Browser agent returned no structured jobs array.")
 
 
-def normalize_jobs(agent_response: Any, max_results: int) -> list[dict[str, str]]:
+def normalize_jobs(
+    agent_response: Any,
+    max_results: int,
+    *,
+    verified_external_hrefs_by_job: Mapping[str, Iterable[str]] | None = None,
+) -> list[dict[str, str]]:
     raw_jobs = extract_jobs(agent_response)
     if len(raw_jobs) > max_results:
         raise LinkedInDiscoveryError("Browser agent exceeded the requested result cap.")
+
+    verified_by_job: dict[str, set[str]] = {}
+    for raw_job_id, hrefs in (verified_external_hrefs_by_job or {}).items():
+        job_id = str(raw_job_id or "").strip()
+        if not job_id.isdigit():
+            continue
+        bucket: set[str] = set()
+        for href in hrefs or ():
+            try:
+                canonical_href = canonical_job_url(str(href or ""))
+            except (TypeError, ValueError):
+                continue
+            host = (urlparse(canonical_href).hostname or "").casefold()
+            if canonical_href and not (host == "linkedin.com" or host.endswith(".linkedin.com")):
+                bucket.add(canonical_href)
+        if bucket:
+            verified_by_job[job_id] = bucket
+
     rows: list[dict[str, str]] = []
     seen_urls: set[str] = set()
     first_url_error: LinkedInDiscoveryError | None = None
@@ -223,9 +248,8 @@ def normalize_jobs(agent_response: Any, max_results: int) -> list[dict[str, str]
             continue
         try:
             url = validate_job_url(str(item.get("url") or ""))
+            job_id = linkedin_job_id(url)
         except LinkedInDiscoveryError as exc:
-            # One malformed model/browser row is not authority to discard
-            # other independently grounded results from the same batch.
             first_url_error = first_url_error or exc
             continue
         company = re.sub(r"\s+", " ", str(item.get("company") or "").strip())[:300]
@@ -235,48 +259,51 @@ def normalize_jobs(agent_response: Any, max_results: int) -> list[dict[str, str]
         jd_text = re.sub(r"\n{3,}", "\n\n", str(item.get("jd_text") or "").strip())
         apply_url = ""
         apply_url_evidence = ""
+        reported_apply_url = ""
         raw_apply_url = str(item.get("apply_url") or "").strip()
-        raw_apply_evidence = str(item.get("apply_url_evidence") or "").strip()
         if raw_apply_url:
             try:
                 candidate_apply_url = canonical_job_url(raw_apply_url)
             except ValueError:
                 candidate_apply_url = ""
-            # An external apply URL is source evidence only.  Keep LinkedIn URLs
-            # out of the ATS-enrollment path so a tracking/internal route cannot
-            # masquerade as an employer ATS source.
-            apply_host = (urlparse(candidate_apply_url).hostname or "").casefold()
-            # Enrollment requires the exact href to be echoed from the
-            # snapshot/DOM evidence. A URL merely asserted by an agent is kept
-            # out of ATS polling authority.
-            if (candidate_apply_url and raw_apply_evidence and raw_apply_url in raw_apply_evidence
-                    and not (apply_host == "linkedin.com" or apply_host.endswith(".linkedin.com"))):
+            if candidate_apply_url:
+                reported_apply_url = candidate_apply_url
+            if candidate_apply_url and candidate_apply_url in verified_by_job.get(job_id, set()):
                 apply_url = candidate_apply_url
-                apply_url_evidence = raw_apply_evidence[:2000]
+                apply_url_evidence = candidate_apply_url
         if not company or not title or len(jd_text) < MIN_JD_CHARS or url in seen_urls:
             continue
         seen_urls.add(url)
-        rows.append({"url": url, "company": company, "title": title, "location": location,
-                     "work_mode": work_mode, "jd_text": jd_text, "apply_url": apply_url,
-                     "apply_url_evidence": apply_url_evidence,
-                     "salary_range": re.sub(r"\s+", " ", str(item.get("salary_range") or item.get("salary") or "").strip())[:300]})
+        rows.append({
+            "url": url, "company": company, "title": title, "location": location,
+            "work_mode": work_mode, "jd_text": jd_text, "apply_url": apply_url,
+            "reported_apply_url": reported_apply_url, "apply_url_evidence": apply_url_evidence,
+            "salary_range": re.sub(r"\s+", " ", str(item.get("salary_range") or item.get("salary") or "").strip())[:300],
+        })
     if not rows:
         if first_url_error is not None:
             raise first_url_error
-        raise LinkedInDiscoveryError(f"No valid JDs: need title/company/URL and {MIN_JD_CHARS}+ characters.")
+        raise LinkedInDiscoveryError(
+            f"No valid JDs: need title/company/URL and {MIN_JD_CHARS}+ characters."
+        )
     return rows
 
 
 def ingest_discovered_jobs(cur, browser_task_id: str, search_input: dict[str, Any],
                            agent_response: Any) -> dict[str, Any]:
+    autonomous = bool(search_input.get("autonomous_discovery"))
     request = validate_search_request(
         str(search_input.get("keywords") or ""), str(search_input.get("location") or ""),
-        search_input.get("max_results"), date_posted=search_input.get("date_posted"),
+        search_input.get("max_results"), max_allowed=(MAX_AUTONOMOUS_DISCOVERY_RESULTS if autonomous else MAX_DISCOVERY_RESULTS),
+        date_posted=search_input.get("date_posted"),
         experience_levels=search_input.get("experience_levels"), employment_types=search_input.get("employment_types"),
         work_modes=search_input.get("work_modes"), companies=search_input.get("companies"),
         sort_by=search_input.get("sort_by"),
     )
-    rows = normalize_jobs(agent_response, request["max_results"])
+    rows = normalize_jobs(
+        agent_response, request["max_results"],
+        verified_external_hrefs_by_job=search_input.get("verified_external_hrefs_by_job") or {},
+    )
     apply_preferences = bool(search_input.get("apply_search_preferences"))
     preferences: dict[str, Any] = {}
     if apply_preferences:
@@ -306,13 +333,14 @@ def ingest_discovered_jobs(cur, browser_task_id: str, search_input: dict[str, An
                 cur, application_id=existing[0], source_name="linkedin", source_job_id=source_job_id,
                 company=row["company"], job_title=row["title"], job_url=row["url"],
                 jd_text=row["jd_text"], jd_hash=jd_hash, location=row["location"],
-                work_mode=row["work_mode"], metadata={"discovery_channel": "search", "browser_task_id": browser_task_id, "ats_company_id": ats_company_id, "external_apply_url": row.get("apply_url") or None, "external_apply_href_evidence": row.get("apply_url_evidence") or None},
+                work_mode=row["work_mode"], metadata={"discovery_channel": "search", "browser_task_id": browser_task_id, "ats_company_id": ats_company_id, "external_apply_url": row.get("apply_url") or None, "reported_external_apply_url": row.get("reported_apply_url") or None, "external_apply_href_evidence": row.get("apply_url_evidence") or None, "external_apply_evidence_authority": "browser_dom_job_bound_v1" if row.get("apply_url_evidence") else None},
             )
             cur.execute(
                 """UPDATE applications
                       SET discovery_channel=CASE WHEN discovery_channel='saved' THEN 'saved' ELSE 'search' END,
+                          salary_range=CASE WHEN nullif(%s,'') IS NOT NULL THEN %s ELSE salary_range END,
                           updated_at=now() WHERE id=%s;""",
-                (existing[0],),
+                (row.get("salary_range") or "", row.get("salary_range") or "", existing[0]),
             )
             duplicates += 1
             continue
@@ -343,13 +371,13 @@ def ingest_discovered_jobs(cur, browser_task_id: str, search_input: dict[str, An
             """INSERT INTO applications
                  (source, company, job_title, job_url, jd_text, jd_hash, current_step,
                   status, intake_channel, ats_type, location, work_mode, source_job_id,
-                  discovery_channel,
+                  discovery_channel, salary_range,
                   first_seen_at, last_seen_at, created_at, updated_at)
                VALUES ('linkedin', %s, %s, %s, %s, %s, 'intake', 'active',
                        'linkedin_browser_discovery', 'linkedin_browser_linked_session',
-                       %s, %s, %s, 'search', now(), now(), now(), now()) RETURNING id::text;""",
+                       %s, %s, %s, 'search', %s, now(), now(), now(), now()) RETURNING id::text;""",
             (row["company"], row["title"], row["url"], row["jd_text"], jd_hash,
-             row["location"], row["work_mode"], source_job_id),
+             row["location"], row["work_mode"], source_job_id, row.get("salary_range") or None),
         )
         application_id = cur.fetchone()[0]
         ats_company_id = enroll_ats_source(
@@ -363,7 +391,7 @@ def ingest_discovered_jobs(cur, browser_task_id: str, search_input: dict[str, An
             cur, application_id=application_id, source_name="linkedin", source_job_id=source_job_id,
             company=row["company"], job_title=row["title"], job_url=row["url"],
             jd_text=row["jd_text"], jd_hash=jd_hash, location=row["location"],
-            work_mode=row["work_mode"], metadata={"discovery_channel": "search", "browser_task_id": browser_task_id, "initial": True, "ats_company_id": ats_company_id, "external_apply_url": row.get("apply_url") or None, "external_apply_href_evidence": row.get("apply_url_evidence") or None},
+            work_mode=row["work_mode"], metadata={"discovery_channel": "search", "browser_task_id": browser_task_id, "initial": True, "ats_company_id": ats_company_id, "external_apply_url": row.get("apply_url") or None, "reported_external_apply_url": row.get("reported_apply_url") or None, "external_apply_href_evidence": row.get("apply_url_evidence") or None, "external_apply_evidence_authority": "browser_dom_job_bound_v1" if row.get("apply_url_evidence") else None},
         )
         immigration = record_jd_immigration_assessment(cur, application_id, row["jd_text"])
         cur.execute(
@@ -393,7 +421,10 @@ def ingest_saved_jobs(cur, browser_task_id: str, saved_input: dict[str, Any],
     """
     request = validate_saved_request(saved_input.get("max_results"))
     sync_id = str(saved_input.get("saved_sync_id") or "").strip() or None
-    rows = normalize_jobs(agent_response, request["max_results"])
+    rows = normalize_jobs(
+        agent_response, request["max_results"],
+        verified_external_hrefs_by_job=saved_input.get("verified_external_hrefs_by_job") or {},
+    )
     created: list[str] = []
     duplicates = 0
     for row in rows:
@@ -410,12 +441,14 @@ def ingest_saved_jobs(cur, browser_task_id: str, saved_input: dict[str, Any],
                 cur, application_id=existing[0], source_name="linkedin", source_job_id=source_job_id,
                 company=row["company"], job_title=row["title"], job_url=row["url"],
                 jd_text=row["jd_text"], jd_hash=jd_hash, location=row["location"],
-                work_mode=row["work_mode"], metadata={"discovery_channel": "saved", "saved_sync_id": sync_id, "browser_task_id": browser_task_id, "ats_company_id": ats_company_id, "external_apply_url": row.get("apply_url") or None, "external_apply_href_evidence": row.get("apply_url_evidence") or None},
+                work_mode=row["work_mode"], metadata={"discovery_channel": "saved", "saved_sync_id": sync_id, "browser_task_id": browser_task_id, "ats_company_id": ats_company_id, "external_apply_url": row.get("apply_url") or None, "reported_external_apply_url": row.get("reported_apply_url") or None, "external_apply_href_evidence": row.get("apply_url_evidence") or None, "external_apply_evidence_authority": "browser_dom_job_bound_v1" if row.get("apply_url_evidence") else None},
             )
             cur.execute(
                 """UPDATE applications SET discovery_channel='saved', linkedin_saved_at=now(),
-                         linkedin_saved_sync_id=%s, updated_at=now() WHERE id=%s;""",
-                (sync_id, existing[0]),
+                         linkedin_saved_sync_id=%s,
+                         salary_range=CASE WHEN nullif(%s,'') IS NOT NULL THEN %s ELSE salary_range END,
+                         updated_at=now() WHERE id=%s;""",
+                (sync_id, row.get("salary_range") or "", row.get("salary_range") or "", existing[0]),
             )
             duplicates += 1
             continue
@@ -423,13 +456,13 @@ def ingest_saved_jobs(cur, browser_task_id: str, saved_input: dict[str, Any],
             """INSERT INTO applications
                  (source, company, job_title, job_url, jd_text, jd_hash, current_step,
                   status, intake_channel, ats_type, location, work_mode, source_job_id,
-                  discovery_channel, linkedin_saved_at, linkedin_saved_sync_id,
+                  discovery_channel, linkedin_saved_at, linkedin_saved_sync_id, salary_range,
                   first_seen_at, last_seen_at, created_at, updated_at)
                VALUES ('linkedin', %s, %s, %s, %s, %s, 'intake', 'active',
                        'linkedin_saved_jobs', 'linkedin_browser_linked_session', %s, %s, %s,
-                       'saved', now(), %s, now(), now(), now(), now()) RETURNING id::text;""",
+                       'saved', now(), %s, %s, now(), now(), now(), now()) RETURNING id::text;""",
             (row["company"], row["title"], row["url"], row["jd_text"], jd_hash,
-             row["location"], row["work_mode"], source_job_id, sync_id),
+             row["location"], row["work_mode"], source_job_id, sync_id, row.get("salary_range") or None),
         )
         application_id = cur.fetchone()[0]
         ats_company_id = enroll_ats_source(
@@ -440,7 +473,7 @@ def ingest_saved_jobs(cur, browser_task_id: str, saved_input: dict[str, Any],
             cur, application_id=application_id, source_name="linkedin", source_job_id=source_job_id,
             company=row["company"], job_title=row["title"], job_url=row["url"],
             jd_text=row["jd_text"], jd_hash=jd_hash, location=row["location"],
-            work_mode=row["work_mode"], metadata={"discovery_channel": "saved", "saved_sync_id": sync_id, "browser_task_id": browser_task_id, "initial": True, "ats_company_id": ats_company_id, "external_apply_url": row.get("apply_url") or None, "external_apply_href_evidence": row.get("apply_url_evidence") or None},
+            work_mode=row["work_mode"], metadata={"discovery_channel": "saved", "saved_sync_id": sync_id, "browser_task_id": browser_task_id, "initial": True, "ats_company_id": ats_company_id, "external_apply_url": row.get("apply_url") or None, "reported_external_apply_url": row.get("reported_apply_url") or None, "external_apply_href_evidence": row.get("apply_url_evidence") or None, "external_apply_evidence_authority": "browser_dom_job_bound_v1" if row.get("apply_url_evidence") else None},
         )
         immigration = record_jd_immigration_assessment(cur, application_id, row["jd_text"])
         cur.execute(

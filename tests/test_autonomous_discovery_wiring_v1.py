@@ -70,7 +70,8 @@ def test_runtime_and_cli_have_inbound_edges_for_profile_discovery():
     periodic = (ROOT / "services/runtime/periodic_tasks_v1.py").read_text()
     jobos = (ROOT / "scripts/jobos.py").read_text()
     planner = (ROOT / "services/discovery/autonomous_discovery_v1.py").read_text()
-    assert '"profile-discovery": WorkerSpec(' in supervisor
+    assert 'specs["profile-discovery"] = WorkerSpec(' in supervisor
+    assert '_truthy("JOBOS_AUTONOMOUS_DISCOVERY_ENABLED", False)' in supervisor
     assert '"profile-discovery": ([sys.executable, "-m", "services.discovery.autonomous_discovery_v1", "run", "--apply"]' in periodic
     assert 'commands.add_parser("discover"' in jobos
     assert 'discover_sub.add_parser("linkedin"' in jobos
@@ -81,14 +82,15 @@ def test_runtime_and_cli_have_inbound_edges_for_profile_discovery():
 
 def test_browser_claim_carries_requested_by_and_autonomous_tasks_remain_bounded():
     worker = (ROOT / "services/browser-controller/browser_queue_worker.py").read_text()
-    assert "autofill_action_scope, requested_by;" in worker
-    assert '"requested_by": row[18]' in worker
+    assert "autofill_action_scope, requested_by, idempotency_key;" in worker
+    assert '"requested_by": row[18], "idempotency_key": row[19]' in worker
+    assert "_lease_heartbeat" in worker
     assert 'task.get("requested_by") == "profile_autonomous_discovery_v1"' in worker
     assert "apply_url" in worker
     assert "exact external employer/ATS apply URL if visibly grounded, otherwise empty" in worker
 
 
-def test_linkedin_intake_has_bucket_idempotency_and_preference_aware_autonomous_payload():
+def test_linkedin_intake_has_durable_idempotency_and_preference_aware_autonomous_payload():
     intake = (ROOT / "services/discovery/linkedin_intake_v1.py").read_text()
     discovery = (ROOT / "services/discovery/linkedin_discovery_v1.py").read_text()
     ats = (ROOT / "services/discovery/ats_discovery_v1.py").read_text()
@@ -100,7 +102,9 @@ def test_linkedin_intake_has_bucket_idempotency_and_preference_aware_autonomous_
     assert "max_active_applications_per_employer" in discovery
     assert "enroll_ats_source(" in discovery
     assert "preference_reason(" in ats
-    assert "existing postings still flow" in ats.casefold()
+    existing_pos = ats.index("if existing_id is not None:")
+    freshness_pos = ats.index("if posted_at and posted_at <", existing_pos)
+    assert existing_pos < freshness_pos
     assert "_enroll_observed_ats_sources" in planner
 
 

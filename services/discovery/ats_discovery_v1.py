@@ -69,7 +69,17 @@ DISCOVERY_VERSION = "ats_discovery_v1_2026_07_31"
 USER_AGENT = "jobos-ats-discovery/1 (personal job search tool, contact via GitHub repo)"
 REQUEST_TIMEOUT = 30
 STALE_CLOSE_DAYS = max(1, int(os.getenv("JOBOS_STALE_CLOSE_DAYS", "14")))
-ATS_RUN_DEADLINE_SECONDS = max(60, min(int(os.getenv("JOBOS_ATS_RUN_DEADLINE_SECONDS", "1200")), 3600))
+ATS_FINALIZATION_GRACE_SECONDS = 45
+ATS_PERIODIC_TIMEOUT_SECONDS = max(180, min(int(os.getenv("JOBOS_ATS_PERIODIC_TIMEOUT_SECONDS", "1320")), 7200))
+ATS_PROCESS_DEADLINE_SECONDS = max(120, min(
+    int(os.getenv("JOBOS_ATS_PROCESS_DEADLINE_SECONDS", "1200")),
+    3600,
+    ATS_PERIODIC_TIMEOUT_SECONDS - ATS_FINALIZATION_GRACE_SECONDS,
+))
+ATS_RUN_DEADLINE_SECONDS = max(60, min(
+    int(os.getenv("JOBOS_ATS_RUN_DEADLINE_SECONDS", "1200")),
+    ATS_PROCESS_DEADLINE_SECONDS,
+))
 # Detail fetches are bounded to leave finalization time before the periodic
 # process timeout; no source may create an unbounded `running` ledger row.
 DETAIL_REQUEST_BUDGET = min(
@@ -173,7 +183,7 @@ def build_jd_text(*, title: str, company: str, location: str,
 # ---------------------------------------------------------------- adapters
 #
 # Each adapter returns a list of normalized dicts:
-#   {external_id, title, location, department, remote, url, jd_text}
+#   {external_id, title, location, department, remote, url, jd_text, salary_range, posted_at}
 
 
 def _mapping(value: Any) -> Dict[str, Any]:
@@ -194,6 +204,46 @@ def _text(value: Any) -> str:
     return ""
 
 
+def _posted_text(*values: Any) -> str:
+    for value in values:
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            number = float(value)
+            if number > 10_000_000_000:  # common milliseconds-since-epoch APIs
+                number /= 1000.0
+            try:
+                return datetime.fromtimestamp(number, tz=timezone.utc).isoformat()
+            except (OverflowError, OSError, ValueError):
+                continue
+        text = _text(value)
+        if text:
+            return text
+    return ""
+
+
+def _salary_text(value: Any) -> str:
+    if isinstance(value, str):
+        return re.sub(r"\s+", " ", value).strip()[:300]
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return str(value)
+    if not isinstance(value, dict):
+        return ""
+    low = value.get("min") or value.get("minimum") or value.get("from")
+    high = value.get("max") or value.get("maximum") or value.get("to")
+    currency = _text(value.get("currency") or value.get("currencyCode"))
+    interval = _text(value.get("interval") or value.get("period") or value.get("unit"))
+    parts = []
+    if low is not None or high is not None:
+        left = _text(low) if low is not None else "?"
+        right = _text(high) if high is not None else left
+        parts.append(f"{currency + ' ' if currency else ''}{left}-{right}")
+    label = _text(value.get("text") or value.get("label") or value.get("description"))
+    if label:
+        parts.append(label)
+    if interval and parts:
+        parts[-1] += f" / {interval}"
+    return re.sub(r"\s+", " ", " ".join(parts)).strip()[:300]
+
+
 def fetch_greenhouse(slug: str) -> List[Dict[str, Any]]:
     data = _mapping(http_get_json(
         f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs?content=true"
@@ -211,6 +261,8 @@ def fetch_greenhouse(slug: str) -> List[Dict[str, Any]]:
             "department": department,
             "remote": "remote" in location.lower(),
             "url": _text(j.get("absolute_url")),
+            "posted_at": _posted_text(j.get("updated_at"), j.get("created_at")),
+            "salary_range": _salary_text(j.get("salary_range") or j.get("compensation")),
             "jd_text": build_jd_text(
                 title=_text(j.get("title")), company=slug, location=location,
                 department=department, body=body,
@@ -239,6 +291,8 @@ def fetch_lever(slug: str) -> List[Dict[str, Any]]:
             "department": department,
             "remote": "remote" in location.lower(),
             "url": _text(j.get("hostedUrl")),
+            "posted_at": _posted_text(j.get("createdAt"), j.get("updatedAt")),
+            "salary_range": _salary_text(j.get("salaryRange") or j.get("compensation")),
             "jd_text": build_jd_text(
                 title=_text(j.get("text")), company=slug, location=location,
                 department=department, body=(body + "\n\n" + extra).strip(),
@@ -262,6 +316,8 @@ def fetch_ashby(slug: str) -> List[Dict[str, Any]]:
             "department": department,
             "remote": coerce_bool(j.get("isRemote")) or "remote" in location.lower(),
             "url": url,
+            "posted_at": _posted_text(j.get("publishedAt"), j.get("createdAt"), j.get("updatedAt")),
+            "salary_range": _salary_text(j.get("compensationTierSummary") or j.get("salaryRange") or j.get("compensation")),
             "jd_text": build_jd_text(
                 title=_text(j.get("title")), company=slug, location=location,
                 department=department, body=body,
@@ -270,7 +326,7 @@ def fetch_ashby(slug: str) -> List[Dict[str, Any]]:
     return out
 
 
-def fetch_smartrecruiters(slug: str, *, with_details: bool = False) -> List[Dict[str, Any]]:
+def fetch_smartrecruiters(slug: str, *, with_details: bool = False, detail_budget: int | None = None) -> List[Dict[str, Any]]:
     data = _mapping(http_get_json(f"https://api.smartrecruiters.com/v1/companies/{slug}/postings"))
     out = []
     for position, j in enumerate(_object_list(data.get("content"))):
@@ -283,7 +339,7 @@ def fetch_smartrecruiters(slug: str, *, with_details: bool = False) -> List[Dict
         job_id = _text(j.get("id"))
         url = _text(j.get("applyUrl") or j.get("postingUrl"))
         body = ""
-        if with_details and job_id and position < DETAIL_REQUEST_BUDGET:
+        if with_details and job_id and position < (DETAIL_REQUEST_BUDGET if detail_budget is None else max(0, int(detail_budget))):
             try:
                 detail = _mapping(http_get_json(
                     f"https://api.smartrecruiters.com/v1/companies/{slug}/postings/{job_id}"
@@ -303,6 +359,8 @@ def fetch_smartrecruiters(slug: str, *, with_details: bool = False) -> List[Dict
             "department": department,
             "remote": coerce_bool(loc.get("remote")) or "remote" in location.lower(),
             "url": url,
+            "posted_at": _posted_text(j.get("releasedDate"), j.get("createdOn"), j.get("updatedOn")),
+            "salary_range": _salary_text(j.get("salary") or j.get("compensation")),
             "jd_text": build_jd_text(
                 title=_text(j.get("name")), company=slug, location=location,
                 department=department,
@@ -326,6 +384,8 @@ def fetch_recruitee(slug: str) -> List[Dict[str, Any]]:
             "department": department,
             "remote": coerce_bool(j.get("remote")) or "remote" in location.lower(),
             "url": _text(j.get("careers_url")),
+            "posted_at": _posted_text(j.get("created_at"), j.get("updated_at"), j.get("published_at")),
+            "salary_range": _salary_text(j.get("salary") or j.get("salary_range")),
             "jd_text": build_jd_text(
                 title=_text(j.get("title")), company=slug, location=location,
                 department=department, body=body.strip(),
@@ -334,7 +394,7 @@ def fetch_recruitee(slug: str) -> List[Dict[str, Any]]:
     return out
 
 
-def fetch_workable(slug: str, *, with_details: bool = False) -> List[Dict[str, Any]]:
+def fetch_workable(slug: str, *, with_details: bool = False, detail_budget: int | None = None) -> List[Dict[str, Any]]:
     data = _mapping(http_get_json(f"https://apply.workable.com/api/v1/widget/accounts/{slug}"))
     out = []
     for position, j in enumerate(_object_list(data.get("jobs"))):
@@ -345,7 +405,7 @@ def fetch_workable(slug: str, *, with_details: bool = False) -> List[Dict[str, A
         department = _text(j.get("department"))
         shortcode = _text(j.get("shortcode"))
         body = ""
-        if with_details and shortcode and position < DETAIL_REQUEST_BUDGET:
+        if with_details and shortcode and position < (DETAIL_REQUEST_BUDGET if detail_budget is None else max(0, int(detail_budget))):
             try:
                 detail = _mapping(http_get_json(
                     f"https://apply.workable.com/api/v1/widget/accounts/{slug}/jobs/{shortcode}"
@@ -360,6 +420,8 @@ def fetch_workable(slug: str, *, with_details: bool = False) -> List[Dict[str, A
             "department": department,
             "remote": coerce_bool(loc.get("remote")) or "remote" in location.lower(),
             "url": _text(j.get("url")),
+            "posted_at": _posted_text(j.get("published"), j.get("created_at"), j.get("updated_at")),
+            "salary_range": _salary_text(j.get("salary") or j.get("salary_range") or j.get("compensation")),
             "jd_text": build_jd_text(
                 title=_text(j.get("title")), company=slug, location=location,
                 department=department,
@@ -384,6 +446,8 @@ def fetch_breezy(slug: str) -> List[Dict[str, Any]]:
             "department": department,
             "remote": "remote" in location.lower(),
             "url": _text(j.get("url")),
+            "posted_at": _posted_text(j.get("published_date"), j.get("created_at"), j.get("updated_at")),
+            "salary_range": _salary_text(j.get("salary") or j.get("salary_range") or j.get("compensation")),
             "jd_text": build_jd_text(
                 title=_text(j.get("name")), company=slug, location=location,
                 department=department, body=body,
@@ -404,7 +468,8 @@ ADAPTERS = {
 
 
 def fetch_jobs(platform: str, slug: str | None, *, with_details: bool = False,
-               source_url: str | None = None, company: str | None = None) -> List[Dict[str, Any]]:
+               source_url: str | None = None, company: str | None = None,
+               detail_budget: int | None = None) -> List[Dict[str, Any]]:
     platform = normalize_ats_key(platform)
     slug = str(slug or "").strip()
     adapter = ADAPTERS.get(platform)
@@ -414,7 +479,7 @@ def fetch_jobs(platform: str, slug: str | None, *, with_details: bool = False,
                 f"{get_definition(platform).display_name} native discovery requires --slug/tenant-key."
             )
         if platform in ("smartrecruiters", "workable"):
-            return adapter(slug, with_details=with_details)
+            return adapter(slug, with_details=with_details, detail_budget=detail_budget)
         return adapter(slug)
 
     definition = get_definition(platform)
@@ -434,7 +499,7 @@ def fetch_jobs(platform: str, slug: str | None, *, with_details: bool = False,
         return fetch_public_job_board(
             career_url=career_url, platform=platform, company_hint=str(company or slug or platform),
             user_agent=USER_AGENT, timeout_seconds=REQUEST_TIMEOUT,
-            max_details=DETAIL_REQUEST_BUDGET,
+            max_details=(DETAIL_REQUEST_BUDGET if detail_budget is None else max(0, int(detail_budget))),
         )
     except PublicPageDiscoveryError as exc:
         # Only a deterministic "no complete structured posting" result may
@@ -448,7 +513,7 @@ def fetch_jobs(platform: str, slug: str | None, *, with_details: bool = False,
                 return discover_public_jobs_with_browser(
                     career_url=career_url, platform=platform,
                     company_hint=str(company or slug or platform),
-                    max_details=min(DETAIL_REQUEST_BUDGET, 50),
+                    max_details=min((DETAIL_REQUEST_BUDGET if detail_budget is None else max(0, int(detail_budget))), 50),
                 )
             except BrowserDiscoveryError as browser_exc:
                 # Preserve the strongest retry signal. Browser availability is
@@ -468,7 +533,7 @@ def fetch_jobs(platform: str, slug: str | None, *, with_details: bool = False,
 
 def intake_job(cur, *, jd_text: str, company: str, job_title: str, job_url: str,
                location: str, work_mode: str, ats_type: str,
-               ats_company_id: str, ats_external_id: str) -> Optional[str]:
+               ats_company_id: str, ats_external_id: str, salary_range: str = "") -> Optional[str]:
     """Create or observe one source-stable discovered posting.
 
     Once an application leaves ``intake`` its evidence snapshot is immutable;
@@ -487,21 +552,26 @@ def intake_job(cur, *, jd_text: str, company: str, job_title: str, job_url: str,
         metadata={"ats_company_id": ats_company_id, "ats_external_id": ats_external_id},
     )
     if existing:
+        if str(salary_range or "").strip():
+            cur.execute(
+                "UPDATE applications SET salary_range=%s,updated_at=now() WHERE id=%s AND coalesce(salary_range,'')<>%s;",
+                (str(salary_range).strip()[:300], existing, str(salary_range).strip()[:300]),
+            )
         return None
     cur.execute(
         """
         INSERT INTO applications
           (source, company, job_title, job_url, jd_text, jd_hash,
            current_step, status, intake_channel, ats_type, location, work_mode,
-           ats_company_id, ats_external_id, source_job_id,
+           ats_company_id, ats_external_id, source_job_id, salary_range,
            first_seen_at, last_seen_at, created_at, updated_at)
         VALUES (%s, %s, %s, %s, %s, %s, 'intake', 'active', 'ats_discovery',
-                %s, %s, %s, %s, %s, %s, now(), now(), now(), now())
+                %s, %s, %s, %s, %s, %s, %s, now(), now(), now(), now())
         RETURNING id::text;
         """,
         (ats_type, company, job_title, identity.canonical_url, jd_text, identity.jd_hash,
          ats_type, location, normalize_work_mode(work_mode).value,
-         ats_company_id, ats_external_id, ats_external_id),
+         ats_company_id, ats_external_id, ats_external_id, str(salary_range or "").strip()[:300] or None),
     )
     app_id = cur.fetchone()[0]
     # Record the first source snapshot through the same append-only boundary so
@@ -650,7 +720,8 @@ def _parse_posted_at(value: Any) -> datetime | None:
     return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
 
 
-def poll_company(conn, cid, name, platform, slug, source_url, *, apply: bool, with_details: bool):
+def poll_company(conn, cid, name, platform, slug, source_url, *, apply: bool, with_details: bool,
+                 deadline_monotonic: float | None = None, detail_budget: int | None = None):
     """Poll one company without letting dry-run mutate discovery state.
 
     Apply mode persists an explicit discovery-run ledger before external I/O.
@@ -674,9 +745,15 @@ def poll_company(conn, cid, name, platform, slug, source_url, *, apply: bool, wi
     error_kind: str | None = None
     transient_failure = False
     unexpected: Exception | None = None
-    deadline = time.monotonic() + ATS_RUN_DEADLINE_SECONDS
+    own_deadline = time.monotonic() + ATS_RUN_DEADLINE_SECONDS
+    deadline = min(own_deadline, deadline_monotonic) if deadline_monotonic is not None else own_deadline
     try:
-        jobs = fetch_jobs(platform, slug, with_details=with_details, source_url=source_url, company=name)
+        if deadline - time.monotonic() <= REQUEST_TIMEOUT + ATS_FINALIZATION_GRACE_SECONDS:
+            raise DiscoveryError("ATS process deadline leaves no safe I/O/finalization window.", kind="run_deadline", transient=True)
+        jobs = fetch_jobs(
+            platform, slug, with_details=with_details, source_url=source_url, company=name,
+            detail_budget=detail_budget,
+        )
         seen = len(jobs)
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM job_search_preferences WHERE profile_key='primary';")
@@ -699,8 +776,6 @@ def poll_company(conn, cid, name, platform, slug, source_url, *, apply: bool, wi
             if not j["title"] or not jd_is_complete(j.get("jd_text")):
                 continue
             posted_at = _parse_posted_at(j.get("posted_at") or j.get("created_at") or j.get("updated_at"))
-            if posted_at and posted_at < datetime.now(timezone.utc) - timedelta(days=freshness_days):
-                continue
             detected = detect_ats_platform(j.get("url"))
             job_ats_type = detected if detected != "custom" else platform
             job_work_mode = str(j.get("work_mode") or ("remote" if j.get("remote") else "unknown"))
@@ -713,18 +788,22 @@ def poll_company(conn, cid, name, platform, slug, source_url, *, apply: bool, wi
                     cur, identity, ats_company_id=cid, source_job_id=j["external_id"]
                 )
             if existing_id is not None:
-                # Existing postings still flow through the canonical observation
-                # writer even when preferences changed after intake; otherwise
-                # freshness/stale detection would silently lose source evidence.
+                # Existing postings always refresh source observation even if the
+                # user's *new-intake* freshness/preferences later become stricter.
+                # Otherwise a still-live old posting can be falsely marked stale.
                 if apply:
                     with conn.cursor() as cur:
                         intake_job(
                             cur, jd_text=j["jd_text"], company=name, job_title=j["title"],
                             job_url=j["url"], location=j["location"], work_mode=job_work_mode,
                             ats_type=job_ats_type, ats_company_id=cid,
-                            ats_external_id=j["external_id"],
+                            ats_external_id=j["external_id"], salary_range=str(j.get("salary_range") or ""),
                         )
                 dup += 1
+                continue
+
+            # Freshness is a new-intake preference, not an observation filter.
+            if posted_at and posted_at < datetime.now(timezone.utc) - timedelta(days=freshness_days):
                 continue
 
             excluded = preference_reason(
@@ -743,7 +822,7 @@ def poll_company(conn, cid, name, platform, slug, source_url, *, apply: bool, wi
                         cur, jd_text=j["jd_text"], company=name, job_title=j["title"],
                         job_url=j["url"], location=j["location"], work_mode=job_work_mode,
                         ats_type=job_ats_type, ats_company_id=cid,
-                        ats_external_id=j["external_id"],
+                        ats_external_id=j["external_id"], salary_range=str(j.get("salary_range") or ""),
                     )
             else:
                 app_id = "dry-run-new"
@@ -870,22 +949,41 @@ def cmd_poll(conn, args) -> int:
         return 0
 
     total_new = 0
-    for cid, name, platform, slug, source_url in rows:
+    failed_count = 0
+    deferred_due_deadline = 0
+    process_deadline = time.monotonic() + ATS_PROCESS_DEADLINE_SECONDS
+    for position, (cid, name, platform, slug, source_url) in enumerate(rows):
+        remaining = process_deadline - time.monotonic()
+        companies_left = max(1, len(rows) - position)
+        if remaining <= REQUEST_TIMEOUT + ATS_FINALIZATION_GRACE_SECONDS:
+            deferred_due_deadline = len(rows) - position
+            print(f"\n  bounded ATS process deadline reached; deferring {deferred_due_deadline} source(s).")
+            break
+        per_source_call_budget = int(
+            max(REQUEST_TIMEOUT, remaining - ATS_FINALIZATION_GRACE_SECONDS)
+            / (REQUEST_TIMEOUT * companies_left)
+        )
+        fair_detail_budget = max(0, min(DETAIL_REQUEST_BUDGET, per_source_call_budget - 1))
         print(f"\n  polling {name} ({platform}:{slug or source_url or '?'}) ...")
         ok, seen, new, dup, err = poll_company(
             conn, cid, name, platform, slug, source_url,
             apply=args.apply, with_details=args.with_details,
+            deadline_monotonic=process_deadline, detail_budget=fair_detail_budget,
         )
         if ok:
             print(f"    seen={seen} new={new} duplicate={dup}")
             total_new += new
         else:
+            failed_count += 1
             print(f"    FAILED: {err}")
 
     print(f"\n{'DRY RUN. ' if not args.apply else ''}Total new postings: {total_new}")
     if not args.apply:
         print("Nothing was written. Re-run with --apply to intake them.")
-    return 0
+    # Periodic health must see partial/failing polls as failures even though the
+    # wrapper process itself stayed alive. Deferred sources are normal bounded
+    # scheduling; they are not failures and will be first next cycle.
+    return 1 if failed_count else 0
 
 
 def main() -> int:

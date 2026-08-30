@@ -91,13 +91,16 @@ def _specs() -> dict[str, WorkerSpec]:
              "--interval-seconds", os.getenv("JOBOS_ATS_POLL_INTERVAL_SECONDS", "900")),
             required=False,
         ),
-        "profile-discovery": WorkerSpec(
+    }
+    # Capability flags permit a manually requested LinkedIn read; only the
+    # separate autonomous opt-in is allowed to start a periodic scheduler.
+    if _truthy("JOBOS_AUTONOMOUS_DISCOVERY_ENABLED", False):
+        specs["profile-discovery"] = WorkerSpec(
             "profile-discovery",
             (sys.executable, "-m", "services.runtime.periodic_tasks_v1", "profile-discovery",
              "--interval-seconds", os.getenv("JOBOS_PROFILE_DISCOVERY_INTERVAL_SECONDS", "900")),
             required=False,
-        ),
-    }
+        )
     if (os.getenv("JOBOS_TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")) and (
         os.getenv("JOBOS_TELEGRAM_ALLOWED_USER_ID") or os.getenv("TELEGRAM_ALLOWED_USER_ID")
     ):

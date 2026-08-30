@@ -1,1 +1,3 @@
 psycopg[binary]
+
+regex>=2024.0,<2027

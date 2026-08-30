@@ -58,11 +58,13 @@ from psycopg.types.json import Jsonb
 from services.autofill.parallel_bypass import execute_parallel_bypass
 import threading
 import requests
+import websocket
 from services.common.value_coercion import coerce_bool
 from services.common.observability import emit_trace, make_trace_id
 from services.common.config import database_dsn, load_repo_env
 from services.discovery.linkedin_discovery_v1 import (
     LinkedInDiscoveryError,
+    MAX_AUTONOMOUS_DISCOVERY_RESULTS, MAX_DISCOVERY_RESULTS,
     ingest_discovered_jobs,
     ingest_saved_jobs,
     blocker_safe_agent_response,
@@ -71,6 +73,7 @@ from services.discovery.linkedin_discovery_v1 import (
     validate_saved_request,
 )
 from services.autofill.autofill_agent_v1 import parse_snapshot
+from services.ats.contracts import canonical_job_url
 from services.autofill.autofill_executor_v1 import OpenClawTransport, TransportError
 from services.autofill.autofill_planner_v1 import plan_autofill
 from services.autofill.autofill_session_v1 import AutofillSession, SessionError, SnapshotState
@@ -174,6 +177,112 @@ def _run_linkedin_agent_with_fake_mouse(*, message: str, timeout: int, session_i
         stop_event.set()
         if thread and thread.is_alive():
             thread.join(timeout=5)
+
+
+def _cdp_runtime_evaluate(ws_url: str, expression: str) -> Any:
+    """Read one value directly from a live CDP page; no LLM evidence is trusted."""
+    ws = websocket.create_connection(ws_url, suppress_origin=True, timeout=3)
+    try:
+        call_id = int(time.time_ns() % 1_000_000_000)
+        ws.send(json.dumps({
+            "id": call_id, "method": "Runtime.evaluate",
+            "params": {"expression": expression, "returnByValue": True},
+        }))
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            message = json.loads(ws.recv())
+            if isinstance(message, dict) and message.get("id") == call_id:
+                if message.get("error"):
+                    raise RuntimeError(f"CDP Runtime.evaluate failed: {message['error']}")
+                return message.get("result", {}).get("result", {}).get("value")
+        raise TimeoutError("CDP Runtime.evaluate response timed out")
+    finally:
+        ws.close()
+
+
+def _verified_external_hrefs_by_linkedin_job() -> dict[str, list[str]]:
+    """Bind independently observed external hrefs to the exact visible LinkedIn job.
+
+    A plain set of hrefs from every open LinkedIn tab is not sufficient evidence:
+    an agent could accidentally associate an href from job A with job B. Only a
+    tab whose own URL identifies a concrete LinkedIn job (detail path or
+    ``currentJobId`` search parameter) contributes evidence, keyed by that job id.
+    """
+    verified: dict[str, set[str]] = {}
+    try:
+        response = requests.get(BROWSER_CDP_URL.rstrip("/") + "/json", timeout=3)
+        response.raise_for_status()
+        tabs = response.json()
+    except Exception:
+        return {}
+    if not isinstance(tabs, list):
+        return {}
+    expression = r'''(() => {
+      const u = new URL(location.href);
+      const pathMatch = location.pathname.match(/\/jobs\/view\/(\d+)/);
+      const jobId = (pathMatch && pathMatch[1]) || u.searchParams.get('currentJobId') || '';
+      const hrefs = Array.from(document.querySelectorAll('a[href]'), a => a.href)
+        .filter(Boolean).slice(0, 1000);
+      return {job_id: jobId, hrefs};
+    })()'''
+    for tab in tabs:
+        if not isinstance(tab, dict) or tab.get("type") != "page":
+            continue
+        page_url = str(tab.get("url") or "")
+        parsed_page = urlsplit(page_url)
+        host = (parsed_page.hostname or "").casefold()
+        if not (host == "linkedin.com" or host.endswith(".linkedin.com")):
+            continue
+        if "/jobs/" not in (parsed_page.path or ""):
+            continue
+        ws_url = str(tab.get("webSocketDebuggerUrl") or "")
+        if not ws_url:
+            continue
+        try:
+            payload = _cdp_runtime_evaluate(ws_url, expression)
+        except Exception:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        job_id = str(payload.get("job_id") or "").strip()
+        if not job_id.isdigit():
+            continue
+        bucket = verified.setdefault(job_id, set())
+        hrefs = payload.get("hrefs")
+        if not isinstance(hrefs, list):
+            continue
+        for href in hrefs:
+            try:
+                canonical = canonical_job_url(str(href or ""))
+            except (TypeError, ValueError):
+                continue
+            parsed = urlsplit(canonical)
+            href_host = (parsed.hostname or "").casefold()
+            if canonical and not (href_host == "linkedin.com" or href_host.endswith(".linkedin.com")):
+                bucket.add(canonical)
+    return {job_id: sorted(hrefs) for job_id, hrefs in verified.items() if hrefs}
+
+
+def _lease_window_seconds(task: Dict[str, Any]) -> int:
+    return max(LEASE_SECONDS, int(task.get("timeout_seconds") or 300) + LEASE_GRACE_SECONDS)
+
+
+def _lease_heartbeat(task: Dict[str, Any], stop_event: threading.Event) -> None:
+    """Extend only this worker's live claim while handler I/O is active."""
+    interval = max(10, min(60, _lease_window_seconds(task) // 3))
+    while not stop_event.wait(interval):
+        try:
+            with psycopg.connect(database_dsn(), autocommit=True) as hb_conn, hb_conn.cursor() as hb_cur:
+                hb_cur.execute(
+                    """UPDATE browser_tasks
+                          SET lease_expires_at=now()+make_interval(secs => %s)
+                        WHERE id=%s AND status='running' AND locked_by=%s;""",
+                    (_lease_window_seconds(task), task["id"], WORKER_ID),
+                )
+                if hb_cur.rowcount != 1:
+                    return
+        except Exception as exc:
+            print(f"  [Lease] heartbeat warning for {task['id']}: {exc}")
 
 
 def _cdp_port_from_url() -> int:
@@ -638,7 +747,7 @@ def claim_next_task(cur) -> Optional[Dict[str, Any]]:
                   generated_document_id::text, document_sha256,
                   bound_artifact_id::text, artifact_sha256, artifact_filename,
                   expected_initial_url, expected_page_fingerprint, autofill_input_hash,
-                  autofill_action_scope, requested_by;
+                  autofill_action_scope, requested_by, idempotency_key;
         """,
         (WORKER_ID, LEASE_SECONDS, LEASE_GRACE_SECONDS),
     )
@@ -655,7 +764,7 @@ def claim_next_task(cur) -> Optional[Dict[str, Any]]:
         "bound_artifact_id": row[11], "artifact_sha256": row[12], "artifact_filename": row[13],
         "expected_initial_url": row[14], "expected_page_fingerprint": row[15], "autofill_input_hash": row[16],
         "autofill_action_scope": row[17] or {},
-        "requested_by": row[18],
+        "requested_by": row[18], "idempotency_key": row[19],
     }
 
 
@@ -669,6 +778,26 @@ def complete_task(cur, task_id: str, result: Dict[str, Any]) -> None:
         """,
         (Jsonb(result), task_id),
     )
+
+
+def _mark_discovery_scheduler_finished(cur, task: Dict[str, Any]) -> None:
+    if task.get("requested_by") != "profile_autonomous_discovery_v1":
+        return
+    key = str(task.get("idempotency_key") or "")
+    state_key = None
+    prefix = "jobos:auto-linkedin:"
+    if key.startswith(prefix) and not key.startswith("jobos:auto-linkedin-saved"):
+        tail = key[len(prefix):]
+        fingerprint = tail.split(":", 1)[0]
+        if fingerprint:
+            state_key = "profile_autonomous_discovery_v1:search:" + fingerprint
+    elif key.startswith("jobos:auto-linkedin-saved"):
+        state_key = "profile_autonomous_discovery_v1:saved"
+    if state_key:
+        cur.execute(
+            "UPDATE discovery_scheduler_state SET last_finished_at=now(),updated_at=now() WHERE scheduler_key=%s;",
+            (state_key,),
+        )
 
 
 def fail_task(cur, task_id: str, error: str) -> None:
@@ -1627,6 +1756,7 @@ def handle_discover_linkedin_jobs(cur, task) -> Dict[str, Any]:
     try:
         request = validate_search_request(
             str(inp.get("keywords") or ""), str(inp.get("location") or ""), inp.get("max_results"),
+            max_allowed=(MAX_AUTONOMOUS_DISCOVERY_RESULTS if inp.get("autonomous_discovery") is True else MAX_DISCOVERY_RESULTS),
             date_posted=inp.get("date_posted"), experience_levels=inp.get("experience_levels"),
             employment_types=inp.get("employment_types"), work_modes=inp.get("work_modes"),
             companies=inp.get("companies"), sort_by=inp.get("sort_by"),
@@ -1667,7 +1797,6 @@ def handle_discover_linkedin_jobs(cur, task) -> Dict[str, Any]:
         "{\"jobs\":[{\"company\":\"...\",\"title\":\"...\",\"location\":\"...\","
         "\"work_mode\":\"remote|hybrid|on-site|unknown\",\"url\":\"https://www.linkedin.com/jobs/...\","
         "\"apply_url\":\"exact external employer/ATS apply URL if visibly grounded, otherwise empty\","
-        "\"apply_url_evidence\":\"the exact snapshot/DOM href evidence containing apply_url, otherwise empty\","
         "\"salary_range\":\"published compensation text if visible, otherwise empty\","
         "\"jd_text\":\"full visible job description text\"}]}\n"
         "Include only pages with a full visible JD of at least 200 characters. Do not "
@@ -1729,7 +1858,8 @@ def handle_discover_linkedin_jobs(cur, task) -> Dict[str, Any]:
     # 3. LƯU VÀO DB
     # =====================================================================
     try:
-        intake = ingest_discovered_jobs(cur, task["id"], inp, agent_response)
+        ingest_input = {**inp, "verified_external_hrefs_by_job": _verified_external_hrefs_by_linkedin_job()}
+        intake = ingest_discovered_jobs(cur, task["id"], ingest_input, agent_response)
     except LinkedInDiscoveryError as exc:
         raise PermanentTaskError(f"LinkedIn discovery result refused: {exc}") from exc
 
@@ -1811,10 +1941,13 @@ def handle_discover_linkedin_saved_jobs(cur, task) -> Dict[str, Any]:
                 print("  [FakeMouse] warning: Saved Jobs helper still stopping in daemon thread")
 
     blocker_text = json.dumps(agent_response, ensure_ascii=False).casefold()
-    if any(word in blocker_text for word in ("captcha", "checkpoint", "sign in", "login required")):
-        raise PermanentTaskError("LinkedIn Saved Jobs requires human login/checkpoint handling; no LinkedIn state changed.")
+    if any(word in blocker_text for word in ("sign in", "login required", "authwall", "not signed in")):
+        raise TransientTaskError("LinkedIn Saved Jobs session requires manual re-authentication; retry after login.")
+    if any(word in blocker_text for word in ("captcha", "checkpoint", "challenge", "security check")):
+        raise PermanentTaskError("LinkedIn Saved Jobs hit a human checkpoint/CAPTCHA; no LinkedIn state changed.")
     try:
-        intake = ingest_saved_jobs(cur, task["id"], inp, agent_response)
+        ingest_input = {**inp, "verified_external_hrefs_by_job": _verified_external_hrefs_by_linkedin_job()}
+        intake = ingest_saved_jobs(cur, task["id"], ingest_input, agent_response)
     except LinkedInDiscoveryError as exc:
         raise PermanentTaskError(f"LinkedIn Saved Jobs result refused: {exc}") from exc
     return {"saved_url": saved_url, "saved": request, "submitted": False,
@@ -2079,6 +2212,13 @@ def process_one(conn) -> bool:
     trace_id = make_trace_id("browser-task", task["id"])
     start = time.perf_counter()
 
+    lease_stop = threading.Event()
+    lease_thread = threading.Thread(
+        target=_lease_heartbeat, args=(task, lease_stop),
+        name=f"jobos-lease-{task['id']}", daemon=True,
+    )
+    lease_thread.start()
+
     try:
         with conn.cursor() as cur:
             if task["task_type"] not in SUPPORTED_TASKS:
@@ -2095,6 +2235,7 @@ def process_one(conn) -> bool:
             result["worker_version"] = WORKER_VERSION
             result["elapsed_seconds"] = round(elapsed, 1)
             complete_task(cur, task["id"], result)
+            _mark_discovery_scheduler_finished(cur, task)
         # Browser completion is a durable boundary of its own. A failure in
         # Human Review materialization must never reclassify already-verified
         # browser writes as uncertain or send the task through retry logic.
@@ -2140,6 +2281,7 @@ def process_one(conn) -> bool:
                 # journal proves that no browser write crossed the boundary.
                 _expire_bound_pre_io_approval(cur, task, f"Preflight refused: {e}")
             fail_task(cur, task["id"], str(e))
+            _mark_discovery_scheduler_finished(cur, task)
             update_saved_sync_failure(cur, task, "failed", str(e))
         conn.commit()
         print(f"  refused (no retry): {e}")
@@ -2159,6 +2301,8 @@ def process_one(conn) -> bool:
         conn.rollback()
         with conn.cursor() as cur:
             status = requeue_or_fail(cur, task, str(e))
+            if status == "failed":
+                _mark_discovery_scheduler_finished(cur, task)
             update_saved_sync_failure(cur, task, status, str(e))
         conn.commit()
         print(f"  transient error -> {status}: {e}")
@@ -2178,6 +2322,8 @@ def process_one(conn) -> bool:
         conn.rollback()
         with conn.cursor() as cur:
             status = requeue_or_fail(cur, task, f"{type(e).__name__}: {e}")
+            if status == "failed":
+                _mark_discovery_scheduler_finished(cur, task)
             update_saved_sync_failure(cur, task, status, f"{type(e).__name__}: {e}")
         conn.commit()
         print(f"  unexpected error -> {status}: {type(e).__name__}: {e}")
@@ -2192,6 +2338,9 @@ def process_one(conn) -> bool:
             task_type=task["task_type"],
             status=status,
         )
+    finally:
+        lease_stop.set()
+        lease_thread.join(timeout=2)
 
     return True
 

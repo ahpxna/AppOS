@@ -1476,7 +1476,7 @@ def handle_message(conn, token: str, allowed_user_id: int, message: dict[str, An
             from services.discovery.linkedin_intake_v1 import queue_saved_sync_task
             with conn.cursor() as cur:
                 sync_id, task_id, created = queue_saved_sync_task(
-                    max_results=10, requested_by="telegram_control", autonomous=False,
+                    cur, max_results=10, requested_by="telegram_control", autonomous=False,
                 )
             conn.commit()
             api(token, "sendMessage", data={"chat_id": str(chat_id),

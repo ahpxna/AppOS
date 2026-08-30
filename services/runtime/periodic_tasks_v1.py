@@ -46,7 +46,8 @@ def _record_health(task: str, *, ok: bool, detail: str = "") -> None:
                      consecutive_failures=CASE WHEN EXCLUDED.last_success_at IS NOT NULL THEN 0 ELSE periodic_task_health.consecutive_failures+1 END,
                      last_success_at=coalesce(EXCLUDED.last_success_at,periodic_task_health.last_success_at),
                      last_failure_at=coalesce(EXCLUDED.last_failure_at,periodic_task_health.last_failure_at),
-                     last_error=coalesce(EXCLUDED.last_error,periodic_task_health.last_error),updated_at=now();""",
+                     last_error=CASE WHEN EXCLUDED.last_success_at IS NOT NULL THEN NULL ELSE EXCLUDED.last_error END,
+                     updated_at=now();""",
                 (task, ok, ok, ok, ok, detail[:2000]),
             )
     except Exception:
@@ -62,13 +63,20 @@ def run_loop(task: str, *, interval_seconds: int, once: bool = False) -> int:
     interval = max(60, int(interval_seconds))
     signal.signal(signal.SIGTERM, lambda *_: globals().__setitem__("STOP", True))
     signal.signal(signal.SIGINT, lambda *_: globals().__setitem__("STOP", True))
+    consecutive_failures = 0
+    exit_threshold = max(1, min(int(os.getenv("JOBOS_PERIODIC_FAILURE_EXIT_THRESHOLD", "3")), 20))
     while not STOP:
         result = DEFAULT_PROCESS_RUNNER.run(argv, cwd=ROOT, timeout_s=timeout_s)
         if not result.ok:
+            consecutive_failures += 1
             detail = (result.output or result.start_error or "unknown periodic task failure").strip()[-2000:]
             _record_health(task, ok=False, detail=detail)
             print(f"[{task}] iteration failed (transient={result.transient}): {detail}", file=sys.stderr, flush=True)
+            if not once and consecutive_failures >= exit_threshold:
+                print(f"[{task}] exiting after {consecutive_failures} consecutive failures so supervisor health/restart policy can act.", file=sys.stderr, flush=True)
+                return 1
         else:
+            consecutive_failures = 0
             _record_health(task, ok=True)
         if once:
             return 0 if result.ok else 1

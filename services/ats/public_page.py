@@ -180,6 +180,34 @@ def _location_text(value: Any) -> str:
     return " | ".join(dict.fromkeys(x for x in out if x))
 
 
+def _schema_salary_text(value: Any) -> str:
+    """Render only explicit schema.org compensation; never infer a salary."""
+    if isinstance(value, str):
+        return " ".join(value.split())[:300]
+    if not isinstance(value, dict):
+        return ""
+    currency = str(value.get("currency") or "").strip()
+    unit = str(value.get("unitText") or "").strip()
+    numeric = value.get("value")
+    if isinstance(numeric, dict):
+        low = numeric.get("minValue")
+        high = numeric.get("maxValue")
+        exact = numeric.get("value")
+        if low is not None or high is not None:
+            left = low if low is not None else high
+            right = high if high is not None else low
+            text = f"{currency + ' ' if currency else ''}{left}-{right}"
+        elif exact is not None:
+            text = f"{currency + ' ' if currency else ''}{exact}"
+        else:
+            text = ""
+    else:
+        text = f"{currency + ' ' if currency else ''}{numeric}" if numeric is not None else ""
+    if text and unit:
+        text += f" / {unit}"
+    return " ".join(text.split())[:300]
+
+
 def _identifier(job: dict[str, Any], *, url: str, title: str) -> str:
     value = job.get("identifier")
     if isinstance(value, dict):
@@ -227,6 +255,8 @@ def normalize_jobposting(job: dict[str, Any], *, page_url: str, company_hint: st
         "remote": work_mode == WorkMode.REMOTE,
         "work_mode": work_mode.value,
         "url": url,
+        "posted_at": str(job.get("datePosted") or "").strip(),
+        "salary_range": _schema_salary_text(job.get("baseSalary") or job.get("estimatedSalary")),
         "jd_text": jd_text,
         "jd_quality": quality.value,
     }

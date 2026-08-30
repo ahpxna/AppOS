@@ -2,9 +2,13 @@
 from __future__ import annotations
 
 import re
+from functools import lru_cache
 from typing import Mapping
 
+import regex as safe_regex
+
 MAX_LOCATION_REGEX_LENGTH = 160
+LOCATION_REGEX_TIMEOUT_SECONDS = 0.02
 _UNSAFE_REGEX = re.compile(r"(?:\([^)]*[+*][^)]*\)[+*])|(?:\.\*[+*])|(?:\{\d{3,}(?:,\d*)?\})")
 
 
@@ -15,18 +19,25 @@ def validate_location_pattern(value: object) -> str:
     if _UNSAFE_REGEX.search(pattern):
         raise ValueError("location regex contains unsupported pathological repetition")
     try:
-        re.compile(pattern, flags=re.I)
-    except re.error as exc:
+        safe_regex.compile(pattern, flags=safe_regex.I)
+    except safe_regex.error as exc:
         raise ValueError(f"invalid location regex: {exc}") from exc
     return pattern
 
 
+@lru_cache(maxsize=256)
+def _compiled_location_pattern(pattern: str):
+    return safe_regex.compile(validate_location_pattern(pattern), flags=safe_regex.I)
+
+
 def _safe_location_match(pattern: str, value: str) -> bool:
     try:
-        return bool(re.search(validate_location_pattern(pattern), value, flags=re.I))
-    except (ValueError, re.error):
-        # Old/corrupt preference rows must fail closed for that pattern, not
-        # abort an otherwise valid discovery run.
+        return bool(_compiled_location_pattern(pattern).search(
+            value, timeout=LOCATION_REGEX_TIMEOUT_SECONDS
+        ))
+    except (ValueError, safe_regex.error, TimeoutError):
+        # Old/corrupt/pathological preference rows must fail closed for that
+        # pattern, not abort or monopolize an otherwise valid discovery run.
         return False
 
 

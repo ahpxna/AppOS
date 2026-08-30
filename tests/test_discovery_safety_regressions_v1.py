@@ -92,3 +92,144 @@ def test_authwall_and_captcha_are_separate_paths_and_retry_restarts_mouse():
     assert "LinkedIn session requires manual re-authentication" in handler
     assert "_run_linkedin_agent_with_fake_mouse" in handler
     assert "after-captcha" in handler
+
+
+def test_agent_cannot_self_attest_external_apply_url_without_independent_dom_href():
+    payload = {"jobs": [{
+        "company": "Acme", "title": "Engineer",
+        "url": "https://www.linkedin.com/jobs/view/123456/",
+        "jd_text": "x" * 300,
+        "apply_url": "https://jobs.lever.co/acme/abc",
+        "apply_url_evidence": "https://jobs.lever.co/acme/abc",
+    }]}
+    unverified = normalize_jobs(payload, 1)
+    assert unverified[0]["apply_url"] == ""
+    assert unverified[0]["reported_apply_url"] == "https://jobs.lever.co/acme/abc"
+    verified = normalize_jobs(payload, 1, verified_external_hrefs_by_job={"123456": ["https://jobs.lever.co/acme/abc"]})
+    assert verified[0]["apply_url"] == "https://jobs.lever.co/acme/abc"
+    assert verified[0]["apply_url_evidence"] == verified[0]["apply_url"]
+    wrong_job = normalize_jobs(payload, 1, verified_external_hrefs_by_job={"999999": ["https://jobs.lever.co/acme/abc"]})
+    assert wrong_job[0]["apply_url"] == ""
+
+
+def test_autonomous_occurrence_keys_are_not_permanent_completed_task_keys():
+    mod = _load("services/discovery/autonomous_discovery_v1.py", "autonomous_occurrence_key_test")
+    base = "jobos:auto-linkedin:abc123"
+    assert mod._occurrence_key(base, 100.0) != mod._occurrence_key(base, 101.0)
+    assert mod._occurrence_key(base, 100.0).startswith(base + ":")
+
+
+def test_structured_jsonld_exposes_explicit_salary_and_posted_date():
+    mod = _load("services/ats/public_page.py", "public_page_salary_test")
+    job = mod.normalize_jobposting({
+        "@type": "JobPosting",
+        "title": "Engineer",
+        "description": "Responsibilities " + ("build systems " * 40),
+        "url": "https://careers.example.com/jobs/1",
+        "datePosted": "2026-08-20",
+        "baseSalary": {"currency": "USD", "value": {"minValue": 120000, "maxValue": 160000}, "unitText": "YEAR"},
+    }, page_url="https://careers.example.com/jobs/1", company_hint="Acme")
+    assert job is not None
+    assert job["posted_at"] == "2026-08-20"
+    assert "120000-160000" in job["salary_range"]
+
+
+def test_periodic_worker_escalates_repeated_child_failures_to_supervisor():
+    source = (ROOT / "services" / "runtime" / "periodic_tasks_v1.py").read_text()
+    assert "JOBOS_PERIODIC_FAILURE_EXIT_THRESHOLD" in source
+    assert "return 1" in source
+
+
+def test_telegram_saved_sync_passes_database_cursor():
+    source = (ROOT / "services" / "telegram" / "telegram_review_bot_v1.py").read_text()
+    start = source.index('if text in {"/saved_sync", "/saved"}')
+    end = source.index('if text == "/discovery_status"', start)
+    assert "queue_saved_sync_task(\n                    cur," in source[start:end]
+
+
+def test_native_auto_enrollment_preserves_operator_disabled_state():
+    mod = _load("services/discovery/ats_source_enrollment_v1.py", "ats_disabled_preserve_test")
+
+    class Cursor:
+        def __init__(self):
+            self.row = None
+            self.sql = []
+        def execute(self, sql, params=()):
+            self.sql.append(sql)
+            low = " ".join(sql.lower().split())
+            if "select id::text,company_name,enabled from ats_companies" in low:
+                self.row = ("source-1", "Acme", False)
+            elif "update ats_companies set notes=" in low and "returning id::text" in low:
+                self.row = ("source-1",)
+            else:
+                self.row = None
+        def fetchone(self):
+            return self.row
+
+    cur = Cursor()
+    source_id = mod.enroll_ats_source(
+        cur, company="Acme",
+        apply_url="https://job-boards.greenhouse.io/acme/jobs/123",
+        href_evidence="https://job-boards.greenhouse.io/acme/jobs/123",
+    )
+    assert source_id == "source-1"
+    assert not any("update ats_companies set enabled" in " ".join(sql.lower().split()) for sql in cur.sql)
+
+
+def test_manual_structured_source_is_not_overwritten_by_auto_refresh():
+    mod = _load("services/discovery/ats_source_enrollment_v1.py", "ats_manual_source_test")
+
+    class Cursor:
+        def __init__(self):
+            self.row = None
+            self.rows = []
+            self.sql = []
+        def execute(self, sql, params=()):
+            self.sql.append((sql, params))
+            low = " ".join(sql.lower().split())
+            self.row, self.rows = None, []
+            if "where ats_platform=%s and source_url=%s for update" in low:
+                self.row = None
+            elif "lower(trim(company_name))=lower(trim(%s))" in low:
+                self.rows = [("manual-1", "https://old.example/jobs/", "operator configured")]
+            elif low.startswith("insert into ats_companies"):
+                self.row = ("auto-2",)
+        def fetchone(self):
+            return self.row
+        def fetchall(self):
+            return self.rows
+
+    cur = Cursor()
+    source_id = mod.enroll_ats_source(
+        cur, company="Acme",
+        apply_url="https://acme.wd5.myworkdayjobs.com/en-US/Careers/job/Engineer_123",
+        href_evidence="https://acme.wd5.myworkdayjobs.com/en-US/Careers/job/Engineer_123",
+    )
+    assert source_id == "auto-2"
+    assert not any("set source_url=" in " ".join(sql.lower().split()) for sql, _ in cur.sql)
+
+
+def test_ats_deadlines_are_clamped_inside_periodic_parent_boundary(monkeypatch):
+    monkeypatch.setenv("JOBOS_ATS_PERIODIC_TIMEOUT_SECONDS", "300")
+    monkeypatch.setenv("JOBOS_ATS_PROCESS_DEADLINE_SECONDS", "1200")
+    monkeypatch.setenv("JOBOS_ATS_RUN_DEADLINE_SECONDS", "1200")
+    mod = _load("services/discovery/ats_discovery_v1.py", "ats_deadline_clamp_test")
+    assert mod.ATS_PROCESS_DEADLINE_SECONDS <= mod.ATS_PERIODIC_TIMEOUT_SECONDS - mod.ATS_FINALIZATION_GRACE_SECONDS
+    assert mod.ATS_RUN_DEADLINE_SECONDS <= mod.ATS_PROCESS_DEADLINE_SECONDS
+
+
+def test_ats_html_extractor_does_not_duplicate_visible_text():
+    mod = _load("services/discovery/ats_discovery_v1.py", "ats_html_text_test")
+    assert mod.html_to_text("<p>Hello world</p>") == "Hello world"
+
+
+def test_exact_location_alternation_can_drive_search_without_regex_syntax(monkeypatch):
+    mod = _load("services/discovery/autonomous_discovery_v1.py", "location_alternation_test")
+    monkeypatch.setattr(mod, "approved_terms", lambda cur: ["Engineer"])
+    monkeypatch.setattr(mod, "_preferences", lambda cur: {
+        "location_allow_patterns": [r"^(Boston|New York)$"],
+        "allowed_work_modes": [], "allowed_employment_types": [], "freshness_days": 7,
+    })
+    monkeypatch.setenv("JOBOS_LINKEDIN_SEARCHES_PER_CYCLE", "2")
+    plan = mod.build_linkedin_plan(object(), now=1.0)
+    assert {item["location"].casefold() for item in plan} == {"boston", "new york"}

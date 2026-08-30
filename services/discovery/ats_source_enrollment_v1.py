@@ -120,65 +120,106 @@ def derive_ats_source(url: str | None) -> ATSSourceEvidence | None:
     return ATSSourceEvidence(platform, None, board_url, canonical)
 
 
+def _normalized_company(value: str) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip()).casefold()
+
+
 def enroll_ats_source(cur, *, company: str, apply_url: str | None,
                       evidence_source: str = "linkedin_browser_discovery",
                       href_evidence: str | None = None) -> str | None:
-    """Upsert one ATS source only from browser/DOM href evidence.
+    """Upsert one ATS source only from independently verified DOM href evidence.
 
-    Manual ``ats add`` is intentionally separate.  Autonomous enrollment must
-    prove that the exact external URL was present in the browser snapshot; an
-    agent-provided URL alone is never an enrollment authority.
+    ``href_evidence`` is not descriptive text from an agent.  The browser worker
+    passes the exact canonical href independently read from the live DOM through
+    CDP.  Autonomous enrollment also refuses to rename an existing tenant/source
+    to a different company and never changes an operator's ``enabled`` choice.
     """
     evidence = derive_ats_source(apply_url)
     if evidence is None:
         return None
-    witness = str(href_evidence or "")
-    if not witness or evidence.evidence_url not in witness:
+    try:
+        witness = canonical_job_url(str(href_evidence or ""))
+    except (TypeError, ValueError):
+        return None
+    if witness != evidence.evidence_url:
         return None
     company_name = re.sub(r"\s+", " ", str(company or "").strip())[:300]
     if not company_name:
         return None
-    note = f"Auto-enrolled from grounded {evidence_source} external apply URL: {evidence.evidence_url}"
-    # Serialize same company/platform enrollment. DB unique indexes remain the
-    # final authority for locator collisions across workers.
-    cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s));", (f"ats:{evidence.platform}:{company_name.casefold()}",))
+    note = f"Auto-enrolled from verified {evidence_source} DOM href: {evidence.evidence_url}"
+
+    locator = evidence.slug or evidence.source_url or ""
+    # Serialize both locator identity and company/platform projection. This keeps
+    # concurrent discoveries deterministic without making company names into a
+    # guessed ATS tenant authority.
+    for lock_key in sorted({
+        f"ats-company:{evidence.platform}:{company_name.casefold()}",
+        f"ats-locator:{evidence.platform}:{locator.casefold()}",
+    }):
+        cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s));", (lock_key,))
+
     if evidence.slug:
         cur.execute(
-            """INSERT INTO ats_companies(company_name,ats_platform,slug,source_url,enabled,notes,updated_at)
-               VALUES (%s,%s,%s,NULL,true,%s,now())
-               ON CONFLICT (ats_platform,slug) WHERE nullif(trim(coalesce(slug,'')),'') IS NOT NULL
-               DO UPDATE SET company_name=EXCLUDED.company_name,
-                             notes=EXCLUDED.notes,updated_at=now()
-               RETURNING id::text;""",
-            (company_name, evidence.platform, evidence.slug, note),
-        )
-    else:
-        # One company/platform source is enough. Refresh its canonical board
-        # URL when a newer valid href witness is observed, while preserving an
-        # operator's enabled=false decision.
-        cur.execute(
-            """SELECT id::text FROM ats_companies
-                 WHERE ats_platform=%s AND lower(trim(company_name))=lower(trim(%s))
-                 ORDER BY created_at LIMIT 1 FOR UPDATE;""",
-            (evidence.platform, company_name),
+            """SELECT id::text,company_name,enabled FROM ats_companies
+                 WHERE ats_platform=%s AND slug=%s FOR UPDATE;""",
+            (evidence.platform, evidence.slug),
         )
         existing = cur.fetchone()
         if existing:
+            if _normalized_company(existing[1]) != _normalized_company(company_name):
+                return None
             cur.execute(
-                """UPDATE ats_companies
-                      SET source_url=%s, notes=%s, updated_at=now()
-                    WHERE id=%s RETURNING id::text;""",
-                (evidence.source_url, note, existing[0]),
+                "UPDATE ats_companies SET notes=%s,updated_at=now() WHERE id=%s RETURNING id::text;",
+                (note, existing[0]),
             )
             return str(cur.fetchone()[0])
         cur.execute(
             """INSERT INTO ats_companies(company_name,ats_platform,slug,source_url,enabled,notes,updated_at)
-               VALUES (%s,%s,NULL,%s,true,%s,now())
-               ON CONFLICT (ats_platform,source_url) WHERE nullif(trim(coalesce(source_url,'')),'') IS NOT NULL
-               DO UPDATE SET company_name=EXCLUDED.company_name,
-                             notes=EXCLUDED.notes,updated_at=now()
-               RETURNING id::text;""",
-            (company_name, evidence.platform, evidence.source_url, note),
+               VALUES (%s,%s,%s,NULL,true,%s,now()) RETURNING id::text;""",
+            (company_name, evidence.platform, evidence.slug, note),
         )
-    row = cur.fetchone()
-    return str(row[0]) if row else None
+        return str(cur.fetchone()[0])
+
+    # A board URL already owned by a different company is an identity conflict,
+    # not evidence that the existing row should be renamed.
+    cur.execute(
+        """SELECT id::text,company_name FROM ats_companies
+             WHERE ats_platform=%s AND source_url=%s FOR UPDATE;""",
+        (evidence.platform, evidence.source_url),
+    )
+    locator_existing = cur.fetchone()
+    if locator_existing and _normalized_company(locator_existing[1]) != _normalized_company(company_name):
+        return None
+
+    if locator_existing:
+        cur.execute(
+            "UPDATE ats_companies SET notes=%s,updated_at=now() WHERE id=%s RETURNING id::text;",
+            (note, locator_existing[0]),
+        )
+        return str(cur.fetchone()[0])
+
+    # Only an auto-enrolled row is ours to retarget when the employer publishes
+    # a newer canonical board URL. Manual/operator rows are immutable authority
+    # here and multiple legitimate boards for one company/platform may coexist.
+    cur.execute(
+        """SELECT id::text,source_url,notes FROM ats_companies
+             WHERE ats_platform=%s AND lower(trim(company_name))=lower(trim(%s))
+             ORDER BY created_at FOR UPDATE;""",
+        (evidence.platform, company_name),
+    )
+    same_company = cur.fetchall()
+    auto_owned = [row for row in same_company if str(row[2] or "").startswith("Auto-enrolled from verified ")]
+    if len(auto_owned) == 1:
+        cur.execute(
+            """UPDATE ats_companies
+                  SET source_url=%s, notes=%s, updated_at=now()
+                WHERE id=%s RETURNING id::text;""",
+            (evidence.source_url, note, auto_owned[0][0]),
+        )
+        return str(cur.fetchone()[0])
+    cur.execute(
+        """INSERT INTO ats_companies(company_name,ats_platform,slug,source_url,enabled,notes,updated_at)
+           VALUES (%s,%s,NULL,%s,true,%s,now()) RETURNING id::text;""",
+        (company_name, evidence.platform, evidence.source_url, note),
+    )
+    return str(cur.fetchone()[0])
