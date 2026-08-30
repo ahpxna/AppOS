@@ -42,7 +42,7 @@ from psycopg.types.json import Jsonb
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from services.discovery.immigration_intelligence import record_jd_immigration_assessment
-from services.common.config import database_dsn
+from services.common.config import database_dsn, env_int
 from services.control_plane.pipeline_state import DEFAULT_PIPELINE_STATE_STORE, PipelineStateError
 from services.runtime.process_runner import DEFAULT_PROCESS_RUNNER
 from services.intake.posting_identity import build_posting_identity
@@ -63,7 +63,7 @@ MARKET_INTELLIGENCE_SCRIPT = os.path.join(
 )
 
 FIT_REVIEW_TTL_HOURS = 48  # long on purpose: a human sleeps (see architecture review)
-ORCHESTRATOR_LEASE_SECONDS = int(os.getenv("JOBOS_ORCHESTRATOR_LEASE_SECONDS", "7200"))
+ORCHESTRATOR_LEASE_SECONDS = env_int("JOBOS_ORCHESTRATOR_LEASE_SECONDS", 7200, minimum=60, maximum=86400)
 _ACTIVE_PROCESSING_RUN_ID: str | None = None
 _ACTIVE_WORKFLOW_STEP_RUN_ID: str | None = None
 

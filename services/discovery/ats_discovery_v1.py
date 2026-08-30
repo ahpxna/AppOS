@@ -55,7 +55,7 @@ from services.discovery.immigration_intelligence import record_jd_immigration_as
 from services.common.config import database_dsn
 from services.common.value_coercion import coerce_bool
 from services.common.search_preferences import preference_reason
-from services.ats.contracts import canonical_job_url, jd_is_complete, normalize_work_mode
+from services.ats.contracts import canonical_job_url, infer_work_mode, jd_is_complete, normalize_work_mode
 from services.ats.http_client import DiscoveryHttpError, get_json
 from services.ats.public_page import PublicPageDiscoveryError, fetch_public_job_board
 from services.ats.browser_discovery import BrowserDiscoveryError, discover_public_jobs_with_browser
@@ -68,22 +68,33 @@ from services.intake.source_observation import find_and_observe_existing, observ
 DISCOVERY_VERSION = "ats_discovery_v1_2026_07_31"
 USER_AGENT = "jobos-ats-discovery/1 (personal job search tool, contact via GitHub repo)"
 REQUEST_TIMEOUT = 30
-STALE_CLOSE_DAYS = max(1, int(os.getenv("JOBOS_STALE_CLOSE_DAYS", "14")))
+
+
+def _env_int(name: str, default: int, low: int, high: int) -> int:
+    """Bound numeric environment input without making a typo an import crash."""
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(low, min(value, high))
+
+
+STALE_CLOSE_DAYS = _env_int("JOBOS_STALE_CLOSE_DAYS", 14, 1, 3650)
 ATS_FINALIZATION_GRACE_SECONDS = 45
-ATS_PERIODIC_TIMEOUT_SECONDS = max(180, min(int(os.getenv("JOBOS_ATS_PERIODIC_TIMEOUT_SECONDS", "1320")), 7200))
+ATS_PERIODIC_TIMEOUT_SECONDS = _env_int("JOBOS_ATS_PERIODIC_TIMEOUT_SECONDS", 1320, 180, 7200)
 ATS_PROCESS_DEADLINE_SECONDS = max(120, min(
-    int(os.getenv("JOBOS_ATS_PROCESS_DEADLINE_SECONDS", "1200")),
+    _env_int("JOBOS_ATS_PROCESS_DEADLINE_SECONDS", 1200, 120, 3600),
     3600,
     ATS_PERIODIC_TIMEOUT_SECONDS - ATS_FINALIZATION_GRACE_SECONDS,
 ))
 ATS_RUN_DEADLINE_SECONDS = max(60, min(
-    int(os.getenv("JOBOS_ATS_RUN_DEADLINE_SECONDS", "1200")),
+    _env_int("JOBOS_ATS_RUN_DEADLINE_SECONDS", 1200, 60, 3600),
     ATS_PROCESS_DEADLINE_SECONDS,
 ))
 # Detail fetches are bounded to leave finalization time before the periodic
 # process timeout; no source may create an unbounded `running` ledger row.
 DETAIL_REQUEST_BUDGET = min(
-    max(1, int(os.getenv("JOBOS_ATS_DETAIL_REQUEST_BUDGET", "100"))),
+    _env_int("JOBOS_ATS_DETAIL_REQUEST_BUDGET", 100, 1, 1000),
     max(1, (ATS_RUN_DEADLINE_SECONDS - 60) // REQUEST_TIMEOUT),
 )
 
@@ -781,7 +792,13 @@ def poll_company(conn, cid, name, platform, slug, source_url, *, apply: bool, wi
             posted_at = _parse_posted_at(j.get("posted_at") or j.get("created_at") or j.get("updated_at"))
             detected = detect_ats_platform(j.get("url"))
             job_ats_type = detected if detected != "custom" else platform
-            job_work_mode = str(j.get("work_mode") or ("remote" if j.get("remote") else "unknown"))
+            # Native adapters historically publish only a remote boolean, while
+            # structured adapters use on_site.  Infer from all grounded posting
+            # evidence and persist one canonical ATS work-mode value.
+            job_work_mode = infer_work_mode(
+                j.get("work_mode"), "remote" if j.get("remote") else "",
+                j.get("location"), j.get("jd_text"),
+            ).value
             identity = build_posting_identity(
                 company=name, job_title=j["title"], jd_text=j["jd_text"],
                 job_url=j["url"], ats_hint=job_ats_type,

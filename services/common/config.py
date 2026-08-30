@@ -77,6 +77,34 @@ def load_repo_env() -> None:
             os.environ.setdefault(key, _parse_dotenv_value(raw_value))
 
 
+def env_int(name: str, default: int, *, minimum: int | None = None, maximum: int | None = None) -> int:
+    """Read a bounded integer env setting without turning a typo into a node crash."""
+    raw = os.getenv(name)
+    try:
+        value = int(raw) if raw is not None else int(default)
+    except (TypeError, ValueError):
+        value = int(default)
+    if minimum is not None:
+        value = max(int(minimum), value)
+    if maximum is not None:
+        value = min(int(maximum), value)
+    return value
+
+
+def env_float(name: str, default: float, *, minimum: float | None = None, maximum: float | None = None) -> float:
+    """Read a bounded float env setting with the same resilient config contract."""
+    raw = os.getenv(name)
+    try:
+        value = float(raw) if raw is not None else float(default)
+    except (TypeError, ValueError):
+        value = float(default)
+    if minimum is not None:
+        value = max(float(minimum), value)
+    if maximum is not None:
+        value = min(float(maximum), value)
+    return value
+
+
 def require_env(name: str) -> str:
     """Read one required setting without changing its credential bytes."""
     load_repo_env()

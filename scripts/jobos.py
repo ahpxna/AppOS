@@ -641,13 +641,28 @@ def status() -> int:
              "last_error": str(row[4] or "")[:300]}
             for row in cur.fetchall()
         ]
-        if periodic_failures:
+        cur.execute(
+            """SELECT id::text,company_name,ats_platform,consecutive_failures,last_error_kind,next_retry_at
+                 FROM ats_companies
+                WHERE enabled=true AND consecutive_failures>0
+                ORDER BY consecutive_failures DESC,company_name;"""
+        )
+        ats_source_failures = [
+            {"source_id": row[0], "company": row[1], "platform": row[2],
+             "consecutive_failures": int(row[3] or 0), "last_error_kind": row[4],
+             "next_retry_at": str(row[5]) if row[5] else None}
+            for row in cur.fetchall()
+        ]
+        if periodic_failures or ats_source_failures:
             runtime["ready"] = False
+        if periodic_failures:
             runtime["periodic_failures"] = [entry["task"] for entry in periodic_failures]
+        if ats_source_failures:
+            runtime["ats_source_failures"] = [entry["source_id"] for entry in ats_source_failures]
     print(json.dumps({
         "runtime": runtime, "database_runtime": database_runtime,
         "workflow_runs": workflow_runs, "control_commands": control_commands,
-        "periodic_task_failures": periodic_failures,
+        "periodic_task_failures": periodic_failures, "ats_source_failures": ats_source_failures,
         "applications_by_status": applications, "applications_by_step": steps, "applications_by_source": sources,
         "browser_tasks": browser_tasks, "attempts": attempts, "pending_human_reviews": pending_reviews,
         "needs_reconciliation": reconciliation,

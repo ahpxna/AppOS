@@ -23,13 +23,46 @@ def csv_list(value: str | None) -> list[str] | None:
     return None if value is None else [part.strip() for part in value.split(",") if part.strip()]
 
 
+def regex_list(value: str | None) -> list[str] | None:
+    """Parse regex preferences without treating regex commas as separators.
+
+    A single CLI value is one regex. Multiple regexes can be supplied as a JSON
+    array, which is unambiguous even when a pattern itself contains commas.
+    """
+    if value is None:
+        return None
+    text = value.strip()
+    if not text:
+        return []
+    if text.startswith("["):
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ValueError("location allow patterns JSON must be a valid array") from exc
+        if not isinstance(parsed, list):
+            raise ValueError("location allow patterns JSON must be an array")
+        if any(not isinstance(item, str) for item in parsed):
+            raise ValueError("location allow patterns JSON entries must be strings")
+        return [item.strip() for item in parsed if item.strip()]
+    # Preserve the historical comma-separated convenience for plain literal
+    # locations, but never split a value that visibly uses regex syntax.  The
+    # latter is what makes patterns such as ``^New York, NY$`` safe.  JSON is
+    # the unambiguous representation for multiple complex patterns.
+    if "," in text and not any(ch in text for ch in r"\^$*+?{}[]|()"):
+        return [part.strip() for part in text.split(",") if part.strip()]
+    return [text]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="JobOS typed discovery preferences")
     subs = parser.add_subparsers(dest="command", required=True)
     subs.add_parser("show")
     update = subs.add_parser("set")
     for field in FIELDS[:6]:
-        update.add_argument("--" + field.replace("_", "-"))
+        help_text = None
+        if field == "location_allow_patterns":
+            help_text = "One regex exactly as written, or a JSON array of regexes; commas inside regexes are preserved."
+        update.add_argument("--" + field.replace("_", "-"), help=help_text)
     update.add_argument("--freshness-days", type=int)
     update.add_argument("--salary-floor", type=float)
     update.add_argument("--max-active-applications-per-employer", type=int)
@@ -44,7 +77,8 @@ def main() -> int:
             return 0
         changes = {}
         for field in FIELDS[:6]:
-            value = csv_list(getattr(args, field))
+            raw = getattr(args, field)
+            value = regex_list(raw) if field == "location_allow_patterns" else csv_list(raw)
             if value is not None:
                 if field == "location_allow_patterns":
                     value = [validate_location_pattern(pattern) for pattern in value]

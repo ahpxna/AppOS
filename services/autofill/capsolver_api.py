@@ -3,7 +3,7 @@ import time
 import requests
 import logging
 
-from services.common.config import load_repo_env
+from services.common.config import env_float, load_repo_env
 
 log = logging.getLogger(__name__)
 
@@ -14,9 +14,9 @@ def _config() -> tuple[str, float, float, float]:
     key = (os.getenv("CAPSOLVER_API_KEY") or "").strip()
     if not key or key == "your_capsolver_key_here":
         raise ValueError("Missing CAPSOLVER_API_KEY in .env")
-    request_timeout = max(2.0, min(30.0, float(os.getenv("CAPSOLVER_REQUEST_TIMEOUT_SECONDS", "10"))))
-    solve_timeout = max(15.0, min(300.0, float(os.getenv("CAPSOLVER_SOLVE_TIMEOUT_SECONDS", "120"))))
-    poll_interval = max(1.0, min(10.0, float(os.getenv("CAPSOLVER_POLL_INTERVAL_SECONDS", "3"))))
+    request_timeout = env_float("CAPSOLVER_REQUEST_TIMEOUT_SECONDS", 10.0, minimum=2.0, maximum=30.0)
+    solve_timeout = env_float("CAPSOLVER_SOLVE_TIMEOUT_SECONDS", 120.0, minimum=15.0, maximum=300.0)
+    poll_interval = env_float("CAPSOLVER_POLL_INTERVAL_SECONDS", 3.0, minimum=1.0, maximum=10.0)
     return key, request_timeout, solve_timeout, poll_interval
 
 

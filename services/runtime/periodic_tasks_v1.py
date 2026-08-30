@@ -68,6 +68,31 @@ def _record_health(task: str, *, ok: bool, detail: str = "") -> None:
         pass
 
 
+
+def _ats_source_health() -> tuple[bool, str]:
+    """Return semantic ATS source health even when no source is due this cycle."""
+    try:
+        from services.common.config import database_dsn
+        import psycopg
+        with psycopg.connect(database_dsn(), autocommit=True) as conn, conn.cursor() as cur:
+            cur.execute(
+                """SELECT company_name,ats_platform,consecutive_failures,last_error_kind,next_retry_at
+                     FROM ats_companies
+                    WHERE enabled=true AND consecutive_failures>0
+                    ORDER BY consecutive_failures DESC,company_name
+                    LIMIT 20;"""
+            )
+            rows = cur.fetchall()
+    except Exception as exc:
+        return False, f"could not read ATS source health: {type(exc).__name__}: {exc}"
+    if not rows:
+        return True, ""
+    parts = [
+        f"{row[0]}({row[1]}): failures={int(row[2] or 0)} kind={row[3] or 'unknown'} retry={row[4]}"
+        for row in rows
+    ]
+    return False, "ATS sources remain degraded/backed off: " + "; ".join(parts)
+
 def run_loop(task: str, *, interval_seconds: int, once: bool = False) -> int:
     global STOP
     if task not in TASKS:
@@ -77,7 +102,7 @@ def run_loop(task: str, *, interval_seconds: int, once: bool = False) -> int:
     signal.signal(signal.SIGTERM, lambda *_: globals().__setitem__("STOP", True))
     signal.signal(signal.SIGINT, lambda *_: globals().__setitem__("STOP", True))
     consecutive_failures = 0
-    exit_threshold = max(1, min(int(os.getenv("JOBOS_PERIODIC_FAILURE_EXIT_THRESHOLD", "3")), 20))
+    exit_threshold = _bounded_timeout("JOBOS_PERIODIC_FAILURE_EXIT_THRESHOLD", 3, 1, 20)
     while not STOP:
         result = DEFAULT_PROCESS_RUNNER.run(argv, cwd=ROOT, timeout_s=timeout_s)
         if not result.ok:
@@ -90,7 +115,15 @@ def run_loop(task: str, *, interval_seconds: int, once: bool = False) -> int:
                 return 1
         else:
             consecutive_failures = 0
-            _record_health(task, ok=True)
+            semantic_ok, semantic_detail = (
+                _ats_source_health() if task == "ats-discovery" else (True, "")
+            )
+            _record_health(task, ok=semantic_ok, detail=semantic_detail)
+            if not semantic_ok:
+                # The wrapper/CLI ran successfully, so do not create a restart
+                # storm while a permanent source is intentionally backed off.
+                # Durable health remains degraded until that source succeeds.
+                print(f"[{task}] semantic health degraded: {semantic_detail}", file=sys.stderr, flush=True)
         if once:
             return 0 if result.ok else 1
         deadline = time.monotonic() + interval

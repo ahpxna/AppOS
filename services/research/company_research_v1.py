@@ -54,7 +54,7 @@ import psycopg
 from psycopg.types.json import Jsonb
 
 from services.common.observability import emit_trace, make_trace_id
-from services.common.config import database_dsn
+from services.common.config import database_dsn, env_int
 from services.common.ai_contracts import parse_json_object as _parse_contract_json_object
 from services.ats.registry import detect_ats_platform
 
@@ -64,7 +64,7 @@ OPENCLAW_BIN = resolve_openclaw_binary()
 OPENCLAW_AGENT = os.getenv("OPENCLAW_AGENT_RESEARCH", "main")
 
 RESEARCH_VERSION = "company_research_v1_webfetch_2026_07_28"
-DEFAULT_TTL_DAYS = int(os.getenv("JOBOS_RESEARCH_TTL_DAYS", "30"))
+DEFAULT_TTL_DAYS = env_int("JOBOS_RESEARCH_TTL_DAYS", 30, minimum=1, maximum=3650)
 
 
 def estimate_tokens(text: str) -> int:

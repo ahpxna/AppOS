@@ -34,6 +34,7 @@ from typing import Any, Sequence
 from urllib.parse import urlsplit
 
 from .model_config import get_model
+from .config import env_int
 
 
 class LLMGatewayError(RuntimeError):
@@ -255,7 +256,7 @@ def _usage(response: dict[str, Any], *, fallback_input: int, fallback_output_tex
 
 
 def _max_output_tokens() -> int:
-    return max(1, int(os.getenv("JOBOS_LLM_MAX_OUTPUT_TOKENS", "4096")))
+    return env_int("JOBOS_LLM_MAX_OUTPUT_TOKENS", 4096, minimum=1, maximum=1_000_000)
 
 
 def _sha_payload(value: Any) -> str:

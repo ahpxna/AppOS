@@ -30,6 +30,7 @@ THIS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(THIS_DIR))
 
+from services.common.config import env_int
 from services.common.project_registry import configured_github_projects, load_registry
 from services.common.value_coercion import coerce_bool
 from repository_claims_v1 import ANALYZER_VERSION, classify_changed_files, extract_claims, persist_claims
@@ -997,7 +998,7 @@ def main() -> int:
     refresh.add_argument("--project-id")
     refresh.add_argument("--dry-run", action="store_true")
     preflight = sub.add_parser("pre-resume")
-    preflight.add_argument("--max-stale-hours", type=int, default=int(os.getenv("JOBOS_PROJECT_MAX_STALE_HOURS", DEFAULT_MAX_STALE_HOURS)))
+    preflight.add_argument("--max-stale-hours", type=int, default=env_int("JOBOS_PROJECT_MAX_STALE_HOURS", DEFAULT_MAX_STALE_HOURS, minimum=1, maximum=8760))
     sub.add_parser("status")
     watcher = sub.add_parser("watch")
     watcher.add_argument("--project-id")

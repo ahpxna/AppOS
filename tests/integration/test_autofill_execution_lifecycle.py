@@ -1170,3 +1170,26 @@ def test_097_document_and_reply_version_lanes_have_unique_db_backstops(db):
         cur.execute("ROLLBACK TO SAVEPOINT duplicate_reply_version")
         cur.execute("RELEASE SAVEPOINT duplicate_reply_version")
         conn.rollback()
+
+
+def test_discovery_location_regex_database_authority(db):
+    """Migration 099 must protect direct SQL/future writers, not only the CLI."""
+    with db.connect(TEST_DSN) as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE job_search_preferences SET location_allow_patterns=%s WHERE profile_key='primary'",
+            ([r"^New York, NY$"],),
+        )
+        cur.execute(
+            "SELECT location_allow_patterns FROM job_search_preferences WHERE profile_key='primary'"
+        )
+        assert cur.fetchone() == ([r"^New York, NY$"],)
+        conn.rollback()
+
+    for invalid in (["[bad"], ["(a+)+"], [None]):
+        with db.connect(TEST_DSN) as conn, conn.cursor() as cur:
+            with pytest.raises(db.Error):
+                cur.execute(
+                    "UPDATE job_search_preferences SET location_allow_patterns=%s WHERE profile_key='primary'",
+                    (invalid,),
+                )
+            conn.rollback()

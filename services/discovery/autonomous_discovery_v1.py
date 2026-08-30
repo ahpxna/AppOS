@@ -180,6 +180,25 @@ def build_linkedin_plan(cur, *, now: float | None = None) -> list[dict[str, Any]
     return ordered[: min(per_cycle, len(candidates))]
 
 
+def _coverage_requirements(cur) -> dict[str, int]:
+    """Describe matrix coverage independently from current queue occupancy."""
+    prefs = _preferences(cur)
+    terms = _prioritized_terms(cur)
+    locations = _literal_locations(prefs.get("location_allow_patterns")) or ([""] if terms else [])
+    matrix_size = len(terms) * len(locations)
+    interval_seconds = _bounded_int("JOBOS_PROFILE_DISCOVERY_INTERVAL_SECONDS", 900, 60, 86400)
+    target_hours = _bounded_int("JOBOS_LINKEDIN_TARGET_COVERAGE_HOURS", 24, 1, 168)
+    cycles_in_target = max(1, int((target_hours * 3600) / interval_seconds))
+    required = math.ceil(matrix_size / cycles_in_target) if matrix_size else 0
+    configured_floor = _bounded_int("JOBOS_LINKEDIN_SEARCHES_PER_CYCLE", 3, 1, 20)
+    return {
+        "matrix_size": matrix_size,
+        "target_hours": target_hours,
+        "cycles_in_target": cycles_in_target,
+        "required_searches_per_cycle": min(20, max(configured_floor, required)) if matrix_size else 0,
+    }
+
+
 def _enroll_observed_ats_sources(cur, *, limit: int = 200) -> int:
     """Project only DOM-href-evidenced external URLs into ATS sources."""
     candidates: list[tuple[str, str, str, str]] = []
@@ -326,17 +345,79 @@ def run_once(cur, *, apply: bool, now: float | None = None) -> dict[str, Any]:
         cur.execute("SELECT cursor FROM discovery_scheduler_state WHERE scheduler_key=%s;", (PLANNER_KEY,))
         cursor_row = cur.fetchone()
         current_cursor = int(cursor_row[0] or 0) if cursor_row else 0
-    planned = build_linkedin_plan(cur, now=now_value)
-    queued: list[dict[str, Any]] = []
-    skipped: list[dict[str, Any]] = []
-    considered = 0
 
     linkedin_capable = _truthy("JOBOS_LINKEDIN_AGENT_DISCOVERY_ENABLED", False)
     autonomous_enabled = _truthy("JOBOS_AUTONOMOUS_DISCOVERY_ENABLED", False)
+    saved_enabled = _truthy("JOBOS_LINKEDIN_SAVED_DISCOVERY_ENABLED", False)
+    queued: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+
+    # Saved Jobs is an explicit user signal. Reserve the first available slot
+    # before ordinary matrix searches so a large search matrix cannot starve it.
+    saved_result: dict[str, Any] | None = None
+    if saved_enabled and autonomous_enabled:
+        saved_cooldown = _bounded_int("JOBOS_LINKEDIN_SAVED_SYNC_COOLDOWN_SECONDS", 21600, 3600, 604800)
+        saved_base_key = "jobos:auto-linkedin-saved"
+        if slots <= 0:
+            saved_result = {"created": False, "reason": "backpressure", "idempotency_key": saved_base_key}
+        elif apply:
+            _, saved_last_queued, saved_last_finished = _ensure_scheduler_state(cur, SAVED_STATE_KEY)
+            retry_key, failure_block = _failed_task_action(
+                cur, base_key=saved_base_key, task_type="discover_linkedin_saved_jobs", now_value=now_value
+            )
+            if failure_block:
+                saved_result = {"created": False, "reason": failure_block, "idempotency_key": saved_base_key}
+                saved_key = ""
+            elif retry_key:
+                saved_key = retry_key
+            elif (saved_anchor := _cooldown_anchor(saved_last_queued, saved_last_finished)) and now_value - saved_anchor.timestamp() < saved_cooldown:
+                saved_result = {"created": False, "reason": "rolling_cooldown", "idempotency_key": saved_base_key}
+                saved_key = ""
+            else:
+                saved_key = _occurrence_key(saved_base_key, now_value)
+            if saved_key:
+                sync_id, task_id, created = queue_saved_sync_task(
+                    cur, max_results=_bounded_int("JOBOS_LINKEDIN_SAVED_MAX_RESULTS", 10, 1, 20),
+                    timeout=_bounded_int("JOBOS_LINKEDIN_SAVED_TIMEOUT_SECONDS", 600, 60, 1800),
+                    requested_by=PLANNER_KEY, autonomous=True, idempotency_key=saved_key,
+                )
+                if created:
+                    cur.execute(
+                        "UPDATE discovery_scheduler_state SET last_queued_at=now(),updated_at=now() WHERE scheduler_key=%s;",
+                        (SAVED_STATE_KEY,),
+                    )
+                    slots -= 1
+                saved_result = {"saved_sync_id": sync_id, "browser_task_id": task_id,
+                                "created": created, "idempotency_key": saved_key}
+        else:
+            saved_key = _occurrence_key(saved_base_key, now_value)
+            saved_result = {"saved_sync_id": "dry-run", "browser_task_id": "dry-run",
+                            "created": True, "idempotency_key": saved_key}
+            slots = max(0, slots - 1)
+
+    coverage = _coverage_requirements(cur)
+    nominal_search_capacity = max_queued - (1 if saved_enabled and autonomous_enabled else 0)
+    coverage["configured_search_queue_capacity"] = max(0, nominal_search_capacity)
+    coverage["available_search_slots_this_cycle"] = max(0, slots)
+    coverage["target_achievable_from_queue_capacity"] = (
+        coverage["required_searches_per_cycle"] <= max(0, nominal_search_capacity)
+    )
+    if not coverage["target_achievable_from_queue_capacity"]:
+        coverage["capacity_shortfall"] = (
+            coverage["required_searches_per_cycle"] - max(0, nominal_search_capacity)
+        )
+
+    # Queue admission is clamped by ``slots`` below, but the candidate scan must
+    # remain wider than the admission budget.  Otherwise a few leading
+    # cooldown/permanent-block entries can leave capacity idle even though later
+    # matrix entries are due.  Coverage feasibility is reported from physical
+    # queue capacity above rather than pretending every planned candidate can be
+    # admitted.
+    planned = build_linkedin_plan(cur, now=now_value)
+    considered = 0
     if linkedin_capable and autonomous_enabled:
         for request in planned:
             if slots <= 0:
-                skipped.append({"reason": "backpressure", "search": request})
                 break
             considered += 1
             fingerprint = _fingerprint(request)
@@ -382,52 +463,14 @@ def run_once(cur, *, apply: bool, now: float | None = None) -> dict[str, Any]:
         skipped.append({"reason": "autonomous_discovery_disabled" if linkedin_capable else "linkedin_capability_disabled",
                         "planned_searches": len(planned)})
 
-    saved_result: dict[str, Any] | None = None
-    if _truthy("JOBOS_LINKEDIN_SAVED_DISCOVERY_ENABLED", False) and autonomous_enabled:
-        saved_cooldown = _bounded_int("JOBOS_LINKEDIN_SAVED_SYNC_COOLDOWN_SECONDS", 21600, 3600, 604800)
-        saved_base_key = "jobos:auto-linkedin-saved"
-        if slots <= 0:
-            saved_result = {"created": False, "reason": "backpressure", "idempotency_key": saved_base_key}
-        elif apply:
-            _, saved_last_queued, saved_last_finished = _ensure_scheduler_state(cur, SAVED_STATE_KEY)
-            retry_key, failure_block = _failed_task_action(
-                cur, base_key=saved_base_key, task_type="discover_linkedin_saved_jobs", now_value=now_value
-            )
-            if failure_block:
-                saved_result = {"created": False, "reason": failure_block, "idempotency_key": saved_base_key}
-                saved_key = ""
-            elif retry_key:
-                saved_key = retry_key
-            elif (saved_anchor := _cooldown_anchor(saved_last_queued, saved_last_finished)) and now_value - saved_anchor.timestamp() < saved_cooldown:
-                saved_result = {"created": False, "reason": "rolling_cooldown", "idempotency_key": saved_base_key}
-                saved_key = ""
-            else:
-                saved_key = _occurrence_key(saved_base_key, now_value)
-            if saved_key:
-                sync_id, task_id, created = queue_saved_sync_task(
-                    cur, max_results=_bounded_int("JOBOS_LINKEDIN_SAVED_MAX_RESULTS", 10, 1, 20),
-                    timeout=_bounded_int("JOBOS_LINKEDIN_SAVED_TIMEOUT_SECONDS", 600, 60, 1800),
-                    requested_by=PLANNER_KEY, autonomous=True, idempotency_key=saved_key,
-                )
-                if created:
-                    cur.execute(
-                        "UPDATE discovery_scheduler_state SET last_queued_at=now(),updated_at=now() WHERE scheduler_key=%s;",
-                        (SAVED_STATE_KEY,),
-                    )
-                    slots -= 1
-                saved_result = {"saved_sync_id": sync_id, "browser_task_id": task_id,
-                                "created": created, "idempotency_key": saved_key}
-        else:
-            saved_key = _occurrence_key(saved_base_key, now_value)
-            saved_result = {"saved_sync_id": "dry-run", "browser_task_id": "dry-run",
-                            "created": True, "idempotency_key": saved_key}
-
     cur.execute("SELECT count(*) FROM ats_companies WHERE enabled=true;")
     ats_companies = int(cur.fetchone()[0])
     return {
         "apply": bool(apply), "approved_term_count": len(approved_terms(cur)),
-        "linkedin_enabled": linkedin_capable, "autonomous_enabled": autonomous_enabled, "active_planner_tasks_before": active,
+        "linkedin_enabled": linkedin_capable, "autonomous_enabled": autonomous_enabled,
+        "active_planner_tasks_before": active,
         "queued_searches": queued, "skipped": skipped, "saved_sync": saved_result,
+        "coverage": coverage,
         "ats_companies_enabled": ats_companies, "ats_sources_enrolled": ats_sources_enrolled,
         "ats_note": ("ATS periodic polling has configured sources." if ats_companies else
                      "No grounded ATS source yet; LinkedIn external apply URLs can auto-enroll deterministic ATS sources."),

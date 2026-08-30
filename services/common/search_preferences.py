@@ -7,6 +7,8 @@ from typing import Mapping
 
 import regex as safe_regex
 
+from services.ats.contracts import WorkMode, normalize_work_mode
+
 MAX_LOCATION_REGEX_LENGTH = 160
 LOCATION_REGEX_TIMEOUT_SECONDS = 0.02
 _UNSAFE_REGEX = re.compile(r"(?:\([^)]*[+*][^)]*\)[+*])|(?:\.\*[+*])|(?:\{\d{3,}(?:,\d*)?\})")
@@ -53,6 +55,8 @@ def regex_patterns(values: object) -> list[str]:
     matching is already case-insensitive via the regex flags.
     """
     return [str(item).strip() for item in (values or []) if str(item).strip()]
+
+
 
 
 def _employment_type(text: str) -> str | None:
@@ -107,9 +111,21 @@ def preference_reason(*, company: str, title: str, location: str, work_mode: str
                         ("location_blacklist", "location")):
         if any(term in values[target] for term in normalized_terms(preferences.get(key))):
             return f"{key}:{target}"
-    allowed_modes = normalized_terms(preferences.get("allowed_work_modes"))
-    if values["work_mode"] and allowed_modes and values["work_mode"] not in allowed_modes:
-        return "work_mode_not_preferred"
+    allowed_modes = {normalize_work_mode(str(item)).value for item in (preferences.get("allowed_work_modes") or [])}
+    allowed_modes.discard(WorkMode.UNKNOWN.value)
+    job_mode = normalize_work_mode(work_mode).value
+    # Unknown is absence of source evidence.  The default all-modes preference
+    # must not reject it merely because an adapter could not classify an
+    # otherwise eligible posting.  A restrictive preference (for example
+    # remote-only), however, still requires affirmative evidence of an allowed
+    # mode rather than silently widening the user's criteria.
+    if allowed_modes:
+        all_known_modes = {WorkMode.REMOTE.value, WorkMode.HYBRID.value, WorkMode.ON_SITE.value}
+        if job_mode == WorkMode.UNKNOWN.value:
+            if allowed_modes != all_known_modes:
+                return "work_mode_not_preferred"
+        elif job_mode not in allowed_modes:
+            return "work_mode_not_preferred"
     patterns = regex_patterns(preferences.get("location_allow_patterns"))
     if patterns and not any(_safe_location_match(pattern, values["location"]) for pattern in patterns):
         return "location_not_allowed"

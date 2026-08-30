@@ -31,7 +31,7 @@ from services.autofill.autofill_agent_v1 import INPUT_ROLES, parse_snapshot
 from services.autofill.autofill_executor_v1 import OpenClawTransport, TransportError
 from services.common.value_coercion import coerce_bool
 from services.common.autofill_identity import canonical_page_url, page_fingerprint
-from services.common.config import database_dsn, load_repo_env
+from services.common.config import database_dsn, env_int, load_repo_env
 from services.common.openclaw_runtime import resolve_openclaw_binary
 from services.control_plane.pipeline_state import DEFAULT_PIPELINE_STATE_STORE, PipelineStateError
 from services.ats.registry import detect_ats_platform
@@ -1523,7 +1523,7 @@ def execute_one(conn, request_id: str) -> dict[str, Any]:
                     observed_domain = (urlsplit(secret).hostname or "").casefold()
                     if not domain or domain != observed_domain:
                         raise PrivilegedActionError("email magic-link domain does not match the approved trust gate")
-                    ttl_minutes = max(15, min(60, int(os.getenv("JOBOS_MAGIC_LINK_TRUST_TTL_MINUTES", "30"))))
+                    ttl_minutes = env_int("JOBOS_MAGIC_LINK_TRUST_TTL_MINUTES", 30, minimum=15, maximum=60)
                     cur.execute(
                         """UPDATE application_scoped_domain_trusts
                               SET enabled=true, expires_at=now()+make_interval(mins => %s),
@@ -1547,7 +1547,7 @@ def execute_one(conn, request_id: str) -> dict[str, Any]:
                         raise PrivilegedActionError("domain binding invalid")
                     if domain != (urlsplit(live_url).hostname or "").casefold():
                         raise PrivilegedActionError("browser target no longer belongs to the approved employer domain")
-                    ttl_minutes = max(15, min(10080, int(os.getenv("JOBOS_EMPLOYER_TRUST_TTL_MINUTES", "1440"))))
+                    ttl_minutes = env_int("JOBOS_EMPLOYER_TRUST_TTL_MINUTES", 1440, minimum=15, maximum=10080)
                     cur.execute(
                         """UPDATE application_scoped_domain_trusts
                               SET enabled=true, expires_at=now()+make_interval(mins => %s),
@@ -1824,7 +1824,7 @@ def recover_stale_executions(conn) -> int:
     consumed. This can create a conservative false-positive review, but cannot
     duplicate an external side effect.
     """
-    ttl = max(60, int(os.getenv("JOBOS_PRIVILEGED_ACTION_STALE_SECONDS", "600")))
+    ttl = env_int("JOBOS_PRIVILEGED_ACTION_STALE_SECONDS", 600, minimum=60, maximum=86400)
     with conn.cursor() as cur:
         cur.execute(
             """WITH stale AS (

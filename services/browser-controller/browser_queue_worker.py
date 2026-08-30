@@ -61,7 +61,7 @@ import requests
 import websocket
 from services.common.value_coercion import coerce_bool
 from services.common.observability import emit_trace, make_trace_id
-from services.common.config import database_dsn, load_repo_env
+from services.common.config import database_dsn, env_int, load_repo_env
 from services.discovery.linkedin_discovery_v1 import (
     LinkedInDiscoveryError,
     MAX_AUTONOMOUS_DISCOVERY_RESULTS, MAX_DISCOVERY_RESULTS,
@@ -116,8 +116,8 @@ WORKER_VERSION = "browser_queue_worker_v4_deterministic_form_session_2026_08_23"
 WORKER_ID = f"{socket.gethostname()}:{os.getpid()}"
 # A claimed task is never reclaimable while its bounded OpenClaw/CDP I/O is
 # still permitted to run. The SQL claim also takes max(task timeout + grace).
-LEASE_SECONDS = max(60, int(os.getenv("JOBOS_BROWSER_LEASE_SECONDS", "600")))
-LEASE_GRACE_SECONDS = max(30, int(os.getenv("JOBOS_BROWSER_LEASE_GRACE_SECONDS", "120")))
+LEASE_SECONDS = env_int("JOBOS_BROWSER_LEASE_SECONDS", 600, minimum=60, maximum=86400)
+LEASE_GRACE_SECONDS = env_int("JOBOS_BROWSER_LEASE_GRACE_SECONDS", 120, minimum=30, maximum=3600)
 
 SUPPORTED_TASKS = {
     "fetch_job_description",
@@ -316,6 +316,59 @@ def _linkedin_ingest_evidence() -> dict[str, Any]:
 def _verified_external_hrefs_by_linkedin_job() -> dict[str, list[str]]:
     """Backward-compatible projection used by older tests/tools."""
     return _linkedin_ingest_evidence()["verified_external_hrefs_by_job"]
+
+
+def _linkedin_detail_target_ids() -> set[str] | None:
+    """Return live LinkedIn detail targets, or ``None`` if ownership is unknown.
+
+    An unavailable baseline must never be represented as an empty baseline: doing
+    so would let cleanup close pre-existing user tabs after a transient CDP read
+    failure.
+    """
+    try:
+        response = requests.get(BROWSER_CDP_URL.rstrip("/") + "/json", timeout=3)
+        response.raise_for_status()
+        tabs = response.json()
+    except Exception:
+        return None
+    if not isinstance(tabs, list):
+        return None
+    result: set[str] = set()
+    for tab in tabs:
+        if not isinstance(tab, dict) or tab.get("type") != "page":
+            continue
+        target_id = str(tab.get("id") or "").strip()
+        page_url = str(tab.get("url") or "")
+        parsed = urlsplit(page_url)
+        host = (parsed.hostname or "").casefold()
+        if not target_id or not (host == "linkedin.com" or host.endswith(".linkedin.com")):
+            continue
+        if re.search(r"/jobs/view/\d+", parsed.path or "") or re.search(r"(?:^|&)currentJobId=\d+(?:&|$)", parsed.query or ""):
+            result.add(target_id)
+    return result
+
+
+def _close_linkedin_detail_tabs_opened_after(baseline: set[str]) -> int:
+    """Close only job-detail tabs created by the bounded discovery task.
+
+    Pre-existing/user tabs are preserved.  This prevents stale job tabs from
+    accumulating and contaminating later CDP evidence scans.
+    """
+    current = _linkedin_detail_target_ids()
+    if current is None:
+        return 0
+    closed = 0
+    for target_id in sorted(current - set(baseline)):
+        try:
+            response = requests.get(
+                BROWSER_CDP_URL.rstrip("/") + "/json/close/" + target_id, timeout=3
+            )
+            if response.ok:
+                closed += 1
+        except Exception as exc:
+            print(f"  [LinkedIn] warning: could not close discovery detail tab {target_id}: {exc}")
+    return closed
+
 
 def _lease_window_seconds(task: Dict[str, Any]) -> int:
     return max(LEASE_SECONDS, int(task.get("timeout_seconds") or 300) + LEASE_GRACE_SECONDS)
@@ -2277,6 +2330,12 @@ def process_one(conn) -> bool:
     trace_id = make_trace_id("browser-task", task["id"])
     start = time.perf_counter()
 
+    linkedin_detail_targets_before = (
+        _linkedin_detail_target_ids()
+        if task["task_type"] in {"discover_linkedin_jobs", "discover_linkedin_saved_jobs"}
+        else None
+    )
+
     lease_stop = threading.Event()
     lease_thread = threading.Thread(
         target=_lease_heartbeat, args=(task, lease_stop),
@@ -2406,6 +2465,8 @@ def process_one(conn) -> bool:
     finally:
         lease_stop.set()
         lease_thread.join(timeout=2)
+        if linkedin_detail_targets_before is not None:
+            _close_linkedin_detail_tabs_opened_after(linkedin_detail_targets_before)
 
     return True
 

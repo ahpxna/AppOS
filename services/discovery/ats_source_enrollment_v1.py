@@ -173,11 +173,9 @@ def enroll_ats_source(cur, *, company: str, apply_url: str | None,
         if existing:
             if _normalized_company(existing[1]) != _normalized_company(company_name):
                 return None
-            cur.execute(
-                "UPDATE ats_companies SET notes=%s,updated_at=now() WHERE id=%s RETURNING id::text;",
-                (note, existing[0]),
-            )
-            return str(cur.fetchone()[0])
+            # Existing rows are operator-owned state. Re-observation proves the
+            # same locator but must not overwrite notes or generate WAL churn.
+            return str(existing[0])
         cur.execute(
             """INSERT INTO ats_companies(company_name,ats_platform,slug,source_url,enabled,notes,updated_at)
                VALUES (%s,%s,%s,NULL,true,%s,now()) RETURNING id::text;""",
@@ -197,11 +195,8 @@ def enroll_ats_source(cur, *, company: str, apply_url: str | None,
         return None
 
     if locator_existing:
-        cur.execute(
-            "UPDATE ats_companies SET notes=%s,updated_at=now() WHERE id=%s RETURNING id::text;",
-            (note, locator_existing[0]),
-        )
-        return str(cur.fetchone()[0])
+        # Preserve operator annotations and source history on repeated evidence.
+        return str(locator_existing[0])
 
     # A new witnessed board is a new locator identity.  Never retarget an
     # existing row merely because company/platform match: employers may operate

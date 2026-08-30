@@ -62,7 +62,7 @@ from services.common.document_prompt_templates_v1 import (
     build_cover_alignment_audit_prompt, build_cover_letter_tailoring_prompt,
     material_requirement_summary,
 )
-from services.common.config import database_dsn
+from services.common.config import database_dsn, env_int
 from services.common.ai_contracts import parse_json_object as _parse_contract_json_object
 from services.common.value_coercion import coerce_bool
 from services.control_plane.document_attempts import (
@@ -1172,7 +1172,7 @@ def main() -> int:
     p.add_argument("--skip-live-project-refresh", action="store_true",
                    help="Offline diagnostic only. DB freshness gates still apply; current GitHub HEAD is not polled.")
     p.add_argument("--project-max-stale-hours", type=int,
-                   default=int(os.getenv("JOBOS_PROJECT_MAX_STALE_HOURS", "24")),
+                   default=env_int("JOBOS_PROJECT_MAX_STALE_HOURS", 24, minimum=1, maximum=8760),
                    help="Last-known-good GitHub snapshot age allowed only when GitHub is temporarily unavailable.")
     args = p.parse_args()
 

@@ -409,11 +409,31 @@ def status() -> int:
                 for row in cur.fetchall()
             ]
             state["periodic_task_health"] = unhealthy
-            if unhealthy:
+            cur.execute(
+                """SELECT id::text,company_name,ats_platform,consecutive_failures,last_error_kind,next_retry_at
+                     FROM ats_companies
+                    WHERE enabled=true AND consecutive_failures>0
+                    ORDER BY consecutive_failures DESC,company_name;"""
+            )
+            ats_unhealthy = [
+                {"source_id": row[0], "company": row[1], "platform": row[2],
+                 "consecutive_failures": int(row[3] or 0), "last_error_kind": row[4],
+                 "next_retry_at": row[5]}
+                for row in cur.fetchall()
+            ]
+            state["ats_source_health"] = ats_unhealthy
+            if unhealthy or ats_unhealthy:
                 state["ready"] = False
+            if unhealthy:
                 state["periodic_failures"] = [entry["task"] for entry in unhealthy]
+            if ats_unhealthy:
+                state["ats_source_failures"] = [entry["source_id"] for entry in ats_unhealthy]
     except Exception as exc:
+        # Runtime readiness is not provable without the durable DB/control-plane
+        # authority.  A live supervisor process alone must never produce a
+        # successful readiness result when that health read failed.
         state["database_runtime"]={"available":False,"error":str(exc)[:300]}
+        state["ready"] = False
     print(json.dumps(state, indent=2, default=str))
     return 0 if state["ready"] else 1
 

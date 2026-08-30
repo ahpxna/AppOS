@@ -17,7 +17,7 @@ import uuid
 import psycopg
 from psycopg.types.json import Jsonb
 
-from services.common.config import database_dsn
+from services.common.config import database_dsn, env_int
 
 
 def sha256_file(path: Path) -> str:
@@ -91,7 +91,7 @@ def begin_render_run(*, document_id: str, input_manifest: dict[str, Any],
     again under a fresh claim token without creating a second logical run.
     """
     input_sha = sha256_json(input_manifest)
-    lease_seconds = max(60, int(os.getenv("JOBOS_RENDER_LEASE_SECONDS", "900")))
+    lease_seconds = env_int("JOBOS_RENDER_LEASE_SECONDS", 900, minimum=60, maximum=86400)
     claim_token = str(uuid.uuid4())
     with psycopg.connect(database_dsn(), autocommit=False) as conn, conn.cursor() as cur:
         template_id = _ensure_template_revision(cur, template)
