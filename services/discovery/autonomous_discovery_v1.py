@@ -261,15 +261,53 @@ def _occurrence_key(base_key: str, now_value: float) -> str:
     return f"{base_key}:{int(now_value * 1000)}"
 
 
-def _retryable_failed_key(cur, *, base_key: str, task_type: str, now_value: float) -> str | None:
+def _failed_task_action(
+    cur, *, base_key: str, task_type: str, now_value: float,
+) -> tuple[str | None, str | None]:
+    """Return (idempotency_key, block_reason) for the latest failed occurrence.
+
+    Retryable/auth-session failures may reuse the exact durable task identity
+    after a short backoff.  Non-retryable OpenClaw/config/policy failures must
+    *not* silently start a fresh occurrence after the ordinary search cooldown;
+    autonomous discovery remains blocked until an operator explicitly repairs
+    the configuration and manually exercises the feature.
+    """
     latest = _latest_task(cur, base_key, task_type)
-    if not latest or latest[1] != 'failed' or not safe_discovery_reissue(latest[2]):
-        return None
+    if not latest or latest[1] != "failed":
+        return None, None
+    if not safe_discovery_reissue(latest[2]):
+        # A non-retryable autonomous failure (bad OpenClaw credentials/policy/
+        # configuration) must not churn forever.  Once an operator explicitly
+        # exercises the same discovery task type successfully, that durable
+        # success is evidence that the external/config boundary was repaired
+        # and autonomous scheduling may resume.
+        failed_finished_at = latest[3]
+        if failed_finished_at is not None:
+            cur.execute(
+                """SELECT 1 FROM browser_tasks
+                    WHERE task_type=%s
+                      AND requested_by<>%s
+                      AND status='completed'
+                      AND finished_at>%s
+                    LIMIT 1;""",
+                (task_type, PLANNER_KEY, failed_finished_at),
+            )
+            if cur.fetchone():
+                return None, None
+        return None, "non_retryable_failure"
     retry_delay = _bounded_int("JOBOS_LINKEDIN_FAILED_RETRY_COOLDOWN_SECONDS", 300, 60, 3600)
     finished_at = latest[3]
     if finished_at is not None and now_value - finished_at.timestamp() < retry_delay:
-        return None
-    return latest[0]
+        return None, "retry_backoff"
+    return latest[0], None
+
+
+def _retryable_failed_key(cur, *, base_key: str, task_type: str, now_value: float) -> str | None:
+    """Backward-compatible projection for tests/tools."""
+    key, _reason = _failed_task_action(
+        cur, base_key=base_key, task_type=task_type, now_value=now_value
+    )
+    return key
 
 
 def run_once(cur, *, apply: bool, now: float | None = None) -> dict[str, Any]:
@@ -306,9 +344,12 @@ def run_once(cur, *, apply: bool, now: float | None = None) -> dict[str, Any]:
             base_key = f"jobos:auto-linkedin:{fingerprint}"
             if apply:
                 _, last_queued_at, last_finished_at = _ensure_scheduler_state(cur, state_key)
-                retry_key = _retryable_failed_key(
+                retry_key, failure_block = _failed_task_action(
                     cur, base_key=base_key, task_type="discover_linkedin_jobs", now_value=now_value
                 )
+                if failure_block:
+                    skipped.append({"reason": failure_block, "search": request})
+                    continue
                 if retry_key:
                     key = retry_key
                 elif (cooldown_anchor := _cooldown_anchor(last_queued_at, last_finished_at)) and (now_value - cooldown_anchor.timestamp()) < cooldown:
@@ -349,10 +390,13 @@ def run_once(cur, *, apply: bool, now: float | None = None) -> dict[str, Any]:
             saved_result = {"created": False, "reason": "backpressure", "idempotency_key": saved_base_key}
         elif apply:
             _, saved_last_queued, saved_last_finished = _ensure_scheduler_state(cur, SAVED_STATE_KEY)
-            retry_key = _retryable_failed_key(
+            retry_key, failure_block = _failed_task_action(
                 cur, base_key=saved_base_key, task_type="discover_linkedin_saved_jobs", now_value=now_value
             )
-            if retry_key:
+            if failure_block:
+                saved_result = {"created": False, "reason": failure_block, "idempotency_key": saved_base_key}
+                saved_key = ""
+            elif retry_key:
                 saved_key = retry_key
             elif (saved_anchor := _cooldown_anchor(saved_last_queued, saved_last_finished)) and now_value - saved_anchor.timestamp() < saved_cooldown:
                 saved_result = {"created": False, "reason": "rolling_cooldown", "idempotency_key": saved_base_key}

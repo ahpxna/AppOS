@@ -241,6 +241,11 @@ def _verified_linkedin_job_evidence() -> dict[str, dict[str, Any]]:
           if (!/^https?:$/.test(parsed.protocol)) return false;
           const host = parsed.hostname.toLowerCase();
           if (host === 'linkedin.com' || host.endsWith('.linkedin.com')) return false;
+          if (a.hidden || a.getAttribute('aria-hidden') === 'true') return false;
+          const style = window.getComputedStyle(a);
+          if (!style || style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity || 1) === 0) return false;
+          const rect = a.getBoundingClientRect();
+          if (!rect || rect.width <= 0 || rect.height <= 0) return false;
           const label = [a.innerText, a.getAttribute('aria-label'), a.getAttribute('title'),
                          a.getAttribute('data-control-name')].filter(Boolean).join(' ');
           return /\bapply\b/i.test(label);
@@ -1965,37 +1970,46 @@ def handle_discover_linkedin_saved_jobs(cur, task) -> Dict[str, Any]:
         "Each record needs a grounded canonical URL and 200+ JD characters."
     )
 
-    # =====================================================================
-    # BẬT FAKE MOUSE CHO SAVED JOBS THROUGH ITS PUBLIC ENTRYPOINT
-    # =====================================================================
-    mouse_stop_event = threading.Event()
-    mouse_thread = None
-    try:
-        mouse_thread = _start_linkedin_fake_mouse(mouse_stop_event)
-        print("  [FakeMouse] Đã bật khiên bảo vệ Brownian Motion cho Saved Jobs...")
-    except Exception as e:
-        print(f"  [FakeMouse] Bỏ qua Fake Mouse vì không thể kết nối CDP: {e}")
-
-    try:
-        agent_response = openclaw_agent(
-            agent=OPENCLAW_AGENT_LINKEDIN_DISCOVERY, message=msg,
-            timeout=task["timeout_seconds"], session_id=f"jobos-saved-{task['id']}",
-        )
-    except RuntimeError as exc:
-        raise TransientTaskError(str(exc)) from exc
-    finally:
-        # [THÊM MỚI] TẮT CHUỘT MA NGAY CẢ KHI LỖI
-        mouse_stop_event.set()
-        if mouse_thread and mouse_thread.is_alive():
-            mouse_thread.join(timeout=5)
-            if mouse_thread.is_alive():
-                print("  [FakeMouse] warning: Saved Jobs helper still stopping in daemon thread")
+    agent_response = _run_linkedin_agent_with_fake_mouse(
+        message=msg, timeout=task["timeout_seconds"], session_id=f"jobos-saved-{task['id']}"
+    )
 
     saved_blocker = classify_linkedin_blocker(agent_response)
     if saved_blocker == "auth":
         raise TransientTaskError("LinkedIn Saved Jobs session requires manual re-authentication; retry after login.")
     if saved_blocker == "captcha":
-        raise PermanentTaskError("LinkedIn Saved Jobs hit a human checkpoint/CAPTCHA; no LinkedIn state changed.")
+        # Saved Jobs is read-only and uses the same exact-page CAPTCHA recovery
+        # boundary as normal LinkedIn search.  Treat network/CDP/CapSolver
+        # availability as transient; only a second grounded CAPTCHA is terminal.
+        try:
+            cdp_port = _cdp_port_from_url()
+            live_captcha_url = _current_linkedin_page_url(saved_url)
+            execute_parallel_bypass(
+                cdp_port=cdp_port,
+                website_url=live_captcha_url,
+                website_key="2CB16598-CB82-458A-898B-53544380C934",
+                regimes_path="data/pointer-regimes.json",
+                captcha_type="FunCaptchaTaskProxyless",
+            )
+            agent_response = _run_linkedin_agent_with_fake_mouse(
+                message=msg, timeout=task["timeout_seconds"],
+                session_id=f"jobos-saved-{task['id']}-after-captcha",
+            )
+            retry_blocker = classify_linkedin_blocker(agent_response)
+            if retry_blocker == "auth":
+                raise TransientTaskError(
+                    "LinkedIn Saved Jobs session expired after CAPTCHA solve; re-authenticate and retry."
+                )
+            if retry_blocker == "captcha":
+                raise PermanentTaskError(
+                    "CapSolver completed but LinkedIn Saved Jobs remains on a grounded CAPTCHA/checkpoint."
+                )
+        except (PermanentTaskError, TransientTaskError):
+            raise
+        except Exception as exc:
+            raise TransientTaskError(
+                f"LinkedIn Saved Jobs CAPTCHA bypass temporarily failed: {exc}"
+            ) from exc
     try:
         ingest_input = {**inp, **_linkedin_ingest_evidence()}
         intake = ingest_saved_jobs(cur, task["id"], ingest_input, agent_response)

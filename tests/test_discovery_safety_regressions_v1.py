@@ -332,11 +332,181 @@ def test_linkedin_evidence_authority_requires_company_and_apply_binding_v2():
     assert "return /\\bapply\\b/i.test(label)" in worker
 
 
-def test_telegram_discovery_command_key_dedupes_within_window_and_rotates_after():
+def test_telegram_discovery_command_uses_rolling_db_dedupe_not_epoch_buckets():
     mod = _load("services/telegram/telegram_review_bot_v1.py", "telegram_discovery_key_test")
     payload = {"keywords": "Data Engineer", "location": "Boston"}
-    a = mod._discovery_command_key("search", 42, payload, now=1000)
-    b = mod._discovery_command_key("search", 42, payload, now=1100)
-    c = mod._discovery_command_key("search", 42, payload, now=1301)
-    assert a == b
-    assert c != a
+    # Occurrence keys are always unique; rolling dedupe is a DB time predicate,
+    # so a 1-second command pair around an epoch boundary cannot split buckets.
+    assert mod._discovery_command_key("search", 42, payload, now=1199) != mod._discovery_command_key(
+        "search", 42, payload, now=1201
+    )
+
+    class Cursor:
+        def __init__(self):
+            self.row = ("jobos:telegram:search:42:abc:old",)
+            self.sql = []
+        def execute(self, sql, params=()):
+            self.sql.append((" ".join(sql.split()), params))
+        def fetchone(self):
+            return self.row
+
+    cur = Cursor()
+    key = mod._rolling_discovery_command_key(
+        cur, kind="search", sender_id=42, payload=payload,
+        task_type="discover_linkedin_jobs", window_seconds=300,
+    )
+    assert key.endswith(":old")
+    joined = "\n".join(sql for sql, _ in cur.sql)
+    assert "created_at >= now() - make_interval(secs => %s)" in joined
+    assert "status IN ('queued','running')" in joined
+
+
+def test_location_regex_runtime_preserves_uppercase_escape_semantics():
+    prefs = {"location_allow_patterns": [r"^\D+$"]}
+    assert preference_reason(
+        company="A", title="Engineer", location="Boston", work_mode="", preferences=prefs
+    ) is None
+    assert preference_reason(
+        company="A", title="Engineer", location="123", work_mode="", preferences=prefs
+    ) == "location_not_allowed"
+
+
+def test_salary_floor_handles_natural_language_units_and_refuses_cross_currency_guess():
+    prefs = {"salary_floor": 100_000}
+    assert preference_reason(
+        company="A", title="Engineer", location="NY", work_mode="",
+        salary_range="$50-$70 an hour", preferences=prefs,
+    ) is None
+    assert preference_reason(
+        company="A", title="Engineer", location="NY", work_mode="",
+        salary_range="$9k-$12k a month", preferences=prefs,
+    ) is None
+    # salary_floor has no currency authority; explicit non-USD compensation
+    # must remain unknown instead of being numerically compared as USD.
+    assert preference_reason(
+        company="A", title="Engineer", location="Toronto", work_mode="",
+        salary_range="CAD 80k-90k/year", preferences=prefs,
+    ) is None
+
+
+def test_autonomous_nonretryable_failure_blocks_future_occurrences():
+    mod = _load("services/discovery/autonomous_discovery_v1.py", "autonomous_failure_gate_test")
+
+    class Cursor:
+        def execute(self, _sql, _params=()):
+            pass
+        def fetchone(self):
+            return (
+                "jobos:auto-linkedin:abc:1000",
+                "failed",
+                "OpenClaw auth failure: unauthorized token mismatch",
+                None,
+            )
+
+    key, reason = mod._failed_task_action(
+        Cursor(), base_key="jobos:auto-linkedin:abc",
+        task_type="discover_linkedin_jobs", now_value=999999,
+    )
+    assert key is None
+    assert reason == "non_retryable_failure"
+
+
+def test_periodic_ats_parent_timeout_uses_same_lower_bound_as_child(monkeypatch):
+    monkeypatch.setenv("JOBOS_ATS_PERIODIC_TIMEOUT_SECONDS", "120")
+    mod = _load("services/runtime/periodic_tasks_v1.py", "periodic_timeout_clamp_test")
+    assert mod.ATS_PERIODIC_TIMEOUT_SECONDS == 180
+    assert mod.TASKS["ats-discovery"][1] == 180
+
+
+def test_readonly_browser_discovery_refuses_to_start_after_deadline():
+    import time
+    mod = _load("services/ats/browser_discovery.py", "browser_deadline_test")
+
+    class Transport:
+        def open(self, _url):
+            raise AssertionError("deadline must be checked before browser I/O")
+        def close(self, _target_id):
+            pass
+
+    with pytest.raises(mod.BrowserDiscoveryError, match="deadline"):
+        mod.discover_public_jobs_with_browser(
+            career_url="https://careers.example.com/jobs/",
+            platform="custom", company_hint="Acme", transport=Transport(),
+            deadline_monotonic=time.monotonic() - 1,
+        )
+
+
+def test_linkedin_apply_dom_evidence_requires_visible_anchor_and_saved_captcha_reuses_bypass():
+    worker = (ROOT / "services" / "browser-controller" / "browser_queue_worker.py").read_text()
+    assert "a.hidden || a.getAttribute('aria-hidden') === 'true'" in worker
+    assert "rect.width <= 0 || rect.height <= 0" in worker
+    saved_start = worker.index("def handle_discover_linkedin_saved_jobs")
+    saved_end = worker.index("def handle_fill_application_form", saved_start)
+    saved = worker[saved_start:saved_end]
+    assert "execute_parallel_bypass(" in saved
+    assert "after-captcha" in saved
+
+
+def test_autonomous_nonretryable_failure_unblocks_after_manual_success():
+    import datetime as dt
+    mod = _load("services/discovery/autonomous_discovery_v1.py", "autonomous_manual_recovery_test")
+    failed_at = dt.datetime(2026, 8, 29, 12, 0, tzinfo=dt.timezone.utc)
+
+    class Cursor:
+        def __init__(self):
+            self.calls = 0
+        def execute(self, _sql, _params=()):
+            self.calls += 1
+        def fetchone(self):
+            if self.calls == 1:
+                return (
+                    "jobos:auto-linkedin:abc:1000", "failed",
+                    "OpenClaw auth failure: unauthorized token mismatch", failed_at,
+                )
+            return (1,)
+
+    key, reason = mod._failed_task_action(
+        Cursor(), base_key="jobos:auto-linkedin:abc",
+        task_type="discover_linkedin_jobs", now_value=999999,
+    )
+    assert key is None
+    assert reason is None
+
+
+def test_readonly_browser_discovery_closes_each_detail_immediately():
+    mod = _load("services/ats/browser_discovery.py", "browser_detail_cleanup_test")
+
+    class Target:
+        def __init__(self, target_id):
+            self.target_id = target_id
+
+    class Transport:
+        def __init__(self):
+            self.closed = []
+        def open(self, url):
+            return Target("board" if "board" in url else "detail")
+        def current_url(self, target_id):
+            return (
+                "https://careers.example.com/board"
+                if target_id == "board"
+                else "https://careers.example.com/jobs/1"
+            )
+        def snapshot(self, target_id):
+            if target_id == "board":
+                return {"snapshot": "- link \"Job\"\n  /url: https://careers.example.com/jobs/1", "truncated": False}
+            return {
+                "snapshot": '- heading "Engineer"\n- paragraph "' + ("Build systems " * 40) + '"',
+                "refs": {"h": {"role": "heading", "name": "Engineer"}},
+                "truncated": False,
+            }
+        def close(self, target_id):
+            self.closed.append(target_id)
+
+    transport = Transport()
+    jobs = mod.discover_public_jobs_with_browser(
+        career_url="https://careers.example.com/board",
+        platform="custom", company_hint="Acme", max_details=1, transport=transport,
+    )
+    assert jobs
+    assert transport.closed[0] == "detail"
+    assert transport.closed[-1] == "board"

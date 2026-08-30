@@ -45,6 +45,16 @@ def normalized_terms(values: object) -> list[str]:
     return [str(item).casefold().strip() for item in (values or []) if str(item).strip()]
 
 
+def regex_patterns(values: object) -> list[str]:
+    """Return regex preferences without changing regex syntax.
+
+    ``casefold()`` is correct for plain-text preference terms, but corrupts
+    uppercase regex escapes such as ``\\D``/``\\S``/``\\W``.  Runtime
+    matching is already case-insensitive via the regex flags.
+    """
+    return [str(item).strip() for item in (values or []) if str(item).strip()]
+
+
 def _employment_type(text: str) -> str | None:
     lowered = (text or "").casefold()
     for value, pattern in (("internship", r"\bintern(ship)?\b"), ("contract", r"\b(contract|contractor|1099)\b"),
@@ -69,14 +79,19 @@ def _salary_ceiling(value: str) -> float | None:
     if not amounts:
         return None
     lowered = text.casefold()
+    # salary_floor has no currency field today.  Comparing an explicitly
+    # non-USD salary numerically against a USD-oriented floor is worse than
+    # leaving it unknown, so fail open until currency conversion is modeled.
+    if re.search(r"(?:\b(?:cad|aud|nzd|gbp|eur|jpy|inr)\b|[£€¥]|\b(?:c|a|nz)\$)", lowered):
+        return None
     multiplier = 1.0
-    if re.search(r"(?:/\s*(?:h|hr|hour)\b|\bper\s+hour\b|\bhourly\b)", lowered):
+    if re.search(r"(?:/\s*(?:h|hr|hour)\b|\bper\s+hour\b|\ban\s+hour\b|\bhourly\b)", lowered):
         multiplier = 2080.0
-    elif re.search(r"(?:/\s*(?:day|d)\b|\bper\s+day\b|\bdaily\b)", lowered):
+    elif re.search(r"(?:/\s*(?:day|d)\b|\bper\s+day\b|\ba\s+day\b|\bdaily\b)", lowered):
         multiplier = 260.0
-    elif re.search(r"(?:/\s*(?:week|wk)\b|\bper\s+week\b|\bweekly\b)", lowered):
+    elif re.search(r"(?:/\s*(?:week|wk)\b|\bper\s+week\b|\ba\s+week\b|\bweekly\b)", lowered):
         multiplier = 52.0
-    elif re.search(r"(?:/\s*(?:month|mo)\b|\bper\s+month\b|\bmonthly\b)", lowered):
+    elif re.search(r"(?:/\s*(?:month|mo)\b|\bper\s+month\b|\ba\s+month\b|\bmonthly\b)", lowered):
         multiplier = 12.0
     elif re.search(r"(?:/\s*(?:year|yr)\b|\bper\s+year\b|\bann(?:ual|ually)\b|\bper\s+annum\b)", lowered):
         multiplier = 1.0
@@ -95,7 +110,7 @@ def preference_reason(*, company: str, title: str, location: str, work_mode: str
     allowed_modes = normalized_terms(preferences.get("allowed_work_modes"))
     if values["work_mode"] and allowed_modes and values["work_mode"] not in allowed_modes:
         return "work_mode_not_preferred"
-    patterns = normalized_terms(preferences.get("location_allow_patterns"))
+    patterns = regex_patterns(preferences.get("location_allow_patterns"))
     if patterns and not any(_safe_location_match(pattern, values["location"]) for pattern in patterns):
         return "location_not_allowed"
     allowed_types = normalized_terms(preferences.get("allowed_employment_types"))

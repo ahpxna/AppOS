@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import re
+import time
 from typing import Any, Protocol
 from urllib.parse import urljoin
 
@@ -153,7 +154,9 @@ def _normalized_snapshot_job(payload: dict[str, Any], *, page_url: str,
 
 def discover_public_jobs_with_browser(*, career_url: str, platform: str, company_hint: str,
                                       max_details: int = 20,
-                                      transport: BrowserDiscoveryTransport | None = None) -> list[dict[str, Any]]:
+                                      transport: BrowserDiscoveryTransport | None = None,
+                                      deadline_monotonic: float | None = None,
+                                      operation_timeout_seconds: int = 30) -> list[dict[str, Any]]:
     """Discover complete jobs from rendered accessibility snapshots only."""
     try:
         board_url = canonical_job_url(career_url)
@@ -165,20 +168,34 @@ def discover_public_jobs_with_browser(*, career_url: str, platform: str, company
             from services.autofill.autofill_executor_v1 import OpenClawTransport
             from services.common.openclaw_runtime import resolve_openclaw_binary
             transport = OpenClawTransport(
-                binary=resolve_openclaw_binary(required=True), profile="remote", timeout=90
+                binary=resolve_openclaw_binary(required=True), profile="remote",
+                timeout=max(5, min(int(operation_timeout_seconds), 90)),
             )
         except Exception as exc:
             raise BrowserDiscoveryError(
                 f"managed read-only browser discovery unavailable: {exc}", kind="browser_unavailable"
             ) from exc
 
+    def require_deadline_window() -> None:
+        if deadline_monotonic is None:
+            return
+        remaining = float(deadline_monotonic) - time.monotonic()
+        if remaining <= max(2, min(int(operation_timeout_seconds), 90)):
+            raise BrowserDiscoveryError(
+                "read-only browser discovery reached the ATS run deadline",
+                kind="run_deadline", transient=True,
+            )
+
     board_target_id = ""
     opened_target_ids: list[str] = []
     try:
+        require_deadline_window()
         board_target = transport.open(board_url)
         board_target_id = str(board_target.target_id)
         opened_target_ids.append(board_target_id)
+        require_deadline_window()
         rendered_board_url = transport.current_url(board_target_id)
+        require_deadline_window()
         board_snapshot = transport.snapshot(board_target_id)
         if coerce_bool(board_snapshot.get("truncated")):
             raise BrowserDiscoveryError(
@@ -209,14 +226,31 @@ def discover_public_jobs_with_browser(*, career_url: str, platform: str, company
                 jobs.append(item)
 
         for detail_url in detail_urls[:max(0, min(int(max_details), 50))]:
+            require_deadline_window()
             detail_target = transport.open(detail_url)
             detail_target_id = str(detail_target.target_id)
             opened_target_ids.append(detail_target_id)
-            final_url = transport.current_url(detail_target_id)
-            snapshot = transport.snapshot(detail_target_id)
-            item = _normalized_snapshot_job(snapshot, page_url=final_url, company_hint=company_hint)
-            if item and all(existing["url"] != item["url"] for existing in jobs):
-                jobs.append(item)
+            try:
+                require_deadline_window()
+                final_url = transport.current_url(detail_target_id)
+                require_deadline_window()
+                snapshot = transport.snapshot(detail_target_id)
+                item = _normalized_snapshot_job(snapshot, page_url=final_url, company_hint=company_hint)
+                if item and all(existing["url"] != item["url"] for existing in jobs):
+                    jobs.append(item)
+            finally:
+                # Detail tabs are independent evidence reads. Close each one
+                # immediately so a large board cannot accumulate dozens of
+                # targets and spend the entire ATS finalization window cleaning
+                # them up after the last detail.
+                try:
+                    transport.close(detail_target_id)
+                except Exception:
+                    pass
+                try:
+                    opened_target_ids.remove(detail_target_id)
+                except ValueError:
+                    pass
         if not jobs:
             raise BrowserDiscoveryError(
                 f"{platform} rendered board exposed no complete deterministic job-detail snapshots",

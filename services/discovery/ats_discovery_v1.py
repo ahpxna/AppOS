@@ -469,7 +469,8 @@ ADAPTERS = {
 
 def fetch_jobs(platform: str, slug: str | None, *, with_details: bool = False,
                source_url: str | None = None, company: str | None = None,
-               detail_budget: int | None = None) -> List[Dict[str, Any]]:
+               detail_budget: int | None = None,
+               deadline_monotonic: float | None = None) -> List[Dict[str, Any]]:
     platform = normalize_ats_key(platform)
     slug = str(slug or "").strip()
     adapter = ADAPTERS.get(platform)
@@ -514,6 +515,8 @@ def fetch_jobs(platform: str, slug: str | None, *, with_details: bool = False,
                     career_url=career_url, platform=platform,
                     company_hint=str(company or slug or platform),
                     max_details=min((DETAIL_REQUEST_BUDGET if detail_budget is None else max(0, int(detail_budget))), 50),
+                    deadline_monotonic=deadline_monotonic,
+                    operation_timeout_seconds=REQUEST_TIMEOUT,
                 )
             except BrowserDiscoveryError as browser_exc:
                 # Preserve the strongest retry signal. Browser availability is
@@ -752,7 +755,7 @@ def poll_company(conn, cid, name, platform, slug, source_url, *, apply: bool, wi
             raise DiscoveryError("ATS process deadline leaves no safe I/O/finalization window.", kind="run_deadline", transient=True)
         jobs = fetch_jobs(
             platform, slug, with_details=with_details, source_url=source_url, company=name,
-            detail_budget=detail_budget,
+            detail_budget=detail_budget, deadline_monotonic=deadline,
         )
         seen = len(jobs)
         with conn.cursor() as cur:

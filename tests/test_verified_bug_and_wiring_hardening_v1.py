@@ -100,7 +100,7 @@ def test_linkedin_discovery_uses_public_fake_mouse_and_live_captcha_target():
     assert "_start_linkedin_fake_mouse" in source
     assert "_current_linkedin_page_url" in source
     assert "execute_parallel_bypass" in source
-    assert "mouse_thread.join(timeout=5)" in source
+    assert "thread.join(timeout=5)" in source
     assert "urlsplit" in source
     assert "challenge_pages" in source and '"/checkpoint"' in source
 

@@ -38,13 +38,47 @@ load_repo_env()
 BOT_KEY = "review_bot"
 
 
-def _discovery_command_key(kind: str, sender_id: int, payload: Any, *, now: float | None = None) -> str:
-    """Deduplicate repeated Telegram discovery commands within five minutes."""
-    timestamp = time.time() if now is None else float(now)
-    bucket = int(timestamp // 300)
+def _discovery_command_base(kind: str, sender_id: int, payload: Any) -> str:
     body = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
     digest = hashlib.sha256(body.encode("utf-8")).hexdigest()[:20]
-    return f"jobos:telegram:{kind}:{sender_id}:{bucket}:{digest}"
+    return f"jobos:telegram:{kind}:{sender_id}:{digest}"
+
+
+def _discovery_command_key(kind: str, sender_id: int, payload: Any, *, now: float | None = None) -> str:
+    """Return one unique occurrence key; rolling dedupe is enforced in PostgreSQL."""
+    timestamp = time.time() if now is None else float(now)
+    return f"{_discovery_command_base(kind, sender_id, payload)}:{int(timestamp * 1000)}"
+
+
+def _rolling_discovery_command_key(
+    cur, *, kind: str, sender_id: int, payload: Any, task_type: str,
+    window_seconds: int = 300,
+) -> str:
+    """Deduplicate Telegram commands over a true rolling window.
+
+    Fixed epoch buckets allow two near-simultaneous commands on opposite sides
+    of a bucket boundary.  Serialize on a stable command identity, reuse an
+    active/recent occurrence when present, otherwise mint a new occurrence key.
+    """
+    base = _discovery_command_base(kind, sender_id, payload)
+    cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s));", (base,))
+    cur.execute(
+        """SELECT idempotency_key
+             FROM browser_tasks
+            WHERE requested_by='telegram_control'
+              AND task_type=%s
+              AND idempotency_key LIKE %s
+              AND (status IN ('queued','running')
+                   OR created_at >= now() - make_interval(secs => %s))
+            ORDER BY created_at DESC
+            LIMIT 1
+            FOR UPDATE;""",
+        (task_type, base + ":%", max(1, int(window_seconds))),
+    )
+    row = cur.fetchone()
+    if row and str(row[0] or "").strip():
+        return str(row[0])
+    return _discovery_command_key(kind, sender_id, payload)
 
 
 class TelegramError(RuntimeError):
@@ -1471,7 +1505,10 @@ def handle_message(conn, token: str, allowed_user_id: int, message: dict[str, An
             with conn.cursor() as cur:
                 task_id, created = queue_discovery_task(
                     cur, request=request, requested_by="telegram_control", autonomous=False,
-                    idempotency_key=_discovery_command_key("search", sender_id, request),
+                    idempotency_key=_rolling_discovery_command_key(
+                        cur, kind="search", sender_id=sender_id, payload=request,
+                        task_type="discover_linkedin_jobs",
+                    ),
                 )
             conn.commit()
             api(token, "sendMessage", data={"chat_id": str(chat_id),
@@ -1487,7 +1524,10 @@ def handle_message(conn, token: str, allowed_user_id: int, message: dict[str, An
             with conn.cursor() as cur:
                 sync_id, task_id, created = queue_saved_sync_task(
                     cur, max_results=10, requested_by="telegram_control", autonomous=False,
-                    idempotency_key=_discovery_command_key("saved", sender_id, {"max_results": 10}),
+                    idempotency_key=_rolling_discovery_command_key(
+                        cur, kind="saved", sender_id=sender_id, payload={"max_results": 10},
+                        task_type="discover_linkedin_saved_jobs",
+                    ),
                 )
             conn.commit()
             api(token, "sendMessage", data={"chat_id": str(chat_id),

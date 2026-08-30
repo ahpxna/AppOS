@@ -23,8 +23,21 @@ from services.runtime.process_runner import DEFAULT_PROCESS_RUNNER
 
 STOP = False
 
+
+def _bounded_timeout(name: str, default: int, low: int, high: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(low, min(value, high))
+
+
+ATS_PERIODIC_TIMEOUT_SECONDS = _bounded_timeout(
+    "JOBOS_ATS_PERIODIC_TIMEOUT_SECONDS", 1320, 180, 7200
+)
+
 TASKS: dict[str, tuple[list[str], int]] = {
-    "ats-discovery": ([sys.executable, "-m", "services.discovery.ats_discovery_v1", "poll", "--apply"], int(os.getenv("JOBOS_ATS_PERIODIC_TIMEOUT_SECONDS", "1320"))),
+    "ats-discovery": ([sys.executable, "-m", "services.discovery.ats_discovery_v1", "poll", "--apply"], ATS_PERIODIC_TIMEOUT_SECONDS),
     "profile-discovery": ([sys.executable, "-m", "services.discovery.autonomous_discovery_v1", "run", "--apply"], 120),
     "repo-freshness": ([sys.executable, "services/repo-audit/repository_freshness_v1.py", "refresh"], 900),
 }
