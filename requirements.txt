@@ -24,7 +24,7 @@
 # run the migration linter and regression suite documented in README.md.
 pglast>=7,<9
 pytest>=8.0,<9
-
+psycopg[binary]>=3.2.3,<4
 # Needed only when the consent-based pointer recorder is used locally.
 pynput>=1.7,<2
 

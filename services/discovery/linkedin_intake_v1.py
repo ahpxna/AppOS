@@ -147,25 +147,113 @@ def cmd_queue(cur, args) -> int:
     return 0
 
 
-def cmd_queue_discovery(cur, args) -> int:
-    """Queue a bounded, user-requested search for the JobOS browser executor."""
+
+def _lock_idempotency(cur, key: str | None) -> None:
+    if key:
+        cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s));", (key,))
+
+
+def queue_discovery_task(
+    cur, *, request: dict[str, Any], timeout: int = 300,
+    requested_by: str = "linkedin_intake_v1", autonomous: bool = False,
+    idempotency_key: str | None = None,
+) -> tuple[str, bool]:
+    """Queue one validated LinkedIn discovery task with durable deduplication.
+
+    ``autonomous`` is permitted only for the profile discovery planner and is
+    represented explicitly in the task payload; manual callers retain
+    ``user_initiated=true``.  A bucketed idempotency key lets the periodic
+    planner rerun the same search after its cooldown without queue storms.
+    """
     if not feature_enabled("JOBOS_LINKEDIN_AGENT_DISCOVERY_ENABLED"):
         raise IntakeError("LinkedIn autonomous discovery is disabled by configuration.")
+    request = validate_search_request(
+        str(request.get("keywords") or ""), str(request.get("location") or ""),
+        int(request.get("max_results") or 0), date_posted=request.get("date_posted"),
+        experience_levels=request.get("experience_levels"), employment_types=request.get("employment_types"),
+        work_modes=request.get("work_modes"), companies=request.get("companies"), sort_by=request.get("sort_by"),
+    )
+    key = str(idempotency_key or "").strip() or None
+    _lock_idempotency(cur, key)
+    if key:
+        cur.execute("SELECT id::text FROM browser_tasks WHERE idempotency_key=%s;", (key,))
+        row = cur.fetchone()
+        if row:
+            return str(row[0]), False
+    payload = {
+        **request,
+        "user_initiated": not autonomous,
+        "autonomous_discovery": bool(autonomous),
+        "source": "linkedin",
+        "auto_ingest": True,
+        "apply_search_preferences": bool(autonomous),
+    }
+    cur.execute(
+        """INSERT INTO browser_tasks
+              (task_type, requested_by, status, priority, input_json, timeout_seconds, idempotency_key)
+           VALUES ('discover_linkedin_jobs', %s, 'queued', 'normal', %s, %s, %s)
+           RETURNING id::text;""",
+        (requested_by, Jsonb(payload), int(timeout), key),
+    )
+    return str(cur.fetchone()[0]), True
+
+
+def queue_saved_sync_task(
+    cur, *, max_results: int = 10, timeout: int = 600,
+    requested_by: str = "linkedin_intake_v1", autonomous: bool = False,
+    idempotency_key: str | None = None,
+) -> tuple[str, str, bool]:
+    """Queue one bounded Saved Jobs sync with the same periodic dedupe contract."""
+    if not feature_enabled("JOBOS_LINKEDIN_SAVED_DISCOVERY_ENABLED"):
+        raise IntakeError("LinkedIn Saved Jobs discovery is disabled by configuration.")
+    request = validate_saved_request(int(max_results))
+    key = str(idempotency_key or "").strip() or None
+    _lock_idempotency(cur, key)
+    if key:
+        cur.execute(
+            """SELECT bt.id::text, coalesce(bt.input_json->>'saved_sync_id','')
+                 FROM browser_tasks bt WHERE bt.idempotency_key=%s;""",
+            (key,),
+        )
+        row = cur.fetchone()
+        if row:
+            return str(row[1]), str(row[0]), False
+    cur.execute(
+        """INSERT INTO linkedin_saved_syncs(requested_limit, status)
+           VALUES (%s, 'queued') RETURNING id::text;""",
+        (request["max_results"],),
+    )
+    sync_id = str(cur.fetchone()[0])
+    cur.execute(
+        """INSERT INTO browser_tasks(
+               task_type, requested_by, status, priority, input_json, timeout_seconds, idempotency_key)
+           VALUES ('discover_linkedin_saved_jobs', %s, 'queued', 'normal', %s, %s, %s)
+           RETURNING id::text;""",
+        (requested_by, Jsonb({
+            "max_results": request["max_results"],
+            "user_initiated": not autonomous,
+            "autonomous_discovery": bool(autonomous),
+            "source": "linkedin", "auto_ingest": True, "saved_sync_id": sync_id,
+        }), int(timeout), key),
+    )
+    task_id = str(cur.fetchone()[0])
+    cur.execute("UPDATE linkedin_saved_syncs SET browser_task_id=%s WHERE id=%s;", (task_id, sync_id))
+    return sync_id, task_id, True
+
+
+def cmd_queue_discovery(cur, args) -> int:
+    """Queue a bounded, user-requested search for the JobOS browser executor."""
     request = validate_search_request(
         args.keywords, args.location, args.max_results, date_posted=args.date_posted,
         experience_levels=args.experience_level, employment_types=args.employment_type,
         work_modes=args.work_mode_filter, companies=args.company, sort_by=args.sort_by,
     )
-    cur.execute(
-        """INSERT INTO browser_tasks
-              (task_type, requested_by, status, priority, input_json, timeout_seconds)
-           VALUES ('discover_linkedin_jobs', 'linkedin_intake_v1', 'queued', 'normal', %s, %s)
-           RETURNING id::text;""",
-        (Jsonb({**request, "user_initiated": True, "source": "linkedin",
-                "auto_ingest": True}), args.timeout),
+    task_id, created = queue_discovery_task(
+        cur, request=request, timeout=args.timeout, requested_by="linkedin_intake_v1",
+        autonomous=False,
     )
     print(json.dumps({
-        "browser_task_id": cur.fetchone()[0], "search": request,
+        "browser_task_id": task_id, "search": request, "created": created,
         "next": "Run the JobOS browser worker; validated JDs are auto-ingested into applications."
     }, indent=2))
     return 0
@@ -173,28 +261,13 @@ def cmd_queue_discovery(cur, args) -> int:
 
 def cmd_queue_saved(cur, args) -> int:
     """Queue a bounded, read-only sync of jobs already saved by the user."""
-    if not feature_enabled("JOBOS_LINKEDIN_SAVED_DISCOVERY_ENABLED"):
-        raise IntakeError("LinkedIn Saved Jobs discovery is disabled by configuration.")
     request = validate_saved_request(args.max_results)
-    cur.execute(
-        """INSERT INTO linkedin_saved_syncs(requested_limit, status)
-           VALUES (%s, 'queued') RETURNING id::text;""",
-        (request["max_results"],),
+    sync_id, task_id, created = queue_saved_sync_task(
+        cur, max_results=request["max_results"], timeout=args.timeout,
+        requested_by="linkedin_intake_v1", autonomous=False,
     )
-    sync_id = cur.fetchone()[0]
-    cur.execute(
-        """INSERT INTO browser_tasks(
-               task_type, requested_by, status, priority, input_json, timeout_seconds)
-           VALUES ('discover_linkedin_saved_jobs', 'linkedin_intake_v1', 'queued', 'normal', %s, %s)
-           RETURNING id::text;""",
-        (Jsonb({"max_results": request["max_results"], "user_initiated": True,
-                "source": "linkedin", "auto_ingest": True, "saved_sync_id": sync_id}),
-         args.timeout),
-    )
-    task_id = cur.fetchone()[0]
-    cur.execute("UPDATE linkedin_saved_syncs SET browser_task_id = %s WHERE id = %s;", (task_id, sync_id))
     print(json.dumps({"saved_sync_id": sync_id, "browser_task_id": task_id,
-                      "max_results": request["max_results"],
+                      "max_results": request["max_results"], "created": created,
                       "next": "Run the JobOS browser worker; saved jobs are auto-ingested read-only."}, indent=2))
     return 0
 

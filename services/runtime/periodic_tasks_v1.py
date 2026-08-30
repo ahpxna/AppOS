@@ -24,6 +24,7 @@ STOP = False
 
 TASKS: dict[str, tuple[list[str], int]] = {
     "ats-discovery": ([sys.executable, "-m", "services.discovery.ats_discovery_v1", "poll", "--apply"], 900),
+    "profile-discovery": ([sys.executable, "-m", "services.discovery.autonomous_discovery_v1", "run", "--apply"], 120),
     "repo-freshness": ([sys.executable, "services/repo-audit/repository_freshness_v1.py", "refresh"], 900),
 }
 

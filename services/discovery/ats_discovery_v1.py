@@ -52,6 +52,7 @@ from psycopg.types.json import Jsonb
 from services.discovery.immigration_intelligence import record_jd_immigration_assessment
 from services.common.config import database_dsn
 from services.common.value_coercion import coerce_bool
+from services.common.search_preferences import preference_reason
 from services.ats.contracts import canonical_job_url, jd_is_complete, normalize_work_mode
 from services.ats.http_client import DiscoveryHttpError, get_json
 from services.ats.public_page import PublicPageDiscoveryError, fetch_public_job_board
@@ -656,36 +657,68 @@ def poll_company(conn, cid, name, platform, slug, source_url, *, apply: bool, wi
     try:
         jobs = fetch_jobs(platform, slug, with_details=with_details, source_url=source_url, company=name)
         seen = len(jobs)
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM job_search_preferences WHERE profile_key='primary';")
+            pref_row = cur.fetchone()
+            preferences = dict(zip([column.name for column in cur.description], pref_row or ()))
+            cur.execute(
+                "SELECT count(*) FROM applications WHERE status='active' AND lower(trim(company))=lower(trim(%s));",
+                (name,),
+            )
+            active_for_employer = int(cur.fetchone()[0])
+        employer_cap = max(1, int(preferences.get("max_active_applications_per_employer") or 1))
         for j in jobs:
             if not j["title"] or not jd_is_complete(j.get("jd_text")):
                 continue
             detected = detect_ats_platform(j.get("url"))
             job_ats_type = detected if detected != "custom" else platform
+            job_work_mode = str(j.get("work_mode") or ("remote" if j.get("remote") else "unknown"))
+            identity = build_posting_identity(
+                company=name, job_title=j["title"], jd_text=j["jd_text"],
+                job_url=j["url"], ats_hint=job_ats_type,
+            )
+            with conn.cursor() as cur:
+                existing_id = find_existing_application(
+                    cur, identity, ats_company_id=cid, source_job_id=j["external_id"]
+                )
+            if existing_id is not None:
+                # Existing postings still flow through the canonical observation
+                # writer even when preferences changed after intake; otherwise
+                # freshness/stale detection would silently lose source evidence.
+                if apply:
+                    with conn.cursor() as cur:
+                        intake_job(
+                            cur, jd_text=j["jd_text"], company=name, job_title=j["title"],
+                            job_url=j["url"], location=j["location"], work_mode=job_work_mode,
+                            ats_type=job_ats_type, ats_company_id=cid,
+                            ats_external_id=j["external_id"],
+                        )
+                dup += 1
+                continue
+
+            excluded = preference_reason(
+                company=name, title=j["title"], location=j["location"],
+                work_mode=job_work_mode, jd_text=j["jd_text"],
+                salary_range=str(j.get("salary_range") or ""), preferences=preferences,
+            )
+            if excluded is None and active_for_employer >= employer_cap:
+                excluded = "max_active_applications_per_employer"
+            if excluded is not None:
+                continue
+
             if apply:
                 with conn.cursor() as cur:
                     app_id = intake_job(
                         cur, jd_text=j["jd_text"], company=name, job_title=j["title"],
-                        job_url=j["url"], location=j["location"],
-                        work_mode=str(j.get("work_mode") or ("remote" if j.get("remote") else "unknown")),
+                        job_url=j["url"], location=j["location"], work_mode=job_work_mode,
                         ats_type=job_ats_type, ats_company_id=cid,
                         ats_external_id=j["external_id"],
                     )
-                exists = app_id is None
             else:
-                # Read-only duplicate classification: use the exact same stable
-                # identity authority as intake without calling the observation
-                # writer. This makes dry-run counts meaningful and mutation-free.
-                identity = build_posting_identity(
-                    company=name, job_title=j["title"], jd_text=j["jd_text"],
-                    job_url=j["url"], ats_hint=job_ats_type,
-                )
-                with conn.cursor() as cur:
-                    exists = find_existing_application(
-                        cur, identity, ats_company_id=cid, source_job_id=j["external_id"]
-                    ) is not None
-                app_id = None if exists else "dry-run-new"
+                app_id = "dry-run-new"
             if app_id:
                 new += 1
+                active_for_employer += 1
                 print(f"    NEW  [{platform}] {name} -- {j['title']}")
             else:
                 dup += 1

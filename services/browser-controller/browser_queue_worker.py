@@ -613,7 +613,7 @@ def claim_next_task(cur) -> Optional[Dict[str, Any]]:
                   generated_document_id::text, document_sha256,
                   bound_artifact_id::text, artifact_sha256, artifact_filename,
                   expected_initial_url, expected_page_fingerprint, autofill_input_hash,
-                  autofill_action_scope;
+                  autofill_action_scope, requested_by;
         """,
         (WORKER_ID, LEASE_SECONDS),
     )
@@ -630,6 +630,7 @@ def claim_next_task(cur) -> Optional[Dict[str, Any]]:
         "bound_artifact_id": row[11], "artifact_sha256": row[12], "artifact_filename": row[13],
         "expected_initial_url": row[14], "expected_page_fingerprint": row[15], "autofill_input_hash": row[16],
         "autofill_action_scope": row[17] or {},
+        "requested_by": row[18],
     }
 
 
@@ -1590,8 +1591,14 @@ def handle_discover_linkedin_jobs(cur, task) -> Dict[str, Any]:
             "JOBOS_LINKEDIN_AGENT_DISCOVERY_ENABLED only for a dedicated, manually logged-in JobOS browser."
         )
     inp = task["input_json"]
-    if inp.get("user_initiated") is not True:
-        raise PermanentTaskError("LinkedIn discovery requires explicit user_initiated=true.")
+    authorized = inp.get("user_initiated") is True or (
+        inp.get("autonomous_discovery") is True
+        and task.get("requested_by") == "profile_autonomous_discovery_v1"
+    )
+    if not authorized:
+        raise PermanentTaskError(
+            "LinkedIn discovery requires explicit user initiation or the bounded profile discovery planner."
+        )
     try:
         request = validate_search_request(
             str(inp.get("keywords") or ""), str(inp.get("location") or ""), inp.get("max_results"),
@@ -1623,7 +1630,9 @@ def handle_discover_linkedin_jobs(cur, task) -> Dict[str, Any]:
         "did not become idle. Never treat a navigation timeout alone as a failed page.\n\n"
         "Do not authenticate, use credentials, solve CAPTCHA, change job preferences, "
         "create alerts, save jobs, message anyone, upload, fill fields, click Easy Apply, "
-        "or submit anything. If the existing browser session is not signed in or a "
+        "click any Apply button, or navigate to an external apply site. Report an external "
+        "apply_url only when that exact URL is already visible/grounded in the current snapshot. "
+        "If the existing browser session is not signed in or a "
         "CAPTCHA appears, stop and report that exact blocker.\n\n"
         "Open at most the requested number of eligible result details. Snapshot each detail pane "
         "and copy its complete visible `About the job` text. "
@@ -1632,6 +1641,7 @@ def handle_discover_linkedin_jobs(cur, task) -> Dict[str, Any]:
         "For each read result return ONLY one JSON object in this exact form:\n"
         "{\"jobs\":[{\"company\":\"...\",\"title\":\"...\",\"location\":\"...\","
         "\"work_mode\":\"remote|hybrid|on-site|unknown\",\"url\":\"https://www.linkedin.com/jobs/...\","
+        "\"apply_url\":\"exact external employer/ATS apply URL if visibly grounded, otherwise empty\","
         "\"jd_text\":\"full visible job description text\"}]}\n"
         "Include only pages with a full visible JD of at least 200 characters. Do not "
         "summarise, infer, invent a URL, or include jobs beyond the cap. If extraction "
@@ -1720,8 +1730,14 @@ def handle_discover_linkedin_saved_jobs(cur, task) -> Dict[str, Any]:
     if not feature_enabled("JOBOS_LINKEDIN_SAVED_DISCOVERY_ENABLED"):
         raise PermanentTaskError("LinkedIn Saved Jobs discovery is disabled by configuration.")
     inp = task["input_json"]
-    if inp.get("user_initiated") is not True:
-        raise PermanentTaskError("Saved Jobs sync requires explicit user_initiated=true.")
+    authorized = inp.get("user_initiated") is True or (
+        inp.get("autonomous_discovery") is True
+        and task.get("requested_by") == "profile_autonomous_discovery_v1"
+    )
+    if not authorized:
+        raise PermanentTaskError(
+            "Saved Jobs sync requires explicit user initiation or the bounded profile discovery planner."
+        )
     try:
         request = validate_saved_request(inp.get("max_results"))
     except LinkedInDiscoveryError as exc:
@@ -1741,10 +1757,12 @@ def handle_discover_linkedin_saved_jobs(cur, task) -> Dict[str, Any]:
         "Open/read this LinkedIn Saved Jobs page only. This task is READ ONLY.\n"
         f"Saved Jobs URL: {saved_url}\n"
         f"Read at most {request['max_results']} existing saved job postings and their complete visible job descriptions.\n\n"
-        "Never authenticate, save/unsave, apply, message, upload, fill fields, submit, or change LinkedIn preferences. "
-        "If login or a checkpoint appears, stop and report it.\n"
+        "Never authenticate, save/unsave, apply, message, upload, fill fields, submit, click any Apply button, "
+        "or navigate to an external apply site. Report apply_url only if the exact external URL is already visible "
+        "in the current snapshot. If login or a checkpoint appears, stop and report it.\n"
         "Return ONLY JSON: {\"jobs\":[{\"company\":\"...\",\"title\":\"...\",\"location\":\"...\","
         "\"work_mode\":\"remote|hybrid|on-site|unknown\",\"url\":\"https://www.linkedin.com/jobs/view/<numeric-id>/\","
+        "\"apply_url\":\"exact external employer/ATS apply URL if visibly grounded, otherwise empty\","
         "\"jd_text\":\"full visible job description\"}]}. "
         "Each record needs a grounded canonical URL and 200+ JD characters."
     )

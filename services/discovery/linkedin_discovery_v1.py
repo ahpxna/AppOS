@@ -15,6 +15,9 @@ from urllib.parse import urlparse
 
 from psycopg.types.json import Jsonb
 from services.discovery.immigration_intelligence import record_jd_immigration_assessment
+from services.discovery.ats_source_enrollment_v1 import enroll_ats_source
+from services.common.search_preferences import preference_reason
+from services.ats.contracts import canonical_job_url
 from services.intake.source_observation import observe_existing_posting
 
 MAX_DISCOVERY_RESULTS = 5
@@ -223,11 +226,24 @@ def normalize_jobs(agent_response: Any, max_results: int) -> list[dict[str, str]
         location = re.sub(r"\s+", " ", str(item.get("location") or "").strip())[:300]
         work_mode = re.sub(r"\s+", " ", str(item.get("work_mode") or "").strip())[:100]
         jd_text = re.sub(r"\n{3,}", "\n\n", str(item.get("jd_text") or "").strip())
+        apply_url = ""
+        raw_apply_url = str(item.get("apply_url") or "").strip()
+        if raw_apply_url:
+            try:
+                candidate_apply_url = canonical_job_url(raw_apply_url)
+            except ValueError:
+                candidate_apply_url = ""
+            # An external apply URL is source evidence only.  Keep LinkedIn URLs
+            # out of the ATS-enrollment path so a tracking/internal route cannot
+            # masquerade as an employer ATS source.
+            apply_host = (urlparse(candidate_apply_url).hostname or "").casefold()
+            if candidate_apply_url and not (apply_host == "linkedin.com" or apply_host.endswith(".linkedin.com")):
+                apply_url = candidate_apply_url
         if not company or not title or len(jd_text) < MIN_JD_CHARS or url in seen_urls:
             continue
         seen_urls.add(url)
         rows.append({"url": url, "company": company, "title": title, "location": location,
-                     "work_mode": work_mode, "jd_text": jd_text})
+                     "work_mode": work_mode, "jd_text": jd_text, "apply_url": apply_url})
     if not rows:
         raise LinkedInDiscoveryError(f"No valid JDs: need title/company/URL and {MIN_JD_CHARS}+ characters.")
     return rows
@@ -243,19 +259,32 @@ def ingest_discovered_jobs(cur, browser_task_id: str, search_input: dict[str, An
         sort_by=search_input.get("sort_by"),
     )
     rows = normalize_jobs(agent_response, request["max_results"])
+    apply_preferences = bool(search_input.get("apply_search_preferences"))
+    preferences: dict[str, Any] = {}
+    if apply_preferences:
+        cur.execute("SELECT * FROM job_search_preferences WHERE profile_key='primary';")
+        pref_row = cur.fetchone()
+        preferences = dict(zip([column.name for column in cur.description], pref_row or ()))
     created: list[str] = []
     duplicates = 0
+    filtered = 0
+    filtered_reasons: dict[str, int] = {}
+    employer_active_counts: dict[str, int] = {}
     for row in rows:
         jd_hash = hashlib.sha256(row["jd_text"].encode("utf-8")).hexdigest()
         source_job_id = linkedin_job_id(row["url"])
         cur.execute("SELECT id::text FROM applications WHERE source = 'linkedin' AND source_job_id = %s;", (source_job_id,))
         existing = cur.fetchone()
         if existing:
+            ats_company_id = enroll_ats_source(
+                cur, company=row["company"], apply_url=row.get("apply_url"),
+                evidence_source="linkedin_browser_discovery",
+            )
             observe_existing_posting(
                 cur, application_id=existing[0], source_name="linkedin", source_job_id=source_job_id,
                 company=row["company"], job_title=row["title"], job_url=row["url"],
                 jd_text=row["jd_text"], jd_hash=jd_hash, location=row["location"],
-                work_mode=row["work_mode"], metadata={"discovery_channel": "search", "browser_task_id": browser_task_id},
+                work_mode=row["work_mode"], metadata={"discovery_channel": "search", "browser_task_id": browser_task_id, "ats_company_id": ats_company_id, "external_apply_url": row.get("apply_url") or None},
             )
             cur.execute(
                 "UPDATE applications SET discovery_channel='search', updated_at=now() WHERE id=%s;",
@@ -263,6 +292,33 @@ def ingest_discovered_jobs(cur, browser_task_id: str, search_input: dict[str, An
             )
             duplicates += 1
             continue
+
+        if apply_preferences:
+            reason = preference_reason(
+                company=row["company"], title=row["title"], location=row["location"],
+                work_mode=row["work_mode"], jd_text=row["jd_text"], salary_range="",
+                preferences=preferences,
+            )
+            employer = row["company"].casefold().strip()
+            cap = max(1, int(preferences.get("max_active_applications_per_employer") or 1))
+            if employer not in employer_active_counts:
+                cur.execute(
+                    """SELECT count(*) FROM applications
+                         WHERE status='active' AND lower(trim(company))=%s;""",
+                    (employer,),
+                )
+                employer_active_counts[employer] = int(cur.fetchone()[0])
+            if reason is None and employer_active_counts[employer] >= cap:
+                reason = "max_active_applications_per_employer"
+            if reason is not None:
+                filtered += 1
+                filtered_reasons[reason] = filtered_reasons.get(reason, 0) + 1
+                continue
+
+        ats_company_id = enroll_ats_source(
+            cur, company=row["company"], apply_url=row.get("apply_url"),
+            evidence_source="linkedin_browser_discovery",
+        )
         cur.execute(
             """INSERT INTO applications
                  (source, company, job_title, job_url, jd_text, jd_hash, current_step,
@@ -276,34 +332,40 @@ def ingest_discovered_jobs(cur, browser_task_id: str, search_input: dict[str, An
              row["location"], row["work_mode"], source_job_id),
         )
         application_id = cur.fetchone()[0]
+        if apply_preferences:
+            employer = row["company"].casefold().strip()
+            employer_active_counts[employer] = employer_active_counts.get(employer, 0) + 1
         observe_existing_posting(
             cur, application_id=application_id, source_name="linkedin", source_job_id=source_job_id,
             company=row["company"], job_title=row["title"], job_url=row["url"],
             jd_text=row["jd_text"], jd_hash=jd_hash, location=row["location"],
-            work_mode=row["work_mode"], metadata={"discovery_channel": "search", "browser_task_id": browser_task_id, "initial": True},
+            work_mode=row["work_mode"], metadata={"discovery_channel": "search", "browser_task_id": browser_task_id, "initial": True, "ats_company_id": ats_company_id, "external_apply_url": row.get("apply_url") or None},
         )
         immigration = record_jd_immigration_assessment(cur, application_id, row["jd_text"])
         cur.execute(
             """INSERT INTO pipeline_events
                  (application_id, from_step, to_step, actor, reason, detail_json)
                VALUES (%s, NULL, 'intake', 'linkedin_browser_discovery',
-                       'User-initiated bounded LinkedIn discovery capture.', %s);""",
+                       'Bounded LinkedIn discovery capture.', %s);""",
             (application_id, Jsonb({"browser_task_id": browser_task_id,
                 "keywords": request["keywords"], "location": request["location"],
                 "max_results": request["max_results"], "job_url": row["url"],
+                "autonomous_discovery": bool(search_input.get("autonomous_discovery")),
                 "immigration_assessment": immigration})),
         )
         created.append(application_id)
     return {"requested_max_results": request["max_results"], "returned_valid_jobs": len(rows),
-            "created_application_ids": created, "duplicates": duplicates}
-
+            "created_application_ids": created, "duplicates": duplicates,
+            "filtered_by_preferences": filtered, "filtered_reasons": filtered_reasons}
 
 def ingest_saved_jobs(cur, browser_task_id: str, saved_input: dict[str, Any],
                       agent_response: Any) -> dict[str, Any]:
     """Ingest existing LinkedIn Saved Jobs through the normal application boundary.
 
-    This only persists already-saved job records returned by the read-only
-    browser task; it never changes a LinkedIn saved state.
+    Saved Jobs are an explicit user signal, so ordinary autonomous-search
+    preferences do not suppress them.  The function still observes duplicates
+    and may enroll a grounded external ATS source without changing LinkedIn
+    saved state.
     """
     request = validate_saved_request(saved_input.get("max_results"))
     sync_id = str(saved_input.get("saved_sync_id") or "").strip() or None
@@ -313,6 +375,10 @@ def ingest_saved_jobs(cur, browser_task_id: str, saved_input: dict[str, Any],
     for row in rows:
         jd_hash = hashlib.sha256(row["jd_text"].encode("utf-8")).hexdigest()
         source_job_id = linkedin_job_id(row["url"])
+        ats_company_id = enroll_ats_source(
+            cur, company=row["company"], apply_url=row.get("apply_url"),
+            evidence_source="linkedin_saved_jobs",
+        )
         cur.execute("SELECT id::text FROM applications WHERE source = 'linkedin' AND source_job_id = %s;", (source_job_id,))
         existing = cur.fetchone()
         if existing:
@@ -320,7 +386,7 @@ def ingest_saved_jobs(cur, browser_task_id: str, saved_input: dict[str, Any],
                 cur, application_id=existing[0], source_name="linkedin", source_job_id=source_job_id,
                 company=row["company"], job_title=row["title"], job_url=row["url"],
                 jd_text=row["jd_text"], jd_hash=jd_hash, location=row["location"],
-                work_mode=row["work_mode"], metadata={"discovery_channel": "saved", "saved_sync_id": sync_id, "browser_task_id": browser_task_id},
+                work_mode=row["work_mode"], metadata={"discovery_channel": "saved", "saved_sync_id": sync_id, "browser_task_id": browser_task_id, "ats_company_id": ats_company_id, "external_apply_url": row.get("apply_url") or None},
             )
             cur.execute(
                 """UPDATE applications SET discovery_channel='saved', linkedin_saved_at=now(),
@@ -346,16 +412,17 @@ def ingest_saved_jobs(cur, browser_task_id: str, saved_input: dict[str, Any],
             cur, application_id=application_id, source_name="linkedin", source_job_id=source_job_id,
             company=row["company"], job_title=row["title"], job_url=row["url"],
             jd_text=row["jd_text"], jd_hash=jd_hash, location=row["location"],
-            work_mode=row["work_mode"], metadata={"discovery_channel": "saved", "saved_sync_id": sync_id, "browser_task_id": browser_task_id, "initial": True},
+            work_mode=row["work_mode"], metadata={"discovery_channel": "saved", "saved_sync_id": sync_id, "browser_task_id": browser_task_id, "initial": True, "ats_company_id": ats_company_id, "external_apply_url": row.get("apply_url") or None},
         )
         immigration = record_jd_immigration_assessment(cur, application_id, row["jd_text"])
         cur.execute(
             """INSERT INTO pipeline_events
                  (application_id, from_step, to_step, actor, reason, detail_json)
                VALUES (%s, NULL, 'intake', 'linkedin_saved_jobs',
-                       'User-initiated read-only LinkedIn Saved Jobs capture.', %s);""",
+                       'Read-only LinkedIn Saved Jobs capture.', %s);""",
             (application_id, Jsonb({"browser_task_id": browser_task_id, "saved_sync_id": sync_id,
                 "max_results": request["max_results"], "job_url": row["url"],
+                "autonomous_discovery": bool(saved_input.get("autonomous_discovery")),
                 "immigration_assessment": immigration, "discovery_channel": "saved"})),
         )
         created.append(application_id)

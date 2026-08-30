@@ -643,6 +643,36 @@ def status() -> int:
     return 0
 
 
+def discover_command(command: str, *, apply: bool = False, keywords: str = "",
+                     location: str = "", max_results: int = 3, timeout: int = 300,
+                     date_posted: str | None = None, experience_levels: list[str] | None = None,
+                     employment_types: list[str] | None = None, work_modes: list[str] | None = None,
+                     companies: list[str] | None = None, sort_by: str = "recent") -> int:
+    """Run/status the autonomous planner or queue one explicit LinkedIn search."""
+    load_repo_env()
+    if command in {"run", "status"}:
+        argv = [sys.executable, "-m", "services.discovery.autonomous_discovery_v1", command]
+        if command == "run":
+            argv.append("--apply" if apply else "--dry-run")
+        return subprocess.call(argv, cwd=ROOT)
+    argv = [
+        sys.executable, str(ROOT / "services" / "discovery" / "linkedin_intake_v1.py"),
+        "queue-discovery", "--keywords", keywords, "--location", location,
+        "--max-results", str(max_results), "--timeout", str(timeout), "--sort-by", sort_by,
+    ]
+    if date_posted:
+        argv.extend(("--date-posted", date_posted))
+    for flag, values in (
+        ("--experience-level", experience_levels or []),
+        ("--employment-type", employment_types or []),
+        ("--work-mode-filter", work_modes or []),
+        ("--company", companies or []),
+    ):
+        for value in values:
+            argv.extend((flag, value))
+    return subprocess.call(argv, cwd=ROOT)
+
+
 def saved_sync(max_results: int, timeout: int) -> int:
     load_repo_env()
     command = [sys.executable, str(ROOT / "services" / "discovery" / "linkedin_intake_v1.py"),
@@ -732,7 +762,7 @@ def runtime_supervisor_command(command: str) -> int:
 
 def _command_kind(args) -> str:
     nested = None
-    for name in ("autofill_command","saved_command","review_command","telegram_command",
+    for name in ("autofill_command","discover_command","saved_command","review_command","telegram_command",
                  "action_command","vault_command","gmail_command"):
         value = getattr(args,name,None)
         if value:
@@ -801,6 +831,18 @@ def _dispatch(args) -> int:
                                 "--output", str(Path(args.output).expanduser())], cwd=ROOT)
     if args.command == "status":
         return status()
+    if args.command == "discover":
+        return discover_command(
+            args.discover_command, apply=getattr(args, "apply", False),
+            keywords=getattr(args, "keywords", ""), location=getattr(args, "location", ""),
+            max_results=getattr(args, "max_results", 3), timeout=getattr(args, "timeout", 300),
+            date_posted=getattr(args, "date_posted", None),
+            experience_levels=getattr(args, "experience_level", []),
+            employment_types=getattr(args, "employment_type", []),
+            work_modes=getattr(args, "work_mode_filter", []),
+            companies=getattr(args, "company", []),
+            sort_by=getattr(args, "sort_by", "recent"),
+        )
     if args.command == "saved":
         return saved_sync(args.limit, args.timeout)
     if args.command == "review":
@@ -849,6 +891,23 @@ def main() -> int:
     prepare_parser.add_argument("--create", action="store_true", help="After showing the plan, prompt to create a one-time approval.")
     prepare_parser.add_argument("--yes", action="store_true", help="Create without an interactive confirmation; use only after reviewing the printed plan.")
     commands.add_parser("status", help="Read-only product status: applications, browser tasks, attempts, and human reviews.")
+
+    discover_parser = commands.add_parser("discover", help="Profile-driven autonomous and explicit job discovery.")
+    discover_sub = discover_parser.add_subparsers(dest="discover_command", required=True)
+    discover_run = discover_sub.add_parser("run", help="Plan one discovery cycle; dry-run unless --apply is given.")
+    discover_run.add_argument("--apply", action="store_true", help="Queue due autonomous discovery work.")
+    discover_sub.add_parser("status", help="Show approved terms, queued planner work and ATS source count.")
+    discover_linkedin = discover_sub.add_parser("linkedin", help="Queue one explicit bounded LinkedIn search.")
+    discover_linkedin.add_argument("--keywords", required=True)
+    discover_linkedin.add_argument("--location", default="")
+    discover_linkedin.add_argument("--max-results", type=int, default=3)
+    discover_linkedin.add_argument("--date-posted", choices=("24h", "week", "month"))
+    discover_linkedin.add_argument("--experience-level", action="append", default=[])
+    discover_linkedin.add_argument("--employment-type", action="append", default=[])
+    discover_linkedin.add_argument("--work-mode-filter", action="append", default=[])
+    discover_linkedin.add_argument("--company", action="append", default=[])
+    discover_linkedin.add_argument("--sort-by", choices=("recent", "relevant"), default="recent")
+    discover_linkedin.add_argument("--timeout", type=int, default=300)
 
     saved_parser = commands.add_parser("saved", help="LinkedIn Saved Jobs read-only intake.")
     saved_sub = saved_parser.add_subparsers(dest="saved_command", required=True)
