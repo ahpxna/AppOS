@@ -68,6 +68,7 @@ from services.discovery.linkedin_discovery_v1 import (
     ingest_discovered_jobs,
     ingest_saved_jobs,
     blocker_safe_agent_response,
+    classify_linkedin_blocker,
     validate_job_url,
     validate_search_request,
     validate_saved_request,
@@ -200,15 +201,14 @@ def _cdp_runtime_evaluate(ws_url: str, expression: str) -> Any:
         ws.close()
 
 
-def _verified_external_hrefs_by_linkedin_job() -> dict[str, list[str]]:
-    """Bind independently observed external hrefs to the exact visible LinkedIn job.
+def _verified_linkedin_job_evidence() -> dict[str, dict[str, Any]]:
+    """Read job-bound company + Apply-link evidence directly from live LinkedIn DOM.
 
-    A plain set of hrefs from every open LinkedIn tab is not sufficient evidence:
-    an agent could accidentally associate an href from job A with job B. Only a
-    tab whose own URL identifies a concrete LinkedIn job (detail path or
-    ``currentJobId`` search parameter) contributes evidence, keyed by that job id.
+    External hrefs count only when their visible/accessible anchor label says
+    Apply; arbitrary footer/company/ad links are not ATS enrollment evidence.
+    Company identity is independently read from the job top card.
     """
-    verified: dict[str, set[str]] = {}
+    raw: dict[str, dict[str, set[str]]] = {}
     try:
         response = requests.get(BROWSER_CDP_URL.rstrip("/") + "/json", timeout=3)
         response.raise_for_status()
@@ -221,9 +221,32 @@ def _verified_external_hrefs_by_linkedin_job() -> dict[str, list[str]]:
       const u = new URL(location.href);
       const pathMatch = location.pathname.match(/\/jobs\/view\/(\d+)/);
       const jobId = (pathMatch && pathMatch[1]) || u.searchParams.get('currentJobId') || '';
-      const hrefs = Array.from(document.querySelectorAll('a[href]'), a => a.href)
-        .filter(Boolean).slice(0, 1000);
-      return {job_id: jobId, hrefs};
+      const selectors = [
+        '.job-details-jobs-unified-top-card__company-name a',
+        '.job-details-jobs-unified-top-card__company-name',
+        '.jobs-unified-top-card__company-name a',
+        '.jobs-unified-top-card__company-name',
+        '[data-view-name="job-details-about-company-name"]'
+      ];
+      let company = '';
+      for (const selector of selectors) {
+        const el = document.querySelector(selector);
+        const text = (el && el.innerText || '').replace(/\s+/g, ' ').trim();
+        if (text) { company = text; break; }
+      }
+      const hrefs = Array.from(document.querySelectorAll('a[href]'))
+        .filter(a => {
+          let parsed;
+          try { parsed = new URL(a.href, location.href); } catch (_) { return false; }
+          if (!/^https?:$/.test(parsed.protocol)) return false;
+          const host = parsed.hostname.toLowerCase();
+          if (host === 'linkedin.com' || host.endsWith('.linkedin.com')) return false;
+          const label = [a.innerText, a.getAttribute('aria-label'), a.getAttribute('title'),
+                         a.getAttribute('data-control-name')].filter(Boolean).join(' ');
+          return /\bapply\b/i.test(label);
+        })
+        .map(a => a.href).filter(Boolean).slice(0, 50);
+      return {job_id: jobId, company, hrefs};
     })()'''
     for tab in tabs:
         if not isinstance(tab, dict) or tab.get("type") != "page":
@@ -247,21 +270,47 @@ def _verified_external_hrefs_by_linkedin_job() -> dict[str, list[str]]:
         job_id = str(payload.get("job_id") or "").strip()
         if not job_id.isdigit():
             continue
-        bucket = verified.setdefault(job_id, set())
+        bucket = raw.setdefault(job_id, {"companies": set(), "hrefs": set()})
+        company = re.sub(r"\s+", " ", str(payload.get("company") or "").strip())[:300]
+        if company:
+            bucket["companies"].add(company)
         hrefs = payload.get("hrefs")
-        if not isinstance(hrefs, list):
-            continue
-        for href in hrefs:
-            try:
-                canonical = canonical_job_url(str(href or ""))
-            except (TypeError, ValueError):
-                continue
-            parsed = urlsplit(canonical)
-            href_host = (parsed.hostname or "").casefold()
-            if canonical and not (href_host == "linkedin.com" or href_host.endswith(".linkedin.com")):
-                bucket.add(canonical)
-    return {job_id: sorted(hrefs) for job_id, hrefs in verified.items() if hrefs}
+        if isinstance(hrefs, list):
+            for href in hrefs:
+                try:
+                    canonical = canonical_job_url(str(href or ""))
+                except (TypeError, ValueError):
+                    continue
+                parsed = urlsplit(canonical)
+                href_host = (parsed.hostname or "").casefold()
+                if canonical and not (href_host == "linkedin.com" or href_host.endswith(".linkedin.com")):
+                    bucket["hrefs"].add(canonical)
+    verified: dict[str, dict[str, Any]] = {}
+    for job_id, bucket in raw.items():
+        companies = sorted(bucket["companies"])
+        verified[job_id] = {
+            "company": companies[0] if len(companies) == 1 else "",
+            "apply_hrefs": sorted(bucket["hrefs"]),
+        }
+    return verified
 
+
+def _linkedin_ingest_evidence() -> dict[str, Any]:
+    evidence = _verified_linkedin_job_evidence()
+    return {
+        "verified_external_hrefs_by_job": {
+            job_id: row.get("apply_hrefs", []) for job_id, row in evidence.items()
+        },
+        "verified_company_by_job": {
+            job_id: str(row.get("company") or "") for job_id, row in evidence.items()
+            if str(row.get("company") or "").strip()
+        },
+    }
+
+
+def _verified_external_hrefs_by_linkedin_job() -> dict[str, list[str]]:
+    """Backward-compatible projection used by older tests/tools."""
+    return _linkedin_ingest_evidence()["verified_external_hrefs_by_job"]
 
 def _lease_window_seconds(task: Dict[str, Any]) -> int:
     return max(LEASE_SECONDS, int(task.get("timeout_seconds") or 300) + LEASE_GRACE_SECONDS)
@@ -1789,6 +1838,7 @@ def handle_discover_linkedin_jobs(cur, task) -> Dict[str, Any]:
         "apply_url only when that exact URL is already visible/grounded in the current snapshot. "
         "If the existing browser session is not signed in or a "
         "CAPTCHA appears, stop and report that exact blocker.\n\n"
+        "Open each included job detail in its own tab and leave those detail tabs open until after the final JSON so JobOS can independently verify company/apply evidence. "
         "Open at most the requested number of eligible result details. Snapshot each detail pane "
         "and copy its complete visible `About the job` text. "
         "Use a canonical URL exactly like https://www.linkedin.com/jobs/view/<numeric-id>/; "
@@ -1811,14 +1861,14 @@ def handle_discover_linkedin_jobs(cur, task) -> Dict[str, Any]:
     # =====================================================================
     # 2. CHECK CAPTCHA & PARALLEL BYPASS (CHỮA BỆNH VÀ PERMANENT FAILURE)
     # =====================================================================
-    agent_raw_output = str(agent_response).casefold()
+    blocker_kind = classify_linkedin_blocker(agent_response)
     # Expired sessions/authwalls require the human to re-authenticate. Do not
     # send an auth problem to CapSolver or mark it permanently impossible.
-    if any(marker in agent_raw_output for marker in ("sign in", "login required", "authwall", "not signed in")):
+    if blocker_kind == "auth":
         raise TransientTaskError(
             "LinkedIn session requires manual re-authentication; task is retryable after login."
         )
-    if any(marker in agent_raw_output for marker in ("captcha", "verification", "security check", "checkpoint", "challenge")):
+    if blocker_kind == "captcha":
         print("  [Bypass] Đụng độ CAPTCHA/challenge LinkedIn! Kích hoạt CapSolver...")
         try:
             cdp_port = _cdp_port_from_url()
@@ -1842,10 +1892,10 @@ def handle_discover_linkedin_jobs(cur, task) -> Dict[str, Any]:
             )
             
             # Nếu lần 2 vẫn dính -> Buông súng, đánh dấu Permanent Failure
-            agent_raw_retry = str(agent_response).lower()
-            if any(marker in agent_raw_retry for marker in ("sign in", "login required", "authwall", "not signed in")):
+            retry_blocker = classify_linkedin_blocker(agent_response)
+            if retry_blocker == "auth":
                 raise TransientTaskError("LinkedIn session expired after CAPTCHA solve; re-authenticate and retry.")
-            if any(marker in agent_raw_retry for marker in ("captcha", "verification", "security check", "checkpoint", "challenge")):
+            if retry_blocker == "captcha":
                 raise PermanentTaskError("CapSolver đã giải nhưng vẫn bị chặn. Đánh dấu lỗi vĩnh viễn (Permanent Failure)!")
         except PermanentTaskError:
             raise
@@ -1858,7 +1908,7 @@ def handle_discover_linkedin_jobs(cur, task) -> Dict[str, Any]:
     # 3. LƯU VÀO DB
     # =====================================================================
     try:
-        ingest_input = {**inp, "verified_external_hrefs_by_job": _verified_external_hrefs_by_linkedin_job()}
+        ingest_input = {**inp, **_linkedin_ingest_evidence()}
         intake = ingest_discovered_jobs(cur, task["id"], ingest_input, agent_response)
     except LinkedInDiscoveryError as exc:
         raise PermanentTaskError(f"LinkedIn discovery result refused: {exc}") from exc
@@ -1903,7 +1953,8 @@ def handle_discover_linkedin_saved_jobs(cur, task) -> Dict[str, Any]:
         "Use the OpenClaw browser tool with profile exactly `remote`, already manually authenticated. "
         "Open/read this LinkedIn Saved Jobs page only. This task is READ ONLY.\n"
         f"Saved Jobs URL: {saved_url}\n"
-        f"Read at most {request['max_results']} existing saved job postings and their complete visible job descriptions.\n\n"
+        f"Read at most {request['max_results']} existing saved job postings and their complete visible job descriptions.\n"
+        "Open each included saved job detail in its own tab and leave those tabs open until the final JSON so JobOS can independently verify company/apply evidence.\n\n"
         "Never authenticate, save/unsave, apply, message, upload, fill fields, submit, click any Apply button, "
         "or navigate to an external apply site. Report apply_url only if the exact external URL is already visible "
         "in the current snapshot. If login or a checkpoint appears, stop and report it.\n"
@@ -1940,13 +1991,13 @@ def handle_discover_linkedin_saved_jobs(cur, task) -> Dict[str, Any]:
             if mouse_thread.is_alive():
                 print("  [FakeMouse] warning: Saved Jobs helper still stopping in daemon thread")
 
-    blocker_text = json.dumps(agent_response, ensure_ascii=False).casefold()
-    if any(word in blocker_text for word in ("sign in", "login required", "authwall", "not signed in")):
+    saved_blocker = classify_linkedin_blocker(agent_response)
+    if saved_blocker == "auth":
         raise TransientTaskError("LinkedIn Saved Jobs session requires manual re-authentication; retry after login.")
-    if any(word in blocker_text for word in ("captcha", "checkpoint", "challenge", "security check")):
+    if saved_blocker == "captcha":
         raise PermanentTaskError("LinkedIn Saved Jobs hit a human checkpoint/CAPTCHA; no LinkedIn state changed.")
     try:
-        ingest_input = {**inp, "verified_external_hrefs_by_job": _verified_external_hrefs_by_linkedin_job()}
+        ingest_input = {**inp, **_linkedin_ingest_evidence()}
         intake = ingest_saved_jobs(cur, task["id"], ingest_input, agent_response)
     except LinkedInDiscoveryError as exc:
         raise PermanentTaskError(f"LinkedIn Saved Jobs result refused: {exc}") from exc

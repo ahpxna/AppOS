@@ -155,15 +155,23 @@ def _lock_idempotency(cur, key: str | None) -> None:
 
 
 def safe_discovery_reissue(error_message: object) -> bool:
-    """Autonomous retries are limited to auth/transient recovery states.
+    """Return true only for failures that can safely recover without config repair.
 
-    A manual command may deliberately retry a terminal read-only capture, but
-    the periodic planner must not continuously requeue a CAPTCHA/policy block.
+    LinkedIn session expiry is retryable after a human logs back in.  OpenClaw
+    gateway credentials/policy/configuration failures are *not* the same thing
+    and must not be churned by the autonomous planner.
     """
     text = str(error_message or "").casefold()
+    permanent_markers = (
+        "openclaw auth failure", "token mismatch", "unauthorized",
+        "unknown agent", "policy block", "configuration error", "permanenttaskerror",
+    )
+    if any(marker in text for marker in permanent_markers):
+        return False
     return any(marker in text for marker in (
-        "manual re-authentication", "login", "auth", "timeout", "temporar",
-        "connection", "rate limit", "transient",
+        "manual re-authentication", "login required", "authwall", "not signed in",
+        "linkedin session", "timeout", "temporar", "connection", "rate limit",
+        "transient", "session collision",
     ))
 
 

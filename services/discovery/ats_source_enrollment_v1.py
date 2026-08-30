@@ -126,7 +126,8 @@ def _normalized_company(value: str) -> str:
 
 def enroll_ats_source(cur, *, company: str, apply_url: str | None,
                       evidence_source: str = "linkedin_browser_discovery",
-                      href_evidence: str | None = None) -> str | None:
+                      href_evidence: str | None = None,
+                      company_evidence: str | None = None) -> str | None:
     """Upsert one ATS source only from independently verified DOM href evidence.
 
     ``href_evidence`` is not descriptive text from an agent.  The browser worker
@@ -146,6 +147,10 @@ def enroll_ats_source(cur, *, company: str, apply_url: str | None,
     company_name = re.sub(r"\s+", " ", str(company or "").strip())[:300]
     if not company_name:
         return None
+    if str(evidence_source).startswith("linkedin_"):
+        witnessed_company = re.sub(r"\s+", " ", str(company_evidence or "").strip())[:300]
+        if not witnessed_company or _normalized_company(witnessed_company) != _normalized_company(company_name):
+            return None
     note = f"Auto-enrolled from verified {evidence_source} DOM href: {evidence.evidence_url}"
 
     locator = evidence.slug or evidence.source_url or ""
@@ -198,25 +203,11 @@ def enroll_ats_source(cur, *, company: str, apply_url: str | None,
         )
         return str(cur.fetchone()[0])
 
-    # Only an auto-enrolled row is ours to retarget when the employer publishes
-    # a newer canonical board URL. Manual/operator rows are immutable authority
-    # here and multiple legitimate boards for one company/platform may coexist.
-    cur.execute(
-        """SELECT id::text,source_url,notes FROM ats_companies
-             WHERE ats_platform=%s AND lower(trim(company_name))=lower(trim(%s))
-             ORDER BY created_at FOR UPDATE;""",
-        (evidence.platform, company_name),
-    )
-    same_company = cur.fetchall()
-    auto_owned = [row for row in same_company if str(row[2] or "").startswith("Auto-enrolled from verified ")]
-    if len(auto_owned) == 1:
-        cur.execute(
-            """UPDATE ats_companies
-                  SET source_url=%s, notes=%s, updated_at=now()
-                WHERE id=%s RETURNING id::text;""",
-            (evidence.source_url, note, auto_owned[0][0]),
-        )
-        return str(cur.fetchone()[0])
+    # A new witnessed board is a new locator identity.  Never retarget an
+    # existing row merely because company/platform match: employers may operate
+    # multiple legitimate boards and old sources retain their own health/history.
+    # The locator advisory lock plus exact source_url lookup above serializes
+    # concurrent enrollment of the same board.
     cur.execute(
         """INSERT INTO ats_companies(company_name,ats_platform,slug,source_url,enabled,notes,updated_at)
            VALUES (%s,%s,NULL,%s,true,%s,now()) RETURNING id::text;""",

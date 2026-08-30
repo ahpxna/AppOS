@@ -38,6 +38,15 @@ load_repo_env()
 BOT_KEY = "review_bot"
 
 
+def _discovery_command_key(kind: str, sender_id: int, payload: Any, *, now: float | None = None) -> str:
+    """Deduplicate repeated Telegram discovery commands within five minutes."""
+    timestamp = time.time() if now is None else float(now)
+    bucket = int(timestamp // 300)
+    body = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
+    digest = hashlib.sha256(body.encode("utf-8")).hexdigest()[:20]
+    return f"jobos:telegram:{kind}:{sender_id}:{bucket}:{digest}"
+
+
 class TelegramError(RuntimeError):
     pass
 
@@ -1462,6 +1471,7 @@ def handle_message(conn, token: str, allowed_user_id: int, message: dict[str, An
             with conn.cursor() as cur:
                 task_id, created = queue_discovery_task(
                     cur, request=request, requested_by="telegram_control", autonomous=False,
+                    idempotency_key=_discovery_command_key("search", sender_id, request),
                 )
             conn.commit()
             api(token, "sendMessage", data={"chat_id": str(chat_id),
@@ -1477,6 +1487,7 @@ def handle_message(conn, token: str, allowed_user_id: int, message: dict[str, An
             with conn.cursor() as cur:
                 sync_id, task_id, created = queue_saved_sync_task(
                     cur, max_results=10, requested_by="telegram_control", autonomous=False,
+                    idempotency_key=_discovery_command_key("saved", sender_id, {"max_results": 10}),
                 )
             conn.commit()
             api(token, "sendMessage", data={"chat_id": str(chat_id),

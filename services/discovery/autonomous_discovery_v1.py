@@ -182,23 +182,26 @@ def build_linkedin_plan(cur, *, now: float | None = None) -> list[dict[str, Any]
 
 def _enroll_observed_ats_sources(cur, *, limit: int = 200) -> int:
     """Project only DOM-href-evidenced external URLs into ATS sources."""
-    candidates: list[tuple[str, str, str]] = []
+    candidates: list[tuple[str, str, str, str]] = []
     cur.execute(
         """SELECT coalesce(company,''),coalesce(metadata_json->>'external_apply_url',''),
-                  coalesce(metadata_json->>'external_apply_href_evidence','')
+                  coalesce(metadata_json->>'external_apply_href_evidence',''),
+                  coalesce(metadata_json->>'external_apply_company_evidence','')
              FROM job_posting_source_revisions
             WHERE nullif(trim(coalesce(metadata_json->>'external_apply_url','')),'') IS NOT NULL
-              AND metadata_json->>'external_apply_evidence_authority' = 'browser_dom_job_bound_v1'
+              AND metadata_json->>'external_apply_evidence_authority' = 'browser_dom_job_company_apply_v2'
               AND metadata_json->>'external_apply_href_evidence' = metadata_json->>'external_apply_url'
+              AND lower(trim(coalesce(metadata_json->>'external_apply_company_evidence',''))) = lower(trim(company))
             ORDER BY observed_at DESC LIMIT %s;""",
         (max(1, min(int(limit), 1000)),),
     )
-    candidates.extend((str(company or ""), str(url or ""), str(witness or "")) for company, url, witness in cur.fetchall())
+    candidates.extend((str(company or ""), str(url or ""), str(witness or ""), str(company_witness or ""))
+                      for company, url, witness, company_witness in cur.fetchall())
     enrolled: set[str] = set()
-    for company, url, witness in candidates:
+    for company, url, witness, company_witness in candidates:
         source_id = enroll_ats_source(
             cur, company=company, apply_url=url, href_evidence=witness,
-            evidence_source="observed_job_source",
+            company_evidence=company_witness, evidence_source="linkedin_observed_job_source",
         )
         if source_id:
             enrolled.add(source_id)
@@ -239,6 +242,17 @@ def _latest_task(cur, base_key: str, task_type: str) -> tuple[str, str, str, Any
     )
     row = cur.fetchone()
     return (str(row[0]), str(row[1]), str(row[2] or ''), row[3]) if row else None
+
+
+def _cooldown_anchor(last_queued_at: Any, last_finished_at: Any) -> Any:
+    """Cooldown starts from completion when known, otherwise from queue time.
+
+    Using queue time alone shortens the effective cooldown by however long a
+    browser task ran.  ``max`` also protects a newly queued occurrence while a
+    previous completion timestamp is still present in scheduler state.
+    """
+    values = [value for value in (last_queued_at, last_finished_at) if value is not None]
+    return max(values) if values else None
 
 
 def _occurrence_key(base_key: str, now_value: float) -> str:
@@ -291,13 +305,13 @@ def run_once(cur, *, apply: bool, now: float | None = None) -> dict[str, Any]:
             state_key = SEARCH_STATE_PREFIX + fingerprint
             base_key = f"jobos:auto-linkedin:{fingerprint}"
             if apply:
-                _, last_queued_at, _ = _ensure_scheduler_state(cur, state_key)
+                _, last_queued_at, last_finished_at = _ensure_scheduler_state(cur, state_key)
                 retry_key = _retryable_failed_key(
                     cur, base_key=base_key, task_type="discover_linkedin_jobs", now_value=now_value
                 )
                 if retry_key:
                     key = retry_key
-                elif last_queued_at and (now_value - last_queued_at.timestamp()) < cooldown:
+                elif (cooldown_anchor := _cooldown_anchor(last_queued_at, last_finished_at)) and (now_value - cooldown_anchor.timestamp()) < cooldown:
                     skipped.append({"reason": "rolling_cooldown", "search": request})
                     continue
                 else:
@@ -334,13 +348,13 @@ def run_once(cur, *, apply: bool, now: float | None = None) -> dict[str, Any]:
         if slots <= 0:
             saved_result = {"created": False, "reason": "backpressure", "idempotency_key": saved_base_key}
         elif apply:
-            _, saved_last_queued, _ = _ensure_scheduler_state(cur, SAVED_STATE_KEY)
+            _, saved_last_queued, saved_last_finished = _ensure_scheduler_state(cur, SAVED_STATE_KEY)
             retry_key = _retryable_failed_key(
                 cur, base_key=saved_base_key, task_type="discover_linkedin_saved_jobs", now_value=now_value
             )
             if retry_key:
                 saved_key = retry_key
-            elif saved_last_queued and now_value - saved_last_queued.timestamp() < saved_cooldown:
+            elif (saved_anchor := _cooldown_anchor(saved_last_queued, saved_last_finished)) and now_value - saved_anchor.timestamp() < saved_cooldown:
                 saved_result = {"created": False, "reason": "rolling_cooldown", "idempotency_key": saved_base_key}
                 saved_key = ""
             else:

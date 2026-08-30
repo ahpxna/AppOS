@@ -55,12 +55,32 @@ def _employment_type(text: str) -> str | None:
 
 
 def _salary_ceiling(value: str) -> float | None:
-    """Return a published upper bound only; unknown compensation is not rejected."""
-    amounts = []
-    for raw, suffix in re.findall(r"\$?\s*([\d,]+(?:\.\d+)?)\s*([kK]?)", value or ""):
+    """Return a conservative annualized published upper bound.
+
+    User ``salary_floor`` is annual compensation.  Explicit hourly/daily/weekly/
+    monthly ranges must therefore be normalized before comparison; unknown
+    units keep their published numeric scale rather than being guessed.
+    """
+    text = str(value or "")
+    amounts: list[float] = []
+    for raw, suffix in re.findall(r"\$?\s*([\d,]+(?:\.\d+)?)\s*([kK]?)", text):
         amount = float(raw.replace(",", ""))
         amounts.append(amount * 1000 if suffix else amount)
-    return max(amounts) if amounts else None
+    if not amounts:
+        return None
+    lowered = text.casefold()
+    multiplier = 1.0
+    if re.search(r"(?:/\s*(?:h|hr|hour)\b|\bper\s+hour\b|\bhourly\b)", lowered):
+        multiplier = 2080.0
+    elif re.search(r"(?:/\s*(?:day|d)\b|\bper\s+day\b|\bdaily\b)", lowered):
+        multiplier = 260.0
+    elif re.search(r"(?:/\s*(?:week|wk)\b|\bper\s+week\b|\bweekly\b)", lowered):
+        multiplier = 52.0
+    elif re.search(r"(?:/\s*(?:month|mo)\b|\bper\s+month\b|\bmonthly\b)", lowered):
+        multiplier = 12.0
+    elif re.search(r"(?:/\s*(?:year|yr)\b|\bper\s+year\b|\bann(?:ual|ually)\b|\bper\s+annum\b)", lowered):
+        multiplier = 1.0
+    return max(amounts) * multiplier
 
 
 def preference_reason(*, company: str, title: str, location: str, work_mode: str,
