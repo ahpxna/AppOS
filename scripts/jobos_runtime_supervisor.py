@@ -33,6 +33,9 @@ SUPERVISOR_PID = RUN_DIR / "supervisor.pid"
 STATE_FILE = RUN_DIR / "runtime.json"
 STOP = False
 MAX_LOG_BYTES = 10 * 1024 * 1024
+BROWSER_HEALTH_INTERVAL_SECONDS = env_int(
+    "JOBOS_RUNTIME_BROWSER_HEALTH_INTERVAL_SECONDS", 15, minimum=5, maximum=120
+)
 
 
 @dataclass(frozen=True)
@@ -94,6 +97,48 @@ def _read_pid() -> int | None:
         return None
 
 
+def runtime_state_ready(
+    state: dict[str, Any], *, running: bool, state_fresh: bool,
+    required_failures: list[str] | tuple[str, ...] | set[str],
+) -> bool:
+    """Return fail-closed readiness from the persisted heartbeat authority.
+
+    PID and worker liveness cannot override the database/migration verdict
+    written by the heartbeat.  Missing or malformed database health is also
+    non-ready so an old runtime.json format cannot silently fail open.
+    """
+    database_health = state.get("database_health")
+    database_ready = bool(
+        isinstance(database_health, dict)
+        and database_health.get("available") is True
+        and not database_health.get("error")
+    )
+    browser_health = state.get("browser_runtime_health")
+    browser_ready = bool(
+        isinstance(browser_health, dict)
+        and browser_health.get("available") is True
+        and not browser_health.get("error")
+    )
+    return bool(running and state_fresh and not required_failures and database_ready and browser_ready)
+
+
+def _browser_runtime_health() -> tuple[bool, str | None]:
+    """Probe gateway RPC + CDP without reading tabs or invoking a model.
+
+    A live browser-worker process proves only its polling loop is alive. It can
+    remain alive indefinitely while the native OpenClaw gateway or Chrome CDP
+    listener is absent, so process liveness alone must not produce READY.
+    """
+    result = DEFAULT_PROCESS_RUNNER.run(
+        [sys.executable, str(ROOT / "services" / "browser-controller" / "browser_queue_worker.py"), "--health"],
+        cwd=ROOT, timeout_s=15,
+    )
+    if result.ok:
+        return True, None
+    detail = (result.output or result.start_error or "Gateway/CDP health probe failed").strip()
+    return False, detail[-1000:]
+
+
 def _specs() -> dict[str, WorkerSpec]:
     specs: dict[str, WorkerSpec] = {
         "orchestrator": WorkerSpec("orchestrator", (sys.executable, "-m", "services.orchestrator.orchestrator_worker_v1", "--poll-seconds", "15")),
@@ -113,6 +158,14 @@ def _specs() -> dict[str, WorkerSpec]:
             required=False,
         ),
     }
+    # Native OpenClaw must have the same lifecycle owner as the workers that
+    # depend on it. Opt-in preserves Docker/external gateway deployments, but
+    # when enabled no terminal or ad-hoc nohup process is part of readiness.
+    if _truthy("JOBOS_RUNTIME_MANAGE_NATIVE_OPENCLAW", False):
+        specs["openclaw-gateway"] = WorkerSpec(
+            "openclaw-gateway",
+            (sys.executable, str(ROOT / "scripts" / "start_openclaw_jobos.py"), "gateway"),
+        )
     # Capability flags permit a manually requested LinkedIn read; only the
     # separate autonomous opt-in is allowed to start a periodic scheduler.
     if _truthy("JOBOS_AUTONOMOUS_DISCOVERY_ENABLED", False):
@@ -136,6 +189,24 @@ def _specs() -> dict[str, WorkerSpec]:
             (sys.executable, "-m", "services.runtime.periodic_tasks_v1", "repo-freshness",
              "--interval-seconds", str(env_int(
                  "JOBOS_REPO_FRESHNESS_INTERVAL_SECONDS", 3600, minimum=60, maximum=86400
+             ))),
+            required=False,
+        )
+    if _truthy("JOBOS_MESSAGE_WORKER_ENABLED", True):
+        specs["message-pipeline"] = WorkerSpec(
+            "message-pipeline",
+            (sys.executable, "-m", "services.runtime.periodic_tasks_v1", "message-pipeline",
+             "--interval-seconds", str(env_int(
+                 "JOBOS_MESSAGE_WORKER_INTERVAL_SECONDS", 60, minimum=60, maximum=86400
+             ))),
+            required=False,
+        )
+    if _truthy("JOBOS_INTERVIEW_PREP_WORKER_ENABLED", True):
+        specs["interview-prep"] = WorkerSpec(
+            "interview-prep",
+            (sys.executable, "-m", "services.runtime.periodic_tasks_v1", "interview-prep",
+             "--interval-seconds", str(env_int(
+                 "JOBOS_INTERVIEW_PREP_INTERVAL_SECONDS", 300, minimum=60, maximum=86400
              ))),
             required=False,
         )
@@ -183,6 +254,17 @@ def _db_runtime_heartbeat(runtime_instance_id: str, children: dict[str, subproce
                     WHERE enabled=true AND consecutive_failures>0 ORDER BY id LIMIT 20;"""
             )
             ats_failures = [str(row[0]) for row in cur.fetchall()]
+            cur.execute(
+                """SELECT count(*) FROM llm_calls
+                    WHERE status='uncertain'
+                       OR (status='running' AND started_at < now()-interval '30 minutes');"""
+            )
+            llm_attention = int((cur.fetchone() or (0,))[0] or 0)
+            cur.execute(
+                """SELECT count(*) FROM llm_cost_reservations
+                    WHERE status='reserved' AND created_at < now()-interval '30 minutes';"""
+            )
+            stale_reservations = int((cur.fetchone() or (0,))[0] or 0)
             health_failures: list[str] = []
             if not migration_current:
                 health_failures.append("migration_not_current=" + latest_path.name)
@@ -190,6 +272,10 @@ def _db_runtime_heartbeat(runtime_instance_id: str, children: dict[str, subproce
                 health_failures.append("periodic=" + ",".join(periodic_failures))
             if ats_failures:
                 health_failures.append("ats_sources=" + ",".join(ats_failures))
+            if llm_attention:
+                health_failures.append(f"llm_calls_needing_reconciliation={llm_attention}")
+            if stale_reservations:
+                health_failures.append(f"stale_llm_reservations={stale_reservations}")
             health_error = "; ".join(health_failures) or None
             runtime_status = "degraded" if degraded or health_error else "running"
             # This is deliberately an UPSERT rather than UPDATE. If PostgreSQL
@@ -245,7 +331,8 @@ def _db_runtime_stop(runtime_instance_id: str) -> None:
 def _write_state(children: dict[str, subprocess.Popen[Any]], restarts: dict[str, int],
                  specs: dict[str, WorkerSpec], degraded: dict[str, str],
                  runtime_instance_id: str | None = None, *, database_ok: bool = False,
-                 database_error: str | None = None) -> None:
+                 database_error: str | None = None, browser_ok: bool = False,
+                 browser_error: str | None = None) -> None:
     required_running = all(
         name in children and children[name].poll() is None
         for name, spec in specs.items() if spec.required
@@ -255,8 +342,10 @@ def _write_state(children: dict[str, subprocess.Popen[Any]], restarts: dict[str,
         "runtime_instance_id": runtime_instance_id,
         "updated_at_unix": int(time.time()),
         "expected_required_services": sorted(name for name, spec in specs.items() if spec.required),
-        "ready": bool(required_running and database_ok and not database_error),
+        "ready": bool(required_running and database_ok and not database_error
+                      and browser_ok and not browser_error),
         "database_health": {"available": bool(database_ok), "error": database_error},
+        "browser_runtime_health": {"available": bool(browser_ok), "error": browser_error},
         "services": {
             name: {
                 "pid": children[name].pid if name in children else None,
@@ -326,6 +415,9 @@ def daemon() -> int:
     last_start: dict[str, float] = {}
     restart_times: dict[str, list[float]] = {}
     degraded: dict[str, str] = {}
+    browser_ok = False
+    browser_error: str | None = "browser runtime has not been probed yet"
+    last_browser_probe = 0.0
     try:
         while not STOP:
             specs = _specs()
@@ -369,9 +461,14 @@ def daemon() -> int:
             database_ok, database_error = _db_runtime_heartbeat(
                 runtime_instance_id, children, restarts, specs, degraded
             )
+            monotonic_now = time.monotonic()
+            if monotonic_now - last_browser_probe >= BROWSER_HEALTH_INTERVAL_SECONDS:
+                browser_ok, browser_error = _browser_runtime_health()
+                last_browser_probe = monotonic_now
             _write_state(
                 children, restarts, specs, degraded, runtime_instance_id,
                 database_ok=database_ok, database_error=database_error,
+                browser_ok=browser_ok, browser_error=browser_error,
             )
             time.sleep(2)
     finally:
@@ -394,6 +491,41 @@ def _start_infra() -> None:
     if _truthy("JOBOS_RUNTIME_START_OPENCLAW", False):
         DEFAULT_PROCESS_RUNNER.run([docker, "compose", "-f", "docker-compose.openclaw.yml", "up", "-d", "openclaw", "browser"],
                                    cwd=ROOT, timeout_s=120)
+
+
+def _preflight_database_contract(*, timeout_seconds: int = 30) -> tuple[bool, str | None]:
+    """Prove the latest migration before any worker is allowed to start.
+
+    ``start`` may boot PostgreSQL itself, so a short bounded connection retry is
+    appropriate.  Schema drift is not transient and returns immediately.  This
+    is deliberately read-only: operators must run the audited migration runner
+    rather than having daily startup mutate production history implicitly.
+    """
+    from scripts.apply_migrations import checksum, migration_files
+
+    latest = migration_files()[-1]
+    deadline = time.monotonic() + max(1, min(int(timeout_seconds), 120))
+    last_error = "PostgreSQL did not become reachable."
+    while True:
+        try:
+            import psycopg
+            with psycopg.connect(database_dsn(), autocommit=True) as conn, conn.cursor() as cur:
+                cur.execute(
+                    "SELECT checksum_sha256 FROM schema_migrations WHERE migration_id=%s;",
+                    (latest.name,),
+                )
+                row = cur.fetchone()
+            expected = checksum(latest)
+            if not row:
+                return False, f"migration_not_current={latest.name}"
+            if str(row[0]) != expected:
+                return False, f"migration_checksum_drift={latest.name}"
+            return True, None
+        except Exception as exc:
+            last_error = f"{type(exc).__name__}: {exc}"[:500]
+        if time.monotonic() >= deadline:
+            return False, last_error
+        time.sleep(0.25)
 
 
 def start() -> int:
@@ -419,6 +551,16 @@ def start() -> int:
     SUPERVISOR_PID.unlink(missing_ok=True)
     STATE_FILE.unlink(missing_ok=True)
     _start_infra()
+    database_ok, database_error = _preflight_database_contract(
+        timeout_seconds=env_int("JOBOS_RUNTIME_DATABASE_STARTUP_TIMEOUT_SECONDS", 30, minimum=1, maximum=120)
+    )
+    if not database_ok:
+        print(
+            "JobOS workers were not started because the PostgreSQL migration contract is not current: "
+            f"{database_error}. Run `python scripts/apply_migrations.py`, then retry `jobos start`.",
+            file=sys.stderr,
+        )
+        return 1
     log = (LOG_DIR / "supervisor.log").open("ab", buffering=0)
     try:
         proc = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "daemon"], cwd=ROOT,
@@ -470,7 +612,12 @@ def status() -> int:
     )
     state["expected_required_services"] = sorted(expected_required)
     state["required_failures"] = required_failures
-    state["ready"] = running and state["state_fresh"] and not required_failures
+    state["ready"] = runtime_state_ready(
+        state,
+        running=running,
+        state_fresh=state["state_fresh"],
+        required_failures=required_failures,
+    )
     try:
         import psycopg
         with psycopg.connect(database_dsn(), autocommit=True) as conn, conn.cursor() as cur:

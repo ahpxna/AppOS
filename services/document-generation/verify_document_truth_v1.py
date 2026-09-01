@@ -203,16 +203,21 @@ def deterministic_cover_structure(company: str, job_title: str) -> set[str]:
 
 def fetch_company_research_text(cur, application_id: str) -> str:
     """Return the cached, URL-backed company context for literal-quote audit."""
+    from services.common.company_identity_v1 import company_identity_key, employer_domain_from_job_url
+    cur.execute("SELECT company,job_url FROM applications WHERE id=%s;", (application_id,))
+    app = cur.fetchone()
+    if not app:
+        return ""
+    identity_key = company_identity_key(app[0], employer_domain_from_job_url(app[1]))
     cur.execute(
         """
         SELECT crc.sources, crc.recent_news
-        FROM applications a
-        JOIN company_research_cache crc ON lower(crc.company_name) = lower(a.company)
-        WHERE a.id = %s
+        FROM company_research_cache crc
+        WHERE crc.identity_key = %s
         ORDER BY crc.last_refreshed_at DESC NULLS LAST, crc.created_at DESC
         LIMIT 1;
         """,
-        (application_id,),
+        (identity_key,),
     )
     row = cur.fetchone()
     if not row:
@@ -852,6 +857,7 @@ def process_document(
     cur, document_id: str, args, *, verbose: bool = True
 ) -> Dict[str, Any]:
     doc = fetch_document(cur, document_id)
+    os.environ["JOBOS_APPLICATION_ID"] = str(doc["application_id"])
     claims = doc["evidence_map"].get("claims", [])
 
     print(f"\n--- {doc['doc_type']} v{doc['version']} "

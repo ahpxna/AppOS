@@ -146,9 +146,8 @@ def begin_render_run(*, document_id: str, input_manifest: dict[str, Any],
         conn.commit()
         return RenderClaim(run_id=run_id, claim_token=claim_token)
 
-def finish_render_run(claim: RenderClaim, *, docx_artifact_id: str | None = None,
-                      pdf_artifact_id: str | None = None) -> None:
-    with psycopg.connect(database_dsn(), autocommit=False) as conn, conn.cursor() as cur:
+def _finish_render_run(cur, claim: RenderClaim, *, docx_artifact_id: str | None = None,
+                       pdf_artifact_id: str | None = None) -> None:
         cur.execute(
             """UPDATE document_render_runs
                   SET status='completed',docx_artifact_id=%s,pdf_artifact_id=%s,
@@ -165,6 +164,23 @@ def finish_render_run(claim: RenderClaim, *, docx_artifact_id: str | None = None
         )
         if cur.rowcount != 1:
             raise RuntimeError("render attempt journal changed before completion")
+
+
+def finish_render_run(claim: RenderClaim, *, docx_artifact_id: str | None = None,
+                      pdf_artifact_id: str | None = None, cur=None) -> None:
+    """Complete a render in the artifact transaction when one is supplied.
+
+    The artifact FK rows are commonly still uncommitted. Opening a second
+    connection here cannot see them and used to mark successful renders
+    uncertain. The optional cursor keeps the ledger and artifacts atomic.
+    """
+    if cur is not None:
+        _finish_render_run(cur, claim, docx_artifact_id=docx_artifact_id,
+                           pdf_artifact_id=pdf_artifact_id)
+        return
+    with psycopg.connect(database_dsn(), autocommit=False) as conn, conn.cursor() as owned_cur:
+        _finish_render_run(owned_cur, claim, docx_artifact_id=docx_artifact_id,
+                           pdf_artifact_id=pdf_artifact_id)
         conn.commit()
 
 

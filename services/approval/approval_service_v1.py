@@ -201,10 +201,16 @@ def normalise_origin(value: str) -> str:
 def fetch_reply_binding(cur, reply_id: str) -> Dict[str, Any]:
     cur.execute(
         """
-        SELECT id::text, thread_id::text, subject, body_text, evidence_map,
-               asset_ids_used, qa_status
-        FROM drafted_replies
-        WHERE id = %s;
+        SELECT dr.id::text, dr.thread_id::text, dr.subject, dr.body_text,
+               dr.evidence_map, dr.asset_ids_used, dr.qa_status,
+               dr.in_reply_to::text, dr.superseded_at,
+               (SELECT m.id::text FROM messages m
+                 WHERE m.thread_id=dr.thread_id AND m.direction='inbound'
+                 ORDER BY coalesce(m.received_at,m.created_at) DESC,m.created_at DESC,m.id DESC
+                 LIMIT 1)
+        FROM drafted_replies dr
+        WHERE dr.id = %s
+        FOR UPDATE OF dr;
         """,
         (reply_id,),
     )
@@ -219,6 +225,9 @@ def fetch_reply_binding(cur, reply_id: str) -> Dict[str, Any]:
         "evidence_map": row[4] or {},
         "asset_ids_used": row[5] or [],
         "qa_status": row[6],
+        "in_reply_to": row[7],
+        "superseded_at": row[8],
+        "latest_inbound_id": row[9],
     }
     return {
         "reply": reply,
@@ -227,6 +236,7 @@ def fetch_reply_binding(cur, reply_id: str) -> Dict[str, Any]:
             "body_text": reply["body_text"],
             "evidence_map": reply["evidence_map"],
             "asset_ids_used": reply["asset_ids_used"],
+            "in_reply_to": reply["in_reply_to"],
         }),
     }
 
@@ -252,6 +262,12 @@ def assert_binding_matches(cur, request_row: Dict[str, Any]) -> None:
         if binding["reply"].get("qa_status") != "pass":
             raise RuntimeError(
                 "Reply has not passed the truth checker yet. Verify it before approval."
+            )
+        if binding["reply"].get("superseded_at") is not None or not binding["reply"].get("in_reply_to") or (
+            str(binding["reply"].get("in_reply_to")) != str(binding["reply"].get("latest_inbound_id") or "")
+        ):
+            raise RuntimeError(
+                "Recruiter thread changed after this reply was drafted. Prepare and verify a fresh reply."
             )
         if payload.get("content_hash") != binding["content_hash"]:
             raise RuntimeError(
@@ -318,6 +334,39 @@ def assert_binding_matches(cur, request_row: Dict[str, Any]) -> None:
         )
         if current_plan_key != str(payload.get("autofill_plan_key") or ""):
             raise RuntimeError("Autofill plan binding changed after preview; prepare a fresh plan.")
+
+
+def _resolve_send_message_decision(cur, *, payload: dict[str, Any], approved: bool) -> None:
+    """Reflect the human decision onto the exact QA-bound draft.
+
+    The approval row is the capability ledger, while ``drafted_replies`` is the
+    messaging domain state consumed by an eventual sender/exporter. Older code
+    updated only the former, leaving every approved reply permanently absent
+    from the domain's approved queue.
+    """
+    reply_id = str((payload or {}).get("drafted_reply_id") or "")
+    if not reply_id:
+        raise RuntimeError("send_message approval payload missing drafted_reply_id.")
+    if approved:
+        cur.execute(
+            """UPDATE drafted_replies dr SET approved=true
+                  WHERE dr.id=%s AND dr.qa_status='pass' AND dr.sent=false
+                    AND dr.superseded_at IS NULL
+                    AND dr.in_reply_to=(
+                         SELECT m.id FROM messages m
+                          WHERE m.thread_id=dr.thread_id AND m.direction='inbound'
+                          ORDER BY coalesce(m.received_at,m.created_at) DESC,m.created_at DESC,m.id DESC
+                          LIMIT 1)
+                RETURNING id::text;""",
+            (reply_id,),
+        )
+        if not cur.fetchone():
+            raise RuntimeError("QA-passed drafted reply is no longer approvable.")
+    else:
+        cur.execute(
+            "UPDATE drafted_replies SET approved=false WHERE id=%s AND sent=false;",
+            (reply_id,),
+        )
 
 
 def log_event(cur, request_id: Optional[str], event: str,
@@ -1132,6 +1181,11 @@ def redeem(conn, token: str, *, decision: str, note: str, actor: str) -> int:
                 cur, application_id=application_id, request_id=request_id,
                 approved=(new_status == "approved"), actor=actor,
             )
+        elif atype == "send_message":
+            _resolve_send_message_decision(
+                cur, payload=dict(payload_request.get("payload_json") or {}),
+                approved=(new_status == "approved"),
+            )
 
         if new_status == "denied":
             denied_payload = payload_request["payload_json"] if isinstance(payload_request.get("payload_json"), dict) else {}
@@ -1243,6 +1297,11 @@ def decide_request_by_id(conn, request_id: str, *, decision: str, note: str,
             _resolve_fit_review_transition(
                 cur, application_id=application_id, request_id=rid,
                 approved=(new_status == "approved"), actor=actor,
+            )
+        elif atype == "send_message":
+            _resolve_send_message_decision(
+                cur, payload=dict(request.get("payload_json") or {}),
+                approved=(new_status == "approved"),
             )
         if new_status == "denied":
             denied_payload = request["payload_json"] if isinstance(request.get("payload_json"), dict) else {}

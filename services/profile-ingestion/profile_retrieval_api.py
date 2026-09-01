@@ -13,12 +13,12 @@ from psycopg.types.json import Jsonb
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from services.common.model_config import get_model  # noqa: E402
 from services.common.llm_gateway import LLMEmbeddingResult, embed_result  # noqa: E402
-from services.common.config import database_dsn  # noqa: E402
+from services.common.config import database_dsn, env_int  # noqa: E402
 
 
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 EMBED_MODEL = get_model("embed")
-EMBED_DIM = int(os.getenv("PROFILE_EMBED_DIM", "768"))
+EMBED_DIM = env_int("PROFILE_EMBED_DIM", 768, minimum=1, maximum=4096)
 
 COMPONENT_NAME = "profile_retrieval_api"
 TASK_TYPE = "retrieve_profile_chunks"

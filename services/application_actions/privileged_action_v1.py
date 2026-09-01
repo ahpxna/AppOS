@@ -455,16 +455,27 @@ def canonical_pipeline_step_for_browser_state(state: str) -> str | None:
 def _update_auth_session(cur, *, application_id: str, url: str, fingerprint: str,
                          state: str, platform: str, detail: dict[str, Any]) -> None:
     cur.execute(
+        "SELECT coalesce(job_url,''),coalesce(jd_hash,'') FROM applications WHERE id=%s;",
+        (application_id,),
+    )
+    application_binding = cur.fetchone()
+    if not application_binding:
+        raise PrivilegedActionError("application auth session cannot bind a missing application")
+    binding_job_url = str(application_binding[0] or "")
+    binding_jd_hash = str(application_binding[1] or "")
+    cur.execute(
         """INSERT INTO application_auth_sessions(
                application_id, employer_origin, platform_hint, auth_state, current_url,
-               page_fingerprint, last_event, detail_json, updated_at)
-           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,now())
+               page_fingerprint, last_event, detail_json,binding_job_url,binding_jd_hash,updated_at)
+           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,now())
            ON CONFLICT (application_id) DO UPDATE SET
                employer_origin=EXCLUDED.employer_origin, platform_hint=EXCLUDED.platform_hint,
                auth_state=EXCLUDED.auth_state, current_url=EXCLUDED.current_url,
                page_fingerprint=EXCLUDED.page_fingerprint, last_event=EXCLUDED.last_event,
-               detail_json=EXCLUDED.detail_json, updated_at=now();""",
-        (application_id, _origin(url), platform, state, url, fingerprint, state, Jsonb(detail)),
+               detail_json=EXCLUDED.detail_json,binding_job_url=EXCLUDED.binding_job_url,
+               binding_jd_hash=EXCLUDED.binding_jd_hash,updated_at=now();""",
+        (application_id, _origin(url), platform, state, url, fingerprint, state, Jsonb(detail),
+         binding_job_url, binding_jd_hash),
     )
     target_step = canonical_pipeline_step_for_browser_state(state)
     if target_step:
@@ -473,6 +484,7 @@ def _update_auth_session(cur, *, application_id: str, url: str, fingerprint: str
             recovery_edges = {
                 ("needs_email_verification", "needs_account_auth"),
                 ("needs_mfa", "needs_account_auth"),
+                ("needs_human_checkpoint", "needs_account_auth"),
                 ("needs_human_checkpoint", "needs_mfa"),
                 ("needs_human_checkpoint", "needs_email_verification"),
                 ("needs_mfa", "needs_email_verification"),
@@ -804,6 +816,21 @@ def _enqueue_state_followup(cur, transport: OpenClawTransport, *, application_id
         create_privileged_request(cur, application_id=application_id, action_type="privileged_auth_manual_retry",
                                   payload=base, summary="Employer SSO/ambiguous auth requires manual login. Complete it in the pinned browser, then approve AUTH RETRY.",
                                   requested_by="auth-state-router")
+        return
+    if state == "unknown":
+        # A successful OPEN APPLY click can land on a provider page whose
+        # controls are not yet classifiable.  The browser effect is real and
+        # the application is already at application_entrypoint_ready, so
+        # silently returning here loses the only continuation capability.
+        # Offer a read-only, exact-target retry; it never replays Apply.
+        create_privileged_request(
+            cur, application_id=application_id,
+            action_type="privileged_auth_manual_retry", payload=base,
+            summary=("The application handoff page could not be classified safely. "
+                     "Inspect or complete the exact pinned page, then approve AUTH RETRY "
+                     "for a fresh read-only snapshot; OPEN APPLY will not be replayed."),
+            requested_by="auth-state-router",
+        )
         return
     if state != "needs_account_auth":
         return

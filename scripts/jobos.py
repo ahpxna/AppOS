@@ -9,6 +9,7 @@ import json
 import subprocess
 import sys
 import shutil
+import time
 import uuid
 from pathlib import Path
 
@@ -528,7 +529,7 @@ def status() -> int:
     load_repo_env()
     runtime = {"running": False}
 
-    from scripts.jobos_runtime_supervisor import _is_supervisor_process
+    from scripts.jobos_runtime_supervisor import _is_supervisor_process, runtime_state_ready
     try:
         runtime_path = ROOT / ".jobos" / "run" / "runtime.json"
         if runtime_path.is_file():
@@ -561,7 +562,12 @@ def status() -> int:
                 name for name in expected_required
                 if not isinstance(services.get(name), dict) or not services[name].get("running")
             )
-            runtime["ready"] = runtime["running"] and runtime["state_fresh"] and not runtime["required_failures"]
+            runtime["ready"] = runtime_state_ready(
+                runtime,
+                running=runtime["running"],
+                state_fresh=runtime["state_fresh"],
+                required_failures=runtime["required_failures"],
+            )
             if not runtime["running"]:
                 runtime["status"] = "stale_runtime_state"
     except Exception:
@@ -648,7 +654,42 @@ def status() -> int:
              "next_retry_at": str(row[5]) if row[5] else None}
             for row in cur.fetchall()
         ]
-        if periodic_failures or ats_source_failures:
+        cur.execute(
+            """SELECT id::text,application_id::text,role,provider,configured_model,status,started_at,error_message
+                 FROM llm_calls
+                WHERE status='uncertain'
+                   OR (status='running' AND started_at < now()-interval '30 minutes')
+                ORDER BY started_at LIMIT 50;"""
+        )
+        llm_call_attention = [
+            {"llm_call_id": row[0], "application_id": row[1], "role": row[2],
+             "provider": row[3], "model": row[4], "status": row[5],
+             "started_at": str(row[6]), "error": str(row[7] or "")[:300]}
+            for row in cur.fetchall()
+        ]
+        cur.execute(
+            """SELECT id::text,application_id::text,role,provider,model_name,budget_date,created_at
+                 FROM llm_cost_reservations
+                WHERE status='reserved' AND created_at < now()-interval '30 minutes'
+                ORDER BY created_at LIMIT 50;"""
+        )
+        stale_llm_reservations = [
+            {"reservation_id": row[0], "application_id": row[1], "role": row[2],
+             "provider": row[3], "model": row[4], "budget_date": str(row[5]),
+             "created_at": str(row[6])}
+            for row in cur.fetchall()
+        ]
+        cur.execute(
+            """SELECT count(*) FROM drafted_replies
+                WHERE approved=true AND sent=false AND superseded_at IS NULL;"""
+        )
+        approved_unsent_replies = int((cur.fetchone() or (0,))[0] or 0)
+        cur.execute(
+            """SELECT count(*) FROM message_threads
+                WHERE needs_user_attention=true AND linked_application_id IS NULL;"""
+        )
+        unlinked_message_threads = int((cur.fetchone() or (0,))[0] or 0)
+        if periodic_failures or ats_source_failures or llm_call_attention or stale_llm_reservations:
             runtime["ready"] = False
         if periodic_failures:
             runtime["periodic_failures"] = [entry["task"] for entry in periodic_failures]
@@ -658,6 +699,10 @@ def status() -> int:
         "runtime": runtime, "database_runtime": database_runtime,
         "workflow_runs": workflow_runs, "control_commands": control_commands,
         "periodic_task_failures": periodic_failures, "ats_source_failures": ats_source_failures,
+        "llm_calls_needing_reconciliation": llm_call_attention,
+        "stale_llm_cost_reservations": stale_llm_reservations,
+        "approved_unsent_replies": approved_unsent_replies,
+        "unlinked_message_threads_needing_attention": unlinked_message_threads,
         "applications_by_status": applications, "applications_by_step": steps, "applications_by_source": sources,
         "browser_tasks": browser_tasks, "attempts": attempts, "pending_human_reviews": pending_reviews,
         "needs_reconciliation": reconciliation,
@@ -667,7 +712,7 @@ def status() -> int:
         "daily_control_surface": "Telegram /start",
         "submit": "telegram_human_approval_then_privileged_executor",
     }, indent=2))
-    return 0
+    return 0 if runtime.get("ready") is True else 1
 
 
 def discover_command(command: str, *, apply: bool = False, keywords: str = "",

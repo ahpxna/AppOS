@@ -17,6 +17,8 @@ _TRANSIENT_MARKERS = (
     "connection refused", "connection reset", "temporarily unavailable",
     "temporary failure", "timed out", "timeout", "rate limit", "429",
     "502", "503", "504", "urlerror",
+    "jobos_retryable_block:", "github api unavailable",
+    "profile facts require review",
 )
 
 

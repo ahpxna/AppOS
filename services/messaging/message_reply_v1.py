@@ -53,7 +53,7 @@ from psycopg.types.json import Jsonb
 # PYTHONPATH already. Confirmed live 2026-08-01.
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from services.common.observability import emit_trace, make_trace_id
-from services.common.llm_gateway import generate_text
+from services.common.llm_gateway import generate_text, resolve_config
 from services.common.model_config import get_model
 from services.common.config import database_dsn
 from services.common.ai_contracts import parse_json_object as _parse_contract_json_object
@@ -155,14 +155,19 @@ def fetch_assets(cur, role_family: Optional[str]) -> List[Dict[str, Any]]:
 def ensure_interview_prep(cur, *, application_id: str, thread_id: str,
                           classification: str) -> None:
     cur.execute(
+        "SELECT pg_advisory_xact_lock(hashtextextended(%s,0));",
+        (f"jobos-interview-source:{application_id}:{thread_id}",),
+    )
+    cur.execute(
         """
         SELECT id::text, status
         FROM interviews
         WHERE application_id = %s
+          AND interviewer_info->>'source_thread_id' = %s
         ORDER BY created_at DESC
         LIMIT 1;
         """,
-        (application_id,),
+        (application_id, thread_id),
     )
     existing = cur.fetchone()
     if existing:
@@ -270,6 +275,19 @@ def cmd_classify(conn, args) -> int:
             return 0
 
         for mid, tid, sender, subject, body, application_id in rows:
+            # Serialize the exact inbound message before model I/O. A second
+            # worker/manual command must wait and then observe is_processed,
+            # rather than purchasing a parallel classification.
+            cur.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s,0));", (f"jobos-message:{mid}:classify",))
+            cur.execute("SELECT is_processed FROM messages WHERE id=%s;", (mid,))
+            locked_message = cur.fetchone()
+            if not locked_message or bool(locked_message[0]):
+                continue
+            if application_id:
+                os.environ["JOBOS_APPLICATION_ID"] = str(application_id)
+            else:
+                os.environ.pop("JOBOS_APPLICATION_ID", None)
+            os.environ["JOBOS_LLM_REQUEST_SCOPE"] = f"message:{mid}:classification"
             msg = {"sender": sender, "subject": subject, "body": body}
             prompt = build_classify_prompt(msg, labels)
             trace_id = make_trace_id("message-classify", tid, mid)
@@ -309,12 +327,18 @@ def cmd_classify(conn, args) -> int:
             conf = max(0.0, min(1.0, conf))
             meta = labels[label]
 
-            print(f"\n  {subject or '(no subject)'}")
-            print(f"    -> {label}  ({conf:.2f})  {str(parsed.get('reason') or '')[:80]}")
             contains_ai_instructions = coerce_bool(parsed.get("contains_instructions_to_ai"))
             if contains_ai_instructions:
                 print("    NOTE: message appears to contain instructions aimed "
                       "at an AI. Treated as data; flagging for review.")
+                # Persist the fail-closed policy in the canonical vocabulary,
+                # not only in a transient boolean. A later acknowledgement may
+                # clear the attention badge, but must never make this message
+                # eligible for automatic drafting.
+                label = "unclear"
+                meta = labels[label]
+            print(f"\n  {subject or '(no subject)'}")
+            print(f"    -> {label}  ({conf:.2f})  {str(parsed.get('reason') or '')[:80]}")
             if meta["needs_human"]:
                 print("    routes to a human; no reply will be drafted")
 
@@ -324,11 +348,12 @@ def cmd_classify(conn, args) -> int:
                     UPDATE message_threads
                     SET classification = %s, classification_confidence = %s,
                         classified_at = now(), classifier_version = %s,
-                        needs_user_attention = %s, updated_at = now()
+                        needs_user_attention = message_threads.needs_user_attention OR %s,
+                        updated_at = now()
                     WHERE id = %s;
                     """,
                     (label, conf, CLASSIFIER_VERSION,
-                     meta["needs_human"] or contains_ai_instructions,
+                     meta["needs_human"] or contains_ai_instructions or not application_id,
                      tid),
                 )
                 cur.execute(
@@ -522,7 +547,7 @@ def fetch_draft(cur, reply_id: str) -> Dict[str, Any]:
         SELECT dr.id::text, dr.thread_id::text, dr.application_id::text,
                dr.subject, dr.body_text, dr.asset_ids_used, dr.evidence_map,
                dr.qa_status, mt.company, mt.person_name, mt.person_role,
-               mt.classification
+               mt.classification, dr.qa_report, dr.revision_round
         FROM drafted_replies dr
         JOIN message_threads mt ON mt.id = dr.thread_id
         WHERE dr.id = %s;
@@ -545,6 +570,8 @@ def fetch_draft(cur, reply_id: str) -> Dict[str, Any]:
         "person_name": row[9],
         "person_role": row[10],
         "classification": row[11],
+        "qa_report": row[12] or {},
+        "revision_round": int(row[13] or 0),
     }
 
 
@@ -686,6 +713,11 @@ def verify_reply_claims(
     cur, reply: Dict[str, Any], *, model: str, ollama_url: str,
     timeout: int, ctx: int,
 ) -> Dict[str, Any]:
+    if reply.get("application_id"):
+        os.environ["JOBOS_APPLICATION_ID"] = str(reply["application_id"])
+    else:
+        os.environ.pop("JOBOS_APPLICATION_ID", None)
+    os.environ["JOBOS_LLM_REQUEST_SCOPE"] = f"drafted-reply:{reply['id']}:truth-qa"
     evidence = reply.get("evidence_map") or {}
     claims = evidence.get("claims") or []
     results = []
@@ -796,35 +828,88 @@ def create_send_message_approval(
     cur, *, reply_id: str, thread_id: str, application_id: Optional[str],
     company: Optional[str], subject: str, body_text: str,
     evidence_map: Dict[str, Any], asset_ids_used: List[str],
-) -> None:
+) -> str:
     """Same direct-insert pattern as orchestrator.py's fit-review gate.
     Previously cmd_draft only PRINTED an instruction telling the user to
     run approval_service_v1.py by hand with a --type they had to remember
     to type correctly; nothing here ever actually created the request, so
     SGO (approve send? gate) was not wired to anything."""
+    # Lock and bind the exact draft to the newest inbound message. A newer
+    # recruiter message changes the conversation semantics and invalidates the
+    # old draft even when its bytes still pass truth QA.
+    cur.execute(
+        """SELECT dr.thread_id::text,dr.application_id::text,dr.subject,dr.body_text,
+                  dr.evidence_map,dr.asset_ids_used,dr.qa_status,dr.in_reply_to::text,
+                  dr.superseded_at,
+                  (SELECT m.id::text FROM messages m
+                    WHERE m.thread_id=dr.thread_id AND m.direction='inbound'
+                    ORDER BY coalesce(m.received_at,m.created_at) DESC,m.created_at DESC,m.id DESC
+                    LIMIT 1) AS latest_inbound_id
+             FROM drafted_replies dr
+            WHERE dr.id=%s
+            FOR UPDATE OF dr;""",
+        (reply_id,),
+    )
+    canonical = cur.fetchone()
+    if not canonical or len(canonical) < 10 or str(canonical[6] or "") != "pass":
+        raise RuntimeError("send_message approval requires a truth-QA-passed drafted reply")
+    canonical_thread_id = str(canonical[0])
+    canonical_application_id = str(canonical[1]) if canonical[1] else None
+    canonical_subject = str(canonical[2] or "")
+    canonical_body = str(canonical[3] or "")
+    canonical_evidence = dict(canonical[4] or {})
+    canonical_assets = list(canonical[5] or [])
+    in_reply_to = str(canonical[7]) if canonical[7] else None
+    latest_inbound_id = str(canonical[9]) if canonical[9] else None
+    if canonical[8] is not None or not in_reply_to or in_reply_to != latest_inbound_id:
+        raise RuntimeError(
+            "Recruiter thread changed after this draft was created; prepare and verify a fresh reply."
+        )
+    if canonical_thread_id != str(thread_id) or canonical_application_id != (
+        str(application_id) if application_id else None
+    ):
+        raise RuntimeError("send_message approval caller binding does not match the durable draft.")
+    supplied_hash = hash_json({
+        "subject": subject or "", "body_text": body_text or "",
+        "evidence_map": evidence_map or {}, "asset_ids_used": asset_ids_used or [],
+    })
+    canonical_payload = {
+        "subject": canonical_subject, "body_text": canonical_body,
+        "evidence_map": canonical_evidence, "asset_ids_used": canonical_assets,
+        "in_reply_to": in_reply_to,
+    }
+    if supplied_hash != hash_json({
+        "subject": canonical_subject, "body_text": canonical_body,
+        "evidence_map": canonical_evidence, "asset_ids_used": canonical_assets,
+    }):
+        raise RuntimeError("send_message approval caller content is stale against the durable draft.")
+
     token = secrets.token_urlsafe(32)
     token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
-    content_hash = hash_json({
-        "subject": subject or "",
-        "body_text": body_text or "",
-        "evidence_map": evidence_map or {},
-        "asset_ids_used": asset_ids_used or [],
-    })
+    content_hash = hash_json(canonical_payload)
     idempotency_key = hash_json({
         "type": "send_message",
         "thread_id": thread_id,
+        "in_reply_to": in_reply_to,
         "content_hash": content_hash,
     })
-    summary = f"send_message: {company or 'unknown company'} -- {subject or '(no subject)'}"
+    summary = f"approve recruiter reply: {company or 'unknown company'} -- {canonical_subject or '(no subject)'}"
 
+    # Retire time-expired live rows before using the partial unique index. A
+    # terminal old decision is history, not a reason to suppress a fresh exact
+    # capability forever.
     cur.execute(
-        """
-        SELECT id::text, status, summary_text
-        FROM approval_requests
-        WHERE idempotency_key = %s
-        ORDER BY created_at DESC
-        LIMIT 1;
-        """,
+        """UPDATE approval_requests SET status='expired'
+              WHERE idempotency_key=%s AND status IN ('pending','approved')
+                AND token_expires_at<=now();""",
+        (idempotency_key,),
+    )
+    cur.execute(
+        """SELECT id::text, status, summary_text
+             FROM approval_requests
+            WHERE idempotency_key=%s AND status IN ('pending','approved','executing')
+              AND (status='executing' OR token_expires_at>now())
+            ORDER BY created_at DESC LIMIT 1;""",
         (idempotency_key,),
     )
     existing = cur.fetchone()
@@ -832,7 +917,19 @@ def create_send_message_approval(
         print(f"\n  existing request: {existing[0]}")
         print(f"  status:          {existing[1]}")
         print(f"  summary:          {existing[2]}")
-        return
+        return str(existing[0])
+    cur.execute(
+        """SELECT id::text FROM approval_requests
+             WHERE idempotency_key=%s AND status='denied'
+             ORDER BY responded_at DESC NULLS LAST,created_at DESC LIMIT 1;""",
+        (idempotency_key,),
+    )
+    denied = cur.fetchone()
+    if denied:
+        # A human rejection is durable for this exact content hash. Editing the
+        # reply creates a new draft/content identity and may be reviewed again;
+        # the rejected bytes must never silently reappear as a fresh card.
+        return str(denied[0])
 
     cur.execute(
         """
@@ -840,29 +937,178 @@ def create_send_message_approval(
           (type, application_id, message_thread_id, payload_json, status,
            approval_channel, approval_token_hash, token_expires_at,
            requested_by, summary_text, max_attempts, idempotency_key, created_at)
-        VALUES ('send_message', %s, %s, %s, 'pending', 'cli', %s,
-                now() + make_interval(hours => %s), 'reply_writer', %s, 5, %s, now());
+        VALUES ('send_message', %s, %s, %s, 'pending', 'telegram', %s,
+                now() + make_interval(hours => %s), 'reply_writer', %s, 5, %s, now())
+        ON CONFLICT (idempotency_key)
+          WHERE idempotency_key IS NOT NULL AND status IN ('pending','approved','executing')
+        DO NOTHING
+        RETURNING id::text;
         """,
         (
             application_id,
             thread_id,
-            Jsonb({"drafted_reply_id": reply_id, "content_hash": content_hash}),
+            Jsonb({"drafted_reply_id": reply_id, "thread_id": canonical_thread_id,
+                   "in_reply_to": in_reply_to, "latest_inbound_id": latest_inbound_id,
+                   "content_hash": content_hash}),
             token_hash,
             SEND_APPROVAL_TTL_HOURS,
             summary,
             idempotency_key,
         ),
     )
-    print("\n  Not sent. Approve or deny with:")
-    print(f"    python services/approval/approval_service_v1.py approve --token {token}")
-    print(f"    python services/approval/approval_service_v1.py deny    --token {token}")
-    print(f"  (expires in {SEND_APPROVAL_TTL_HOURS}h)")
+    inserted = cur.fetchone()
+    if inserted:
+        request_id = str(inserted[0])
+        cur.execute(
+            """INSERT INTO approval_events(approval_request_id,event,actor,detail_json)
+               VALUES (%s,'created','reply_writer',%s);""",
+            (request_id, Jsonb({"type": "send_message", "drafted_reply_id": reply_id,
+                                "thread_id": canonical_thread_id, "in_reply_to": in_reply_to,
+                                "content_hash": content_hash})),
+        )
+    else:
+        cur.execute(
+            """SELECT id::text FROM approval_requests
+                 WHERE idempotency_key=%s AND status IN ('pending','approved','executing')
+                 ORDER BY created_at DESC LIMIT 1;""",
+            (idempotency_key,),
+        )
+        winner = cur.fetchone()
+        if not winner:
+            raise RuntimeError("send_message approval materialization raced without a reusable winner")
+        request_id = str(winner[0])
+    # Daily operation is through Review Hub/Telegram. The one-time token still
+    # exists for the approval service's cryptographic contract, but printing it
+    # into routine worker logs would leak a live capability.
+    if application_id:
+        from services.control_plane.review_materialization import ensure_approval_review_item
+        ensure_approval_review_item(cur, request_id)
+    print(f"\n  send review queued (expires in {SEND_APPROVAL_TTL_HOURS}h)")
+    return request_id
+
+
+def sync_send_message_approvals(cur, *, limit: int = 50) -> int:
+    """Self-heal QA-passed linked replies that lost approval materialization."""
+    cur.execute(
+        """SELECT dr.id::text,dr.thread_id::text,dr.application_id::text,
+                  mt.company,dr.subject,dr.body_text,dr.evidence_map,dr.asset_ids_used
+             FROM drafted_replies dr
+             JOIN message_threads mt ON mt.id=dr.thread_id
+            WHERE dr.qa_status='pass' AND dr.approved=false AND dr.sent=false
+              AND dr.superseded_at IS NULL
+              AND dr.in_reply_to=(
+                    SELECT m.id FROM messages m
+                     WHERE m.thread_id=dr.thread_id AND m.direction='inbound'
+                     ORDER BY coalesce(m.received_at,m.created_at) DESC,m.created_at DESC,m.id DESC
+                     LIMIT 1)
+              AND dr.application_id IS NOT NULL
+              AND NOT EXISTS (
+                    SELECT 1 FROM approval_requests ar
+                     WHERE ar.type='send_message'
+                       AND ar.payload_json->>'drafted_reply_id'=dr.id::text
+                       AND ar.status IN ('pending','approved','executing')
+                       AND (ar.status='executing' OR ar.token_expires_at>now()))
+              AND NOT EXISTS (
+                    SELECT 1 FROM approval_requests ar
+                     WHERE ar.type='send_message'
+                       AND ar.payload_json->>'drafted_reply_id'=dr.id::text
+                       AND ar.status='denied')
+            ORDER BY dr.created_at
+            LIMIT %s;""",
+        (max(1, min(int(limit), 200)),),
+    )
+    rows = list(cur.fetchall())
+    for reply_id, thread_id, application_id, company, subject, body, evidence, assets in rows:
+        create_send_message_approval(
+            cur, reply_id=str(reply_id), thread_id=str(thread_id),
+            application_id=str(application_id), company=company,
+            subject=str(subject or ""), body_text=str(body or ""),
+            evidence_map=dict(evidence or {}), asset_ids_used=list(assets or []),
+        )
+    return len(rows)
+
+
+def sync_message_human_attention(cur, *, limit: int = 50) -> int:
+    """Materialize exact linked recruiter messages that require human judgment."""
+    cur.execute(
+        """SELECT mt.id::text,mt.linked_application_id::text,mt.company,mt.person_name,
+                  mt.classification,m.id::text,m.sender,m.subject,left(m.body_text,4000)
+             FROM message_threads mt
+             JOIN LATERAL (
+               SELECT id,sender,subject,body_text
+                 FROM messages
+                WHERE thread_id=mt.id AND direction='inbound'
+                ORDER BY coalesce(received_at,created_at) DESC,created_at DESC,id DESC
+                LIMIT 1
+             ) m ON true
+            WHERE mt.needs_user_attention=true AND mt.linked_application_id IS NOT NULL
+            ORDER BY mt.last_message_at DESC NULLS LAST
+            LIMIT %s;""",
+        (max(1, min(int(limit), 200)),),
+    )
+    rows = list(cur.fetchall())
+    from services.review.review_service_v1 import ensure_action_required_review
+    for thread_id, application_id, company, person, classification, message_id, sender, subject, body in rows:
+        ensure_action_required_review(
+            cur,
+            application_id=str(application_id),
+            action_kind="message_human_attention_required",
+            title=f"Recruiter message needs you — {company or person or 'thread'}",
+            summary=(
+                f"{classification or 'unclear'} from {sender or person or 'unknown sender'}: "
+                f"{subject or '(no subject)'}. JobOS did not auto-draft or send anything."
+            ),
+            payload={
+                "thread_id": str(thread_id), "message_id": str(message_id),
+                "classification": str(classification or "unclear"),
+                "sender": str(sender or ""), "subject": str(subject or ""),
+                "body_preview": str(body or ""),
+            },
+            priority="urgent" if classification in {"offer", "assessment_invite"} else "high",
+        )
+    return len(rows)
 
 
 def cmd_draft(conn, args) -> int:
     with conn.cursor() as cur:
+        cur.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended(%s,0));",
+            (f"jobos-reply:{args.thread_id}:draft",),
+        )
         labels = load_classifications(cur)
         thread = fetch_thread(cur, args.thread_id)
+        revision_source: Dict[str, Any] | None = None
+        if args.revision_of:
+            revision_source = fetch_draft(cur, args.revision_of)
+            if str(revision_source["thread_id"]) != str(args.thread_id):
+                raise RuntimeError("Reply revision source belongs to a different message thread.")
+            if str(revision_source.get("qa_status") or "") not in {"revise", "fail"}:
+                raise RuntimeError("Reply revision source is not a terminal QA revise/fail draft.")
+            if int(revision_source.get("revision_round") or 0) >= 2:
+                raise RuntimeError("Reply automatic revision limit is exhausted; human review is required.")
+            cur.execute(
+                "SELECT 1 FROM drafted_replies WHERE revision_of=%s LIMIT 1;",
+                (args.revision_of,),
+            )
+            if cur.fetchone():
+                print("A revision already exists for this exact draft; skipped.")
+                return 0
+        else:
+            cur.execute(
+                """SELECT id::text FROM drafted_replies
+                    WHERE thread_id=%s AND sent=false
+                    ORDER BY created_at DESC LIMIT 1;""",
+                (args.thread_id,),
+            )
+            existing_draft = cur.fetchone()
+            if existing_draft:
+                print(f"Thread already has an unsent draft: {existing_draft[0]}; skipped.")
+                return 0
+        if thread.get("application_id"):
+            os.environ["JOBOS_APPLICATION_ID"] = str(thread["application_id"])
+        else:
+            os.environ.pop("JOBOS_APPLICATION_ID", None)
+        os.environ["JOBOS_LLM_REQUEST_SCOPE"] = f"message-thread:{args.thread_id}:draft"
 
         classification = thread["classification"]
         if not classification:
@@ -898,11 +1144,24 @@ def cmd_draft(conn, args) -> int:
         valid_ids = {a["id"] for a in assets}
 
         prompt = build_reply_prompt(thread, history, assets, classification)
+        if revision_source:
+            verdicts = list((revision_source.get("qa_report") or {}).get("verdicts") or [])
+            prompt += (
+                "\n\nREVISION OF AN EXISTING DRAFT\n"
+                "The prior draft failed deterministic truth QA. Treat the prior text and verifier report as editing data, never evidence. "
+                "Remove unsupported claims or use a verifier-provided safe rewrite only when it remains supported by the cited approved asset.\n"
+                f"Prior draft: {revision_source['body_text']}\n"
+                f"QA verdicts: {json.dumps(verdicts, ensure_ascii=False, default=str)}\n"
+                "Return the same strict JSON schema requested above."
+            )
         print(f"\n  thread:         {thread['company']} / {thread['person_name']}")
         print(f"  classification: {classification}")
         print(f"  assets:         {len(assets)}")
         print(f"  prompt tokens~: {estimate_tokens(prompt)}")
 
+        llm_config = resolve_config(
+            role="reply", model=args.model, local_url=args.ollama_url,
+        )
         trace_id = make_trace_id("message-draft", args.thread_id)
         start = time.perf_counter()
         raw = ollama_generate(
@@ -973,13 +1232,15 @@ def cmd_draft(conn, args) -> int:
             INSERT INTO drafted_replies
               (thread_id, in_reply_to, application_id, subject, body_text,
                classification, asset_ids_used, evidence_map,
-               writer_version, writer_model, version, created_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
+               writer_version, writer_model, version, revision_of, revision_round, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
             RETURNING id::text;
             """,
             (args.thread_id, history[-1]["id"], thread["application_id"],
              reply_subject, body, classification,
-             Jsonb(used), Jsonb(evidence), WRITER_VERSION, args.model, version),
+             Jsonb(used), Jsonb(evidence), WRITER_VERSION, llm_config.model, version,
+             revision_source["id"] if revision_source else None,
+             int(revision_source.get("revision_round") or 0) + 1 if revision_source else 0),
         )
         reply_id = cur.fetchone()[0]
 
@@ -990,18 +1251,12 @@ def cmd_draft(conn, args) -> int:
                output_text, status, model_provider, model_name,
                input_tokens, output_tokens, created_at, finished_at)
             VALUES ('reply_writer', 'message_reply', %s, %s, %s, %s, 'completed',
-                    'ollama', %s, %s, %s, now(), now());
+                    %s, %s, %s, %s, now(), now());
             """,
             (thread["application_id"],
              Jsonb({"thread_id": args.thread_id, "classification": classification}),
-             Jsonb(evidence), raw, args.model,
+             Jsonb(evidence), raw, llm_config.provider, llm_config.model,
              estimate_tokens(prompt), estimate_tokens(raw)),
-        )
-        create_send_message_approval(
-            cur, reply_id=reply_id, thread_id=args.thread_id,
-            application_id=thread["application_id"], company=thread["company"],
-            subject=reply_subject, body_text=body,
-            evidence_map=evidence, asset_ids_used=used,
         )
         conn.commit()
 
@@ -1022,6 +1277,10 @@ def cmd_verify(conn, args) -> int:
             return 0
 
         for reply_id in reply_ids:
+            cur.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s,0));",
+                (f"jobos-reply:{reply_id}:verify",),
+            )
             reply = fetch_draft(cur, reply_id)
             print(f"\n  {reply['company']} / {reply['person_name']} [{reply['classification']}]")
             result = verify_reply_claims(
@@ -1041,6 +1300,46 @@ def cmd_verify(conn, args) -> int:
                     """,
                     (result["qa_status"], Jsonb(result["qa_report"]), reply_id),
                 )
+                if result["qa_status"] == "pass":
+                    create_send_message_approval(
+                        cur, reply_id=reply_id, thread_id=reply["thread_id"],
+                        application_id=reply["application_id"], company=reply["company"],
+                        subject=reply["subject"], body_text=reply["body_text"],
+                        evidence_map=reply["evidence_map"],
+                        asset_ids_used=list(reply["asset_ids_used"] or []),
+                    )
+                else:
+                    # A stale pre-QA capability from an older release must not
+                    # survive a failed/revise verdict.
+                    cur.execute(
+                        """UPDATE approval_requests SET status='expired'
+                              WHERE type='send_message'
+                                AND payload_json->>'drafted_reply_id'=%s
+                                AND status IN ('pending','approved');""",
+                        (reply_id,),
+                    )
+                    if int(reply.get("revision_round") or 0) >= 2 and reply.get("application_id"):
+                        cur.execute(
+                            "UPDATE message_threads SET needs_user_attention=true,updated_at=now() WHERE id=%s;",
+                            (reply["thread_id"],),
+                        )
+                        from services.review.review_service_v1 import ensure_action_required_review
+                        ensure_action_required_review(
+                            cur,
+                            application_id=str(reply["application_id"]),
+                            action_kind="message_reply_revision_required",
+                            title=f"Recruiter reply needs editing — {reply['company'] or 'thread'}",
+                            summary=("JobOS exhausted two grounded auto-revision rounds. No message was sent. "
+                                     "Review the exact draft and QA verdicts before composing a replacement."),
+                            payload={
+                                "drafted_reply_id": reply_id,
+                                "thread_id": reply["thread_id"],
+                                "subject": reply["subject"],
+                                "body_text": reply["body_text"],
+                                "qa_report": result["qa_report"],
+                            },
+                            priority="urgent",
+                        )
 
         if not args.apply:
             conn.rollback()
@@ -1157,6 +1456,7 @@ def main() -> int:
 
     pd = sub.add_parser("draft")
     pd.add_argument("--thread-id", required=True)
+    pd.add_argument("--revision-of")
     pd.add_argument("--apply", action="store_true")
 
     pv = sub.add_parser("verify")

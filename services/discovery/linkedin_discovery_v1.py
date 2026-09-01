@@ -18,7 +18,8 @@ from services.discovery.immigration_intelligence import record_jd_immigration_as
 from services.discovery.ats_source_enrollment_v1 import enroll_ats_source
 from services.common.search_preferences import preference_reason
 from services.ats.contracts import canonical_job_url
-from services.intake.source_observation import observe_existing_posting
+from services.intake.posting_identity import build_posting_identity
+from services.intake.source_observation import find_and_observe_existing, observe_existing_posting
 
 MAX_DISCOVERY_RESULTS = 5
 MAX_AUTONOMOUS_DISCOVERY_RESULTS = 20
@@ -348,10 +349,18 @@ def ingest_discovered_jobs(cur, browser_task_id: str, search_input: dict[str, An
     filtered_reasons: dict[str, int] = {}
     employer_active_counts: dict[str, int] = {}
     for row in rows:
-        jd_hash = hashlib.sha256(row["jd_text"].encode("utf-8")).hexdigest()
         source_job_id = linkedin_job_id(row["url"])
-        cur.execute("SELECT id::text FROM applications WHERE source = 'linkedin' AND source_job_id = %s;", (source_job_id,))
-        existing = cur.fetchone()
+        identity = build_posting_identity(
+            company=row["company"], job_title=row["title"], jd_text=row["jd_text"],
+            job_url=row["url"], ats_hint="linkedin_browser_linked_session",
+        )
+        jd_hash = identity.jd_hash
+        existing, _ = find_and_observe_existing(
+            cur, identity=identity, source_name="linkedin", source_job_id=source_job_id,
+            jd_text=row["jd_text"], company=row["company"], job_title=row["title"],
+            location=row["location"], work_mode=row["work_mode"],
+            metadata={"discovery_channel": "search", "browser_task_id": browser_task_id},
+        )
         if existing:
             # Existing postings are a durable company/job observation, so a
             # witnessed external href may refresh their ATS source.  New
@@ -463,10 +472,19 @@ def ingest_saved_jobs(cur, browser_task_id: str, saved_input: dict[str, Any],
     created: list[str] = []
     duplicates = 0
     for row in rows:
-        jd_hash = hashlib.sha256(row["jd_text"].encode("utf-8")).hexdigest()
         source_job_id = linkedin_job_id(row["url"])
-        cur.execute("SELECT id::text FROM applications WHERE source = 'linkedin' AND source_job_id = %s;", (source_job_id,))
-        existing = cur.fetchone()
+        identity = build_posting_identity(
+            company=row["company"], job_title=row["title"], jd_text=row["jd_text"],
+            job_url=row["url"], ats_hint="linkedin_browser_linked_session",
+        )
+        jd_hash = identity.jd_hash
+        existing, _ = find_and_observe_existing(
+            cur, identity=identity, source_name="linkedin", source_job_id=source_job_id,
+            jd_text=row["jd_text"], company=row["company"], job_title=row["title"],
+            location=row["location"], work_mode=row["work_mode"],
+            metadata={"discovery_channel": "saved", "saved_sync_id": sync_id,
+                      "browser_task_id": browser_task_id},
+        )
         if existing:
             ats_company_id = enroll_ats_source(
                 cur, company=row["company"], apply_url=row.get("apply_url"),

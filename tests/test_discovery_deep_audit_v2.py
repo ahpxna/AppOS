@@ -360,7 +360,7 @@ def test_supervisor_state_never_reports_ready_when_db_heartbeat_failed(monkeypat
 
     mod._write_state(
         children, {}, specs, {}, "00000000-0000-0000-0000-000000000001",
-        database_ok=True,
+        database_ok=True, browser_ok=True,
     )
     assert json.loads(mod.STATE_FILE.read_text())["ready"] is True
 
@@ -373,6 +373,18 @@ def test_supervisor_operational_intervals_are_bounded_and_typo_safe(monkeypatch)
     specs = mod._specs()
     assert specs["ats-discovery"].argv[-1] == "900"
     assert specs["profile-discovery"].argv[-1] == "60"
+
+
+def test_supervisor_can_own_native_openclaw_gateway(monkeypatch):
+    mod = _load("scripts/jobos_runtime_supervisor.py", "supervisor_native_openclaw_test")
+    monkeypatch.setenv("JOBOS_RUNTIME_MANAGE_NATIVE_OPENCLAW", "1")
+    specs = mod._specs()
+    gateway = specs["openclaw-gateway"]
+    assert gateway.required is True
+    assert gateway.argv[-2:] == (
+        str(ROOT / "scripts" / "start_openclaw_jobos.py"),
+        "gateway",
+    )
 
 
 def test_supervisor_heartbeat_recovers_missing_parent_and_surfaces_degraded_health(monkeypatch):
@@ -449,8 +461,98 @@ def test_supervisor_readiness_fails_closed_on_missing_latest_migration(monkeypat
     available, health_error = mod._db_runtime_heartbeat(
         "00000000-0000-0000-0000-000000000001", {}, {}, {}, {},
     )
+    from scripts.apply_migrations import migration_files
+    latest = migration_files()[-1].name
     assert available is True
-    assert health_error and "migration_not_current=100_remove_legacy_production_mock_seeds.sql" in health_error
+    assert health_error and f"migration_not_current={latest}" in health_error
+
+
+def test_supervisor_status_preserves_heartbeat_migration_failure(monkeypatch, tmp_path, capsys):
+    mod = _load("scripts/jobos_runtime_supervisor.py", "supervisor_status_migration_test")
+    import psycopg
+
+    state_file = tmp_path / "runtime.json"
+    state_file.write_text(json.dumps({
+        "updated_at_unix": int(mod.time.time()),
+        "ready": False,
+        "database_health": {
+            "available": True,
+            "error": "migration_not_current=100_remove_legacy_production_mock_seeds.sql",
+        },
+        "services": {"required": {"running": True, "required": True}},
+    }))
+    monkeypatch.setattr(mod, "STATE_FILE", state_file)
+    monkeypatch.setattr(mod, "_read_pid", lambda: 123)
+    monkeypatch.setattr(mod, "_is_supervisor_process", lambda pid: True)
+    monkeypatch.setattr(
+        mod, "_specs",
+        lambda: {"required": mod.WorkerSpec("required", ("python",), required=True)},
+    )
+
+    class Cursor:
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def execute(self, sql, params=()): self.sql = sql
+        def fetchone(self): return None
+        def fetchall(self): return []
+
+    class Connection:
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def cursor(self): return Cursor()
+
+    monkeypatch.setattr(psycopg, "connect", lambda *args, **kwargs: Connection())
+    assert mod.status() == 1
+    output = json.loads(capsys.readouterr().out)
+    assert output["ready"] is False
+    assert output["database_health"]["error"].startswith("migration_not_current=")
+
+
+def test_jobos_status_preserves_heartbeat_migration_failure(monkeypatch, tmp_path, capsys):
+    mod = _load("scripts/jobos.py", "jobos_status_migration_test")
+    supervisor = __import__("scripts.jobos_runtime_supervisor", fromlist=["dummy"])
+    import psycopg
+
+    run_dir = tmp_path / ".jobos" / "run"
+    run_dir.mkdir(parents=True)
+    (run_dir / "supervisor.pid").write_text("123")
+    (run_dir / "runtime.json").write_text(json.dumps({
+        "supervisor_pid": 123,
+        "updated_at_unix": int(mod.time.time()),
+        "ready": False,
+        "database_health": {
+            "available": True,
+            "error": "migration_not_current=100_remove_legacy_production_mock_seeds.sql",
+        },
+        "expected_required_services": ["required"],
+        "services": {"required": {"running": True, "required": True}},
+    }))
+    monkeypatch.setattr(mod, "ROOT", tmp_path)
+    monkeypatch.setattr(mod, "load_repo_env", lambda: None)
+    monkeypatch.setattr(supervisor, "_is_supervisor_process", lambda pid: True)
+
+    class Cursor:
+        row = None
+        rows: list[tuple] = []
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def execute(self, sql, params=()):
+            normalized = " ".join(sql.lower().split())
+            self.row = (0,) if "select count(*)" in normalized else None
+            self.rows = []
+        def fetchone(self): return self.row
+        def fetchall(self): return list(self.rows)
+
+    class Connection:
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def cursor(self): return Cursor()
+
+    monkeypatch.setattr(psycopg, "connect", lambda *args, **kwargs: Connection())
+    assert mod.status() == 1
+    output = json.loads(capsys.readouterr().out)
+    assert output["runtime"]["ready"] is False
+    assert output["runtime"]["database_health"]["error"].startswith("migration_not_current=")
 
 
 def test_supervisor_pid_identity_rejects_reused_unrelated_pid(monkeypatch):

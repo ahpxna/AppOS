@@ -108,6 +108,7 @@ def render_document_pdf(cur, document_id: str) -> Path:
     )
     out_dir.mkdir(parents=True, exist_ok=True)
     docx_artifact_id = None
+    cur.execute("SAVEPOINT jobos_review_render")
     try:
         if doc_type == "resume":
             tailoring = (evidence_map or {}).get("resume_template") or {}
@@ -125,9 +126,12 @@ def render_document_pdf(cur, document_id: str) -> Path:
         pdf_artifact_id = _register(cur, document_id=document_id, application_id=application_id,
                                     doc_type=doc_type, path=pdf)
         finish_render_run(render_claim, docx_artifact_id=docx_artifact_id,
-                          pdf_artifact_id=pdf_artifact_id)
+                          pdf_artifact_id=pdf_artifact_id, cur=cur)
+        cur.execute("RELEASE SAVEPOINT jobos_review_render")
         return pdf
     except Exception as exc:
+        cur.execute("ROLLBACK TO SAVEPOINT jobos_review_render")
+        cur.execute("RELEASE SAVEPOINT jobos_review_render")
         fail_render_run(render_claim, exc, uncertain=bool(out_dir.exists()))
         raise
 

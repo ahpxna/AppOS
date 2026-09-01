@@ -102,7 +102,9 @@ def test_linkedin_discovery_uses_public_fake_mouse_and_live_captcha_target():
     assert "execute_parallel_bypass" in source
     assert "thread.join(timeout=5)" in source
     assert "urlsplit" in source
-    assert "challenge_pages" in source and '"/checkpoint"' in source
+    assert "_current_linkedin_page_target" in source
+    assert "pre_attempt_target_ids" in source and '"/checkpoint"' in source
+    assert 'target_id=captcha_target["target_id"]' in source
 
 
 def test_reference_pdf_renderer_is_reachable_from_canonical_resume_artifact():

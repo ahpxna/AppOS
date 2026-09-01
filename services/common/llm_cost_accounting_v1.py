@@ -30,6 +30,22 @@ class Reservation:
     # from the reservation row under lock.
     budget_date: date | None = None
     llm_call_id: str | None = None
+    cached_response_json: dict[str, Any] | None = None
+    cached_resolved_model: str | None = None
+    cached_input_tokens: int = 0
+    cached_output_tokens: int = 0
+    cached_cost_usd: Decimal = Decimal(0)
+    cached_request_id: str | None = None
+
+
+@dataclass(frozen=True)
+class CachedCall:
+    response_json: dict[str, Any]
+    resolved_model: str
+    input_tokens: int
+    output_tokens: int
+    cost_usd: Decimal
+    request_id: str | None
 
 
 def _application_id() -> str | None:
@@ -52,6 +68,65 @@ def _workflow_step_run_id() -> str | None:
         return None
 
 
+def _request_scope() -> str | None:
+    explicit = (os.getenv("JOBOS_LLM_REQUEST_SCOPE") or "").strip()
+    if explicit:
+        if not 3 <= len(explicit) <= 300 or any(ord(char) < 32 for char in explicit):
+            raise LLMBudgetError("JOBOS_LLM_REQUEST_SCOPE must be 3-300 printable characters.")
+        return explicit
+    application_id = _application_id()
+    return f"application:{application_id}" if application_id else None
+
+
+def _cached_from_row(row: Any) -> CachedCall | None:
+    if not row or str(row[1]) != "completed" or not isinstance(row[2], dict):
+        return None
+    return CachedCall(
+        response_json=dict(row[2]),
+        resolved_model=str(row[3] or ""),
+        input_tokens=max(0, int(row[4] or 0)),
+        output_tokens=max(0, int(row[5] or 0)),
+        request_id=str(row[6]) if row[6] else None,
+        cost_usd=Decimal(row[7] or 0),
+    )
+
+
+def lookup_completed_call(*, role: str, provider: str, model: str,
+                          request_kind: str, request_sha256: str) -> CachedCall | None:
+    """Return a validated exact business-subject response, best effort.
+
+    Cross-subject reuse is forbidden even when prompts happen to hash the same.
+    Callers without an application or explicit request scope retain historical
+    behavior because there is no durable business identity to bind a replay.
+    """
+    request_scope = _request_scope()
+    if not request_scope:
+        return None
+    try:
+        import psycopg
+        from services.common.config import database_dsn
+        with psycopg.connect(database_dsn(), autocommit=True) as conn, conn.cursor() as cur:
+            cur.execute(
+                """SELECT lc.id::text,lc.status,lc.response_json,lc.resolved_model,
+                          lc.input_tokens,lc.output_tokens,lc.provider_request_id,
+                          coalesce(cost.estimated_cost_usd,0)
+                     FROM llm_calls lc
+                     LEFT JOIN LATERAL (
+                       SELECT estimated_cost_usd FROM cost_ledger
+                        WHERE llm_call_id=lc.id ORDER BY created_at DESC LIMIT 1
+                     ) cost ON true
+                    WHERE lc.request_scope=%s AND lc.role=%s AND lc.provider=%s
+                      AND lc.configured_model=%s AND lc.request_kind=%s
+                      AND lc.request_sha256=%s AND lc.status='completed'
+                      AND lc.response_json IS NOT NULL
+                    ORDER BY lc.started_at DESC LIMIT 1;""",
+                (request_scope, role, provider, model, request_kind, request_sha256),
+            )
+            return _cached_from_row(cur.fetchone())
+    except Exception:
+        # Local/offline calls historically treat accounting as best effort.
+        # Paid calls repeat this check transactionally in reserve_paid_call.
+        return None
 def _price(cur, provider: str, model: str, *, require_priced: bool) -> tuple[Decimal, Decimal, bool]:
     cur.execute(
         """SELECT input_usd_per_1k, output_usd_per_1k, is_local, notes
@@ -97,6 +172,49 @@ def reserve_paid_call(*, role: str, provider: str, model: str,
     except Exception as exc:
         raise LLMBudgetError(f"Cannot load PostgreSQL accounting for paid LLM call: {exc}") from exc
     with psycopg.connect(database_dsn(), autocommit=False) as conn, conn.cursor() as cur:
+        application_id = _application_id()
+        request_scope = _request_scope()
+        if request_sha256 and request_scope:
+            identity = "\x1f".join(
+                (request_scope, role, provider, model, request_kind, request_sha256)
+            )
+            # Serialize exact paid-call admission even when two higher-level
+            # workers are accidentally started. The lock is transaction-scoped.
+            cur.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s,0));", (identity,))
+            cur.execute(
+                """SELECT lc.id::text,lc.status,lc.response_json,lc.resolved_model,
+                          lc.input_tokens,lc.output_tokens,lc.provider_request_id,
+                          coalesce(cost.estimated_cost_usd,0)
+                     FROM llm_calls lc
+                     LEFT JOIN LATERAL (
+                       SELECT estimated_cost_usd FROM cost_ledger
+                        WHERE llm_call_id=lc.id ORDER BY created_at DESC LIMIT 1
+                     ) cost ON true
+                    WHERE lc.request_scope=%s AND lc.role=%s AND lc.provider=%s
+                      AND lc.configured_model=%s AND lc.request_kind=%s
+                      AND lc.request_sha256=%s
+                      AND lc.status IN ('running','completed','uncertain')
+                    ORDER BY lc.started_at DESC LIMIT 1
+                    FOR UPDATE OF lc;""",
+                (request_scope, role, provider, model, request_kind, request_sha256),
+            )
+            prior = cur.fetchone()
+            cached = _cached_from_row(prior)
+            if cached:
+                return Reservation(
+                    id="", reserved_cost_usd=Decimal(0), model_name=model, provider=provider,
+                    llm_call_id=str(prior[0]), cached_response_json=cached.response_json,
+                    cached_resolved_model=cached.resolved_model,
+                    cached_input_tokens=cached.input_tokens,
+                    cached_output_tokens=cached.output_tokens,
+                    cached_cost_usd=cached.cost_usd,
+                    cached_request_id=cached.request_id,
+                )
+            if prior and str(prior[1]) in {"running", "uncertain"}:
+                raise LLMBudgetError(
+                    "An identical business-subject LLM request is already running or has an uncertain "
+                    "provider outcome. JobOS will not replay it automatically and risk a duplicate charge."
+                )
         cur.execute("SELECT CURRENT_DATE;")
         budget_date = cur.fetchone()[0]
         cur.execute(
@@ -131,9 +249,10 @@ def reserve_paid_call(*, role: str, provider: str, model: str,
             cur.execute(
                 """INSERT INTO llm_calls(
                        workflow_step_run_id,application_id,role,provider,configured_model,resolved_model,
-                       request_kind,request_sha256,status,started_at)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'running',now()) RETURNING id::text;""",
-                (_workflow_step_run_id(), _application_id(), role, provider, model, model, request_kind, request_sha256),
+                       request_kind,request_sha256,request_scope,status,started_at)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,'running',now()) RETURNING id::text;""",
+                (_workflow_step_run_id(), application_id, role, provider, model, model,
+                 request_kind, request_sha256, request_scope),
             )
             llm_call_id = str(cur.fetchone()[0])
             cur.execute(
@@ -144,7 +263,7 @@ def reserve_paid_call(*, role: str, provider: str, model: str,
             """INSERT INTO llm_cost_reservations(
                    application_id,role,provider,model_name,reserved_cost_usd,budget_date,llm_call_id)
                VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id::text;""",
-            (_application_id(), role, provider, model, reserve, budget_date, llm_call_id),
+            (application_id, role, provider, model, reserve, budget_date, llm_call_id),
         )
         rid = str(cur.fetchone()[0])
         if llm_call_id:
@@ -172,8 +291,10 @@ def _record_ledger(cur, *, role: str, provider: str, configured_model: str,
 
 def settle_paid_call(reservation: Reservation, *, role: str, configured_model: str,
                      resolved_model: str, input_tokens: int, output_tokens: int,
-                     request_id: str | None, response_sha256: str | None = None) -> Decimal:
+                     request_id: str | None, response_sha256: str | None = None,
+                     response_json: dict[str, Any] | None = None) -> Decimal:
     import psycopg
+    from psycopg.types.json import Jsonb
     from services.common.config import database_dsn
     with psycopg.connect(database_dsn(), autocommit=False) as conn, conn.cursor() as cur:
         cur.execute(
@@ -207,8 +328,10 @@ def settle_paid_call(reservation: Reservation, *, role: str, configured_model: s
         if reservation.llm_call_id:
             cur.execute(
                 """UPDATE llm_calls SET status='completed',resolved_model=%s,provider_request_id=%s,
-                          input_tokens=%s,output_tokens=%s,response_sha256=%s,finished_at=now() WHERE id=%s;""",
-                (resolved_model, request_id, int(input_tokens), int(output_tokens), response_sha256, reservation.llm_call_id),
+                          input_tokens=%s,output_tokens=%s,response_sha256=%s,response_json=%s,
+                          finished_at=now() WHERE id=%s;""",
+                (resolved_model, request_id, int(input_tokens), int(output_tokens), response_sha256,
+                 Jsonb(response_json) if response_json is not None else None, reservation.llm_call_id),
             )
             cur.execute(
                 """UPDATE llm_call_attempts SET status='completed',provider_request_id=%s,finished_at=now()
@@ -276,9 +399,10 @@ def mark_paid_call_uncertain(reservation: Reservation, *, role: str, configured_
 def record_local_call(*, role: str, provider: str, model: str,
                       input_tokens: int, output_tokens: int, request_id: str | None = None,
                       request_sha256: str | None = None, response_sha256: str | None = None,
-                      request_kind: str = 'chat') -> None:
+                      request_kind: str = 'chat', response_json: dict[str, Any] | None = None) -> None:
     try:
         import psycopg
+        from psycopg.types.json import Jsonb
         from services.common.config import database_dsn
         with psycopg.connect(database_dsn(), autocommit=True) as conn, conn.cursor() as cur:
             llm_call_id = None
@@ -286,10 +410,11 @@ def record_local_call(*, role: str, provider: str, model: str,
                 cur.execute(
                     """INSERT INTO llm_calls(workflow_step_run_id,application_id,role,provider,configured_model,resolved_model,
                                request_kind,request_sha256,status,provider_request_id,input_tokens,output_tokens,response_sha256,
-                               started_at,finished_at)
-                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'completed',%s,%s,%s,%s,now(),now()) RETURNING id::text;""",
+                               response_json,request_scope,started_at,finished_at)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'completed',%s,%s,%s,%s,%s,%s,now(),now()) RETURNING id::text;""",
                     (_workflow_step_run_id(),_application_id(),role,provider,model,model,request_kind,request_sha256,request_id,
-                     int(input_tokens),int(output_tokens),response_sha256),
+                     int(input_tokens),int(output_tokens),response_sha256,
+                     Jsonb(response_json) if response_json is not None else None, _request_scope()),
                 )
                 llm_call_id = str(cur.fetchone()[0])
                 cur.execute(

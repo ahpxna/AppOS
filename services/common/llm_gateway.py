@@ -280,6 +280,33 @@ def generate_result(*, role: str, prompt: str, model: str | None = None,
             estimated_input_tokens=input_est, max_output_tokens=_max_output_tokens(),
             request_sha256=request_sha256, request_kind='generate',
         )
+        if reservation.cached_response_json is not None:
+            cached_text = reservation.cached_response_json.get("text")
+            if not isinstance(cached_text, str) or not cached_text.strip():
+                raise LLMGatewayError("Cached exact generate response is invalid; refusing provider replay.")
+            return LLMResult(
+                text=cached_text, provider=config.provider,
+                model=reservation.cached_resolved_model or config.model,
+                tokens_input=reservation.cached_input_tokens,
+                tokens_output=reservation.cached_output_tokens,
+                estimated_cost_usd=float(reservation.cached_cost_usd),
+                request_id=reservation.cached_request_id,
+            )
+    else:
+        from .llm_cost_accounting_v1 import lookup_completed_call
+        cached = lookup_completed_call(
+            role=role, provider=config.provider, model=config.model,
+            request_kind="generate", request_sha256=request_sha256,
+        )
+        if cached is not None:
+            cached_text = cached.response_json.get("text")
+            if isinstance(cached_text, str) and cached_text.strip():
+                return LLMResult(
+                    text=cached_text, provider=config.provider,
+                    model=cached.resolved_model or config.model,
+                    tokens_input=cached.input_tokens, tokens_output=cached.output_tokens,
+                    estimated_cost_usd=float(cached.cost_usd), request_id=cached.request_id,
+                )
     try:
         if config.backend == "ollama":
             options: dict[str, Any] = {"temperature": temperature}
@@ -319,13 +346,14 @@ def generate_result(*, role: str, prompt: str, model: str | None = None,
         cost = float(settle_paid_call(reservation, role=role, configured_model=config.model,
                                       resolved_model=resolved_model, input_tokens=input_tokens,
                                       output_tokens=output_tokens, request_id=request_id,
-                                      response_sha256=_sha_payload({"text": text})))
+                                      response_sha256=_sha_payload({"text": text}),
+                                      response_json={"text": text}))
     else:
         from .llm_cost_accounting_v1 import record_local_call
         record_local_call(role=role, provider="ollama", model=resolved_model,
                           input_tokens=input_tokens, output_tokens=output_tokens, request_id=request_id,
                           request_sha256=request_sha256, response_sha256=_sha_payload({"text": text}),
-                          request_kind='generate')
+                          request_kind='generate', response_json={"text": text})
     return LLMResult(text=text, provider=config.provider,
                      model=resolved_model, tokens_input=input_tokens, tokens_output=output_tokens,
                      estimated_cost_usd=cost, request_id=request_id)
@@ -356,6 +384,33 @@ def chat_result(*, role: str, messages: Sequence[dict[str, str]], model: str | N
         reservation = reserve_paid_call(role=role, provider=config.provider, model=config.model,
                                         estimated_input_tokens=input_est, max_output_tokens=_max_output_tokens(),
                                         request_sha256=request_sha256, request_kind='chat')
+        if reservation.cached_response_json is not None:
+            cached_text = reservation.cached_response_json.get("text")
+            if not isinstance(cached_text, str) or not cached_text.strip():
+                raise LLMGatewayError("Cached exact chat response is invalid; refusing provider replay.")
+            return LLMResult(
+                text=cached_text, provider=config.provider,
+                model=reservation.cached_resolved_model or config.model,
+                tokens_input=reservation.cached_input_tokens,
+                tokens_output=reservation.cached_output_tokens,
+                estimated_cost_usd=float(reservation.cached_cost_usd),
+                request_id=reservation.cached_request_id,
+            )
+    else:
+        from .llm_cost_accounting_v1 import lookup_completed_call
+        cached = lookup_completed_call(
+            role=role, provider=config.provider, model=config.model,
+            request_kind="chat", request_sha256=request_sha256,
+        )
+        if cached is not None:
+            cached_text = cached.response_json.get("text")
+            if isinstance(cached_text, str) and cached_text.strip():
+                return LLMResult(
+                    text=cached_text, provider=config.provider,
+                    model=cached.resolved_model or config.model,
+                    tokens_input=cached.input_tokens, tokens_output=cached.output_tokens,
+                    estimated_cost_usd=float(cached.cost_usd), request_id=cached.request_id,
+                )
     try:
         if config.backend == "ollama":
             options: dict[str, Any] = {"temperature": temperature}
@@ -398,13 +453,14 @@ def chat_result(*, role: str, messages: Sequence[dict[str, str]], model: str | N
         cost = float(settle_paid_call(reservation, role=role, configured_model=config.model,
                                       resolved_model=resolved_model, input_tokens=input_tokens,
                                       output_tokens=output_tokens, request_id=request_id,
-                                      response_sha256=_sha_payload({"text": text})))
+                                      response_sha256=_sha_payload({"text": text}),
+                                      response_json={"text": text}))
     else:
         from .llm_cost_accounting_v1 import record_local_call
         record_local_call(role=role, provider="ollama", model=resolved_model,
                           input_tokens=input_tokens, output_tokens=output_tokens, request_id=request_id,
                           request_sha256=request_sha256, response_sha256=_sha_payload({"text": text}),
-                          request_kind='chat')
+                          request_kind='chat', response_json={"text": text})
     return LLMResult(text=text, provider=config.provider,
                      model=resolved_model, tokens_input=input_tokens, tokens_output=output_tokens,
                      estimated_cost_usd=cost, request_id=request_id)
@@ -458,6 +514,42 @@ def embed_result(*, texts: Sequence[str], model: str | None = None,
         reservation = reserve_paid_call(role="embed", provider=config.provider, model=config.model,
                                         estimated_input_tokens=input_est, max_output_tokens=0,
                                         request_sha256=request_sha256, request_kind='embed')
+        if reservation.cached_response_json is not None:
+            cached_vectors = reservation.cached_response_json.get("embeddings")
+            normalized_cached = (
+                [_embedding_vector(value) for value in cached_vectors]
+                if isinstance(cached_vectors, list) else []
+            )
+            if len(normalized_cached) != len(text_list) or any(value is None for value in normalized_cached):
+                raise LLMGatewayError("Cached exact embedding response is invalid; refusing provider replay.")
+            return LLMEmbeddingResult(
+                vectors=[value for value in normalized_cached if value is not None],
+                provider=config.provider, configured_model=config.model,
+                model=reservation.cached_resolved_model or config.model,
+                tokens_input=reservation.cached_input_tokens,
+                estimated_cost_usd=float(reservation.cached_cost_usd),
+                request_id=reservation.cached_request_id,
+            )
+    else:
+        from .llm_cost_accounting_v1 import lookup_completed_call
+        cached = lookup_completed_call(
+            role="embed", provider=config.provider, model=config.model,
+            request_kind="embed", request_sha256=request_sha256,
+        )
+        if cached is not None:
+            cached_vectors = cached.response_json.get("embeddings")
+            normalized_cached = (
+                [_embedding_vector(value) for value in cached_vectors]
+                if isinstance(cached_vectors, list) else []
+            )
+            if len(normalized_cached) == len(text_list) and all(value is not None for value in normalized_cached):
+                return LLMEmbeddingResult(
+                    vectors=[value for value in normalized_cached if value is not None],
+                    provider=config.provider, configured_model=config.model,
+                    model=cached.resolved_model or config.model,
+                    tokens_input=cached.input_tokens,
+                    estimated_cost_usd=float(cached.cost_usd), request_id=cached.request_id,
+                )
     try:
         if config.backend == "ollama":
             response = _post_json(
@@ -552,6 +644,7 @@ def embed_result(*, texts: Sequence[str], model: str | None = None,
             reservation, role="embed", configured_model=config.model, resolved_model=resolved_model,
             input_tokens=input_tokens, output_tokens=0, request_id=request_id,
             response_sha256=_sha_payload({"embeddings": vectors}),
+            response_json={"embeddings": vectors},
         ))
     else:
         from .llm_cost_accounting_v1 import record_local_call
@@ -559,7 +652,7 @@ def embed_result(*, texts: Sequence[str], model: str | None = None,
             role="embed", provider="ollama", model=resolved_model,
             input_tokens=input_tokens, output_tokens=0, request_id=request_id,
             request_sha256=request_sha256, response_sha256=_sha_payload({"embeddings": vectors}),
-            request_kind='embed',
+            request_kind='embed', response_json={"embeddings": vectors},
         )
     return LLMEmbeddingResult(
         vectors=vectors, provider=config.provider, configured_model=config.model, model=resolved_model,

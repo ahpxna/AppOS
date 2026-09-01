@@ -20,7 +20,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 # broken this way before today's fix).
 sys.path.insert(0, str(PROJECT_ROOT))
 from services.common.observability import emit_trace, make_trace_id
-from services.common.llm_gateway import generate_text
+from services.common.llm_gateway import generate_text, resolve_config
 from services.common.model_config import get_model
 from services.common.config import database_dsn
 from services.common.ai_contracts import parse_json_object as _parse_contract_json_object
@@ -339,6 +339,7 @@ def insert_component_run(
     *,
     application_id: str,
     model: str,
+    provider: str,
     input_json: Dict[str, Any],
     output_json: Dict[str, Any],
     raw_output: str,
@@ -365,7 +366,7 @@ def insert_component_run(
           %s, %s, %s,
           %s, %s, %s,
           'completed',
-          'ollama_local',
+          %s,
           %s,
           %s,
           %s,
@@ -381,6 +382,7 @@ def insert_component_run(
             Jsonb(input_json),
             Jsonb(output_json),
             raw_output,
+            provider,
             model,
             estimate_tokens(prompt),
             estimate_tokens(raw_output),
@@ -580,6 +582,7 @@ def main() -> int:
                 job_url=args.job_url,
                 source=args.source,
             )
+            os.environ["JOBOS_APPLICATION_ID"] = str(application_id)
 
             prompt = build_prompt(app, profile_pack_text)
 
@@ -598,6 +601,9 @@ def main() -> int:
                 print("===== END PROMPT =====")
                 print("")
 
+            llm_config = resolve_config(
+                role="job_fit", model=args.model, local_url=args.ollama_url,
+            )
             start = time.perf_counter()
             raw_output = ollama_generate(
                 model=args.model,
@@ -647,7 +653,8 @@ def main() -> int:
             component_run_id = insert_component_run(
                 cur,
                 application_id=application_id,
-                model=args.model,
+                model=llm_config.model,
+                provider=llm_config.provider,
                 input_json=input_json,
                 output_json=analysis,
                 raw_output=raw_output,
@@ -659,7 +666,7 @@ def main() -> int:
                 application_id=application_id,
                 component_run_id=component_run_id,
                 profile_context_pack_id=profile_pack_id,
-                model=args.model,
+                model=llm_config.model,
                 analysis=analysis,
                 raw_output=raw_output,
             )

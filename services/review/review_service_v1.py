@@ -524,10 +524,30 @@ def sync_workflow_followup_required(cur) -> int:
     count = 0
     cur.execute(
         """SELECT a.id::text, a.current_step, a.company, a.job_title,
-                  s.current_url, s.page_fingerprint, s.detail_json
+                  CASE WHEN a.current_step='application_entrypoint_ready'
+                            AND nav.result_json->>'target_id' IS NOT NULL
+                       THEN nav.result_json->>'url' ELSE s.current_url END AS current_url,
+                  CASE WHEN a.current_step='application_entrypoint_ready'
+                            AND nav.result_json->>'target_id' IS NOT NULL
+                       THEN nav.result_json->>'page_fingerprint' ELSE s.page_fingerprint END AS page_fingerprint,
+                  CASE WHEN a.current_step='application_entrypoint_ready'
+                            AND nav.result_json->>'target_id' IS NOT NULL
+                       THEN jsonb_build_object('target_id', nav.result_json->>'target_id')
+                       ELSE s.detail_json END AS detail_json
              FROM applications a
              LEFT JOIN application_auth_sessions s ON s.application_id=a.id
-            WHERE a.current_step IN ('needs_account_auth','needs_email_verification','needs_mfa','needs_human_checkpoint','application_form_ready')
+             LEFT JOIN LATERAL (
+                   SELECT pae.result_json
+                     FROM privileged_action_executions pae
+                     JOIN approval_requests ar ON ar.id=pae.approval_request_id
+                    WHERE pae.application_id=a.id
+                      AND ar.type='privileged_begin_application'
+                      AND pae.status='completed'
+                      AND pae.result_json->>'target_id' IS NOT NULL
+                    ORDER BY pae.finished_at DESC NULLS LAST, pae.started_at DESC
+                    LIMIT 1
+             ) nav ON true
+            WHERE a.current_step IN ('application_entrypoint_ready','needs_account_auth','needs_email_verification','needs_mfa','needs_human_checkpoint','application_form_ready')
               AND a.status NOT IN ('submitted','abandoned')
               AND NOT EXISTS (
                     SELECT 1 FROM approval_requests ar
@@ -550,6 +570,31 @@ def sync_workflow_followup_required(cur) -> int:
             payload={"expected_step": state, "target_id": target_id,
                      "expected_url": str(url or ""), "expected_page_fingerprint": str(fp or "")},
             priority="high",
+        ):
+            count += 1
+    return count
+
+
+def sync_orchestrator_recovery_required(cur) -> int:
+    """Expose durable orchestrator failures/blocks in the single human inbox."""
+    count = 0
+    cur.execute(
+        """SELECT id::text,company,job_title,current_step,last_error_step,last_error,
+                  orchestrator_blocker_kind,orchestrator_next_attempt_at
+             FROM applications
+            WHERE status NOT IN ('submitted','abandoned')
+              AND (current_step='error' OR orchestrator_blocker_kind IS NOT NULL)
+            ORDER BY updated_at DESC;"""
+    )
+    for app_id, company, role, step, failed_step, error, blocker, retry_at in cur.fetchall():
+        if ensure_action_required_review(
+            cur, application_id=app_id, action_kind="orchestrator_recovery_required",
+            title="JobOS pipeline needs recovery",
+            summary=(f"{company} — {role}. Blocker: {blocker or 'application_error'}. "
+                     "Fix the prerequisite if needed, then tap Retry; no browser or submit action occurs."),
+            payload={"current_step": step, "failed_step": failed_step,
+                     "blocker_kind": blocker, "retry_at": retry_at,
+                     "error": str(error or "")[:800]}, priority="urgent",
         ):
             count += 1
     return count
@@ -1073,6 +1118,18 @@ def reconcile_materialized_review_state(cur) -> None:
             WHERE ar.application_id=a.id AND a.status IN ('submitted','abandoned')
               AND ar.status IN ('pending','approved');"""
     )
+    # Releases before the message pipeline was fully wired could create a
+    # send_message approval as soon as a draft existed, before truth QA. Retire
+    # those capabilities before Review Hub materializes them. A new exact send
+    # gate is created only by message_reply_v1 after qa_status='pass'.
+    cur.execute(
+        """UPDATE approval_requests ar SET status='expired'
+             FROM drafted_replies dr
+            WHERE ar.type='send_message'
+              AND ar.payload_json->>'drafted_reply_id'=dr.id::text
+              AND dr.qa_status IS DISTINCT FROM 'pass'
+              AND ar.status IN ('pending','approved');"""
+    )
     cur.execute(
         """UPDATE document_revision_requests drr
               SET status='cancelled',claimed_by=NULL,lease_expires_at=NULL,
@@ -1199,8 +1256,16 @@ def sync_inbox(cur) -> dict[str, int]:
         if ensure_document_review(cur, doc_id):
             counts["documents"] += 1
     counts["questions"] = sync_missing_questions(cur) + sync_runtime_questions(cur)
+    # Truth-QA and human authorization are separate durable boundaries. Repair
+    # a lost post-QA send gate before scanning pending approvals into the inbox.
+    from services.messaging.message_reply_v1 import (
+        sync_message_human_attention, sync_send_message_approvals,
+    )
+    sync_send_message_approvals(cur)
+    counts["action_required"] += sync_message_human_attention(cur)
     counts["action_required"] += sync_action_required(cur)
     counts["action_required"] += sync_workflow_followup_required(cur)
+    counts["action_required"] += sync_orchestrator_recovery_required(cur)
     cur.execute("""SELECT id::text FROM approval_requests
                     WHERE status = 'pending' AND application_id IS NOT NULL
                       AND token_expires_at > now();""")
@@ -1826,7 +1891,16 @@ def decide_item(conn, item_id: str, *, decision: str, actor: str, note: str = ""
                         target_id = bound.target_id
                         live_url, live_snap, live_nodes, live_fp = _snapshot(transport, target_id)
                         live_state, live_detail = detect_page_state(live_url, live_snap, live_nodes)
-                        if live_state != expected_step:
+                        # application_entrypoint_ready is the durable boundary
+                        # immediately after OPEN APPLY, not a browser classifier
+                        # value.  An exact bound target that remains ``unknown``
+                        # must still be recoverable through a read-only manual
+                        # retry.  Every canonical auth/form state remains strict.
+                        state_matches = (
+                            live_state == expected_step
+                            or (expected_step == "application_entrypoint_ready" and live_state == "unknown")
+                        )
+                        if not state_matches:
                             raise ReviewError(
                                 f"live page classifies as {live_state!r}, not authoritative {expected_step!r}; resync auth state first"
                             )
@@ -1841,6 +1915,49 @@ def decide_item(conn, item_id: str, *, decision: str, actor: str, note: str = ""
                             "detail": live_detail, "page_fingerprint": live_fp, "followup": "state_gate",
                         }
                         note = (note + " Fresh page snapshot captured; next gate will be materialized after this review decision commits.").strip()
+                    elif action_kind == "orchestrator_recovery_required":
+                        cur.execute(
+                            "SELECT current_step,last_error_step FROM applications WHERE id=%s FOR UPDATE;",
+                            (app_id,),
+                        )
+                        recovery = cur.fetchone()
+                        if not recovery:
+                            raise ReviewError("application no longer exists")
+                        current_step, failed_step = str(recovery[0]), str(recovery[1] or "")
+                        if current_step == "error":
+                            if failed_step not in {"intake","screened","fit_analyzed","docs_generated"}:
+                                raise ReviewError("error has no safe recorded recovery step; inspect details or stop the application")
+                            DEFAULT_PIPELINE_STATE_STORE.transition(
+                                cur, application_id=app_id, expected_from="error", to=failed_step,
+                                actor=actor, reason="Human requested retry after resolving orchestrator blocker.",
+                                detail={"review_item_id": item_id}, require_automated=False,
+                            )
+                        cur.execute(
+                            """UPDATE applications SET orchestrator_failure_streak=0,
+                                      orchestrator_next_attempt_at=NULL,orchestrator_blocker_kind=NULL
+                                  WHERE id=%s;""", (app_id,)
+                        )
+                        note = (note + " Durable blocker cleared; orchestrator retry is now eligible.").strip()
+                    elif action_kind == "interview_prep_ready":
+                        note = (note + " Interview prep acknowledged; no external action was executed.").strip()
+                    elif action_kind == "message_reply_revision_required":
+                        note = (note + " Reply QA issue acknowledged; no external message was sent.").strip()
+                    elif action_kind == "message_human_attention_required":
+                        thread_id = str(payload.get("thread_id") or "")
+                        message_id = str(payload.get("message_id") or "")
+                        cur.execute(
+                            """UPDATE message_threads mt SET needs_user_attention=false,updated_at=now()
+                                  WHERE mt.id=%s AND mt.linked_application_id=%s
+                                    AND %s=(SELECT m.id::text FROM messages m
+                                            WHERE m.thread_id=mt.id AND m.direction='inbound'
+                                            ORDER BY coalesce(m.received_at,m.created_at) DESC,
+                                                     m.created_at DESC,m.id DESC LIMIT 1)
+                                RETURNING mt.id::text;""",
+                            (thread_id, app_id, message_id),
+                        )
+                        if not cur.fetchone():
+                            raise ReviewError("recruiter thread changed; sync the newest exact message card")
+                        note = (note + " Exact recruiter message acknowledged; JobOS sent nothing.").strip()
                     else:
                         raise ReviewError(f"unsupported action-required kind: {action_kind}")
                 except ReviewError:

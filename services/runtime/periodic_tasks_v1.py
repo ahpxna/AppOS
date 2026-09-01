@@ -27,11 +27,27 @@ STOP = False
 ATS_PERIODIC_TIMEOUT_SECONDS = env_int(
     "JOBOS_ATS_PERIODIC_TIMEOUT_SECONDS", 1320, minimum=180, maximum=7200
 )
+MESSAGE_PERIODIC_TIMEOUT_SECONDS = env_int(
+    "JOBOS_MESSAGE_WORKER_TIMEOUT_SECONDS", 900, minimum=60, maximum=3600
+)
+INTERVIEW_PERIODIC_TIMEOUT_SECONDS = env_int(
+    "JOBOS_INTERVIEW_PREP_TIMEOUT_SECONDS", 1200, minimum=60, maximum=7200
+)
 
 TASKS: dict[str, tuple[list[str], int]] = {
     "ats-discovery": ([sys.executable, "-m", "services.discovery.ats_discovery_v1", "poll", "--apply"], ATS_PERIODIC_TIMEOUT_SECONDS),
     "profile-discovery": ([sys.executable, "-m", "services.discovery.autonomous_discovery_v1", "run", "--apply"], 120),
     "repo-freshness": ([sys.executable, "services/repo-audit/repository_freshness_v1.py", "refresh"], 900),
+    "message-pipeline": (
+        [sys.executable, "-m", "services.messaging.message_pipeline_worker_v1"],
+        MESSAGE_PERIODIC_TIMEOUT_SECONDS,
+    ),
+    "interview-prep": (
+        [sys.executable, "services/interview-prep/interview_prep_v1.py", "--apply", "--limit", str(env_int(
+            "JOBOS_INTERVIEW_PREP_BATCH_SIZE", 10, minimum=1, maximum=100
+        ))],
+        INTERVIEW_PERIODIC_TIMEOUT_SECONDS,
+    ),
 }
 
 

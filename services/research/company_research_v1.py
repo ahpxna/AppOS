@@ -38,8 +38,13 @@ _JOBOS_ROOT = _JobOSPath(__file__).resolve().parents[2]
 if str(_JOBOS_ROOT) not in _jobos_sys.path:
     _jobos_sys.path.insert(0, str(_JOBOS_ROOT))
 import uuid
+import html as _html
+import ipaddress
+import socket
+import urllib.request
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -59,6 +64,12 @@ from services.common.ai_contracts import parse_json_object as _parse_contract_js
 from services.ats.registry import detect_ats_platform
 
 from services.common.openclaw_runtime import resolve_openclaw_binary
+from services.common.llm_cost_accounting_v1 import (
+    mark_paid_call_uncertain, reserve_paid_call, settle_paid_call,
+)
+from services.common.company_identity_v1 import (
+    company_identity_key, employer_domain_from_job_url, normalize_company_domain,
+)
 
 OPENCLAW_BIN = resolve_openclaw_binary()
 OPENCLAW_AGENT = os.getenv("OPENCLAW_AGENT_RESEARCH", "main")
@@ -97,6 +108,45 @@ def openclaw_agent(message: str, *, timeout: int) -> str:
         err = (proc.stderr or proc.stdout or "").strip()[:400]
         raise RuntimeError(f"openclaw agent failed: {err}")
     return proc.stdout
+
+
+def accounted_openclaw_agent(message: str, *, timeout: int) -> str:
+    """Execute one tool-using agent call behind hard budget + exact replay."""
+    provider = os.getenv("JOBOS_OPENCLAW_ACCOUNTING_PROVIDER", "openrouter").strip().casefold()
+    model = os.getenv("JOBOS_OPENCLAW_ACCOUNTING_MODEL", "openrouter/auto").strip()
+    request_sha = hashlib.sha256(json.dumps(
+        {"agent": OPENCLAW_AGENT, "message": message, "provider": provider, "model": model},
+        sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    ).encode("utf-8")).hexdigest()
+    estimated_input = estimate_tokens(message)
+    reservation = reserve_paid_call(
+        role="company_research", provider=provider, model=model,
+        estimated_input_tokens=estimated_input,
+        max_output_tokens=env_int("JOBOS_OPENCLAW_MAX_OUTPUT_TOKENS", 4096,
+                                  minimum=128, maximum=100000),
+        request_sha256=request_sha, request_kind="openclaw_agent",
+    )
+    if reservation.cached_response_json is not None:
+        cached_raw = reservation.cached_response_json.get("raw")
+        if not isinstance(cached_raw, str):
+            raise RuntimeError("cached OpenClaw research response is malformed")
+        return cached_raw
+    try:
+        raw = openclaw_agent(message, timeout=timeout)
+    except Exception as exc:
+        mark_paid_call_uncertain(
+            reservation, role="company_research", configured_model=model,
+            estimated_input_tokens=estimated_input, error=str(exc),
+        )
+        raise
+    settle_paid_call(
+        reservation, role="company_research", configured_model=model,
+        resolved_model=model, input_tokens=estimated_input,
+        output_tokens=estimate_tokens(raw), request_id=None,
+        response_sha256=hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+        response_json={"raw": raw},
+    )
+    return raw
 
 
 def unwrap_agent_payload(raw: str) -> str:
@@ -151,12 +201,7 @@ _SHARED_JOB_HOST_SUFFIXES = (
 
 def normalize_domain_hint(value: Any) -> str:
     """Return a bare lower-case host from a user/application domain hint."""
-    raw = str(value or "").strip()
-    if not raw:
-        return ""
-    parsed = urlsplit(raw if "://" in raw else f"https://{raw}")
-    host = (parsed.hostname or "").strip(".").casefold()
-    return host[4:] if host.startswith("www.") else host
+    return normalize_company_domain(value)
 
 
 def _host_matches(host: str, suffix: str) -> bool:
@@ -171,17 +216,7 @@ def company_domain_hint_from_job_url(job_url: Any) -> Optional[str]:
     research as the company's website steers search toward the wrong entity and
     also corrupts the self-source risk boundary.
     """
-    raw = str(job_url or "").strip()
-    if not raw:
-        return None
-    host = normalize_domain_hint(raw)
-    if not host:
-        return None
-    if detect_ats_platform(raw) != "custom":
-        return None
-    if any(_host_matches(host, suffix) for suffix in _SHARED_JOB_HOST_SUFFIXES):
-        return None
-    return host
+    return employer_domain_from_job_url(job_url) or None
 
 
 def _url_is_on_domain(url: Any, domain: str) -> bool:
@@ -365,19 +400,82 @@ def validate(parsed: Dict[str, Any], *, expected_domain: Optional[str] = None) -
     }
 
 
+def _fetch_source_text(url: str, *, timeout: int = 12, max_bytes: int = 1_500_000) -> str:
+    """Fetch public evidence without allowing loopback/private-network SSRF."""
+    parsed = urlsplit(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("research source must be an absolute HTTP(S) URL")
+    for info in socket.getaddrinfo(parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80)):
+        address = ipaddress.ip_address(info[4][0])
+        if not address.is_global:
+            raise ValueError("research source resolves to a non-public address")
+    request = urllib.request.Request(url, headers={"User-Agent": "JobOS-Research-Evidence/1.0"})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        content_type = str(response.headers.get("Content-Type") or "").casefold()
+        if not any(kind in content_type for kind in ("text/", "json", "xml")):
+            raise ValueError("research source is not textual")
+        raw = response.read(max_bytes + 1)
+        if len(raw) > max_bytes:
+            raise ValueError("research source exceeds evidence fetch limit")
+        charset = response.headers.get_content_charset() or "utf-8"
+    text = raw.decode(charset, errors="replace")
+    text = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", text)
+    text = re.sub(r"(?s)<[^>]+>", " ", text)
+    return " ".join(_html.unescape(text).split()).casefold()
+
+
+def verify_fetched_evidence(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep only claims whose quoted evidence is present in an independent fetch."""
+    fetched: dict[str, str] = {}
+    failed: set[str] = set()
+    for url in data.get("sources") or []:
+        try:
+            fetched[url] = _fetch_source_text(url)
+        except Exception:
+            failed.add(url)
+
+    dropped = data.setdefault("dropped_unsourced", [])
+    evidence = data.get("field_evidence") or {}
+    for field in ("summary", "mission", "products"):
+        kept = [item for item in evidence.get(field, [])
+                if item.get("source_url") in fetched
+                and " ".join(str(item.get("supporting_quote") or "").split()).casefold()
+                in fetched[item["source_url"]]]
+        if not kept and data.get(field):
+            dropped.append(f"{field}: independent source fetch did not contain the quoted evidence")
+            data[field] = ""
+        if kept:
+            evidence[field] = kept
+        else:
+            evidence.pop(field, None)
+    data["field_evidence"] = evidence
+    for collection in ("recent_news", "risks"):
+        kept = []
+        for item in data.get(collection) or []:
+            url = item.get("source_url")
+            quote = " ".join(str(item.get("supporting_quote") or "").split()).casefold()
+            if url in fetched and quote and quote in fetched[url]:
+                kept.append(item)
+            else:
+                dropped.append(f"{collection}: independent source fetch did not confirm quote")
+        data[collection] = kept
+    data["sources"] = [url for url in data.get("sources") or [] if url in fetched]
+    return data
+
+
 # ---------------------------------------------------------------- data access
 
-def get_cached(cur, company: str) -> Optional[Dict[str, Any]]:
+def get_cached(cur, company: str, domain: Optional[str] = None) -> Optional[Dict[str, Any]]:
     cur.execute(
         """
         SELECT id::text, company_domain, summary, last_refreshed_at, expires_at,
                (expires_at IS NOT NULL AND expires_at > now()) AS fresh
         FROM company_research_cache
-        WHERE lower(company_name) = lower(%s)
+        WHERE identity_key = %s
         ORDER BY last_refreshed_at DESC NULLS LAST
         LIMIT 1;
         """,
-        (company,),
+        (company_identity_key(company, domain),),
     )
     r = cur.fetchone()
     if not r:
@@ -387,21 +485,23 @@ def get_cached(cur, company: str) -> Optional[Dict[str, Any]]:
 
 
 def upsert_research(cur, company: str, data: Dict[str, Any], ttl_days: int) -> str:
-    cur.execute(
-        "DELETE FROM company_research_cache WHERE lower(company_name) = lower(%s);",
-        (company,),
-    )
+    identity_key = company_identity_key(company, data.get("company_domain"))
     cur.execute(
         """
         INSERT INTO company_research_cache
-          (company_name, company_domain, summary, mission, products,
+          (company_name, company_domain, identity_key, summary, mission, products,
            recent_news, risks, sources, last_refreshed_at, expires_at, created_at)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s,
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s,
                 now(), now() + make_interval(days => %s), now())
+        ON CONFLICT (identity_key) DO UPDATE SET
+          company_name=EXCLUDED.company_name,company_domain=EXCLUDED.company_domain,
+          summary=EXCLUDED.summary,mission=EXCLUDED.mission,products=EXCLUDED.products,
+          recent_news=EXCLUDED.recent_news,risks=EXCLUDED.risks,sources=EXCLUDED.sources,
+          last_refreshed_at=now(),expires_at=EXCLUDED.expires_at
         RETURNING id::text;
         """,
         (
-            company, data["company_domain"] or None, data["summary"],
+            company, data["company_domain"] or None, identity_key, data["summary"],
             data["mission"], data["products"],
             Jsonb(data["recent_news"]), Jsonb(data["risks"]),
             Jsonb({"urls": data["sources"],
@@ -429,7 +529,7 @@ def company_for_application(cur, application_id: str) -> tuple:
 
 def research_company(conn, company: str, domain: Optional[str], args) -> int:
     with conn.cursor() as cur:
-        cached = get_cached(cur, company)
+        cached = get_cached(cur, company, domain)
         if cached and cached["fresh"] and not args.force:
             print(f"  cache hit, fresh until {cached['expires']}")
             print(f"  {cached['summary'][:200]}")
@@ -448,7 +548,7 @@ def research_company(conn, company: str, domain: Optional[str], args) -> int:
         # `_uuid` name on top of that), which raised TypeError the moment
         # this path actually ran against a live OpenClaw install. Fixed
         # 2026-07-31.
-        raw = openclaw_agent(prompt, timeout=args.timeout)
+        raw = accounted_openclaw_agent(prompt, timeout=args.timeout)
         elapsed = time.perf_counter() - start
         emit_trace(
             make_trace_id("company-research", company),
@@ -461,7 +561,7 @@ def research_company(conn, company: str, domain: Optional[str], args) -> int:
         )
 
         parsed = extract_json_object(raw)
-        data = validate(parsed, expected_domain=domain)
+        data = verify_fetched_evidence(validate(parsed, expected_domain=domain))
 
         print(f"\n  elapsed:  {elapsed:.1f}s")
         print(f"  domain:   {data['company_domain'] or '(none)'}")

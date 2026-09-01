@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import os
 from pathlib import Path
+import subprocess
 import sys
 
 
@@ -54,7 +55,25 @@ def main() -> int:
     env = runtime_env()
     command = [str(OPENCLAW_BIN), "gateway", "run", "--compact"]
     if args.action == "health":
-        command = [str(OPENCLAW_BIN), "gateway", "status"]
+        # OpenClaw 2026.7 may return process status 0 even when its own
+        # connectivity probe says `failed`. Translate the semantic health
+        # result into the CLI contract expected by operators and automation.
+        completed = subprocess.run(
+            [str(OPENCLAW_BIN), "gateway", "status"],
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+        output = completed.stdout or ""
+        print(output, end="" if output.endswith("\n") else "\n")
+        if completed.returncode != 0:
+            return completed.returncode
+        normalized = output.lower()
+        if "connectivity probe: ok" not in normalized:
+            return 1
+        return 0
     os.execvpe(command[0], command, env)
     return 1
 

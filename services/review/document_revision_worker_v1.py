@@ -21,6 +21,7 @@ from psycopg.types.json import Jsonb
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 from services.common.config import database_dsn, load_repo_env
+from services.control_plane.pipeline_state import DEFAULT_PIPELINE_STATE_STORE, PipelineStateError
 
 TRANSIENT = (
     "Connection refused", "timed out", "Temporary failure", "Connection reset",
@@ -273,6 +274,25 @@ def process_one(conn, worker_id: str) -> bool:
         return True
 
     with conn.cursor() as cur:
+        if str(qa[0] if qa else "") == "pass" and doc_type == "resume":
+            cur.execute("SELECT current_step FROM applications WHERE id=%s FOR UPDATE;", (app_id,))
+            app_step = cur.fetchone()
+            if app_step and str(app_step[0]) == "docs_failed_qa":
+                try:
+                    DEFAULT_PIPELINE_STATE_STORE.transition(
+                        cur, application_id=app_id, expected_from="docs_failed_qa",
+                        to="docs_verified", actor="document_revision_worker",
+                        reason="Candidate-requested revision passed truth QA.",
+                        detail={"generated_document_id": new_doc_id,
+                                "revision_request_id": request_id},
+                        require_automated=True,
+                    )
+                except PipelineStateError as exc:
+                    conn.rollback()
+                    _finish_failure(conn, request_id, review_item_id,
+                                    f"document QA recovery transition failed: {exc}",
+                                    transient=False, attempts=attempts)
+                    return True
         cur.execute(
             """UPDATE document_revision_requests
                   SET status='completed',generated_document_id=%s,claimed_by=NULL,lease_expires_at=NULL,

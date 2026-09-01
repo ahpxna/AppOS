@@ -54,6 +54,9 @@ if str(REPO_ROOT) not in sys.path:
 
 import psycopg
 from psycopg.types.json import Jsonb
+from services.common.llm_cost_accounting_v1 import (
+    LLMBudgetError, mark_paid_call_uncertain, reserve_paid_call, settle_paid_call,
+)
 # Sửa lại đoạn import ở đầu file browser_queue_worker.py
 from services.autofill.parallel_bypass import execute_parallel_bypass
 import threading
@@ -401,46 +404,162 @@ def _cdp_port_from_url() -> int:
     return 443 if parsed.scheme == "https" else 80
 
 
-def _current_linkedin_page_url(expected_url: str) -> str:
-    """Return the live exact LinkedIn page URL for CAPTCHA binding.
-
-    OpenClaw may add filters and therefore mutate the search query.  CapSolver
-    must bind to that live URL, not the seed URL constructed before navigation.
-    """
+def _linkedin_page_catalog() -> dict[str, dict[str, str]]:
+    """Return the live LinkedIn page catalog keyed by stable CDP target id."""
     response = requests.get(BROWSER_CDP_URL.rstrip("/") + "/json", timeout=3)
     response.raise_for_status()
     tabs = response.json()
     if not isinstance(tabs, list):
         raise TransientTaskError("CDP /json did not return a page list while binding LinkedIn CAPTCHA")
-    wanted = urlsplit(expected_url)
-    wanted_host = (wanted.hostname or "").casefold()
-    wanted_path = (wanted.path or "/").rstrip("/") or "/"
-    same_page: list[str] = []
-    challenge_pages: list[str] = []
-    linkedin_pages: list[str] = []
-    challenge_markers = ("/checkpoint", "/challenge", "/authwall", "/uas/login", "/login", "/security")
+    catalog: dict[str, dict[str, str]] = {}
     for tab in tabs:
         if not isinstance(tab, dict) or tab.get("type") != "page":
             continue
+        target_id = str(tab.get("id") or tab.get("targetId") or "").strip()
         current = str(tab.get("url") or "")
         parsed = urlsplit(current)
         host = (parsed.hostname or "").casefold()
-        if host == "linkedin.com" or host.endswith(".linkedin.com"):
-            linkedin_pages.append(current)
-            path = (parsed.path or "/").rstrip("/") or "/"
-            if any(marker in path.casefold() for marker in challenge_markers):
-                challenge_pages.append(current)
-            if host == wanted_host and path == wanted_path:
-                same_page.append(current)
-    # A challenge redirect intentionally changes the path away from /jobs/search.
-    # Prefer one explicit challenge/auth page even when another ordinary LinkedIn
-    # tab is open; otherwise keep exact same-path affinity before singleton fallback.
-    candidates = challenge_pages if len(challenge_pages) == 1 else (same_page or linkedin_pages)
+        if not target_id or not (host == "linkedin.com" or host.endswith(".linkedin.com")):
+            continue
+        catalog[target_id] = {
+            "target_id": target_id,
+            "url": current,
+            "opener_id": str(tab.get("openerId") or "").strip(),
+            "websocket_url": str(tab.get("webSocketDebuggerUrl") or "").strip(),
+        }
+    return catalog
+
+
+def _linkedin_challenge_evidence(tab: dict[str, str]) -> bool:
+    """Require URL or live DOM evidence before giving a target to CapSolver."""
+    path = (urlsplit(str(tab.get("url") or "")).path or "/").casefold()
+    challenge_markers = ("/checkpoint", "/challenge", "/authwall", "/uas/login", "/login", "/security")
+    if any(marker in path for marker in challenge_markers):
+        return True
+    websocket_url = str(tab.get("websocket_url") or "")
+    if not websocket_url:
+        return False
+    expression = r'''(() => Boolean(
+      document.querySelector('input[name="fc-token"], #fc-token, #g-recaptcha-response, textarea[name="g-recaptcha-response"], iframe[src*="arkoselabs" i], iframe[src*="recaptcha" i], iframe[title*="challenge" i]')
+    ))()'''
+    try:
+        return _cdp_runtime_evaluate(websocket_url, expression) is True
+    except Exception:
+        return False
+
+
+def _current_linkedin_page_target(
+    expected_url: str,
+    *,
+    source_target_id: str,
+    pre_attempt_target_ids: set[str],
+) -> dict[str, str]:
+    """Bind CAPTCHA to this attempt's source or causally-created descendants.
+
+    Pre-existing LinkedIn tabs are never candidates merely because they look
+    like a challenge.  This prevents a Saved Jobs task from injecting into a
+    different user's/job's tab when many LinkedIn pages are open.
+    """
+    del expected_url  # The task-owned target id, not a mutable URL, is authority.
+    catalog = _linkedin_page_catalog()
+    source_target_id = str(source_target_id or "").strip()
+    if not source_target_id:
+        raise TransientTaskError("LinkedIn CAPTCHA binding has no task-owned source target")
+
+    causal_ids = {source_target_id}
+    causal_ids.update(set(catalog) - set(pre_attempt_target_ids))
+    # Include descendants opened by the task even if CDP catalog refresh timing
+    # caused their ids to appear in the captured baseline.
+    changed = True
+    while changed:
+        changed = False
+        for target_id, tab in catalog.items():
+            if target_id not in causal_ids and tab.get("opener_id") in causal_ids:
+                causal_ids.add(target_id)
+                changed = True
+
+    candidates = [
+        tab for target_id, tab in catalog.items()
+        if target_id in causal_ids and _linkedin_challenge_evidence(tab)
+    ]
     if len(candidates) != 1:
         raise TransientTaskError(
-            f"Cannot bind one live LinkedIn CAPTCHA page for {expected_url!r}; found {len(candidates)} candidates"
+            "Cannot bind exactly one task-owned LinkedIn CAPTCHA page; "
+            f"found {len(candidates)} causal challenge candidates"
         )
     return candidates[0]
+
+
+def _current_linkedin_page_url(
+    expected_url: str,
+    *,
+    source_target_id: str,
+    pre_attempt_target_ids: set[str],
+) -> str:
+    """Backward-compatible URL projection of the exact target binding."""
+    return _current_linkedin_page_target(
+        expected_url,
+        source_target_id=source_target_id,
+        pre_attempt_target_ids=pre_attempt_target_ids,
+    )["url"]
+
+
+def _prepare_linkedin_task_target(task: Dict[str, Any], expected_url: str) -> tuple[str, str, set[str]]:
+    """Open one task-owned source tab and capture the pre-agent causal boundary."""
+    transport = OpenClawTransport(
+        binary=OPENCLAW_BIN,
+        profile=os.getenv("JOBOS_BROWSER_PROFILE", "remote"),
+        timeout=min(int(task.get("timeout_seconds") or 60), 90),
+        environment=openclaw_runtime_env(),
+    )
+    try:
+        before_open = _linkedin_page_catalog()
+        target = transport.open(expected_url)
+        live_url = transport.current_url(target.target_id)
+        after_open = _linkedin_page_catalog()
+    except (TransportError, OSError, requests.RequestException) as exc:
+        raise TransientTaskError(f"Cannot open an exact task-owned LinkedIn source tab: {exc}") from exc
+    host = (urlsplit(live_url).hostname or "").casefold()
+    if not (host == "linkedin.com" or host.endswith(".linkedin.com")):
+        try:
+            transport.close(target.target_id)
+        except Exception:
+            pass
+        raise TransientTaskError("Task-owned LinkedIn source target redirected outside LinkedIn")
+    task.setdefault("_owned_linkedin_target_ids", []).append(str(target.target_id))
+    new_cdp_ids = set(after_open) - set(before_open)
+    if len(new_cdp_ids) != 1:
+        raise TransientTaskError(
+            "JobOS opened a LinkedIn source tab but could not bind exactly one new CDP target"
+        )
+    cdp_target_id = next(iter(new_cdp_ids))
+    cdp_live_url = str(after_open[cdp_target_id].get("url") or "")
+    if canonical_page_url(cdp_live_url) != canonical_page_url(live_url):
+        raise TransientTaskError(
+            "OpenClaw and CDP disagree about the task-owned LinkedIn source target URL"
+        )
+    return cdp_target_id, str(target.target_id), set(after_open)
+
+
+def _close_linkedin_task_targets(task: Dict[str, Any]) -> None:
+    """Close only source tabs created and recorded by this exact task attempt."""
+    target_ids = [str(value).strip() for value in task.get("_owned_linkedin_target_ids", []) if str(value).strip()]
+    if not target_ids:
+        return
+    try:
+        transport = OpenClawTransport(
+            binary=OPENCLAW_BIN,
+            profile=os.getenv("JOBOS_BROWSER_PROFILE", "remote"),
+            timeout=30,
+            environment=openclaw_runtime_env(),
+        )
+    except Exception:
+        return
+    for target_id in target_ids:
+        try:
+            transport.close(target_id)
+        except Exception as exc:
+            print(f"  [LinkedIn] warning: could not close task-owned source tab {target_id}: {exc}")
 
 
 class PermanentTaskError(Exception):
@@ -515,27 +634,86 @@ def openclaw_agent(*, agent: str, message: str, timeout: int,
         # overlap, and lets one posting's context bleed into the next one's.
         args += ["--session-id", session_id]
 
-    proc = run_openclaw(args, timeout=timeout + 30)
+    provider = os.getenv("JOBOS_OPENCLAW_ACCOUNTING_PROVIDER", "openrouter").strip().casefold()
+    model = os.getenv("JOBOS_OPENCLAW_ACCOUNTING_MODEL", "openrouter/auto").strip()
+    request_sha = hashlib.sha256(json.dumps(
+        {"agent": agent, "message": message, "provider": provider, "model": model},
+        sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    ).encode("utf-8")).hexdigest()
+    prior_scope = os.environ.get("JOBOS_LLM_REQUEST_SCOPE")
+    os.environ["JOBOS_LLM_REQUEST_SCOPE"] = f"openclaw-session:{session_id or request_sha}"
+    def restore_scope() -> None:
+        if prior_scope is None:
+            os.environ.pop("JOBOS_LLM_REQUEST_SCOPE", None)
+        else:
+            os.environ["JOBOS_LLM_REQUEST_SCOPE"] = prior_scope
+    input_tokens = max(1, len(message.encode("utf-8")) // 3)
+    try:
+        reservation = reserve_paid_call(
+            role=f"openclaw_{agent}", provider=provider, model=model,
+            estimated_input_tokens=input_tokens,
+            max_output_tokens=env_int("JOBOS_OPENCLAW_MAX_OUTPUT_TOKENS", 4096,
+                                      minimum=128, maximum=100000),
+            request_sha256=request_sha, request_kind="openclaw_agent",
+        )
+    except LLMBudgetError as exc:
+        restore_scope()
+        raise PermanentTaskError(f"OpenClaw hard-budget admission failed: {exc}") from exc
+
+    if reservation.cached_response_json is not None:
+        cached = reservation.cached_response_json.get("agent_response")
+        if not isinstance(cached, dict):
+            raise PermanentTaskError("Cached OpenClaw agent response is malformed.")
+        restore_scope()
+        return cached
+
+    try:
+        proc = run_openclaw(args, timeout=timeout + 30)
+    except Exception as exc:
+        mark_paid_call_uncertain(
+            reservation, role=f"openclaw_{agent}", configured_model=model,
+            estimated_input_tokens=input_tokens, error=str(exc),
+        )
+        restore_scope()
+        raise
 
     if proc.returncode != 0:
         err = (proc.stderr or proc.stdout or "").strip()[:500]
         low = err.lower()
         if "unauthorized" in low or "token mismatch" in low:
-            raise PermanentTaskError(
+            failure = PermanentTaskError(
                 f"OpenClaw auth failure: {err}. "
                 "gateway.remote.token must equal gateway.auth.token."
             )
-        if "agent" in low and "not found" in low:
-            raise PermanentTaskError(f"Unknown agent id '{agent}': {err}")
-        if "session" in low and "changed while starting" in low:
+        elif "agent" in low and "not found" in low:
+            failure = PermanentTaskError(f"Unknown agent id '{agent}': {err}")
+        elif "session" in low and "changed while starting" in low:
             # Transient: another call held the session. Retrying with a fresh
             # session id normally clears it.
-            raise TransientTaskError(f"session collision: {err}")
-        raise TransientTaskError(f"openclaw agent exit {proc.returncode}: {err}")
+            failure = TransientTaskError(f"session collision: {err}")
+        else:
+            failure = TransientTaskError(f"openclaw agent exit {proc.returncode}: {err}")
+        mark_paid_call_uncertain(
+            reservation, role=f"openclaw_{agent}", configured_model=model,
+            estimated_input_tokens=input_tokens, error=str(failure),
+        )
+        restore_scope()
+        raise failure
 
     parsed = parse_agent_output(proc.stdout)
     if agent == OPENCLAW_AGENT_LINKEDIN_DISCOVERY:
-        return blocker_safe_agent_response(parsed)
+        parsed = blocker_safe_agent_response(parsed)
+    try:
+        settle_paid_call(
+            reservation, role=f"openclaw_{agent}", configured_model=model,
+            resolved_model=model, input_tokens=input_tokens,
+            output_tokens=max(1, len(proc.stdout.encode("utf-8")) // 3),
+            request_id=session_id,
+            response_sha256=hashlib.sha256(proc.stdout.encode("utf-8")).hexdigest(),
+            response_json={"agent_response": parsed},
+        )
+    finally:
+        restore_scope()
     return parsed
 
 
@@ -1874,10 +2052,15 @@ def handle_discover_linkedin_jobs(cur, task) -> Dict[str, Any]:
         "keywords": request["keywords"], "location": request["location"],
     })
     check_domain(cur, search_url)
+    source_target_id, source_openclaw_target_id, pre_attempt_target_ids = (
+        _prepare_linkedin_task_target(task, search_url)
+    )
     msg = (
         "Use the OpenClaw browser tool with profile exactly `remote`; it is the attach-only "
         "JobOS Chrome CDP profile that is already signed in to LinkedIn. Never use or start "
         "a profile named `linkedin`, `work`, `openclaw`, or `chrome`. "
+        f"JobOS already opened the task-owned source target `{source_openclaw_target_id}`. Focus and use "
+        "that exact target for this task; never substitute another pre-existing LinkedIn tab. "
         "Search the URL below. "
         "This is a bounded, read-only user-requested discovery task.\n"
         f"Search URL: {search_url}\n"
@@ -1930,7 +2113,12 @@ def handle_discover_linkedin_jobs(cur, task) -> Dict[str, Any]:
         print("  [Bypass] Đụng độ CAPTCHA/challenge LinkedIn! Kích hoạt CapSolver...")
         try:
             cdp_port = _cdp_port_from_url()
-            live_captcha_url = _current_linkedin_page_url(search_url)
+            captcha_target = _current_linkedin_page_target(
+                search_url,
+                source_target_id=source_target_id,
+                pre_attempt_target_ids=pre_attempt_target_ids,
+            )
+            live_captcha_url = captcha_target["url"]
 
             # Bind CapSolver to the exact live page after LinkedIn applied filters.
             execute_parallel_bypass(
@@ -1938,7 +2126,8 @@ def handle_discover_linkedin_jobs(cur, task) -> Dict[str, Any]:
                 website_url=live_captcha_url,
                 website_key="2CB16598-CB82-458A-898B-53544380C934", # FunCaptcha public key mặc định của LinkedIn
                 regimes_path="data/pointer-regimes.json",
-                captcha_type="FunCaptchaTaskProxyless"
+                captcha_type="FunCaptchaTaskProxyless",
+                target_id=captcha_target["target_id"],
             )
             print("  [Bypass] Vượt rào thành công! Thử cào lại lần 2...")
             
@@ -2007,8 +2196,13 @@ def handle_discover_linkedin_saved_jobs(cur, task) -> Dict[str, Any]:
                 WHERE id = %s;""",
             (sync_id,),
         )
+    source_target_id, source_openclaw_target_id, pre_attempt_target_ids = (
+        _prepare_linkedin_task_target(task, saved_url)
+    )
     msg = (
         "Use the OpenClaw browser tool with profile exactly `remote`, already manually authenticated. "
+        f"JobOS already opened task-owned source target `{source_openclaw_target_id}`. Focus and use that exact "
+        "target; never substitute another pre-existing LinkedIn tab. "
         "Open/read this LinkedIn Saved Jobs page only. This task is READ ONLY.\n"
         f"Saved Jobs URL: {saved_url}\n"
         f"Read at most {request['max_results']} existing saved job postings and their complete visible job descriptions.\n"
@@ -2036,13 +2230,19 @@ def handle_discover_linkedin_saved_jobs(cur, task) -> Dict[str, Any]:
         # availability as transient; only a second grounded CAPTCHA is terminal.
         try:
             cdp_port = _cdp_port_from_url()
-            live_captcha_url = _current_linkedin_page_url(saved_url)
+            captcha_target = _current_linkedin_page_target(
+                saved_url,
+                source_target_id=source_target_id,
+                pre_attempt_target_ids=pre_attempt_target_ids,
+            )
+            live_captcha_url = captcha_target["url"]
             execute_parallel_bypass(
                 cdp_port=cdp_port,
                 website_url=live_captcha_url,
                 website_key="2CB16598-CB82-458A-898B-53544380C934",
                 regimes_path="data/pointer-regimes.json",
                 captcha_type="FunCaptchaTaskProxyless",
+                target_id=captcha_target["target_id"],
             )
             agent_response = _run_linkedin_agent_with_fake_mouse(
                 message=msg, timeout=task["timeout_seconds"],
@@ -2465,6 +2665,7 @@ def process_one(conn) -> bool:
     finally:
         lease_stop.set()
         lease_thread.join(timeout=2)
+        _close_linkedin_task_targets(task)
         if linkedin_detail_targets_before is not None:
             _close_linkedin_detail_tabs_opened_after(linkedin_detail_targets_before)
 

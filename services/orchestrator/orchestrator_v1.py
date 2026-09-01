@@ -67,6 +67,21 @@ ORCHESTRATOR_LEASE_SECONDS = env_int("JOBOS_ORCHESTRATOR_LEASE_SECONDS", 7200, m
 _ACTIVE_PROCESSING_RUN_ID: str | None = None
 _ACTIVE_WORKFLOW_STEP_RUN_ID: str | None = None
 
+# Runtime ownership is deliberately narrower than the generic pipeline metadata.
+# ``application_form_ready`` is owned by Review Hub/autofill preparation and
+# ``autofill_executing`` is owned by the browser worker.  Claiming every
+# non-terminal/non-human step here made the orchestrator repeatedly lease work
+# for which it has no handler, creating ledger churn and contention with the
+# actual owner.  Keep this list adjacent to ``advance_one`` and use it for both
+# discovery and the durable claim CAS so a new pipeline state cannot become
+# orchestrator-owned by accident.
+ORCHESTRATOR_OWNED_STEPS = (
+    "intake",
+    "screened",
+    "fit_analyzed",
+    "docs_generated",
+)
+
 
 # ---------------------------------------------------------------- transitions
 
@@ -103,6 +118,11 @@ def transition(
         )
     except PipelineStateError as exc:
         raise RuntimeError(str(exc)) from exc
+    cur.execute(
+        """UPDATE applications SET orchestrator_failure_streak=0,
+                  orchestrator_next_attempt_at=NULL,orchestrator_blocker_kind=NULL
+              WHERE id=%s;""", (application_id,)
+    )
     print(f"    {from_step} -> {to_step}  ({reason})")
 
 
@@ -267,10 +287,16 @@ def record_failure(cur, application_id: str, step: str, output: str,
         """
         UPDATE applications
         SET error_count = error_count + 1,
-            last_error_step = %s, last_error_at = now(), last_error = %s
+            last_error_step = %s, last_error_at = now(), last_error = %s,
+            orchestrator_failure_streak=orchestrator_failure_streak+1,
+            orchestrator_blocker_kind=%s,
+            orchestrator_next_attempt_at=CASE WHEN %s THEN
+              now()+make_interval(secs => least(3600,15*power(2,least(orchestrator_failure_streak,8)))::int)
+              ELSE NULL END
         WHERE id = %s;
         """,
-        (step, output[-1000:], application_id),
+        (step, output[-1000:], "transient_dependency" if transient else "unrecoverable_error",
+         transient, application_id),
     )
     if transient:
         # Leave the application where it is. A dependency being briefly
@@ -285,7 +311,7 @@ def record_failure(cur, application_id: str, step: str, output: str,
              "Transient failure; staying put for retry.",
              Jsonb({"output": output[-2000:], "transient": True})),
         )
-        print("    transient failure; step unchanged, will retry next run")
+        print("    transient failure; step unchanged, durable backoff scheduled")
     else:
         transition(cur, application_id=application_id, to_step="error",
                    actor="orchestrator", reason="Unrecoverable failure.",
@@ -338,11 +364,23 @@ def soft_block_missing_profile(cur, *, application_id: str, step: str) -> bool:
         return False
     detail = "; ".join(blockers)
     cur.execute(
+        """UPDATE applications SET orchestrator_blocker_kind='profile_prerequisites',
+                  orchestrator_failure_streak=orchestrator_failure_streak+1,
+                  orchestrator_next_attempt_at=now()+interval '15 minutes',
+                  last_error_step=%s,last_error_at=now(),last_error=%s
+              WHERE id=%s;""", (step, detail, application_id)
+    )
+    cur.execute(
         """INSERT INTO pipeline_events(application_id,from_step,to_step,actor,reason,detail_json)
-           VALUES (%s,%s,%s,'pipeline-preflight',%s,%s);""",
+           SELECT %s,%s,%s,'pipeline-preflight',%s,%s
+            WHERE NOT EXISTS (
+              SELECT 1 FROM pipeline_events WHERE application_id=%s
+                AND actor='pipeline-preflight' AND created_at > now()-interval '15 minutes'
+                AND detail_json->'blockers'=%s->'blockers');""",
         (application_id, step, step,
          "Missing profile prerequisites; state preserved for recovery instead of transitioning to error.",
-         Jsonb({"blockers": blockers, "browser_io": False, "fabrication": False})),
+         Jsonb({"blockers": blockers, "browser_io": False, "fabrication": False}),
+         application_id, Jsonb({"blockers": blockers})),
     )
     print(f"    blocked by profile prerequisites (state preserved): {detail}")
     return True
@@ -373,9 +411,9 @@ def create_fit_review_approval(
         (application_id, Jsonb({"score": score, "reason": "borderline_fit_60_75"}),
          token_hash, FIT_REVIEW_TTL_HOURS, summary),
     )
-    print(f"    fit review needed (score {score}/100). Decide with:")
-    print(f"      python services/approval/approval_service_v1.py approve --token {token}")
-    print(f"      python services/approval/approval_service_v1.py deny    --token {token}")
+    # The raw bearer token must never enter a long-lived supervisor log. Daily
+    # operation uses the exact Review Hub/Telegram item by request id.
+    print(f"    fit review needed (score {score}/100); available in Review Hub/Telegram")
     print(f"    (expires in {FIT_REVIEW_TTL_HOURS}h)")
 
 
@@ -676,12 +714,11 @@ def claim_application(cur, application_id: str) -> tuple[str, str, str] | None:
               SET processing_run_id=%s::uuid, processing_step=a.current_step,
                   processing_started_at=now(),
                   processing_lease_expires_at=now()+make_interval(secs => %s)
-            FROM pipeline_steps ps
-           WHERE a.id=%s AND ps.step=a.current_step
-             AND ps.is_terminal=false AND ps.requires_human=false
+           WHERE a.id=%s AND a.current_step = ANY(%s)
+             AND (a.orchestrator_next_attempt_at IS NULL OR a.orchestrator_next_attempt_at <= now())
              AND (a.processing_run_id IS NULL OR a.processing_lease_expires_at <= now())
         RETURNING a.current_step;""",
-        (run_id, ORCHESTRATOR_LEASE_SECONDS, application_id),
+        (run_id, ORCHESTRATOR_LEASE_SECONDS, application_id, list(ORCHESTRATOR_OWNED_STEPS)),
     )
     row = cur.fetchone()
     if not row:
@@ -804,10 +841,12 @@ def cmd_advance(conn, args) -> int:
                 """
                 SELECT a.id::text FROM applications a
                 JOIN pipeline_steps ps ON ps.step = a.current_step
-                WHERE ps.is_terminal = false AND ps.requires_human = false
+                WHERE a.current_step = ANY(%s)
+                  AND (a.orchestrator_next_attempt_at IS NULL OR a.orchestrator_next_attempt_at <= now())
                   AND (a.processing_run_id IS NULL OR a.processing_lease_expires_at <= now())
                 ORDER BY ps.sort_order, a.updated_at;
-                """
+                """,
+                (list(ORCHESTRATOR_OWNED_STEPS),),
             )
             ids = [r[0] for r in cur.fetchall()]
 

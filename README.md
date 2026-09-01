@@ -518,19 +518,21 @@ bootstrap với `--force` để áp dụng thay đổi, sau khi xem backup đư�
 
 ## 10. L9 — Interview prep
 
-Không nằm trong state machine tự động của orchestrator (interviews không đi
-qua `applications.pipeline_step`) — chạy tay như một lệnh riêng, giống cách
-chạy `message_reply_v1.py`:
+Interview prep có queue riêng vì interviews không đi qua
+`applications.pipeline_step`, nhưng queue này vẫn thuộc cùng runtime supervisor.
+Khi message classifier tạo `prep_needed`, worker sinh package có bounded retry,
+rồi đưa card **Interview prep ready** vào Telegram/Review Hub. Không cần chạy
+CLI trong daily workflow.
 
 ```bash
 # xem hàng đợi (interview đã classify, chưa có prep package) — không gọi LLM, không ghi DB
 python services/interview-prep/interview_prep_v1.py --list-only
 
-# sinh prep package cho 1 interview cụ thể và ghi vào DB
+# admin/debug: sinh prep package cho 1 interview cụ thể và ghi vào DB
 python services/interview-prep/interview_prep_v1.py --interview-id APPLICATION_UUID --apply
 
-# không có --interview-id: xử lý toàn bộ hàng đợi
-python services/interview-prep/interview_prep_v1.py --apply
+# admin/debug: xử lý bounded batch từ hàng đợi
+python services/interview-prep/interview_prep_v1.py --apply --limit 10
 ```
 
 Không truyền `--apply` = dry-run mặc định (in ra prep notes rồi rollback,

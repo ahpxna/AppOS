@@ -282,11 +282,56 @@ def _select_exact_page(tabs: list[dict], website_url: str) -> str:
     return str(candidates[0]["webSocketDebuggerUrl"])
 
 
-def _inject_solution(ws_url: str, solution_token: str, captcha_type: str) -> None:
+def _select_exact_target(tabs: list[dict], target_id: str, website_url: str) -> str:
+    """Bind one already-authorized CDP target and revalidate its live URL.
+
+    URL-only selection is intentionally retained for backward compatibility,
+    but discovery/CAPTCHA callers that already own a stable target must use
+    this stronger identity boundary.  Two tabs can legitimately share the
+    same LinkedIn URL; a target id is the only unambiguous browser identity.
+    """
+    wanted_id = str(target_id or "").strip()
+    if not wanted_id:
+        raise RuntimeError("Expected CDP target id is empty")
+    candidates: list[dict] = []
+    for tab in tabs:
+        if tab.get("type") != "page" or not tab.get("webSocketDebuggerUrl"):
+            continue
+        aliases = {
+            str(tab.get(key) or "").strip()
+            for key in ("id", "targetId", "tabId", "suggestedTargetId")
+        }
+        if wanted_id in aliases:
+            candidates.append(tab)
+    if len(candidates) != 1:
+        raise RuntimeError(
+            f"Expected exactly one CDP page for target {wanted_id!r}; found {len(candidates)}"
+        )
+    live_url = str(candidates[0].get("url") or "")
+    if _canonical_target_url(live_url) != _canonical_target_url(website_url):
+        raise RuntimeError(
+            "Exact CDP target changed URL before CAPTCHA injection; refusing stale binding"
+        )
+    return str(candidates[0]["webSocketDebuggerUrl"])
+
+
+def _inject_solution(
+    ws_url: str,
+    solution_token: str,
+    captcha_type: str,
+    *,
+    expected_url: str | None = None,
+) -> None:
     token_js = json.dumps(str(solution_token))
     ws = websocket.create_connection(ws_url, suppress_origin=True, timeout=3)
     try:
         ws.settimeout(3)
+        if expected_url is not None:
+            live_url = _page_url(ws)
+            if _canonical_target_url(live_url) != _canonical_target_url(expected_url):
+                raise RuntimeError(
+                    "Exact CAPTCHA target changed URL while awaiting the solver; refusing stale injection"
+                )
         if captcha_type.casefold().startswith("funcaptcha"):
             expression = (
                 "(() => { const token = " + token_js + "; "
@@ -321,7 +366,8 @@ def _inject_solution(ws_url: str, solution_token: str, captcha_type: str) -> Non
 
 
 def execute_parallel_bypass(cdp_port: int, website_url: str, website_key: str, regimes_path: str,
-                            captcha_type: str = "ReCaptchaV2TaskProxyLess"):
+                            captcha_type: str = "ReCaptchaV2TaskProxyLess",
+                            *, target_id: str | None = None):
     """Bounded orchestrator preserving the existing CapSolver/FakeMouse feature."""
     try:
         response = requests.get(f"http://127.0.0.1:{cdp_port}/json", timeout=3)
@@ -329,7 +375,11 @@ def execute_parallel_bypass(cdp_port: int, website_url: str, website_key: str, r
         tabs = response.json()
         if not isinstance(tabs, list):
             raise RuntimeError("CDP /json did not return a page list")
-        ws_url = _select_exact_page(tabs, website_url)
+        ws_url = (
+            _select_exact_target(tabs, target_id, website_url)
+            if target_id
+            else _select_exact_page(tabs, website_url)
+        )
     except Exception as exc:
         raise RuntimeError(f"Cannot bind exact Chrome CDP page on port {cdp_port}: {exc}") from exc
 
@@ -345,5 +395,10 @@ def execute_parallel_bypass(cdp_port: int, website_url: str, website_key: str, r
             log.error("[FakeMouse] helper did not exit within 5s; daemon thread will not block worker shutdown")
 
     if solution_token:
-        _inject_solution(ws_url, solution_token, captcha_type)
+        _inject_solution(
+            ws_url,
+            solution_token,
+            captcha_type,
+            expected_url=website_url,
+        )
     return solution_token

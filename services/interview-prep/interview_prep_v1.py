@@ -71,17 +71,24 @@ def fetch_context_pack(cur) -> str:
     return row[0] if row else ""
 
 
-def fetch_research(cur, company: str) -> Dict[str, Any]:
+def fetch_research(cur, company: str, application_id: str | None = None) -> Dict[str, Any]:
+    from services.common.company_identity_v1 import company_identity_key, employer_domain_from_job_url
+    job_url = None
+    if application_id:
+        cur.execute("SELECT job_url FROM applications WHERE id=%s;", (application_id,))
+        app = cur.fetchone()
+        job_url = app[0] if app else None
+    identity_key = company_identity_key(company, employer_domain_from_job_url(job_url))
     cur.execute(
         """
         SELECT company_domain, summary, mission, products, recent_news, risks, sources
         FROM company_research_cache
-        WHERE lower(company_name) = lower(%s)
+        WHERE identity_key = %s
           AND (expires_at IS NULL OR expires_at > now())
         ORDER BY last_refreshed_at DESC NULLS LAST
         LIMIT 1;
         """,
-        (company,),
+        (identity_key,),
     )
     row = cur.fetchone()
     if not row:
@@ -109,7 +116,7 @@ def fetch_research(cur, company: str) -> Dict[str, Any]:
     }
 
 
-def fetch_queue(cur, interview_id: Optional[str]) -> List[Dict[str, Any]]:
+def fetch_queue(cur, interview_id: Optional[str], *, limit: int = 20) -> List[Dict[str, Any]]:
     if interview_id:
         cur.execute(
             """
@@ -127,8 +134,10 @@ def fetch_queue(cur, interview_id: Optional[str]) -> List[Dict[str, Any]]:
             SELECT interview_id::text, application_id::text, interview_type,
                    scheduled_at, timezone, company, job_title, fit_score,
                    fit_decision
-            FROM v_interviews_pending_prep;
-            """
+            FROM v_interviews_pending_prep
+            LIMIT %s;
+            """,
+            (max(1, min(int(limit), 100)),),
         )
     rows = cur.fetchall()
     return [
@@ -214,7 +223,7 @@ Return ONLY valid JSON:
 
 def cmd_prep(conn, args) -> int:
     with conn.cursor() as cur:
-        interviews = fetch_queue(cur, args.interview_id)
+        interviews = fetch_queue(cur, args.interview_id, limit=args.limit)
         if not interviews:
             print("Nothing to prep.")
             return 0
@@ -231,7 +240,22 @@ def cmd_prep(conn, args) -> int:
 
         context_pack = fetch_context_pack(cur)
         for interview in interviews:
-            prompt = build_prompt(interview, context_pack, fetch_research(cur, interview["company"]))
+            cur.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s,0));",
+                (f"jobos-interview:{interview['interview_id']}:prep",),
+            )
+            cur.execute(
+                "SELECT prep_package_id::text,status FROM interviews WHERE id=%s FOR UPDATE;",
+                (interview["interview_id"],),
+            )
+            locked_interview = cur.fetchone()
+            if not locked_interview or locked_interview[0] or str(locked_interview[1] or "") != "prep_needed":
+                continue
+            os.environ["JOBOS_APPLICATION_ID"] = str(interview["application_id"])
+            os.environ["JOBOS_LLM_REQUEST_SCOPE"] = f"interview:{interview['interview_id']}:prep"
+            prompt = build_prompt(interview, context_pack, fetch_research(
+                cur, interview["company"], interview.get("application_id")
+            ))
             trace_id = make_trace_id("interview-prep", interview["interview_id"])
             start = time.perf_counter()
             raw = ollama_generate(
@@ -284,6 +308,22 @@ def cmd_prep(conn, args) -> int:
                     """,
                     (prep_package_id, prep_notes, interview["interview_id"]),
                 )
+                from services.review.review_service_v1 import ensure_action_required_review
+                ensure_action_required_review(
+                    cur,
+                    application_id=str(interview["application_id"]),
+                    action_kind="interview_prep_ready",
+                    title=f"Interview prep ready — {interview['company']}",
+                    summary=prep_notes,
+                    payload={
+                        "interview_id": str(interview["interview_id"]),
+                        "prep_package_id": str(prep_package_id),
+                        "interview_type": interview.get("interview_type") or "NaN",
+                        "scheduled_at": str(interview.get("scheduled_at") or "NaN"),
+                        "prep": prep_json,
+                    },
+                    priority="high",
+                )
 
         if not args.apply:
             conn.rollback()
@@ -299,6 +339,8 @@ def main() -> int:
     p.add_argument("--apply", action="store_true")
     p.add_argument("--list-only", action="store_true",
                     help="Print the pending-prep queue and exit; no LLM calls, no writes.")
+    p.add_argument("--limit", type=int, default=20,
+                   help="Bounded number of pending interviews to prepare in one run (default: 20).")
     p.add_argument("--model", default=MODEL)
     p.add_argument("--ollama-url", default=DEFAULT_OLLAMA_URL)
     p.add_argument("--timeout", type=int, default=300)

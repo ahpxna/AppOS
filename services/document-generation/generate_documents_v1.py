@@ -124,7 +124,7 @@ def fetch_application_context(cur, application_id: str) -> Dict[str, Any]:
     cur.execute(
         """
         SELECT
-          a.id::text, a.company, a.job_title, a.jd_text,
+          a.id::text, a.company, a.job_title, a.jd_text, a.job_url,
           jfa.fit_score, jfa.fit_decision, jfa.role_family, jfa.seniority_level,
           jfa.matched_requirements, jfa.missing_or_weak_requirements,
           jfa.hard_blockers, jfa.risk_flags
@@ -140,33 +140,32 @@ def fetch_application_context(cur, application_id: str) -> Dict[str, Any]:
     if not row:
         raise RuntimeError(f"Application not found: {application_id}")
 
-    if row[5] is None:
+    if row[6] is None:
         raise RuntimeError(
             "This application has no fit analysis yet. "
             "Run analyze_job_fit_v1.py --apply first."
         )
 
-    if row[5] == "reject":
+    if row[6] == "reject":
         raise RuntimeError(
-            f"Fit decision is 'reject' (score {row[4]}). "
+            f"Fit decision is 'reject' (score {row[5]}). "
             "Document generation is blocked for rejected applications. "
             "Override intentionally with --force if you disagree with the verdict."
         )
 
     app = {
         "id": row[0], "company": row[1], "job_title": row[2], "jd_text": row[3] or "",
-        "fit_score": row[4], "fit_decision": row[5],
-        "role_family": row[6], "seniority_level": row[7],
-        "matched_requirements": row[8] or [],
-        "missing_or_weak_requirements": row[9] or [],
-        "hard_blockers": row[10] or [],
-        "risk_flags": row[11] or [],
+        "job_url": row[4] or "", "fit_score": row[5], "fit_decision": row[6],
+        "role_family": row[7], "seniority_level": row[8],
+        "matched_requirements": row[9] or [],
+        "missing_or_weak_requirements": row[10] or [],
+        "hard_blockers": row[11] or [], "risk_flags": row[12] or [],
     }
-    app["company_context"] = fetch_company_context(cur, app["company"])
+    app["company_context"] = fetch_company_context(cur, app["company"], app["job_url"])
     return app
 
 
-def fetch_company_context(cur, company: Optional[str]) -> Dict[str, Any]:
+def fetch_company_context(cur, company: Optional[str], job_url: Optional[str] = None) -> Dict[str, Any]:
     """Return fresh, source-bearing company facts for cover-letter motivation.
 
     This is intentionally separate from profile assets: company facts never
@@ -175,36 +174,42 @@ def fetch_company_context(cur, company: Optional[str]) -> Dict[str, Any]:
     """
     if not company:
         return {}
+    from services.common.company_identity_v1 import company_identity_key, employer_domain_from_job_url
+    identity_key = company_identity_key(company, employer_domain_from_job_url(job_url))
     cur.execute(
         """
-        SELECT company_domain, summary, mission, products, recent_news, sources
+        SELECT id::text, company_domain, summary, mission, products, recent_news, sources, identity_key
         FROM company_research_cache
-        WHERE lower(company_name) = lower(%s)
+        WHERE identity_key = %s
           AND (expires_at IS NULL OR expires_at > now())
         ORDER BY last_refreshed_at DESC NULLS LAST, created_at DESC
         LIMIT 1;
         """,
-        (company,),
+        (identity_key,),
     )
     row = cur.fetchone()
     if not row:
         return {}
-    sources = sorted(company_research_source_urls(row[5]))
+    # Keep direct/in-memory adapters from older releases readable while the
+    # database query above remains bound to the new exact identity columns.
+    if len(row) == 6:
+        row = (None, *row, identity_key)
+    sources = sorted(company_research_source_urls(row[6]))
     if not sources:
         return {}
-    field_evidence = company_research_field_evidence(row[5])
+    field_evidence = company_research_field_evidence(row[6])
     # New research rows bind generated company facts to source excerpts. Legacy
     # rows remain readable for URL compatibility, but their free-text fields are
     # not promoted into a new employer-facing claim until refreshed under the
     # stronger evidence contract.
-    evidence_aware = isinstance(row[5], dict) and "field_evidence" in row[5]
+    evidence_aware = isinstance(row[6], dict) and "field_evidence" in row[6]
     return {
-        "company_domain": row[0] or "",
-        "summary": (row[1] or "") if evidence_aware and field_evidence.get("summary") else "",
-        "mission": (row[2] or "") if evidence_aware and field_evidence.get("mission") else "",
-        "products": (row[3] or "") if evidence_aware and field_evidence.get("products") else "",
+        "research_cache_id": row[0], "identity_key": row[7], "company_domain": row[1] or "",
+        "summary": (row[2] or "") if evidence_aware and field_evidence.get("summary") else "",
+        "mission": (row[3] or "") if evidence_aware and field_evidence.get("mission") else "",
+        "products": (row[4] or "") if evidence_aware and field_evidence.get("products") else "",
         "recent_news": [
-            item for item in (row[4] or [])
+            item for item in (row[5] or [])
             if isinstance(item, dict)
             and item.get("source_url") in sources
             and str(item.get("supporting_quote") or "").strip()
@@ -1072,6 +1077,7 @@ def next_version(cur, application_id: str, doc_type: str) -> int:
 
 def insert_component_run(
     cur, *, component: str, application_id: str, model: str,
+    provider: str,
     input_json: Dict[str, Any], output_json: Dict[str, Any],
     raw_output: str, prompt: str,
 ) -> str:
@@ -1083,12 +1089,12 @@ def insert_component_run(
           status, model_provider, model_name,
           input_tokens, output_tokens, created_at, finished_at
         )
-        VALUES (%s, %s, %s, %s, %s, %s, 'completed', 'ollama', %s, %s, %s, now(), now())
+        VALUES (%s, %s, %s, %s, %s, %s, 'completed', %s, %s, %s, %s, now(), now())
         RETURNING id::text;
         """,
         (
             component, "document_generation", application_id,
-            Jsonb(input_json), Jsonb(output_json), raw_output, model,
+            Jsonb(input_json), Jsonb(output_json), raw_output, provider, model,
             estimate_tokens(prompt), estimate_tokens(raw_output),
         ),
     )
@@ -1186,6 +1192,7 @@ def main() -> int:
         else:
             ok, detail = run_live_project_freshness(max_stale_hours=args.project_max_stale_hours)
             if not ok:
+                print("JOBOS_RETRYABLE_BLOCK: repository_freshness")
                 print("ERROR: live project freshness preflight failed. Resume generation is blocked.")
                 if detail:
                     print(detail)
@@ -1205,6 +1212,7 @@ def main() -> int:
                     allow_last_known_good_hours=(None if args.skip_live_project_refresh else args.project_max_stale_hours),
                 )
                 if not ready:
+                    print("JOBOS_RETRYABLE_BLOCK: profile_freshness")
                     print("ERROR: resume profile freshness gate is blocked.")
                     for blocker in blockers:
                         print(f"  - {blocker}")
@@ -1231,6 +1239,11 @@ def main() -> int:
                 else:
                     print(f"ERROR: {e}")
                     return 1
+
+            # Bind every model request in this process to the durable
+            # application identity. This enables exact response replay after a
+            # caller crash without permitting cross-application cache reuse.
+            os.environ["JOBOS_APPLICATION_ID"] = str(app["id"])
 
             revision_context: dict[str, Any] = {}
             if args.revision_feedback and args.revision_feedback_stdin:
@@ -1514,14 +1527,15 @@ def main() -> int:
             doc_id = insert_document(
                 cur, application_id=app["id"], doc_type=args.doc_type,
                 content=content, asset_ids=used, evidence_map=evidence,
-                model=args.model, role_family=app["role_family"], version=version,
+                model=resolved_llm.model, role_family=app["role_family"], version=version,
             )
             if attempt_id:
                 complete_document_attempt(cur, attempt_id=attempt_id, document_id=doc_id)
             insert_component_run(
                 cur,
                 component=COMPONENT_BY_DOC_TYPE[args.doc_type],
-                application_id=app["id"], model=args.model,
+                application_id=app["id"], model=resolved_llm.model,
+                provider=resolved_llm.provider,
                 input_json={
                     "doc_type": args.doc_type,
                     "generator_version": GENERATOR_VERSION,

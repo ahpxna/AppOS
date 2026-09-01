@@ -1193,3 +1193,89 @@ def test_discovery_location_regex_database_authority(db):
                     (invalid,),
                 )
             conn.rollback()
+
+
+def test_103_new_latest_inbound_supersedes_exact_reply_and_send_capability(db):
+    """Conversation authority is the latest inbound, not merely draft bytes."""
+    with db.connect(TEST_DSN) as conn, conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO applications(company,job_title,current_step) VALUES ('Reply Co','Role','submitted') RETURNING id"
+        )
+        app_id = cur.fetchone()[0]
+        cur.execute(
+            """INSERT INTO message_threads(source,external_thread_id,status,linked_application_id)
+                 VALUES ('test',%s,'open',%s) RETURNING id""",
+            (f"thread-{uuid.uuid4()}", app_id),
+        )
+        thread_id = cur.fetchone()[0]
+        cur.execute(
+            """INSERT INTO messages(thread_id,direction,external_id,body_text,received_at)
+                 VALUES (%s,'inbound',%s,'first',now()) RETURNING id""",
+            (thread_id, f"message-{uuid.uuid4()}"),
+        )
+        first_message = cur.fetchone()[0]
+        cur.execute(
+            """INSERT INTO drafted_replies(
+                   thread_id,in_reply_to,application_id,body_text,qa_status,version)
+                 VALUES (%s,%s,%s,'reply','pass',1) RETURNING id""",
+            (thread_id, first_message, app_id),
+        )
+        reply_id = cur.fetchone()[0]
+        cur.execute(
+            """INSERT INTO approval_requests(
+                   type,application_id,message_thread_id,payload_json,status,
+                   approval_token_hash,token_expires_at)
+                 VALUES ('send_message',%s,%s,jsonb_build_object('drafted_reply_id',%s::text),
+                         'pending',%s,now()+interval '1 hour') RETURNING id""",
+            (app_id, thread_id, reply_id, f"token-{uuid.uuid4()}"),
+        )
+        approval_id = cur.fetchone()[0]
+
+        # A late backfill older than the bound message is not a conversation change.
+        cur.execute(
+            """INSERT INTO messages(thread_id,direction,external_id,body_text,received_at)
+                 VALUES (%s,'inbound',%s,'old backfill',now()-interval '1 day')""",
+            (thread_id, f"message-{uuid.uuid4()}"),
+        )
+        cur.execute("SELECT superseded_at FROM drafted_replies WHERE id=%s", (reply_id,))
+        assert cur.fetchone() == (None,)
+        cur.execute("SELECT status FROM approval_requests WHERE id=%s", (approval_id,))
+        assert cur.fetchone() == ('pending',)
+
+        cur.execute(
+            """INSERT INTO messages(thread_id,direction,external_id,body_text,received_at)
+                 VALUES (%s,'inbound',%s,'new question',now()+interval '1 second')""",
+            (thread_id, f"message-{uuid.uuid4()}"),
+        )
+        cur.execute("SELECT approved,superseded_at IS NOT NULL FROM drafted_replies WHERE id=%s", (reply_id,))
+        assert cur.fetchone() == (False, True)
+        cur.execute("SELECT status FROM approval_requests WHERE id=%s", (approval_id,))
+        assert cur.fetchone() == ('expired',)
+        conn.rollback()
+
+
+def test_104_auth_session_rejects_foreign_application_identity(db):
+    with db.connect(TEST_DSN) as conn, conn.cursor() as cur:
+        cur.execute(
+            """INSERT INTO applications(company,job_title,current_step,job_url,jd_hash)
+                 VALUES ('Identity Co','Role','needs_account_auth','https://jobs.example.test/a','jd-a')
+                 RETURNING id"""
+        )
+        app_id = cur.fetchone()[0]
+        cur.execute("SAVEPOINT bad_auth_identity")
+        with pytest.raises(db.Error, match="auth session application/JD identity mismatch"):
+            cur.execute(
+                """INSERT INTO application_auth_sessions(
+                       application_id,auth_state,binding_job_url,binding_jd_hash)
+                     VALUES (%s,'needs_account_auth','https://jobs.example.test/b','jd-b')""",
+                (app_id,),
+            )
+        cur.execute("ROLLBACK TO SAVEPOINT bad_auth_identity")
+        cur.execute("RELEASE SAVEPOINT bad_auth_identity")
+        cur.execute(
+            """INSERT INTO application_auth_sessions(
+                   application_id,auth_state,binding_job_url,binding_jd_hash)
+                 VALUES (%s,'needs_account_auth','https://jobs.example.test/a','jd-a')""",
+            (app_id,),
+        )
+        conn.rollback()

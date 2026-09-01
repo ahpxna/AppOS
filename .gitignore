@@ -14,6 +14,7 @@ logs/
 data/openclaw-config/
 data/openclaw-workspace/
 data/openclaw-runtime/
+.jobos/
 data/pointer-traces/
 data/browser-profiles/
 data/resume-template/

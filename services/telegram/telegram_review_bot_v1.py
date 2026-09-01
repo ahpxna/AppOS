@@ -275,6 +275,10 @@ def _keyboard(cur, item_id: str, allowed_user_id: int, item_type: str,
             "email_verification_binding_required": "📧 Bind OTP page",
             "email_verification_candidate_ambiguity": "📧 Confirm email",
             "workflow_followup_required": "🔄 Retry safely",
+            "orchestrator_recovery_required": "🔄 Retry pipeline",
+            "interview_prep_ready": "✅ Got it",
+            "message_reply_revision_required": "✅ Got it",
+            "message_human_attention_required": "✅ Got it",
         }.get(action_kind, "✅ Continue")
         rows = [
             [{"text": label, "callback_data": f"rv:{approve}"}],
@@ -793,6 +797,12 @@ def _dashboard_data(cur) -> dict[str, Any]:
             GROUP BY current_step;"""
     )
     by_step = {str(step): int(count) for step, count in cur.fetchall()}
+    cur.execute(
+        """SELECT count(*) FROM applications
+            WHERE status NOT IN ('submitted','abandoned')
+              AND (current_step='error' OR orchestrator_blocker_kind IS NOT NULL);"""
+    )
+    orchestrator_stuck = int((cur.fetchone() or (0,))[0] or 0)
     active = sum(by_step.values())
     waiting_user = sum(by_step.get(step, 0) for step in (
         'docs_verified','needs_account_auth','needs_email_verification','needs_mfa',
@@ -807,23 +817,38 @@ def _dashboard_data(cur) -> dict[str, Any]:
             WHERE created_at >= now() - interval '12 hours';"""
     )
     recent_found, recent_filtered, recent_ready = cur.fetchone()
+    cur.execute(
+        """SELECT count(*) FILTER (WHERE linked_application_id IS NULL),
+                  count(*) FILTER (WHERE linked_application_id IS NOT NULL)
+             FROM message_threads WHERE needs_user_attention=true;"""
+    )
+    unlinked_messages, linked_messages = cur.fetchone()
+    cur.execute(
+        """SELECT count(*) FROM drafted_replies
+            WHERE approved=true AND sent=false AND superseded_at IS NULL;"""
+    )
+    approved_unsent = int((cur.fetchone() or (0,))[0] or 0)
     return {
         "active": active,
         "pending": int(pending or 0),
         "attention": int(needs_attention or 0),
         "reconciliation": int(reconciliation or 0),
+        "orchestrator_stuck": orchestrator_stuck,
         "waiting_user": int(waiting_user),
         "safe": safe,
         "by_step": by_step,
         "recent_found": int(recent_found or 0),
         "recent_filtered": int(recent_filtered or 0),
         "recent_ready": int(recent_ready or 0),
+        "linked_messages": int(linked_messages or 0),
+        "unlinked_messages": int(unlinked_messages or 0),
+        "approved_unsent_replies": approved_unsent,
     }
 
 
 def _dashboard_text(data: dict[str, Any]) -> str:
     safe_count = len(data.get("safe") or [])
-    red = int(data.get("reconciliation") or 0)
+    red = int(data.get("reconciliation") or 0) + int(data.get("orchestrator_stuck") or 0)
     lines = [
         "🤖 JOBOS",
         "",
@@ -836,6 +861,10 @@ def _dashboard_text(data: dict[str, Any]) -> str:
     if safe_count:
         apps = len({row['application_id'] for row in data['safe']})
         lines.extend(["", f"✅ {safe_count} low-risk decision(s) trên {apps} application(s) có thể approve cùng lúc."])
+    if int(data.get("unlinked_messages") or 0):
+        lines.extend(["", f"⚠️ {int(data['unlinked_messages'])} recruiter thread(s) chưa link application; JobOS không auto-draft."])
+    if int(data.get("approved_unsent_replies") or 0):
+        lines.extend(["", f"✉️ {int(data['approved_unsent_replies'])} reply draft(s) đã approve nhưng chưa có delivery transport; không có message nào được gửi tự động."])
     if not data.get("pending"):
         lines.extend(["", "Không có việc nào cần thao tác. JobOS sẽ tiếp tục tự động những bước an toàn."])
     return "\n".join(lines)
