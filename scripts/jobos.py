@@ -31,13 +31,11 @@ def mark(results: list[tuple[str, bool, str]], name: str, ok: bool, detail: str 
     results.append((name, ok, detail))
 
 
-def _latest_migration_contract() -> tuple[str, str, str]:
+def _migration_contracts() -> list[tuple[str, str]]:
     migrations = sorted((ROOT / "db" / "migrations").glob("*.sql"), key=lambda path: path.name)
     if not migrations:
         raise RuntimeError("No SQL migrations are present.")
-    latest = migrations[-1]
-    prefix = latest.name.split("_", 1)[0]
-    return latest.name, prefix, hashlib.sha256(latest.read_bytes()).hexdigest()
+    return [(path.name, hashlib.sha256(path.read_bytes()).hexdigest()) for path in migrations]
 
 
 
@@ -118,9 +116,11 @@ def doctor(*, check_browser: bool, strict: bool = False, require_autofill: bool 
     mark(results, "Telegram approval channel", tg, "configured" if tg else "set Telegram bot + allowed user id")
 
     try:
-        latest_migration, latest_number, latest_checksum = _latest_migration_contract()
+        migration_contracts = _migration_contracts()
+        latest_migration = migration_contracts[-1][0]
+        latest_number = latest_migration.split("_", 1)[0]
     except Exception as exc:
-        latest_migration, latest_number, latest_checksum = "unknown", "?", ""
+        migration_contracts, latest_migration, latest_number = [], "unknown", "?"
         mark(results, "Migration files", False, str(exc))
     migration_check_name = f"Migrations through {latest_number}"
 
@@ -128,11 +128,15 @@ def doctor(*, check_browser: bool, strict: bool = False, require_autofill: bool 
         import psycopg
         with psycopg.connect(database_dsn(), connect_timeout=5) as conn, conn.cursor() as cur:
             mark(results, "PostgreSQL", True)
-            cur.execute("SELECT checksum_sha256 FROM schema_migrations WHERE migration_id=%s", (latest_migration,))
-            migration_row = cur.fetchone()
-            migration_ok = bool(migration_row and str(migration_row[0]) == latest_checksum)
+            cur.execute("SELECT migration_id,checksum_sha256 FROM schema_migrations")
+            applied_migrations = {str(name): str(checksum) for name, checksum in cur.fetchall()}
+            missing_or_drift = next(
+                (name for name, expected in migration_contracts if applied_migrations.get(name) != expected),
+                None,
+            )
+            migration_ok = missing_or_drift is None
             mark(results, migration_check_name, migration_ok,
-                 latest_migration if migration_ok else f"missing/checksum drift: {latest_migration}")
+                 latest_migration if migration_ok else f"missing/checksum drift: {missing_or_drift}")
             cur.execute("SELECT to_regclass('public.privileged_action_executions') IS NOT NULL")
             mark(results, "Human Approval Bus", bool(cur.fetchone()[0]))
             cur.execute("SELECT to_regclass('public.autofill_action_journal') IS NOT NULL")

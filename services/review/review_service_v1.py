@@ -593,7 +593,8 @@ def sync_orchestrator_recovery_required(cur) -> int:
             summary=(f"{company} — {role}. Blocker: {blocker or 'application_error'}. "
                      "Fix the prerequisite if needed, then tap Retry; no browser or submit action occurs."),
             payload={"current_step": step, "failed_step": failed_step,
-                     "blocker_kind": blocker, "retry_at": retry_at,
+                     "blocker_kind": blocker,
+                     "retry_at": retry_at.isoformat() if retry_at else None,
                      "error": str(error or "")[:800]}, priority="urgent",
         ):
             count += 1
@@ -1908,7 +1909,7 @@ def decide_item(conn, item_id: str, *, decision: str, actor: str, note: str = ""
                         _update_auth_session(
                             cur, application_id=app_id, url=live_url, fingerprint=live_fp,
                             state=live_state, platform=platform,
-                            detail={**live_detail, "target_id": target_id, "human_refocus": True},
+                            detail={**live_detail, "target_id": target_id, "human_refocus": True}, snapshot=live_snap,
                         )
                         workflow_followup_result = {
                             "target_id": target_id, "url": live_url, "state": live_state,

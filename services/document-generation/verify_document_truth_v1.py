@@ -150,16 +150,20 @@ def fetch_company_source_urls(cur, application_id: str) -> set[str]:
     that a URL the cover-letter generator recorded came from the company's
     cache, not that it is still fresh today.
     """
+    from services.common.company_identity_v1 import company_identity_key, employer_domain_from_job_url, research_cache_lookup_predicate
+    cur.execute("SELECT company,job_url FROM applications WHERE id=%s;", (application_id,))
+    app = cur.fetchone()
+    if not app:
+        return set()
+    identity_key = company_identity_key(app[0], employer_domain_from_job_url(app[1]))
     cur.execute(
-        """
+        f"""
         SELECT crc.sources
-        FROM applications a
-        JOIN company_research_cache crc
-          ON lower(crc.company_name) = lower(a.company)
-        WHERE a.id = %s
+        FROM company_research_cache crc
+        WHERE {research_cache_lookup_predicate()}
         ORDER BY crc.last_refreshed_at DESC NULLS LAST, crc.created_at DESC;
         """,
-        (application_id,),
+        (identity_key, identity_key),
     )
     urls: set[str] = set()
     for (sources,) in cur.fetchall():
@@ -203,21 +207,21 @@ def deterministic_cover_structure(company: str, job_title: str) -> set[str]:
 
 def fetch_company_research_text(cur, application_id: str) -> str:
     """Return the cached, URL-backed company context for literal-quote audit."""
-    from services.common.company_identity_v1 import company_identity_key, employer_domain_from_job_url
+    from services.common.company_identity_v1 import company_identity_key, employer_domain_from_job_url, research_cache_lookup_predicate
     cur.execute("SELECT company,job_url FROM applications WHERE id=%s;", (application_id,))
     app = cur.fetchone()
     if not app:
         return ""
     identity_key = company_identity_key(app[0], employer_domain_from_job_url(app[1]))
     cur.execute(
-        """
+        f"""
         SELECT crc.sources, crc.recent_news
         FROM company_research_cache crc
-        WHERE crc.identity_key = %s
+        WHERE {research_cache_lookup_predicate()}
         ORDER BY crc.last_refreshed_at DESC NULLS LAST, crc.created_at DESC
         LIMIT 1;
         """,
-        (identity_key,),
+        (identity_key, identity_key),
     )
     row = cur.fetchone()
     if not row:

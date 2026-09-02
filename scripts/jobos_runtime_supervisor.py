@@ -9,6 +9,7 @@ existing workers alive.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import shutil
@@ -31,6 +32,7 @@ RUN_DIR = ROOT / ".jobos" / "run"
 LOG_DIR = ROOT / ".jobos" / "logs"
 SUPERVISOR_PID = RUN_DIR / "supervisor.pid"
 STATE_FILE = RUN_DIR / "runtime.json"
+SUPERVISOR_LOCK = RUN_DIR / "supervisor.lock"
 STOP = False
 MAX_LOG_BYTES = 10 * 1024 * 1024
 BROWSER_HEALTH_INTERVAL_SECONDS = env_int(
@@ -182,7 +184,11 @@ def _specs() -> dict[str, WorkerSpec]:
     ):
         specs["telegram"] = WorkerSpec("telegram", (sys.executable, "-m", "services.telegram.telegram_review_bot_v1"))
     if os.getenv("JOBOS_GMAIL_ACCOUNT") or os.getenv("GMAIL_ACCOUNT"):
-        specs["gmail-watcher"] = WorkerSpec("gmail-watcher", (sys.executable, "-m", "services.auth.gmail_verification_watcher_v1", "--interval-seconds", "10"))
+        specs["gmail-watcher"] = WorkerSpec(
+            "gmail-watcher",
+            (sys.executable, "-m", "services.auth.gmail_verification_watcher_v1",
+             "--wake-listen", "--interval-seconds", "10"),
+        )
     if _truthy("JOBOS_REPO_FRESHNESS_WATCH_ENABLED", False):
         specs["repo-freshness"] = WorkerSpec(
             "repo-freshness",
@@ -375,7 +381,7 @@ def _spawn(spec: WorkerSpec) -> subprocess.Popen[Any]:
     stream = _rotate_log(spec.name).open("ab", buffering=0)
     try:
         return subprocess.Popen(spec.argv, cwd=ROOT, stdout=stream, stderr=subprocess.STDOUT,
-                                start_new_session=False, close_fds=True)
+                                start_new_session=True, close_fds=True)
     finally:
         # The child inherited its descriptor.  Keeping a parent descriptor open
         # on each restart eventually leaks FDs in a long-running daily runtime.
@@ -386,7 +392,7 @@ def _shutdown(children: dict[str, subprocess.Popen[Any]]) -> None:
     for proc in children.values():
         if proc.poll() is None:
             try:
-                proc.terminate()
+                os.killpg(proc.pid, signal.SIGTERM)
             except Exception:
                 pass
     deadline = time.time() + 8
@@ -395,7 +401,7 @@ def _shutdown(children: dict[str, subprocess.Popen[Any]]) -> None:
     for proc in children.values():
         if proc.poll() is None:
             try:
-                proc.kill()
+                os.killpg(proc.pid, signal.SIGKILL)
             except Exception:
                 pass
 
@@ -405,6 +411,13 @@ def daemon() -> int:
     load_repo_env()
     RUN_DIR.mkdir(parents=True, exist_ok=True)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
+    lock_stream = SUPERVISOR_LOCK.open("a+")
+    try:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock_stream.close()
+        print("Another JobOS supervisor already owns the runtime lock.", file=sys.stderr)
+        return 1
     SUPERVISOR_PID.write_text(str(os.getpid()))
     runtime_instance_id = str(uuid.uuid4())
     _db_runtime_start(runtime_instance_id)
@@ -426,7 +439,10 @@ def daemon() -> int:
                 degraded.pop(stale, None)
                 restart_times.pop(stale, None)
                 if proc.poll() is None:
-                    proc.terminate()
+                    try:
+                        os.killpg(proc.pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
             for name, spec in specs.items():
                 proc = children.get(name)
                 if proc is None or proc.poll() is not None:
@@ -479,6 +495,8 @@ def daemon() -> int:
             SUPERVISOR_PID.unlink(missing_ok=True)
         except Exception:
             pass
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+        lock_stream.close()
     return 0
 
 
@@ -503,23 +521,21 @@ def _preflight_database_contract(*, timeout_seconds: int = 30) -> tuple[bool, st
     """
     from scripts.apply_migrations import checksum, migration_files
 
-    latest = migration_files()[-1]
+    expected_migrations = migration_files()
     deadline = time.monotonic() + max(1, min(int(timeout_seconds), 120))
     last_error = "PostgreSQL did not become reachable."
     while True:
         try:
             import psycopg
             with psycopg.connect(database_dsn(), autocommit=True) as conn, conn.cursor() as cur:
-                cur.execute(
-                    "SELECT checksum_sha256 FROM schema_migrations WHERE migration_id=%s;",
-                    (latest.name,),
-                )
-                row = cur.fetchone()
-            expected = checksum(latest)
-            if not row:
-                return False, f"migration_not_current={latest.name}"
-            if str(row[0]) != expected:
-                return False, f"migration_checksum_drift={latest.name}"
+                cur.execute("SELECT migration_id,checksum_sha256 FROM schema_migrations;")
+                applied = {str(migration_id): str(digest) for migration_id, digest in cur.fetchall()}
+            for migration in expected_migrations:
+                actual = applied.get(migration.name)
+                if actual is None:
+                    return False, f"migration_not_current={migration.name}"
+                if actual != checksum(migration):
+                    return False, f"migration_checksum_drift={migration.name}"
             return True, None
         except Exception as exc:
             last_error = f"{type(exc).__name__}: {exc}"[:500]

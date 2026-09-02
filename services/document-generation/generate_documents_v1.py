@@ -174,18 +174,18 @@ def fetch_company_context(cur, company: Optional[str], job_url: Optional[str] = 
     """
     if not company:
         return {}
-    from services.common.company_identity_v1 import company_identity_key, employer_domain_from_job_url
+    from services.common.company_identity_v1 import company_identity_key, employer_domain_from_job_url, research_cache_lookup_predicate
     identity_key = company_identity_key(company, employer_domain_from_job_url(job_url))
     cur.execute(
-        """
+        f"""
         SELECT id::text, company_domain, summary, mission, products, recent_news, sources, identity_key
-        FROM company_research_cache
-        WHERE identity_key = %s
+        FROM company_research_cache crc
+        WHERE {research_cache_lookup_predicate()}
           AND (expires_at IS NULL OR expires_at > now())
         ORDER BY last_refreshed_at DESC NULLS LAST, created_at DESC
         LIMIT 1;
         """,
-        (identity_key,),
+        (identity_key, identity_key),
     )
     row = cur.fetchone()
     if not row:

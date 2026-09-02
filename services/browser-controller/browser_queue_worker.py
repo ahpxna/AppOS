@@ -55,7 +55,8 @@ if str(REPO_ROOT) not in sys.path:
 import psycopg
 from psycopg.types.json import Jsonb
 from services.common.llm_cost_accounting_v1 import (
-    LLMBudgetError, mark_paid_call_uncertain, reserve_paid_call, settle_paid_call,
+    LLMBudgetError, mark_paid_call_uncertain, openclaw_accounting_identity,
+    reserve_paid_call, settle_paid_call,
 )
 # Sửa lại đoạn import ở đầu file browser_queue_worker.py
 from services.autofill.parallel_bypass import execute_parallel_bypass
@@ -467,7 +468,9 @@ def _current_linkedin_page_target(
         raise TransientTaskError("LinkedIn CAPTCHA binding has no task-owned source target")
 
     causal_ids = {source_target_id}
-    causal_ids.update(set(catalog) - set(pre_attempt_target_ids))
+    # A target created after the baseline is not automatically task-owned:
+    # unrelated user/browser activity can create a LinkedIn challenge tab at
+    # the same time. Extend ownership solely through opener lineage below.
     # Include descendants opened by the task even if CDP catalog refresh timing
     # caused their ids to appear in the captured baseline.
     changed = True
@@ -634,8 +637,7 @@ def openclaw_agent(*, agent: str, message: str, timeout: int,
         # overlap, and lets one posting's context bleed into the next one's.
         args += ["--session-id", session_id]
 
-    provider = os.getenv("JOBOS_OPENCLAW_ACCOUNTING_PROVIDER", "openrouter").strip().casefold()
-    model = os.getenv("JOBOS_OPENCLAW_ACCOUNTING_MODEL", "openrouter/auto").strip()
+    provider, model = openclaw_accounting_identity(agent)
     request_sha = hashlib.sha256(json.dumps(
         {"agent": agent, "message": message, "provider": provider, "model": model},
         sort_keys=True, separators=(",", ":"), ensure_ascii=False,
@@ -700,10 +702,12 @@ def openclaw_agent(*, agent: str, message: str, timeout: int,
         restore_scope()
         raise failure
 
-    parsed = parse_agent_output(proc.stdout)
-    if agent == OPENCLAW_AGENT_LINKEDIN_DISCOVERY:
-        parsed = blocker_safe_agent_response(parsed)
     try:
+        # A parse/normalisation failure occurs after a paid provider response;
+        # preserve it as uncertain instead of leaving a running reservation.
+        parsed = parse_agent_output(proc.stdout)
+        if agent == OPENCLAW_AGENT_LINKEDIN_DISCOVERY:
+            parsed = blocker_safe_agent_response(parsed)
         settle_paid_call(
             reservation, role=f"openclaw_{agent}", configured_model=model,
             resolved_model=model, input_tokens=input_tokens,
@@ -712,6 +716,12 @@ def openclaw_agent(*, agent: str, message: str, timeout: int,
             response_sha256=hashlib.sha256(proc.stdout.encode("utf-8")).hexdigest(),
             response_json={"agent_response": parsed},
         )
+    except Exception as exc:
+        mark_paid_call_uncertain(
+            reservation, role=f"openclaw_{agent}", configured_model=model,
+            estimated_input_tokens=input_tokens, error=str(exc),
+        )
+        raise
     finally:
         restore_scope()
     return parsed

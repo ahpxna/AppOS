@@ -175,7 +175,7 @@ def observe_once(conn, *, limit: int = 20) -> list[dict[str, Any]]:
             _update_auth_session(
                 cur, application_id=application_id, url=live_url, fingerprint=fp,
                 state=live_state, platform=platform,
-                detail={**live_detail, "target_id": target_id, "observed_by": "browser_state_watcher_v1"},
+                detail={**live_detail, "target_id": target_id, "observed_by": "browser_state_watcher_v1"}, snapshot=snap,
             )
         conn.commit()
         if canonical_step == expected_step:

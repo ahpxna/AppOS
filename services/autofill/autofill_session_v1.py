@@ -149,6 +149,12 @@ class AutofillSession:
             pauses = any(item.action == "pause" for item in initial_actions)
             return SessionResult("needs_review" if pauses else "completed", (), (), (), target.target_id)
         self.begin_execution(target.target_id)
+        # The execution CAS is the durable boundary between planning and I/O.
+        # Re-read after it because ATS accessibility refs can rerender while
+        # the capability is being consumed.
+        state = self.snapshot_state(target.target_id)
+        self._assert_origin(target)
+        self._assert_initial_page(target, state)
         completed: set[tuple[str, str | None, str | None, str | None]] = set()
         verified: list[str] = []
         executed: list[str] = []

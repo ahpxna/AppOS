@@ -41,3 +41,16 @@ def company_identity_key(company: Any, domain: Any = None) -> str:
     if not name:
         raise ValueError("company research identity requires a company name or domain")
     return f"name:{name}"
+
+
+def research_cache_lookup_predicate(alias_table: str = "company_research_identity_aliases") -> str:
+    """SQL predicate for the canonical cache row or a durable identity alias.
+
+    A posting on LinkedIn/Greenhouse commonly begins with name-only identity,
+    then research discovers the employer domain. Consumers must resolve both
+    to the same row rather than repeatedly paying for research.
+    """
+    return (
+        "(crc.identity_key = %s OR crc.id = "
+        f"(SELECT research_cache_id FROM {alias_table} WHERE identity_key=%s))"
+    )

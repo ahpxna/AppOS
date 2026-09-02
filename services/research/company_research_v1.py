@@ -65,10 +65,12 @@ from services.ats.registry import detect_ats_platform
 
 from services.common.openclaw_runtime import resolve_openclaw_binary
 from services.common.llm_cost_accounting_v1 import (
-    mark_paid_call_uncertain, reserve_paid_call, settle_paid_call,
+    LLMBudgetError, mark_paid_call_uncertain, openclaw_accounting_identity,
+    reserve_paid_call, settle_paid_call,
 )
 from services.common.company_identity_v1 import (
     company_identity_key, employer_domain_from_job_url, normalize_company_domain,
+    research_cache_lookup_predicate,
 )
 
 OPENCLAW_BIN = resolve_openclaw_binary()
@@ -112,8 +114,10 @@ def openclaw_agent(message: str, *, timeout: int) -> str:
 
 def accounted_openclaw_agent(message: str, *, timeout: int) -> str:
     """Execute one tool-using agent call behind hard budget + exact replay."""
-    provider = os.getenv("JOBOS_OPENCLAW_ACCOUNTING_PROVIDER", "openrouter").strip().casefold()
-    model = os.getenv("JOBOS_OPENCLAW_ACCOUNTING_MODEL", "openrouter/auto").strip()
+    try:
+        provider, model = openclaw_accounting_identity(OPENCLAW_AGENT)
+    except LLMBudgetError as exc:
+        raise RuntimeError(str(exc)) from exc
     request_sha = hashlib.sha256(json.dumps(
         {"agent": OPENCLAW_AGENT, "message": message, "provider": provider, "model": model},
         sort_keys=True, separators=(",", ":"), ensure_ascii=False,
@@ -400,8 +404,8 @@ def validate(parsed: Dict[str, Any], *, expected_domain: Optional[str] = None) -
     }
 
 
-def _fetch_source_text(url: str, *, timeout: int = 12, max_bytes: int = 1_500_000) -> str:
-    """Fetch public evidence without allowing loopback/private-network SSRF."""
+def _require_public_http_url(url: str) -> None:
+    """Validate every URL hop before an evidence fetch reaches the network."""
     parsed = urlsplit(url)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         raise ValueError("research source must be an absolute HTTP(S) URL")
@@ -409,8 +413,22 @@ def _fetch_source_text(url: str, *, timeout: int = 12, max_bytes: int = 1_500_00
         address = ipaddress.ip_address(info[4][0])
         if not address.is_global:
             raise ValueError("research source resolves to a non-public address")
+
+
+class _PublicOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Revalidate redirect destinations to close public-URL -> private SSRF."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[override]
+        _require_public_http_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _fetch_source_text(url: str, *, timeout: int = 12, max_bytes: int = 1_500_000) -> str:
+    """Fetch public evidence without allowing loopback/private-network SSRF."""
+    _require_public_http_url(url)
     request = urllib.request.Request(url, headers={"User-Agent": "JobOS-Research-Evidence/1.0"})
-    with urllib.request.urlopen(request, timeout=timeout) as response:
+    opener = urllib.request.build_opener(_PublicOnlyRedirectHandler())
+    with opener.open(request, timeout=timeout) as response:
+        _require_public_http_url(response.geturl())
         content_type = str(response.headers.get("Content-Type") or "").casefold()
         if not any(kind in content_type for kind in ("text/", "json", "xml")):
             raise ValueError("research source is not textual")
@@ -466,16 +484,17 @@ def verify_fetched_evidence(data: Dict[str, Any]) -> Dict[str, Any]:
 # ---------------------------------------------------------------- data access
 
 def get_cached(cur, company: str, domain: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    identity_key = company_identity_key(company, domain)
     cur.execute(
-        """
+        f"""
         SELECT id::text, company_domain, summary, last_refreshed_at, expires_at,
                (expires_at IS NOT NULL AND expires_at > now()) AS fresh
-        FROM company_research_cache
-        WHERE identity_key = %s
+        FROM company_research_cache crc
+        WHERE {research_cache_lookup_predicate()}
         ORDER BY last_refreshed_at DESC NULLS LAST
         LIMIT 1;
         """,
-        (company_identity_key(company, domain),),
+        (identity_key, identity_key),
     )
     r = cur.fetchone()
     if not r:
@@ -484,7 +503,8 @@ def get_cached(cur, company: str, domain: Optional[str] = None) -> Optional[Dict
             "refreshed": r[3], "expires": r[4], "fresh": r[5]}
 
 
-def upsert_research(cur, company: str, data: Dict[str, Any], ttl_days: int) -> str:
+def upsert_research(cur, company: str, data: Dict[str, Any], ttl_days: int,
+                    *, lookup_domain: Optional[str] = None) -> str:
     identity_key = company_identity_key(company, data.get("company_domain"))
     cur.execute(
         """
@@ -512,7 +532,17 @@ def upsert_research(cur, company: str, data: Dict[str, Any], ttl_days: int) -> s
             ttl_days,
         ),
     )
-    return cur.fetchone()[0]
+    cache_id = str(cur.fetchone()[0])
+    aliases = {company_identity_key(company, lookup_domain), identity_key}
+    for alias in aliases:
+        cur.execute(
+            """INSERT INTO company_research_identity_aliases(identity_key,research_cache_id)
+                 VALUES (%s,%s::uuid)
+               ON CONFLICT (identity_key) DO UPDATE SET research_cache_id=EXCLUDED.research_cache_id,
+                 updated_at=now();""",
+            (alias, cache_id),
+        )
+    return cache_id
 
 
 def company_for_application(cur, application_id: str) -> tuple:
@@ -589,7 +619,7 @@ def research_company(conn, company: str, domain: Optional[str], args) -> int:
             print("\nDRY RUN. Nothing committed.")
             return 0
 
-        row_id = upsert_research(cur, company, data, args.ttl_days)
+        row_id = upsert_research(cur, company, data, args.ttl_days, lookup_domain=domain)
         conn.commit()
         print(f"\n  saved: {row_id} (expires in {args.ttl_days} days)")
         return 0

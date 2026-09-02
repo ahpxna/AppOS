@@ -453,7 +453,8 @@ def canonical_pipeline_step_for_browser_state(state: str) -> str | None:
 
 
 def _update_auth_session(cur, *, application_id: str, url: str, fingerprint: str,
-                         state: str, platform: str, detail: dict[str, Any]) -> None:
+                         state: str, platform: str, detail: dict[str, Any],
+                         snapshot: dict[str, Any] | None = None) -> None:
     cur.execute(
         "SELECT coalesce(job_url,''),coalesce(jd_hash,'') FROM applications WHERE id=%s;",
         (application_id,),
@@ -478,6 +479,18 @@ def _update_auth_session(cur, *, application_id: str, url: str, fingerprint: str
          binding_job_url, binding_jd_hash),
     )
     target_step = canonical_pipeline_step_for_browser_state(state)
+    if target_step == "application_form_ready":
+        # A target id plus trusted origin is not application identity: the user
+        # can navigate the same ATS tab to another job. Require the exact job
+        # URL or observable company+role identity before this path advances.
+        cur.execute("SELECT coalesce(company,''),coalesce(job_title,'') FROM applications WHERE id=%s;", (application_id,))
+        identity = cur.fetchone()
+        words = lambda value: " ".join(re.findall(r"[a-z0-9]+", str(value or "").casefold()))
+        text = words((snapshot or {}).get("snapshot"))
+        title, company = words(identity[1] if identity else ""), words(identity[0] if identity else "")
+        same_url = bool(binding_job_url and canonical_page_url(url) == canonical_page_url(binding_job_url))
+        if not same_url and not (title and len(title) >= 4 and title in text and (not company or company in text)):
+            raise PrivilegedActionError("application form identity is not grounded to this application")
     if target_step:
         current = _application_step(cur, application_id)
         if current != target_step:
@@ -943,7 +956,13 @@ def _select_after_navigation_target(transport: OpenClawTransport, source_target:
     new_tabs = [t for t in after_tabs if transport._stable_id(t) and transport._stable_id(t) not in before_ids]
     source_before = next((t for t in before_tabs if transport._stable_id(t) == source_target), {})
     source_after = next((t for t in after_tabs if transport._stable_id(t) == source_target), {})
-    candidate_tabs: list[tuple[dict[str, Any], bool]] = [(tab, False) for tab in new_tabs]
+    # A tab that appeared concurrently is not proof that the Apply click
+    # created it. Only an opener-bound descendant is eligible for automatic
+    # selection; other new tabs remain a human ambiguity choice.
+    candidate_tabs: list[tuple[dict[str, Any], bool]] = [
+        (tab, False) for tab in new_tabs
+        if str(tab.get("openerId") or "") == str(source_target)
+    ]
     if source_after:
         candidate_tabs.append((source_after, True))
 
@@ -1011,7 +1030,7 @@ def _after_navigation(cur, transport: OpenClawTransport, application_id: str, so
     # state until the separate trust capability is approved.
     if trusted:
         _update_auth_session(cur, application_id=application_id, url=url, fingerprint=fp,
-                             state=state, platform=platform, detail={**detail, "target_id": target_id})
+                             state=state, platform=platform, detail={**detail, "target_id": target_id}, snapshot=snap)
 
     # Do not package the next approval in the same transaction as an external
     # browser effect.  Return enough evidence for a post-commit best-effort
@@ -1216,7 +1235,7 @@ def reconcile_observed_privileged_effect(cur, *, application_id: str, approval_r
     if trusted:
         _update_auth_session(
             cur, application_id=application_id, url=url, fingerprint=fp, state=state, platform=platform,
-            detail={**detail, "target_id": observed_target, "reconciled_from": action_type},
+            detail={**detail, "target_id": observed_target, "reconciled_from": action_type}, snapshot=snap,
         )
     followup = "state_gate" if trusted else "trust_domain_required"
     return {"target_id": observed_target, "url": url, "page_fingerprint": fp,
@@ -1507,7 +1526,7 @@ def execute_one(conn, request_id: str) -> dict[str, Any]:
                         cur, application_id=app_id, url=live_url, fingerprint=live_fp,
                         state=state, platform=platform,
                         detail={**detail, "target_id": str(payload.get("target_id") or ""),
-                                "selected_from_navigation_ambiguity": True},
+                                "selected_from_navigation_ambiguity": True}, snapshot=live_snap,
                     )
                 result = {
                     "target_id": str(payload.get("target_id") or ""), "url": live_url,
@@ -1592,7 +1611,7 @@ def execute_one(conn, request_id: str) -> dict[str, Any]:
                     platform = detect_platform(live_url, live_snap)
                     state, detail = detect_page_state(live_url, live_snap, live_nodes)
                     _update_auth_session(cur, application_id=app_id, url=live_url, fingerprint=live_fp,
-                                         state=state, platform=platform, detail={**detail, "target_id": str(payload.get("target_id") or "")})
+                                         state=state, platform=platform, detail={**detail, "target_id": str(payload.get("target_id") or "")}, snapshot=live_snap)
                     result = {"trusted_domain": domain, "target_id": str(payload.get("target_id") or ""),
                               "url": live_url, "page_fingerprint": live_fp, "state": state,
                               "platform": platform, "followup": "state_gate",
@@ -1605,7 +1624,7 @@ def execute_one(conn, request_id: str) -> dict[str, Any]:
                 _require_trusted_target(cur, url, application_id=app_id)
                 snap = transport.snapshot(target_id); nodes = parse_snapshot(snap); fp = page_fingerprint(snap, page_url=url)
                 platform = detect_platform(url, snap); state, detail = detect_page_state(url, snap, nodes)
-                _update_auth_session(cur, application_id=app_id, url=url, fingerprint=fp, state=state, platform=platform, detail={**detail, "target_id": target_id})
+                _update_auth_session(cur, application_id=app_id, url=url, fingerprint=fp, state=state, platform=platform, detail={**detail, "target_id": target_id}, snapshot=snap)
                 result = {"target_id": target_id, "url": url, "page_fingerprint": fp,
                           "state": state, "platform": platform, "followup": "state_gate"}
             else:

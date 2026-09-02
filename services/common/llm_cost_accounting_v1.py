@@ -19,6 +19,26 @@ class LLMBudgetError(RuntimeError):
     pass
 
 
+def openclaw_accounting_identity(agent: str) -> tuple[str, str]:
+    """Resolve accounting identity from the exact OpenClaw agent model.
+
+    A single global alias cannot account for a configuration where ``main`` is
+    an OpenAI model and LinkedIn uses OpenRouter. The model selector is the
+    same per-agent environment authority consumed by the OpenClaw bootstrap.
+    """
+    normalized = str(agent or "main").strip().upper().replace("-", "_")
+    model_key = "OPENCLAW_MODEL_PRIMARY" if normalized == "MAIN" else f"OPENCLAW_{normalized}_MODEL"
+    model = str(os.getenv(model_key) or "").strip()
+    if not model:
+        # Kept solely for old deployments; new configuration must use the
+        # agent-specific model so cost records remain truthful.
+        model = str(os.getenv("JOBOS_OPENCLAW_ACCOUNTING_MODEL") or "").strip()
+    if not model or "/" not in model:
+        raise LLMBudgetError(f"OpenClaw agent {agent!r} has no exact provider/model configuration ({model_key}).")
+    provider = model.split("/", 1)[0].casefold()
+    return provider, model
+
+
 @dataclass(frozen=True)
 class Reservation:
     id: str

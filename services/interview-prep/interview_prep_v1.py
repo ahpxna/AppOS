@@ -72,7 +72,7 @@ def fetch_context_pack(cur) -> str:
 
 
 def fetch_research(cur, company: str, application_id: str | None = None) -> Dict[str, Any]:
-    from services.common.company_identity_v1 import company_identity_key, employer_domain_from_job_url
+    from services.common.company_identity_v1 import company_identity_key, employer_domain_from_job_url, research_cache_lookup_predicate
     job_url = None
     if application_id:
         cur.execute("SELECT job_url FROM applications WHERE id=%s;", (application_id,))
@@ -80,15 +80,15 @@ def fetch_research(cur, company: str, application_id: str | None = None) -> Dict
         job_url = app[0] if app else None
     identity_key = company_identity_key(company, employer_domain_from_job_url(job_url))
     cur.execute(
-        """
+        f"""
         SELECT company_domain, summary, mission, products, recent_news, risks, sources
-        FROM company_research_cache
-        WHERE identity_key = %s
+        FROM company_research_cache crc
+        WHERE {research_cache_lookup_predicate()}
           AND (expires_at IS NULL OR expires_at > now())
         ORDER BY last_refreshed_at DESC NULLS LAST
         LIMIT 1;
         """,
-        (identity_key,),
+        (identity_key, identity_key),
     )
     row = cur.fetchone()
     if not row:

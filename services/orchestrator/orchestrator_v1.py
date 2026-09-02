@@ -113,7 +113,11 @@ def transition(
         DEFAULT_PIPELINE_STATE_STORE.transition(
             cur, application_id=application_id, expected_from=str(from_step), to=to_step,
             actor=actor, reason=reason, detail=detail,
-            require_automated=(actor == "orchestrator"), lease_run_id=_ACTIVE_PROCESSING_RUN_ID,
+            # Actor names the producing machine component. Passing False means
+            # "require a human edge", which incorrectly blocked the filter and
+            # truth-QA workers merely because they have distinct actor names.
+            require_automated=(actor in {"orchestrator", "no_llm_filter", "truth_quality_checker"}),
+            lease_run_id=_ACTIVE_PROCESSING_RUN_ID,
             workflow_run_id=_ACTIVE_PROCESSING_RUN_ID,
         )
     except PipelineStateError as exc:
@@ -765,9 +769,10 @@ def release_application_claim(cur, application_id: str, run_id: str, *,
 
 def _subprocess_env(args: List[str]) -> dict[str, str]:
     env = os.environ.copy()
-    if "--application-id" in args:
+    application_flag = next((flag for flag in ("--application-id", "--for-application") if flag in args), None)
+    if application_flag:
         try:
-            env["JOBOS_APPLICATION_ID"] = str(args[args.index("--application-id") + 1])
+            env["JOBOS_APPLICATION_ID"] = str(args[args.index(application_flag) + 1])
         except (ValueError, IndexError):
             pass
     if _ACTIVE_PROCESSING_RUN_ID:
